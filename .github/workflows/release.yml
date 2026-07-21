@@ -147,6 +147,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
@@ -157,6 +162,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           release_args=(
