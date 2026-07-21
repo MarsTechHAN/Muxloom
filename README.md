@@ -13,8 +13,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml"><img alt="Build and release" src="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/MarsTechHAN/Muxloom/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/MarsTechHAN/Muxloom?display_name=tag"></a>
   <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust">
-  <img alt="macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555">
+  <img alt="macOS, Linux, and Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-555555">
   <img alt="Local and SSH" src="https://img.shields.io/badge/targets-local%20%7C%20SSH-2f81f7">
   <img alt="GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-green">
 </p>
@@ -35,6 +37,7 @@
 - [Overview](#en-overview)
 - [Why Muxloom](#en-why)
 - [Quick start](#en-quick-start)
+- [Automated builds and releases](#en-releases)
 - [First-run workflow](#en-first-run)
 - [Layout and interaction model](#en-layout)
 - [Launching, browsing, and resuming](#en-launch-flow)
@@ -119,10 +122,14 @@ Unrelated tmux sessions are not listed, resized, attached, or deleted.
 
 Controller machine:
 
-- macOS or Linux;
+- macOS, Linux, or Windows;
 - Rust 1.85 or newer to build;
 - `ssh` for remote targets;
 - `tmux` when running local managed sessions.
+
+The Windows build is currently intended as an SSH controller for remote
+POSIX/tmux targets. Local managed sessions require tmux and are supported on
+macOS and Linux.
 
 Each remote target:
 
@@ -172,6 +179,36 @@ muxloom init [--config PATH]
 | `--config PATH` | Use a non-default TOML file |
 | `--debug` | Log to `~/.local/state/muxloom/debug.log` |
 | `--debug-log PATH` | Log to an explicit path |
+
+<a id="en-releases"></a>
+
+### Automated builds and releases
+
+Every push to `main` runs formatting, Clippy, and the complete test suite, then
+builds downloadable workflow artifacts for:
+
+| Platform | Rust target | Archive |
+| --- | --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+
+Each archive includes the executable, this README, and the GPL license. A
+matching `.sha256` file is uploaded beside every archive.
+
+Push a `v*` tag to publish the same artifacts as a GitHub Release with generated
+release notes:
+
+```bash
+git tag -a v0.2.0 -m "Muxloom v0.2.0"
+git push origin main
+git push origin v0.2.0
+```
+
+Tags containing a hyphen, such as `v0.3.0-rc.1`, are published as prereleases.
+The workflow can also be started manually from the Actions tab; manual runs
+produce artifacts but never create a Release.
 
 <a id="en-first-run"></a>
 
@@ -823,8 +860,8 @@ would otherwise compete over the same server's pane-size policy. They cover:
 - Codex-to-Claude and Claude-to-Codex history conversion is **not implemented**.
   Their private event formats evolve independently; v0.2 does not mutate or
   copy those files.
-- The implementation currently assumes a POSIX shell, OpenSSH semantics, and
-  tmux on managed targets. macOS and Linux are the intended environments.
+- Managed targets require a POSIX shell and tmux. A Windows controller can
+  manage remote targets through OpenSSH, but cannot run a local managed session.
 - There is no separate controller daemon. Persistence is provided by target-side
   tmux, while discovery occurs when a dashboard is running.
 - Only sessions created and tagged by Muxloom or compatible `agent-deck`
@@ -862,6 +899,7 @@ conversation files.
 - [项目定位](#zh-overview)
 - [解决的问题](#zh-why)
 - [快速开始](#zh-quick-start)
+- [自动构建与发布](#zh-releases)
 - [首次使用流程](#zh-first-run)
 - [布局与交互模型](#zh-layout)
 - [启动、选路径与恢复会话](#zh-launch-flow)
@@ -940,10 +978,13 @@ conversation files.
 
 控制机要求：
 
-- macOS 或 Linux；
+- macOS、Linux 或 Windows；
 - 编译需要 Rust 1.85 或更高版本；
 - 管理远程机器需要 `ssh`；
 - 管理本地会话需要 tmux。
+
+Windows 构建目前用于通过 SSH 管理远程 POSIX/tmux 目标。本地托管会话依赖 tmux，
+因此只在 macOS 和 Linux 上支持。
 
 每台远程目标机器要求：
 
@@ -985,6 +1026,34 @@ CLI 参数：
 | `--config PATH` | 使用指定 TOML 配置 |
 | `--debug` | 写入默认 Debug Log |
 | `--debug-log PATH` | 写入指定 Debug Log |
+
+<a id="zh-releases"></a>
+
+### 自动构建与发布
+
+每次 Push 到 `main` 都会执行格式检查、Clippy 和完整测试，然后生成四个平台的
+Workflow Artifact：
+
+| 平台 | Rust Target | 压缩格式 |
+| --- | --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+
+每个压缩包包含可执行文件、README 和 GPL License，并同时上传对应的 `.sha256`
+校验文件。
+
+推送 `v*` Tag 会使用相同的构建结果创建 GitHub Release，并自动生成 Release Notes：
+
+```bash
+git tag -a v0.2.0 -m "Muxloom v0.2.0"
+git push origin main
+git push origin v0.2.0
+```
+
+包含连字符的 Tag（例如 `v0.3.0-rc.1`）会发布为 Prerelease。也可以从 Actions 页面
+手动运行；手动运行只生成 Artifact，不会创建 Release。
 
 <a id="zh-first-run"></a>
 
@@ -1444,7 +1513,8 @@ cargo build --release
 
 - **尚未实现 Codex 与 Claude 之间的历史转换**。两者的私有事件格式独立变化，v0.2
   不会修改或复制这些文件；
-- 当前依赖 POSIX Shell、OpenSSH 语义和 tmux，目标环境主要是 macOS/Linux；
+- 被管理的目标机器必须提供 POSIX Shell 和 tmux；Windows 控制端可以通过 OpenSSH
+  管理远程目标，但不能运行本地托管会话；
 - 没有单独的控制端 Daemon；持久化由目标 tmux 提供，Dashboard 运行时才进行发现；
 - 只管理由 Muxloom 或兼容的 `agent-deck` 版本创建并带标签的 Session；
 - Attention Detection 是启发式逻辑，每台机器的 Pattern 应尽量具体；
