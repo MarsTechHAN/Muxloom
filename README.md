@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml"><img alt="Build and release" src="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml"><img alt="Build and release" src="https://github.com/MarsTechHAN/Muxloom/actions/workflows/release.yml/badge.svg"></a>
   <a href="https://github.com/MarsTechHAN/Muxloom/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/MarsTechHAN/Muxloom?display_name=tag"></a>
   <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust">
   <img alt="macOS, Linux, and Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-555555">
@@ -184,8 +184,8 @@ muxloom init [--config PATH]
 
 ### Automated builds and releases
 
-Every push to `main` runs formatting, Clippy, and the complete test suite, then
-builds downloadable workflow artifacts for:
+Every pushed `v*` tag runs formatting, Clippy, and the complete test suite,
+then builds downloadable workflow artifacts for:
 
 | Platform | Rust target | Archive |
 | --- | --- | --- |
@@ -1031,7 +1031,7 @@ CLI 参数：
 
 ### 自动构建与发布
 
-每次 Push 到 `main` 都会执行格式检查、Clippy 和完整测试，然后生成四个平台的
+每次 Push `v*` Tag 都会执行格式检查、Clippy 和完整测试，然后生成四个平台的
 Workflow Artifact：
 
 | 平台 | Rust Target | 压缩格式 |

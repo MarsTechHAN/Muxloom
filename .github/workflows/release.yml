@@ -2,8 +2,6 @@ name: Build and release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -13,11 +11,12 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  RUST_VERSION: "1.97.1"
 
 jobs:
   check:
@@ -29,8 +28,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
           rustup component add rustfmt clippy
 
       - name: Install tmux for integration tests
@@ -82,8 +81,8 @@ jobs:
       - name: Install Rust target
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
           rustup target add "${{ matrix.target }}"
 
       - name: Build release binary

@@ -603,10 +603,8 @@ fn parse_history_matches(output: &str) -> Vec<HistoryMatch> {
         .filter_map(|line| {
             let (recap, rest) = if let Some(rest) = line.strip_prefix("__AD_RECAP__") {
                 (true, rest)
-            } else if let Some(rest) = line.strip_prefix("__AD_HISTORY__") {
-                (false, rest)
             } else {
-                return None;
+                (false, line.strip_prefix("__AD_HISTORY__")?)
             };
             let (number, text) = rest.split_once('\t')?;
             Some(HistoryMatch {
