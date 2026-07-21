@@ -1,0 +1,22 @@
+[package]
+name = "muxloom"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A terminal loom for persistent Codex and Claude Code sessions across machines"
+license = "GPL-3.0-only"
+repository = "https://github.com/MarsTechHAN/Muxloom"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+libc = "0.2"
+portable-pty = "0.8"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = "0.3"
+toml = "0.8"
+unicode-width = "0.2"
+vt100 = "0.15"
