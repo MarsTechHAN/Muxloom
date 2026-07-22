@@ -175,21 +175,21 @@ impl Worker {
                             for session in sessions.iter_mut().filter(|session| {
                                 !session.dead && session.kind != crate::model::AgentKind::Terminal
                             }) {
-                                match runtime.detect_attention(
+                                match runtime.inspect_agent(
                                     &request.target,
                                     &session.id,
                                     session.kind,
                                     &request.attention_patterns,
                                 ) {
-                                    Ok(Some(reason)) => {
-                                        session.needs_attention = true;
-                                        session.attention_reason = Some(reason);
+                                    Ok((working, attention)) => {
+                                        session.working = working;
+                                        session.needs_attention = attention.is_some();
+                                        session.attention_reason = attention;
                                     }
-                                    Ok(None) => {}
                                     Err(error) => debug::log(
                                         "worker",
                                         format!(
-                                            "attention check failed session={}: {error}",
+                                            "agent state check failed session={}: {error}",
                                             session.id
                                         ),
                                     ),

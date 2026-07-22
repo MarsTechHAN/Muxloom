@@ -988,6 +988,47 @@ impl Runtime {
         Ok(reason)
     }
 
+    pub fn inspect_agent(
+        &self,
+        target: &Target,
+        session_id: &str,
+        kind: AgentKind,
+        patterns: &[String],
+    ) -> Result<(bool, Option<String>)> {
+        validate_session_id(session_id)?;
+        let script = shell_join(&["tmux", "capture-pane", "-p", "-t", session_id]);
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "inspect agent state")?;
+        let screen = String::from_utf8_lossy(&output.stdout);
+        let attention = attention_reason(kind, &screen, patterns);
+        let working = attention.is_none() && agent_is_working(kind, &screen);
+        if let Some(reason) = &attention {
+            debug::log(
+                "attention",
+                format!(
+                    "matched target={} session={} kind={} reason={} tail={}",
+                    target.id,
+                    session_id,
+                    kind,
+                    reason,
+                    attention_debug_tail(&screen)
+                ),
+            );
+        }
+        debug::log(
+            "activity",
+            format!(
+                "target={} session={} kind={} working={} attention={}",
+                target.id,
+                session_id,
+                kind,
+                working,
+                attention.is_some()
+            ),
+        );
+        Ok((working, attention))
+    }
+
     pub fn search_history(
         &self,
         target: &Target,
@@ -1667,6 +1708,30 @@ fn attention_reason(kind: AgentKind, screen: &str, patterns: &[String]) -> Optio
     None
 }
 
+fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
+    if kind == AgentKind::Terminal {
+        return false;
+    }
+    let tail = attention_tail(screen).to_lowercase();
+    let interruptible = tail.contains("esc to interrupt");
+    match kind {
+        AgentKind::Codex => {
+            interruptible
+                && (tail.contains("working (")
+                    || tail.contains("background terminal running")
+                    || tail.contains("to view…"))
+        }
+        AgentKind::Claude => {
+            interruptible
+                && (tail.contains("running…")
+                    || tail.contains("running...")
+                    || tail.contains("tokens)")
+                    || tail.contains("tokens ·"))
+        }
+        AgentKind::Terminal => false,
+    }
+}
+
 fn attention_tail(screen: &str) -> String {
     let lines: Vec<_> = screen.lines().collect();
     lines[lines.len().saturating_sub(24)..].join("\n")
@@ -2203,6 +2268,7 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     created_at: metadata.0[3].parse().unwrap_or(0),
                     dead: fields[metadata.1] == "1",
                     pid: fields[metadata.2].parse().ok(),
+                    working: false,
                     needs_attention: false,
                     attention_reason: None,
                 });
@@ -2414,6 +2480,22 @@ mod tests {
             "gpt-5.6-sol max · /work/project\n"
         );
         assert_eq!(attention_reason(AgentKind::Codex, idle_prompt, &[]), None);
+
+        let codex_working = "• Working (7s • esc to interrupt) · 1 background terminal running";
+        assert!(agent_is_working(AgentKind::Codex, codex_working));
+        assert!(!agent_is_working(AgentKind::Codex, idle_prompt));
+        let claude_working = concat!(
+            "Bash(sleep 20)\n",
+            "  Running… (7s)\n",
+            "✶ Tomfoolering… (9s · ↓ 82 tokens)\n",
+            "manual mode on · esc to interrupt"
+        );
+        assert!(agent_is_working(AgentKind::Claude, claude_working));
+        assert!(!agent_is_working(
+            AgentKind::Claude,
+            "❯ \nmanual mode on · ? for shortcuts"
+        ));
+        assert!(!agent_is_working(AgentKind::Terminal, codex_working));
 
         let mut stale_prompt =
             String::from("Would you like to run the following command?\n› 1. Yes\n  2. No\n");

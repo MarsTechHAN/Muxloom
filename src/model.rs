@@ -183,6 +183,7 @@ pub struct AgentSession {
     pub created_at: u64,
     pub dead: bool,
     pub pid: Option<u32>,
+    pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,
 }

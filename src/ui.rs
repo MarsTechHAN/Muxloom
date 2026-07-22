@@ -362,6 +362,18 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut rows = Vec::new();
     for target_index in &visible {
         let status = &app.targets[*target_index];
+        let codex_working = app.sessions.iter().any(|session| {
+            session.target_id == status.target.id
+                && session.kind == AgentKind::Codex
+                && session.working
+                && !session.dead
+        });
+        let claude_working = app.sessions.iter().any(|session| {
+            session.target_id == status.target.id
+                && session.kind == AgentKind::Claude
+                && session.working
+                && !session.dead
+        });
         let (marker, marker_color) = match status.state {
             ConnectionState::Disabled => (" ", MUTED),
             ConnectionState::Scanning => ("~", Color::Yellow),
@@ -402,9 +414,19 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else if status.enabled {
             Line::from(vec![
                 Span::raw("    "),
-                capability("◉", status.probe.codex, CODEX),
+                runtime_capability(
+                    AgentKind::Codex,
+                    status.probe.codex,
+                    codex_working,
+                    app.animation_frame,
+                ),
                 Span::raw(" "),
-                capability("✻", status.probe.claude, CLAUDE),
+                runtime_capability(
+                    AgentKind::Claude,
+                    status.probe.claude,
+                    claude_working,
+                    app.animation_frame,
+                ),
             ])
         } else {
             Line::styled("    disabled", Style::default().fg(MUTED))
@@ -474,13 +496,15 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         if app.selected_session_id.as_deref() == Some(&session.id) {
             selected_row = Some(row);
         }
-        let (icon, runtime_name, color) = agent_visual(session.kind);
+        let (icon, runtime_name, _) = agent_visual(session.kind);
         let state = if session.dead {
             "archived - Enter to resume"
         } else if session.needs_attention {
             "waiting for input"
+        } else if session.working {
+            "working"
         } else {
-            "running"
+            "idle"
         };
         let state_color = if session.dead {
             MUTED
@@ -491,11 +515,11 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
         let selected = app.selected_session_id.as_deref() == Some(&session.id);
         let activity = if session.needs_attention {
-            "!!"
-        } else if !session.dead && session.kind != AgentKind::Terminal {
-            running_agent_effect(app.animation_frame)
+            "!"
+        } else if session.working && !session.dead {
+            running_agent_effect(session.kind, app.animation_frame)
         } else {
-            "  "
+            icon
         };
         let mut lines = vec![Line::from(vec![
             Span::styled(
@@ -509,10 +533,6 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         CODEX
                     })
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                icon,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
@@ -1904,10 +1924,23 @@ fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
         .border_style(Style::default().fg(if focused { ACCENT } else { Color::DarkGray }))
 }
 
-fn capability(label: &'static str, available: bool, color: Color) -> Span<'static> {
+fn runtime_capability(
+    kind: AgentKind,
+    available: bool,
+    working: bool,
+    frame: u64,
+) -> Span<'static> {
+    let (idle, _, color) = agent_visual(kind);
+    let label = if working {
+        running_agent_effect(kind, frame)
+    } else {
+        idle
+    };
     Span::styled(
         label,
-        Style::default().fg(if available { color } else { MUTED }),
+        Style::default()
+            .fg(if available { color } else { MUTED })
+            .add_modifier(Modifier::BOLD),
     )
 }
 
@@ -1919,9 +1952,15 @@ fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
     }
 }
 
-fn running_agent_effect(frame: u64) -> &'static str {
-    const FRAMES: [&str; 4] = ["*✽", "✽*", "*✻", "✻*"];
-    FRAMES[(frame / 5 % FRAMES.len() as u64) as usize]
+fn running_agent_effect(kind: AgentKind, frame: u64) -> &'static str {
+    const CODEX_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    const CLAUDE_FRAMES: [&str; 4] = ["✻", "✽", "✶", "✳"];
+    let frames = match kind {
+        AgentKind::Codex => &CODEX_FRAMES,
+        AgentKind::Claude => &CLAUDE_FRAMES,
+        AgentKind::Terminal => return "▣",
+    };
+    frames[(frame / 3 % frames.len() as u64) as usize]
 }
 
 fn segment(label: &'static str, selected: bool, color: Color) -> Span<'static> {
@@ -2059,6 +2098,7 @@ mod tests {
                 created_at: 1,
                 dead: false,
                 pid: Some(100),
+                working: false,
                 needs_attention: true,
                 attention_reason: Some("approve".into()),
             });
@@ -2107,7 +2147,10 @@ mod tests {
         assert!(text.lines[0].spans.iter().any(|span| {
             span.content == "background" && span.style.bg == Some(Color::Rgb(1, 2, 3))
         }));
-        assert_ne!(running_agent_effect(0), running_agent_effect(5));
+        assert_ne!(
+            running_agent_effect(AgentKind::Codex, 0),
+            running_agent_effect(AgentKind::Codex, 5)
+        );
     }
 
     #[test]
@@ -2218,6 +2261,7 @@ mod tests {
             created_at: 1,
             dead: true,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });

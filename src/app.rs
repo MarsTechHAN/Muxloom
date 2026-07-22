@@ -314,7 +314,6 @@ pub struct App {
     clipboard_request: Option<String>,
     pending_install_launch: Option<(LaunchForm, Option<String>)>,
     pending_archived_resume: Option<ArchivedResume>,
-    focus_modifier_latched_until: Option<Instant>,
 }
 
 impl App {
@@ -391,7 +390,6 @@ impl App {
             clipboard_request: None,
             pending_install_launch: None,
             pending_archived_resume: None,
-            focus_modifier_latched_until: None,
         }
     }
 
@@ -1763,31 +1761,7 @@ impl App {
     }
 
     fn focus_direction_for_key(&mut self, key: KeyEvent) -> Option<FocusDirection> {
-        const MODIFIER_LATCH: Duration = Duration::from_millis(700);
-
-        if let Some(direction) = focus_navigation_direction(key) {
-            self.focus_modifier_latched_until = Some(Instant::now() + MODIFIER_LATCH);
-            return Some(direction);
-        }
-        let continuation = if key.modifiers == KeyModifiers::NONE {
-            arrow_direction(key.code)
-        } else {
-            None
-        };
-        if let Some(direction) = continuation
-            && self
-                .focus_modifier_latched_until
-                .is_some_and(|deadline| Instant::now() <= deadline)
-        {
-            self.focus_modifier_latched_until = Some(Instant::now() + MODIFIER_LATCH);
-            debug::log(
-                "focus",
-                format!("continued latched modifier direction={direction:?}"),
-            );
-            return Some(direction);
-        }
-        self.focus_modifier_latched_until = None;
-        None
+        focus_navigation_direction(key)
     }
 
     fn geometric_focus(&self, direction: FocusDirection) -> Option<Focus> {
@@ -4211,6 +4185,7 @@ mod tests {
             created_at: 1,
             dead: false,
             pid: Some(10),
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4304,7 +4279,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_arrow_latch_covers_unmodified_continuation_events() {
+    fn modified_arrows_do_not_latch_for_following_plain_arrows() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
         let mut app = App::new(
@@ -4321,11 +4296,6 @@ mod tests {
         );
         assert_eq!(
             app.focus_direction_for_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            Some(FocusDirection::Left)
-        );
-        app.focus_modifier_latched_until = Some(Instant::now() - Duration::from_millis(1));
-        assert_eq!(
-            app.focus_direction_for_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             None
         );
     }
@@ -4659,6 +4629,7 @@ mod tests {
             created_at: 1,
             dead: true,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4671,6 +4642,7 @@ mod tests {
             created_at: 2,
             dead: true,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4707,6 +4679,7 @@ mod tests {
             created_at: 1,
             dead: true,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4773,6 +4746,7 @@ mod tests {
             created_at: 1,
             dead: false,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4825,6 +4799,7 @@ mod tests {
             created_at: 1,
             dead: false,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
@@ -4893,6 +4868,7 @@ mod tests {
             created_at: 1,
             dead: true,
             pid: None,
+            working: false,
             needs_attention: false,
             attention_reason: None,
         });
