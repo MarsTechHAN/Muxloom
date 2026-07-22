@@ -1,19 +1,19 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal, PaneLayout,
-        PathPickerForm, ResumeForm, SearchForm, SettingsForm, SettingsScope,
+        App, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal,
+        PaneLayout, PathPickerForm, ResumeForm, SearchForm, SettingsForm, SettingsScope,
     },
     debug,
-    model::{AgentKind, ConnectionState, SearchMatchKind},
+    model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
 };
 
 const ACCENT: Color = Color::Rgb(112, 184, 255);
@@ -490,11 +490,24 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Color::Green
         };
         let selected = app.selected_session_id.as_deref() == Some(&session.id);
+        let activity = if session.needs_attention {
+            "!!"
+        } else if !session.dead && session.kind != AgentKind::Terminal {
+            running_agent_effect(app.animation_frame)
+        } else {
+            "  "
+        };
         let mut lines = vec![Line::from(vec![
             Span::styled(
-                if session.needs_attention { "! " } else { "  " },
+                activity,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(if session.needs_attention {
+                        Color::Yellow
+                    } else if session.kind == AgentKind::Claude {
+                        CLAUDE
+                    } else {
+                        CODEX
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -669,9 +682,10 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         app.history.text.clone()
     };
-    let line_count = body.lines().count() as u16;
+    let history = ansi_history_text(&body);
+    let line_count = history.height().min(u16::MAX as usize) as u16;
     let scroll = line_count.saturating_sub(inner.height);
-    let paragraph = Paragraph::new(Text::raw(body)).scroll((scroll, 0));
+    let paragraph = Paragraph::new(history).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
     highlight_terminal_selection(frame, inner, app.terminal_selection);
 }
@@ -750,6 +764,140 @@ fn vt_color(color: vt100::Color) -> Color {
     }
 }
 
+fn ansi_history_text(value: &str) -> Text<'static> {
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut buffer = String::new();
+    let mut style = Style::default();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\x1b' && characters.peek() == Some(&'[') {
+            characters.next();
+            if !buffer.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buffer), style));
+            }
+            let mut parameters = String::new();
+            let mut final_byte = None;
+            for next in characters.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    final_byte = Some(next);
+                    break;
+                }
+                parameters.push(next);
+            }
+            if final_byte == Some('m') {
+                apply_sgr(&mut style, &parameters);
+            }
+        } else if character == '\n' {
+            if !buffer.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buffer), style));
+            }
+            lines.push(Line::from(std::mem::take(&mut spans)));
+        } else if character == '\t' {
+            buffer.push_str("    ");
+        } else if !character.is_control() {
+            buffer.push(character);
+        }
+    }
+    if !buffer.is_empty() {
+        spans.push(Span::styled(buffer, style));
+    }
+    if !spans.is_empty() || lines.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
+}
+
+fn apply_sgr(style: &mut Style, parameters: &str) {
+    let values: Vec<u16> = if parameters.is_empty() {
+        vec![0]
+    } else {
+        parameters
+            .split(';')
+            .map(|value| value.parse().unwrap_or(0))
+            .collect()
+    };
+    let mut index = 0;
+    while index < values.len() {
+        let value = values[index];
+        match value {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            7 => *style = style.add_modifier(Modifier::REVERSED),
+            9 => *style = style.add_modifier(Modifier::CROSSED_OUT),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            27 => *style = style.remove_modifier(Modifier::REVERSED),
+            29 => *style = style.remove_modifier(Modifier::CROSSED_OUT),
+            30..=37 => *style = style.fg(ansi_basic_color(value - 30, false)),
+            90..=97 => *style = style.fg(ansi_basic_color(value - 90, true)),
+            40..=47 => *style = style.bg(ansi_basic_color(value - 40, false)),
+            100..=107 => *style = style.bg(ansi_basic_color(value - 100, true)),
+            38 | 48 => {
+                let foreground = value == 38;
+                if values.get(index + 1) == Some(&5)
+                    && let Some(color) = values.get(index + 2)
+                {
+                    let color = Color::Indexed((*color).min(255) as u8);
+                    *style = if foreground {
+                        style.fg(color)
+                    } else {
+                        style.bg(color)
+                    };
+                    index += 2;
+                } else if values.get(index + 1) == Some(&2)
+                    && let (Some(red), Some(green), Some(blue)) = (
+                        values.get(index + 2),
+                        values.get(index + 3),
+                        values.get(index + 4),
+                    )
+                {
+                    let color = Color::Rgb(
+                        (*red).min(255) as u8,
+                        (*green).min(255) as u8,
+                        (*blue).min(255) as u8,
+                    );
+                    *style = if foreground {
+                        style.fg(color)
+                    } else {
+                        style.bg(color)
+                    };
+                    index += 4;
+                }
+            }
+            39 => *style = style.fg(Color::Reset),
+            49 => *style = style.bg(Color::Reset),
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn ansi_basic_color(index: u16, bright: bool) -> Color {
+    match (index, bright) {
+        (0, false) => Color::Black,
+        (1, false) => Color::Red,
+        (2, false) => Color::Green,
+        (3, false) => Color::Yellow,
+        (4, false) => Color::Blue,
+        (5, false) => Color::Magenta,
+        (6, false) => Color::Cyan,
+        (7, false) => Color::Gray,
+        (0, true) => Color::DarkGray,
+        (1, true) => Color::LightRed,
+        (2, true) => Color::LightGreen,
+        (3, true) => Color::LightYellow,
+        (4, true) => Color::LightBlue,
+        (5, true) => Color::LightMagenta,
+        (6, true) => Color::LightCyan,
+        _ => Color::White,
+    }
+}
+
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let busy = if app.busy_operations > 0 {
         "  [working]"
@@ -759,7 +907,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let help = if app.interactive {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
-        "  n new  Enter open  / search  q quit  ? more"
+        "  n new  Enter open  Ctrl-f files  / search  q quit"
     } else {
         match app.focus {
             Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
@@ -794,19 +942,32 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
     match modal {
         Modal::Launch(form) => draw_launch_modal(frame, form, outer),
-        Modal::ConfirmKill { label, .. } => {
+        Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
             frame.render_widget(Clear, area);
+            let (title, prompt, action) = if *archive {
+                (
+                    " Archive agent ",
+                    format!("Stop '{label}' and keep it in Archived?"),
+                    "Enter/y archive    Esc/n cancel",
+                )
+            } else {
+                (
+                    " Permanently remove session ",
+                    format!("Permanently remove '{label}'?"),
+                    "Enter/y remove    Esc/n cancel",
+                )
+            };
             let text = vec![
                 Line::raw(""),
-                Line::raw(format!("Close session '{}' ?", label)),
+                Line::raw(prompt),
                 Line::raw(""),
-                Line::styled("Enter/y close    Esc/n cancel", Style::default().fg(MUTED)),
+                Line::styled(action, Style::default().fg(MUTED)),
             ];
             frame.render_widget(
                 Paragraph::new(text)
                     .alignment(Alignment::Center)
-                    .block(panel(" Close agent session ", true)),
+                    .block(panel(title, true)),
                 area,
             );
         }
@@ -847,6 +1008,261 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
         Modal::Search(form) => draw_search_modal(frame, form, outer),
         Modal::PathPicker(form) => draw_path_picker(frame, form, outer),
         Modal::Resume(form) => draw_resume_modal(frame, form, outer),
+        Modal::Files(form) => draw_file_manager(frame, form, outer),
+    }
+}
+
+fn draw_file_manager(frame: &mut Frame<'_>, form: &mut FileManagerForm, outer: Rect) {
+    frame.render_widget(Clear, outer);
+    let title = format!(
+        " Files  {}:{} ",
+        form.target.label,
+        truncate(&form.path, outer.width.saturating_sub(20) as usize)
+    );
+    let block = panel(&title, true);
+    let inner = block.inner(outer);
+    frame.render_widget(block, outer);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .split(inner);
+    let panes = if rows[0].width >= 80 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(rows[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(rows[0])
+    };
+    let list_area = panes[0];
+    let preview_area = panes[1];
+    form.list_area = Some(list_area);
+    form.preview_area = Some(preview_area);
+
+    let list_block = panel(" Browser ", true);
+    let list_inner = list_block.inner(list_area);
+    let items: Vec<_> = if form.loading {
+        vec![ListItem::new(Line::styled(
+            "Loading...",
+            Style::default().fg(MUTED),
+        ))]
+    } else if let Some(error) = &form.error {
+        vec![ListItem::new(Line::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))]
+    } else if form.entries.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "Empty directory",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        form.entries
+            .iter()
+            .map(|entry| {
+                let (icon, color) = match entry.kind {
+                    FileEntryKind::Directory => ("▸", ACCENT),
+                    FileEntryKind::File => ("·", Color::White),
+                    FileEntryKind::Symlink => ("↗", Color::Cyan),
+                    FileEntryKind::Other => ("?", MUTED),
+                };
+                let size = if entry.kind == FileEntryKind::File {
+                    format_bytes(entry.size)
+                } else {
+                    String::new()
+                };
+                let name_width = list_inner.width.saturating_sub(12) as usize;
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                    Span::styled(
+                        truncate(&entry.name, name_width),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(format!(" {size:>8}"), Style::default().fg(MUTED)),
+                ]))
+            })
+            .collect()
+    };
+    let mut state = ratatui::widgets::ListState::default();
+    if !form.entries.is_empty() && !form.loading {
+        state.select(Some(form.selected.min(form.entries.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(list_block)
+        .highlight_style(Style::default().bg(Color::Rgb(42, 48, 58)))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, list_area, &mut state);
+    form.entry_rows = if form.entries.is_empty() {
+        Vec::new()
+    } else {
+        form.entries
+            .iter()
+            .enumerate()
+            .skip(state.offset())
+            .take(list_inner.height as usize)
+            .enumerate()
+            .map(|(visible, (index, _))| {
+                (
+                    index,
+                    Rect::new(
+                        list_inner.x,
+                        list_inner.y + visible as u16,
+                        list_inner.width,
+                        1,
+                    ),
+                )
+            })
+            .collect()
+    };
+
+    let preview_block = panel(" Preview ", false);
+    let preview_inner = preview_block.inner(preview_area);
+    frame.render_widget(preview_block, preview_area);
+    let selected = form.entries.get(form.selected);
+    let preview = if let Some(error) = &form.preview_error {
+        Text::from(Line::styled(error.clone(), Style::default().fg(Color::Red)))
+    } else if form.preview_loading {
+        Text::from(Line::styled(
+            "Loading preview...",
+            Style::default().fg(MUTED),
+        ))
+    } else if let Some(preview) = &form.preview {
+        file_preview_text(preview)
+    } else if let Some(entry) = selected {
+        let kind = match entry.kind {
+            FileEntryKind::Directory => "directory",
+            FileEntryKind::File => "file",
+            FileEntryKind::Symlink => "symbolic link",
+            FileEntryKind::Other => "special file",
+        };
+        Text::from(vec![
+            Line::styled(entry.name.clone(), Style::default().fg(ACCENT).bold()),
+            Line::raw(""),
+            Line::styled(kind, Style::default().fg(MUTED)),
+            Line::raw(entry.path.clone()),
+        ])
+    } else {
+        Text::from(Line::styled("No file selected", Style::default().fg(MUTED)))
+    };
+    let preview_lines = preview.height();
+    form.preview_max_scroll = preview_lines
+        .saturating_sub(preview_inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    form.preview_scroll = form.preview_scroll.min(form.preview_max_scroll);
+    frame.render_widget(
+        Paragraph::new(preview)
+            .scroll((form.preview_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        preview_inner,
+    );
+
+    let footer = if form.loading {
+        "Loading directory..."
+    } else {
+        "↑↓ select   ← parent   →/Enter open   c copy path   d download   drop files upload   Ctrl-f close"
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
+        rows[1],
+    );
+}
+
+fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{}  ", preview.kind),
+            Style::default().fg(ACCENT).bold(),
+        ),
+        Span::styled(preview.mime.clone(), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("  {}", format_bytes(preview.size)),
+            Style::default().fg(MUTED),
+        ),
+    ])];
+    if preview.truncated {
+        lines.push(Line::styled(
+            "Preview truncated at 256 KiB",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::raw(""));
+    if preview.kind == FilePreviewKind::Markdown {
+        lines.extend(markdown_lines(&preview.content));
+    } else {
+        lines.extend(
+            preview
+                .content
+                .lines()
+                .map(|line| Line::raw(line.to_string())),
+        );
+    }
+    Text::from(lines)
+}
+
+fn markdown_lines(content: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut code = false;
+    for raw in content.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            code = !code;
+            continue;
+        }
+        if code {
+            lines.push(Line::styled(
+                format!("  {raw}"),
+                Style::default()
+                    .fg(Color::Rgb(180, 210, 190))
+                    .bg(Color::Rgb(28, 34, 32)),
+            ));
+        } else if let Some(heading) = trimmed.strip_prefix("### ") {
+            lines.push(Line::styled(
+                heading.to_string(),
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        } else if let Some(heading) = trimmed
+            .strip_prefix("## ")
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            lines.push(Line::styled(
+                heading.to_string(),
+                Style::default().fg(ACCENT).bold(),
+            ));
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            lines.push(Line::from(vec![
+                Span::styled(" • ", Style::default().fg(ACCENT)),
+                Span::raw(item.to_string()),
+            ]));
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            lines.push(Line::styled(
+                format!("│ {quote}"),
+                Style::default().fg(Color::Gray).italic(),
+            ));
+        } else {
+            lines.push(Line::raw(raw.to_string()));
+        }
+    }
+    lines
+}
+
+fn format_bytes(size: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", size, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -892,7 +1308,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Mouse drag",
             "Select and copy terminal text; Alt-drag forwards",
         ),
-        help_row("x", "Close the selected tmux session"),
+        help_row(
+            "x",
+            "Archive live agents; permanently remove archived agents",
+        ),
         help_row("a", "Expand or collapse Archived sessions"),
         help_row("Up twice at top", "Open the first agent waiting for input"),
         Line::raw(""),
@@ -910,8 +1329,18 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("/ / Ctrl-p", "Search every discovered agent history"),
         help_row("Enter in search", "Open the selected match"),
         Line::raw(""),
+        help_header("File Manager"),
+        help_row(
+            "Ctrl-f",
+            "Open or close files on the selected agent machine",
+        ),
+        help_row("Arrows / Enter", "Select, move to parent, or open an entry"),
+        help_row("d", "Download the selected file to Downloads"),
+        help_row("c", "Copy the selected target path to the clipboard"),
+        help_row("Drop local files", "Upload them into the visible directory"),
+        Line::raw(""),
         help_header("View And Configuration"),
-        help_row("f / Ctrl-f", "Toggle grouped and flat agent views"),
+        help_row("f", "Toggle grouped and flat agent views"),
         help_row(",", "Edit configuration for the selected machine"),
         help_row("Ctrl-,", "Edit global configuration defaults"),
         help_row("?", "Open or close this help"),
@@ -1490,6 +1919,11 @@ fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
     }
 }
 
+fn running_agent_effect(frame: u64) -> &'static str {
+    const FRAMES: [&str; 4] = ["*✽", "✽*", "*✻", "✻*"];
+    FRAMES[(frame / 5 % FRAMES.len() as u64) as usize]
+}
+
 fn segment(label: &'static str, selected: bool, color: Color) -> Span<'static> {
     if selected {
         Span::styled(
@@ -1660,6 +2094,20 @@ mod tests {
             UnicodeWidthStr::width(truncate("机器-alpha", 9).as_str()),
             9
         );
+    }
+
+    #[test]
+    fn ansi_history_preserves_colors_and_attributes() {
+        let text =
+            ansi_history_text("plain \x1b[31;1mred\x1b[0m \x1b[48;2;1;2;3mbackground\x1b[0m");
+        assert_eq!(text.lines.len(), 1);
+        assert!(text.lines[0].spans.iter().any(|span| span.content == "red"
+            && span.style.fg == Some(Color::Red)
+            && span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(text.lines[0].spans.iter().any(|span| {
+            span.content == "background" && span.style.bg == Some(Color::Rgb(1, 2, 3))
+        }));
+        assert_ne!(running_agent_effect(0), running_agent_effect(5));
     }
 
     #[test]
@@ -1881,6 +2329,48 @@ mod tests {
             .collect();
         assert!(rendered.contains("New session"));
         assert!(rendered.contains("first user message"));
+
+        app.modal = Some(Modal::Files(FileManagerForm {
+            target: Target::local(),
+            path: "/work".into(),
+            entries: vec![crate::model::FileEntry {
+                name: "README.md".into(),
+                path: "/work/README.md".into(),
+                kind: crate::model::FileEntryKind::File,
+                size: 42,
+            }],
+            selected: 0,
+            loading: false,
+            error: None,
+            preview: Some(crate::model::FilePreview {
+                path: "/work/README.md".into(),
+                mime: "text/markdown".into(),
+                kind: crate::model::FilePreviewKind::Markdown,
+                size: 42,
+                content: "# File preview\n\n- item".into(),
+                truncated: false,
+            }),
+            preview_requested_path: Some("/work/README.md".into()),
+            preview_loading: false,
+            preview_error: None,
+            preview_scroll: 0,
+            preview_max_scroll: 0,
+            entry_rows: Vec::new(),
+            list_area: None,
+            preview_area: None,
+        }));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Files  This machine:/work"));
+        assert!(rendered.contains("README.md"));
+        assert!(rendered.contains("File preview"));
+        assert!(rendered.contains("copy path"));
 
         app.modal = Some(Modal::Help(HelpForm {
             offset: HELP_CONTENT_ROWS - 1,

@@ -217,6 +217,59 @@ pub struct DirectoryListing {
     pub directories: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: FileEntryKind,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileListing {
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePreviewKind {
+    Text,
+    Markdown,
+    Audio,
+    Video,
+    Binary,
+}
+
+impl fmt::Display for FilePreviewKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Text => "text",
+            Self::Markdown => "markdown",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Binary => "binary",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePreview {
+    pub path: String,
+    pub mime: String,
+    pub kind: FilePreviewKind,
+    pub size: u64,
+    pub content: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeCandidate {
     pub id: String,

@@ -20,7 +20,8 @@ use crate::{
     config::{CommandConfig, Config},
     debug,
     model::{
-        AgentKind, AgentSession, DirectoryListing, HistoryMatch, HistoryPage, LaunchRequest, Probe,
+        AgentKind, AgentSession, DirectoryListing, FileEntry, FileEntryKind, FileListing,
+        FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LaunchRequest, Probe,
         ResumeCandidate, Target, Transport,
     },
 };
@@ -143,19 +144,29 @@ impl Runtime {
              if {claude_probe} >/dev/null 2>&1; then printf 'claude=1\\n'; else printf 'claude=0\\n'; fi; \
              if command -v tmux >/dev/null 2>&1; then printf 'tmux=1\\n'; else printf 'tmux=0\\n'; fi",
         );
-        let script = format!(
-            "{}; {}",
-            probe,
-            shell_join(&[
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                FORMAT,
-                "-f",
-                "#{m/r:^(muxloom-|ad-),#{session_name}}",
-            ]) + " 2>/dev/null || true"
+        let managed_panes = shell_join(&[
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}",
+            "-f",
+            "#{m/r:^(muxloom-|ad-),#{session_name}}",
+        ]);
+        let enable_archive = format!(
+            "{managed_panes} 2>/dev/null | while IFS= read -r pane; do \
+             tmux set-option -w -t \"$pane\" remain-on-exit on 2>/dev/null || true; done"
         );
+        let discover = shell_join(&[
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            FORMAT,
+            "-f",
+            "#{m/r:^(muxloom-|ad-),#{session_name}}",
+        ]) + " 2>/dev/null || true";
+        let script = format!("{probe}; {enable_archive}; {discover}");
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "target probe")?;
         let (probe, mut sessions) =
@@ -857,6 +868,36 @@ impl Runtime {
         ensure_success(&output, "upload runtime file")
     }
 
+    fn scp_from(&self, alias: &str, remote_path: &str, local_path: &Path) -> Result<()> {
+        let control_path = ssh_control_path();
+        let output = Command::new("scp")
+            .args([
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                &format!("ConnectTimeout={}", self.ssh_connect_timeout_secs),
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                SSH_CONTROL_PERSIST_OPTION,
+                "-o",
+                SSH_SERVER_ALIVE_INTERVAL_OPTION,
+                "-o",
+                SSH_SERVER_ALIVE_COUNT_OPTION,
+                "-o",
+                SSH_CONNECTION_ATTEMPTS_OPTION,
+                "-o",
+                &format!("ControlPath={control_path}"),
+            ])
+            .arg(format!("{alias}:{}", shell_quote(remote_path)))
+            .arg(local_path)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("failed to download {remote_path}"))?;
+        ensure_success(&output, "download remote file")
+    }
+
     pub fn capture_page(
         &self,
         target: &Target,
@@ -895,7 +936,7 @@ impl Runtime {
             session_id,
             "#{pane_width}",
         ]);
-        let capture = shell_join(&["tmux", "capture-pane", "-p", "-t", session_id]);
+        let capture = shell_join(&["tmux", "capture-pane", "-p", "-e", "-t", session_id]);
         let script = format!(
             "history_size=$({history_size}) || exit $?; \
              pane_height=$({pane_height}) || exit $?; \
@@ -1034,6 +1075,165 @@ END {
         parse_directory_listing(&output.stdout)
     }
 
+    pub fn list_files(&self, target: &Target, path: &str) -> Result<FileListing> {
+        let path = if path.trim().is_empty() { "." } else { path };
+        let collect = r#"for entry do
+            if [ -L "$entry" ]; then kind=l; size=0;
+            elif [ -d "$entry" ]; then kind=d; size=0;
+            elif [ -f "$entry" ]; then kind=f; size=$(wc -c < "$entry" | tr -d '[:space:]');
+            else kind=o; size=0; fi
+            name=${entry#./}
+            printf '%s\0%s\0%s\0' "$kind" "$size" "$name"
+        done"#;
+        let find = shell_join(&[
+            "find",
+            ".",
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-exec",
+            "sh",
+            "-c",
+            collect,
+            "sh",
+            "{}",
+            "+",
+        ]);
+        let script = format!(
+            "cd {} && printf '%s\\0' \"$(pwd -P)\" && {find}",
+            shell_quote(path)
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "list files")?;
+        parse_file_listing(&output.stdout)
+    }
+
+    pub fn preview_file(&self, target: &Target, path: &str) -> Result<FilePreview> {
+        const LIMIT: u64 = 256 * 1024;
+        let quoted = shell_quote(path);
+        let script = format!(
+            r#"path={quoted}
+            test -f "$path" || {{ printf 'not a regular file\n' >&2; exit 2; }}
+            size=$(wc -c < "$path" | tr -d '[:space:]')
+            if command -v file >/dev/null 2>&1; then
+                mime=$(file -b --mime-type -- "$path" 2>/dev/null || printf application/octet-stream)
+                description=$(file -b -- "$path" 2>/dev/null || true)
+            else
+                mime=application/octet-stream
+                description='file utility unavailable'
+            fi
+            lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+            case "$lower" in
+                *.md|*.markdown|*.mdown|*.mkd) kind=markdown ;;
+                *) case "$mime" in
+                    text/*|application/json|application/xml|application/javascript|application/x-sh|application/toml) kind=text ;;
+                    audio/*) kind=audio ;;
+                    video/*) kind=video ;;
+                    *) kind=binary ;;
+                esac ;;
+            esac
+            if [ "$size" -gt {LIMIT} ]; then truncated=1; else truncated=0; fi
+            printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
+            case "$kind" in
+                text|markdown) head -c {LIMIT} -- "$path" ;;
+                audio|video)
+                    if command -v ffprobe >/dev/null 2>&1; then
+                        ffprobe -v error -show_entries format=format_name,duration,size,bit_rate:stream=index,codec_name,codec_type,width,height,sample_rate,channels -of default=noprint_wrappers=1 -- "$path" 2>&1 | head -n 160
+                    else
+                        printf '%s\n' "$description"
+                        printf 'ffprobe is not installed on the target\n'
+                    fi ;;
+                *) printf '%s\n' "$description" ;;
+            esac"#
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "preview file")?;
+        parse_file_preview(&output.stdout)
+    }
+
+    pub fn download_file(
+        &self,
+        target: &Target,
+        remote_path: &str,
+        local_directory: &Path,
+    ) -> Result<PathBuf> {
+        let name = Path::new(remote_path)
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .context("selected file has no filename")?;
+        fs::create_dir_all(local_directory).with_context(|| {
+            format!(
+                "failed to create download directory {}",
+                local_directory.display()
+            )
+        })?;
+        let destination = unique_destination(local_directory, name);
+        match &target.transport {
+            Transport::Local => {
+                fs::copy(remote_path, &destination).with_context(|| {
+                    format!(
+                        "failed to copy {} to {}",
+                        remote_path,
+                        destination.display()
+                    )
+                })?;
+            }
+            Transport::Ssh { alias } => {
+                let check = format!("test -f {}", shell_quote(remote_path));
+                let output = self.run_shell(target, &check, false)?;
+                ensure_success(&output, "validate remote download")?;
+                self.scp_from(alias, remote_path, &destination)?;
+            }
+        }
+        Ok(destination)
+    }
+
+    pub fn upload_files(
+        &self,
+        target: &Target,
+        local_paths: &[PathBuf],
+        remote_directory: &str,
+    ) -> Result<usize> {
+        if local_paths.is_empty() {
+            bail!("no local files were provided");
+        }
+        let check = format!("test -d {}", shell_quote(remote_directory));
+        let output = self.run_shell(target, &check, false)?;
+        ensure_success(&output, "validate upload directory")?;
+        let mut uploaded = 0;
+        for local_path in local_paths {
+            if !local_path.is_file() {
+                bail!(
+                    "upload source is not a regular file: {}",
+                    local_path.display()
+                );
+            }
+            let name = local_path
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .context("upload source has no filename")?
+                .to_string_lossy();
+            let destination = remote_child_path(remote_directory, &name);
+            match &target.transport {
+                Transport::Local => {
+                    let source = fs::canonicalize(local_path).with_context(|| {
+                        format!("failed to resolve upload source {}", local_path.display())
+                    })?;
+                    let destination_path = PathBuf::from(&destination);
+                    if fs::canonicalize(&destination_path).ok().as_ref() != Some(&source) {
+                        fs::copy(&source, &destination_path).with_context(|| {
+                            format!("failed to upload to {}", destination_path.display())
+                        })?;
+                    }
+                }
+                Transport::Ssh { alias } => self.scp_to(alias, local_path, &destination)?,
+            }
+            uploaded += 1;
+        }
+        Ok(uploaded)
+    }
+
     pub fn scan_resumes(
         &self,
         target: &Target,
@@ -1077,6 +1277,29 @@ END {
         let script = shell_join(&["tmux", "kill-session", "-t", session_id]);
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "delete agent session")
+    }
+
+    pub fn archive(&self, target: &Target, session_id: &str) -> Result<()> {
+        debug::log(
+            "runtime",
+            format!("archive target={} session={session_id}", target.id),
+        );
+        validate_session_id(session_id)?;
+        let script = format!(
+            "{} && {}",
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-w",
+                "-t",
+                session_id,
+                "remain-on-exit",
+                "on",
+            ]),
+            shell_join(&["tmux", "respawn-pane", "-k", "-t", session_id, "exit 0",])
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "archive agent session")
     }
 
     pub fn attach(&self, target: &Target, session_id: &str) -> Result<()> {
@@ -1519,6 +1742,120 @@ fn parse_directory_listing(output: &[u8]) -> Result<DirectoryListing> {
     Ok(DirectoryListing { path, directories })
 }
 
+fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
+    let mut fields = output.split(|byte| *byte == 0);
+    let path = fields
+        .next()
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).to_string())
+        .context("file listing did not include its canonical path")?;
+    let values: Vec<_> = fields.filter(|field| !field.is_empty()).collect();
+    if values.len() % 3 != 0 {
+        bail!("file listing returned incomplete metadata");
+    }
+    let mut entries = Vec::new();
+    for fields in values.chunks_exact(3) {
+        let kind = match fields[0] {
+            b"d" => FileEntryKind::Directory,
+            b"f" => FileEntryKind::File,
+            b"l" => FileEntryKind::Symlink,
+            _ => FileEntryKind::Other,
+        };
+        let size = String::from_utf8_lossy(fields[1]).parse().unwrap_or(0);
+        let name = String::from_utf8_lossy(fields[2]).to_string();
+        if name.is_empty() || name.contains('/') {
+            continue;
+        }
+        entries.push(FileEntry {
+            path: remote_child_path(&path, &name),
+            name,
+            kind,
+            size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        (left.kind != FileEntryKind::Directory)
+            .cmp(&(right.kind != FileEntryKind::Directory))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(FileListing { path, entries })
+}
+
+fn parse_file_preview(output: &[u8]) -> Result<FilePreview> {
+    let mut fields = output.splitn(6, |byte| *byte == 0);
+    let path = fields
+        .next()
+        .map(|value| String::from_utf8_lossy(value).to_string())
+        .context("file preview did not include a path")?;
+    let mime = fields
+        .next()
+        .map(|value| String::from_utf8_lossy(value).to_string())
+        .context("file preview did not include a MIME type")?;
+    let kind = match fields.next().map(String::from_utf8_lossy).as_deref() {
+        Some("text") => FilePreviewKind::Text,
+        Some("markdown") => FilePreviewKind::Markdown,
+        Some("audio") => FilePreviewKind::Audio,
+        Some("video") => FilePreviewKind::Video,
+        Some("binary") => FilePreviewKind::Binary,
+        _ => bail!("file preview returned an unknown type"),
+    };
+    let size = fields
+        .next()
+        .map(String::from_utf8_lossy)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let truncated = fields.next().is_some_and(|value| value == b"1");
+    let content = fields
+        .next()
+        .map(|value| String::from_utf8_lossy(value).to_string())
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect();
+    Ok(FilePreview {
+        path,
+        mime,
+        kind,
+        size,
+        content,
+        truncated,
+    })
+}
+
+fn remote_child_path(directory: &str, name: &str) -> String {
+    if directory == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", directory.trim_end_matches('/'))
+    }
+}
+
+fn unique_destination(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let original = directory.join(name);
+    if !original.exists() {
+        return original;
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .unwrap_or(name)
+        .to_string_lossy()
+        .to_string();
+    let extension = path.extension().map(|value| value.to_string_lossy());
+    for index in 1..10_000 {
+        let candidate = if let Some(extension) = &extension {
+            directory.join(format!("{stem} ({index}).{extension}"))
+        } else {
+            directory.join(format!("{stem} ({index})"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem}-{}", std::process::id()))
+}
+
 fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<ResumeCandidate> {
     let mut titles = HashMap::new();
     let chunks: Vec<_> = output.split('\u{1e}').collect();
@@ -1943,6 +2280,27 @@ mod tests {
         assert_eq!(shell_quote("two words"), "'two words'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn parses_structured_file_listings_and_previews() {
+        let listing = b"/work/project\x00f\x005\x00z.txt\x00d\x000\x00src\x00f\x0012\x00a.md\x00";
+        let listing = parse_file_listing(listing).unwrap();
+        assert_eq!(listing.path, "/work/project");
+        assert_eq!(listing.entries.len(), 3);
+        assert_eq!(listing.entries[0].name, "src");
+        assert_eq!(listing.entries[1].name, "a.md");
+        assert_eq!(listing.entries[1].size, 12);
+        assert_eq!(listing.entries[1].path, "/work/project/a.md");
+
+        let preview = parse_file_preview(
+            b"/work/project/a.md\x00text/markdown\x00markdown\x0012\x000\x00# Heading\n- item\n",
+        )
+        .unwrap();
+        assert_eq!(preview.kind, FilePreviewKind::Markdown);
+        assert_eq!(preview.mime, "text/markdown");
+        assert!(preview.content.contains("Heading"));
+        assert!(!preview.truncated);
     }
 
     #[test]

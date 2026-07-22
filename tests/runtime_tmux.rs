@@ -124,6 +124,18 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
     assert_eq!(session.path, path);
     assert_eq!(session.label, "legacy session");
     assert_eq!(session.created_at, 123);
+    let remain = Command::new("tmux")
+        .args([
+            "show-options",
+            "-w",
+            "-v",
+            "-t",
+            &session_id,
+            "remain-on-exit",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&remain.stdout).trim(), "on");
 }
 
 #[test]
@@ -263,6 +275,118 @@ fn exited_terminal_is_removed_instead_of_archived() {
 }
 
 #[test]
+fn live_agent_can_be_archived_before_permanent_removal() {
+    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux is not installed; skipping integration check");
+        return;
+    }
+    let config = Config::default();
+    let runtime = Runtime::new(&config);
+    let target = Target::local();
+    let request = LaunchRequest {
+        target: target.clone(),
+        kind: AgentKind::Codex,
+        path: std::env::temp_dir().display().to_string(),
+        label: "archive lifecycle".into(),
+        resume_id: None,
+    };
+    let command = CommandConfig {
+        command: "sh".into(),
+        args: vec!["-c".into(), "printf 'archive-me\\n'; sleep 30".into()],
+        ..CommandConfig::default()
+    };
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
+    let _guard = SessionGuard {
+        runtime: &runtime,
+        target: &target,
+        session_id: session_id.clone(),
+    };
+    runtime.archive(&target, &session_id).unwrap();
+
+    let mut archived = None;
+    for _ in 0..20 {
+        let (_, sessions) = runtime
+            .probe_and_discover(&target, "sh", "sh", &[])
+            .unwrap();
+        archived = sessions
+            .into_iter()
+            .find(|session| session.id == session_id && session.dead);
+        if archived.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let archived = archived.expect("archived pane should remain discoverable");
+    assert_eq!(archived.kind, AgentKind::Codex);
+    assert_eq!(archived.label, "archive lifecycle");
+}
+
+#[test]
+fn local_file_manager_lists_previews_uploads_and_downloads() {
+    let nonce = format!("{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("muxloom-files-{nonce}"));
+    let source_root = std::env::temp_dir().join(format!("muxloom-files-source-{nonce}"));
+    let downloads = std::env::temp_dir().join(format!("muxloom-files-download-{nonce}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&downloads);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(&source_root).unwrap();
+    std::fs::write(root.join("README.md"), "# Preview\n\n- item\n").unwrap();
+    let upload = source_root.join("upload.txt");
+    std::fs::write(&upload, "uploaded").unwrap();
+
+    let runtime = Runtime::new(&Config::default());
+    let target = Target::local();
+    let listing = runtime
+        .list_files(&target, &root.display().to_string())
+        .unwrap();
+    assert_eq!(listing.entries[0].name, "src");
+    assert!(
+        listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == "README.md")
+    );
+    let preview = runtime
+        .preview_file(&target, &root.join("README.md").display().to_string())
+        .unwrap();
+    assert_eq!(preview.kind, muxloom::model::FilePreviewKind::Markdown);
+    assert!(preview.content.contains("# Preview"));
+
+    assert_eq!(
+        runtime
+            .upload_files(
+                &target,
+                std::slice::from_ref(&upload),
+                &root.display().to_string()
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("upload.txt")).unwrap(),
+        "uploaded"
+    );
+    let downloaded = runtime
+        .download_file(
+            &target,
+            &root.join("README.md").display().to_string(),
+            &downloads,
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(downloaded).unwrap(),
+        "# Preview\n\n- item\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(source_root);
+    let _ = std::fs::remove_dir_all(downloads);
+}
+
+#[test]
 fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
     if Command::new("tmux").arg("-V").output().is_err() {
@@ -283,7 +407,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         command: "sh".into(),
         args: vec![
             "-c".into(),
-            "i=0; while [ $i -lt 80 ]; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done; printf 'full-history-needle\\nREADY\\n'; IFS= read -r line"
+            "i=0; while [ $i -lt 80 ]; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done; printf '\\033[31;1mstyled-history\\033[0m\\nfull-history-needle\\nREADY\\n'; IFS= read -r line"
                 .into(),
         ],
         ..CommandConfig::default()
@@ -312,6 +436,11 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
 
     assert_eq!(before, after, "history capture changed the tmux pane size");
     assert!(page.text.contains("READY"));
+    assert!(page.text.contains("styled-history"));
+    assert!(
+        page.text.contains("\x1b["),
+        "tmux history capture should retain SGR styling"
+    );
     assert_eq!(oldest.offset_from_bottom, oldest.history_size);
     assert!(
         matches

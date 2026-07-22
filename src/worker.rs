@@ -1,11 +1,11 @@
-use std::{sync::mpsc, thread};
+use std::{path::PathBuf, sync::mpsc, thread};
 
 use crate::{
     config::CommandConfig,
     debug,
     model::{
-        AgentKind, AgentSession, DirectoryListing, HistoryMatch, HistoryPage, LaunchRequest, Probe,
-        ResumeCandidate, SearchMatchKind, SearchResult, Target,
+        AgentKind, AgentSession, DirectoryListing, FileListing, FilePreview, HistoryMatch,
+        HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind, SearchResult, Target,
     },
     runtime::Runtime,
 };
@@ -45,6 +45,10 @@ pub enum Request {
         target: Target,
         session_id: String,
     },
+    Archive {
+        target: Target,
+        session_id: String,
+    },
     Search {
         query: String,
         sessions: Vec<(Target, AgentSession)>,
@@ -57,6 +61,24 @@ pub enum Request {
         target: Target,
         kind: AgentKind,
         path: String,
+    },
+    ListFiles {
+        target: Target,
+        path: String,
+    },
+    PreviewFile {
+        target: Target,
+        path: String,
+    },
+    DownloadFile {
+        target: Target,
+        remote_path: String,
+        local_directory: PathBuf,
+    },
+    UploadFiles {
+        target: Target,
+        local_paths: Vec<PathBuf>,
+        remote_directory: String,
     },
 }
 
@@ -84,6 +106,11 @@ pub enum Event {
         target_id: String,
         result: Result<(), String>,
     },
+    Archived {
+        target_id: String,
+        session_id: String,
+        result: Result<(), String>,
+    },
     Searched {
         query: String,
         results: Vec<SearchResult>,
@@ -98,6 +125,24 @@ pub enum Event {
         kind: AgentKind,
         path: String,
         result: Result<Vec<ResumeCandidate>, String>,
+    },
+    FilesListed {
+        target_id: String,
+        requested_path: String,
+        result: Result<FileListing, String>,
+    },
+    FilePreviewed {
+        target_id: String,
+        path: String,
+        result: Result<FilePreview, String>,
+    },
+    FileDownloaded {
+        result: Result<PathBuf, String>,
+    },
+    FilesUploaded {
+        target_id: String,
+        remote_directory: String,
+        result: Result<usize, String>,
     },
 }
 
@@ -242,6 +287,23 @@ impl Worker {
                         }
                         let _ = events.send(Event::Killed { target_id, result });
                     }
+                    Request::Archive { target, session_id } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .archive(&target, &session_id)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("archive failed target={target_id}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::Archived {
+                            target_id,
+                            session_id,
+                            result,
+                        });
+                    }
                     Request::Search { query, sessions } => {
                         let mut results = Vec::new();
                         let mut history_jobs = Vec::new();
@@ -315,6 +377,54 @@ impl Worker {
                             target_id,
                             kind,
                             path,
+                            result,
+                        });
+                    }
+                    Request::ListFiles { target, path } => {
+                        let target_id = target.id.clone();
+                        let requested_path = path.clone();
+                        let result = runtime
+                            .list_files(&target, &path)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::FilesListed {
+                            target_id,
+                            requested_path,
+                            result,
+                        });
+                    }
+                    Request::PreviewFile { target, path } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .preview_file(&target, &path)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::FilePreviewed {
+                            target_id,
+                            path,
+                            result,
+                        });
+                    }
+                    Request::DownloadFile {
+                        target,
+                        remote_path,
+                        local_directory,
+                    } => {
+                        let result = runtime
+                            .download_file(&target, &remote_path, &local_directory)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::FileDownloaded { result });
+                    }
+                    Request::UploadFiles {
+                        target,
+                        local_paths,
+                        remote_directory,
+                    } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .upload_files(&target, &local_paths, &remote_directory)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::FilesUploaded {
+                            target_id,
+                            remote_directory,
                             result,
                         });
                     }
