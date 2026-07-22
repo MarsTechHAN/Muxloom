@@ -1,12 +1,13 @@
 use std::{
-    collections::HashSet,
-    env,
+    collections::{HashMap, HashSet},
+    env, fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{layout::Rect, widgets::ListState};
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     config::{CommandConfig, Config, HostConfig, State},
@@ -45,6 +46,12 @@ pub struct LaunchForm {
 }
 
 #[derive(Debug, Clone)]
+struct ArchivedResume {
+    source_session_id: String,
+    launch: LaunchForm,
+}
+
+#[derive(Debug, Clone)]
 pub struct PathPickerForm {
     pub launch: LaunchForm,
     pub path: String,
@@ -73,7 +80,14 @@ pub struct ResumeForm {
 #[derive(Debug, Clone)]
 pub enum Modal {
     Launch(LaunchForm),
-    ConfirmKill { session_id: String, label: String },
+    ConfirmKill {
+        session_id: String,
+        label: String,
+    },
+    ConfirmInstall {
+        launch: LaunchForm,
+        resume_id: Option<String>,
+    },
     Help(HelpForm),
     Settings(SettingsForm),
     Search(SearchForm),
@@ -86,7 +100,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 41;
+pub const HELP_CONTENT_ROWS: usize = 43;
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -107,34 +121,48 @@ pub struct SearchForm {
     pub query: String,
     pub submitted_query: String,
     pub results: Vec<SearchResult>,
+    pub result_rows: Vec<(usize, Rect)>,
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    pub edited_at: Instant,
 }
 
-pub const SETTING_LABELS: [&str; 12] = [
+pub const SETTING_LABELS: [&str; 18] = [
     "Refresh interval (ms)",
     "SSH timeout (sec)",
     "History limit",
     "History chunk lines",
     "SSH config path",
+    "Environment (A=x B=y)",
+    "Tunnel RPORT:LHOST:LPORT",
     "Codex command",
-    "Codex args (JSON)",
+    "Codex args",
+    "Codex install command",
+    "Codex sync files",
     "Claude command",
-    "Claude args (JSON)",
+    "Claude args",
+    "Claude install command",
+    "Claude sync files",
     "Terminal command",
-    "Terminal args (JSON)",
-    "Attention patterns (JSON)",
+    "Terminal args",
+    "Attention patterns",
 ];
 
-pub const HOST_SETTING_LABELS: [&str; 7] = [
+pub const HOST_SETTING_LABELS: [&str; 13] = [
+    "Environment (A=x B=y)",
+    "Tunnel RPORT:LHOST:LPORT",
     "Codex command",
-    "Codex args (JSON)",
+    "Codex args",
+    "Codex install command",
+    "Codex sync files",
     "Claude command",
-    "Claude args (JSON)",
+    "Claude args",
+    "Claude install command",
+    "Claude sync files",
     "Terminal command",
-    "Terminal args (JSON)",
-    "Attention patterns (JSON)",
+    "Terminal args",
+    "Attention patterns",
 ];
 
 impl SettingsForm {
@@ -156,6 +184,16 @@ pub enum Action {
 enum DragDivider {
     Machines,
     Agents,
+    PortraitMachines,
+    PortraitTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,8 +201,41 @@ pub struct PaneLayout {
     pub machines: Option<Rect>,
     pub agents: Option<Rect>,
     pub recap: Option<Rect>,
-    pub machine_divider_x: Option<u16>,
-    pub agents_divider_x: Option<u16>,
+    pub machine_divider: Option<Rect>,
+    pub agents_divider: Option<Rect>,
+    pub portrait_machine_divider: Option<Rect>,
+    pub portrait_terminal_divider: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPoint {
+    pub row: u16,
+    pub column: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelection {
+    pub anchor: TerminalPoint,
+    pub cursor: TerminalPoint,
+    dragging: bool,
+}
+
+impl TerminalSelection {
+    pub fn contains(self, row: u16, column: u16) -> bool {
+        if self.anchor == self.cursor {
+            return false;
+        }
+        let (start, end) = self.normalized();
+        (row, column) >= (start.row, start.column) && (row, column) <= (end.row, end.column)
+    }
+
+    fn normalized(self) -> (TerminalPoint, TerminalPoint) {
+        if (self.anchor.row, self.anchor.column) <= (self.cursor.row, self.cursor.column) {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
 }
 
 pub struct App {
@@ -201,9 +272,12 @@ pub struct App {
     pub terminal_session_id: Option<String>,
     pub pending_terminal: Option<TerminalSession>,
     pub pending_terminal_session_id: Option<String>,
+    pub terminal_selection: Option<TerminalSelection>,
     worker: Worker,
     pending_scans: HashSet<String>,
-    pending_capture: Option<String>,
+    pending_capture: Option<(String, String, usize)>,
+    history_cache: HashMap<String, Vec<HistoryPage>>,
+    history_cache_dir: PathBuf,
     dragging: Option<DragDivider>,
     last_refresh: Instant,
     top_up_count: u8,
@@ -214,6 +288,10 @@ pub struct App {
     pending_terminal_started_at: Option<Instant>,
     pending_terminal_has_output: bool,
     pending_terminal_take_input: bool,
+    clipboard_request: Option<String>,
+    pending_install_launch: Option<(LaunchForm, Option<String>)>,
+    pending_archived_resume: Option<ArchivedResume>,
+    focus_modifier_latched_until: Option<Instant>,
 }
 
 impl App {
@@ -225,6 +303,10 @@ impl App {
         targets: Vec<Target>,
         worker: Worker,
     ) -> Self {
+        let history_cache_dir = state_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("history");
         let statuses = targets
             .into_iter()
             .map(|target| {
@@ -266,9 +348,12 @@ impl App {
             terminal_session_id: None,
             pending_terminal: None,
             pending_terminal_session_id: None,
+            terminal_selection: None,
             worker,
             pending_scans: HashSet::new(),
             pending_capture: None,
+            history_cache: HashMap::new(),
+            history_cache_dir,
             dragging: None,
             last_refresh: Instant::now(),
             top_up_count: 0,
@@ -279,6 +364,10 @@ impl App {
             pending_terminal_started_at: None,
             pending_terminal_has_output: false,
             pending_terminal_take_input: false,
+            clipboard_request: None,
+            pending_install_launch: None,
+            pending_archived_resume: None,
+            focus_modifier_latched_until: None,
         }
     }
 
@@ -290,6 +379,7 @@ impl App {
     pub fn on_tick(&mut self) {
         self.drain_worker();
         self.poll_terminal();
+        self.maybe_auto_submit_search();
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -306,8 +396,15 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if is_copy_shortcut(key) && self.copy_terminal_selection() {
+            return Action::Continue;
+        }
         if let Some(modal) = self.modal.take() {
             return self.handle_modal(key, modal);
+        }
+        if let Some(direction) = self.focus_direction_for_key(key) {
+            self.move_focus(direction);
+            return Action::Continue;
         }
         if self.interactive {
             return self.handle_interactive_key(key);
@@ -423,14 +520,6 @@ impl App {
                 self.toggle_target(self.selected_target);
                 Action::Continue
             }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-                self.focus_left();
-                Action::Continue
-            }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                self.focus_right();
-                Action::Continue
-            }
             KeyCode::Up => {
                 if !self.handle_top_up() {
                     self.move_selection(-1);
@@ -458,14 +547,60 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
-        if let Some(Modal::Help(form)) = self.modal.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(3),
-                MouseEventKind::ScrollDown => {
-                    form.offset = form.offset.saturating_add(3).min(HELP_CONTENT_ROWS - 1)
+        if let Some(modal) = self.modal.as_mut() {
+            match modal {
+                Modal::Help(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(3),
+                    MouseEventKind::ScrollDown => {
+                        form.offset = form.offset.saturating_add(3).min(HELP_CONTENT_ROWS - 1)
+                    }
+                    _ => {}
+                },
+                Modal::Search(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp if !form.results.is_empty() => {
+                        form.selected = form.selected.saturating_sub(1);
+                    }
+                    MouseEventKind::ScrollDown if !form.results.is_empty() => {
+                        form.selected = (form.selected + 1).min(form.results.len() - 1);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some((index, _)) = form
+                            .result_rows
+                            .iter()
+                            .find(|(_, area)| inside(*area, mouse.column, mouse.row))
+                        {
+                            form.selected = *index;
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {
+                    // Modal clicks must never activate panes behind the overlay.
                 }
-                _ => {}
             }
+            return Action::Continue;
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && !mouse.modifiers.contains(KeyModifiers::ALT)
+            && self.begin_terminal_selection(mouse.column, mouse.row)
+        {
+            return Action::Continue;
+        }
+        if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
+            && self
+                .terminal_selection
+                .is_some_and(|selection| selection.dragging)
+        {
+            self.update_terminal_selection(mouse.column, mouse.row);
+            return Action::Continue;
+        }
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+            && self
+                .terminal_selection
+                .is_some_and(|selection| selection.dragging)
+        {
+            self.update_terminal_selection(mouse.column, mouse.row);
+            self.finish_terminal_selection(mouse);
             return Action::Continue;
         }
         match mouse.kind {
@@ -481,6 +616,9 @@ impl App {
                 if button == MouseButton::Left && self.on_divider(mouse.column, mouse.row) {
                     return Action::Continue;
                 }
+                if button == MouseButton::Left {
+                    self.terminal_selection = None;
+                }
                 if self.forward_terminal_mouse(mouse) {
                     return Action::Continue;
                 }
@@ -490,7 +628,7 @@ impl App {
             }
             MouseEventKind::Drag(button) => {
                 if button == MouseButton::Left && self.dragging.is_some() {
-                    self.drag_divider(mouse.column);
+                    self.drag_divider(mouse.column, mouse.row);
                 } else {
                     self.forward_terminal_mouse(mouse);
                 }
@@ -532,10 +670,7 @@ impl App {
                 }
                 Modal::Search(form) => {
                     form.query.push_str(&text);
-                    form.submitted_query.clear();
-                    form.results.clear();
-                    form.selected = 0;
-                    form.error = None;
+                    mark_search_edited(form);
                 }
                 Modal::Settings(form) => {
                     if let Some(value) = form.values.get_mut(form.selected) {
@@ -599,6 +734,7 @@ impl App {
             .iter()
             .filter(|session| {
                 (self.state.flatten || selected_target == Some(session.target_id.as_str()))
+                    && !(session.dead && session.kind == AgentKind::Terminal)
                     && (!session.dead || self.state.show_archived)
             })
             .collect();
@@ -621,6 +757,7 @@ impl App {
             .iter()
             .filter(|session| {
                 session.dead
+                    && session.kind != AgentKind::Terminal
                     && (self.state.flatten || selected_target == Some(session.target_id.as_str()))
             })
             .count()
@@ -628,6 +765,10 @@ impl App {
 
     pub fn take_notifications(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notifications)
+    }
+
+    pub fn take_clipboard_request(&mut self) -> Option<String> {
+        self.clipboard_request.take()
     }
 
     pub fn selected_session(&self) -> Option<&AgentSession> {
@@ -676,11 +817,6 @@ impl App {
     }
 
     fn handle_interactive_key(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Left && key.modifiers.is_empty() {
-            self.release_terminal_input("Agent terminal remains attached");
-            self.focus = Focus::Agents;
-            return Action::Continue;
-        }
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             self.page_history(key.code == KeyCode::PageUp);
             return Action::Continue;
@@ -698,7 +834,63 @@ impl App {
     }
 
     fn activate_terminal(&mut self) {
-        self.connect_terminal(true);
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        if session.dead {
+            self.resume_archived_session(session);
+        } else {
+            self.pending_archived_resume = None;
+            self.connect_terminal(true);
+        }
+    }
+
+    fn resume_archived_session(&mut self, session: AgentSession) {
+        if session.kind == AgentKind::Terminal {
+            self.status_message = "Exited terminals are removed automatically".into();
+            return;
+        }
+        if self
+            .pending_archived_resume
+            .as_ref()
+            .is_some_and(|pending| pending.source_session_id == session.id)
+        {
+            self.status_message = format!("Finding {} history to resume...", session.kind);
+            return;
+        }
+        let Some(target) = self.target(&session.target_id).cloned() else {
+            self.status_message = "Archived session machine is no longer available".into();
+            return;
+        };
+        self.close_terminal();
+        let launch = LaunchForm {
+            target: target.clone(),
+            kind: session.kind,
+            path: session.path.clone(),
+            label: session.label.clone(),
+            field: LaunchField::Kind,
+        };
+        let request = Request::ScanResumes {
+            target,
+            kind: session.kind,
+            path: session.path,
+        };
+        if self.worker.requests.send(request).is_err() {
+            self.status_message = "Resume scanner is unavailable".into();
+            return;
+        }
+        debug::log(
+            "resume",
+            format!(
+                "archived scan target={} session={} kind={} path={}",
+                session.target_id, session.id, session.kind, launch.path
+            ),
+        );
+        self.pending_archived_resume = Some(ArchivedResume {
+            source_session_id: session.id,
+            launch,
+        });
+        self.status_message = format!("Finding {} history to resume...", session.kind);
     }
 
     fn connect_terminal(&mut self, take_input: bool) {
@@ -796,6 +988,7 @@ impl App {
 
     fn close_terminal(&mut self) {
         self.interactive = false;
+        self.terminal_selection = None;
         self.terminal = None;
         self.terminal_session_id = None;
         self.clear_pending_terminal();
@@ -989,6 +1182,22 @@ impl App {
                                     ),
                                 );
                             }
+                            for session in sessions.iter().filter(|session| session.dead) {
+                                let just_exited = self.sessions.iter().any(|previous| {
+                                    previous.id == session.id
+                                        && previous.target_id == session.target_id
+                                        && !previous.dead
+                                });
+                                if just_exited {
+                                    self.history_cache.remove(&history_cache_key(
+                                        &session.target_id,
+                                        &session.id,
+                                    ));
+                                    if self.selected_session_id.as_deref() == Some(&session.id) {
+                                        self.history = HistoryPage::default();
+                                    }
+                                }
+                            }
                             self.sessions
                                 .retain(|session| session.target_id != target_id);
                             self.sessions.extend(sessions);
@@ -1018,32 +1227,52 @@ impl App {
                     self.request_history();
                 }
             }
-            Event::Captured { session_id, result } => {
-                if self.pending_capture.as_deref() == Some(&session_id) {
+            Event::Captured {
+                target_id,
+                session_id,
+                result,
+            } => {
+                if self
+                    .pending_capture
+                    .as_ref()
+                    .is_some_and(|(pending_target, pending_id, _)| {
+                        pending_target == &target_id && pending_id == &session_id
+                    })
+                {
                     self.pending_capture = None;
-                    if self.selected_session_id.as_deref() == Some(&session_id) {
-                        match result {
-                            Ok(mut page) => {
-                                page.text = sanitize_terminal_text(&page.text);
-                                if page.offset_from_bottom == self.history_offset {
-                                    self.history = page;
-                                    self.history_message = if self.history.text.is_empty() {
-                                        "No terminal output yet.".into()
-                                    } else {
-                                        String::new()
-                                    };
-                                    self.history_loading = false;
+                    match result {
+                        Ok(mut page) => {
+                            page.text = sanitize_terminal_text(&page.text);
+                            if self.selected_session_id.as_deref() == Some(&session_id)
+                                && self.history_offset > page.history_size
+                            {
+                                self.history_offset = page.history_size;
+                                self.status_message = if page.history_size == 0 {
+                                    "This terminal has no older scrollback".into()
                                 } else {
-                                    self.request_history();
-                                }
+                                    format!(
+                                        "Reached the oldest available history ({} lines)",
+                                        page.history_size
+                                    )
+                                };
                             }
-                            Err(error) => {
+                            self.store_history_page(&target_id, &session_id, page);
+                            if self.selected_session_id.as_deref() == Some(&session_id) {
+                                self.request_history();
+                            }
+                        }
+                        Err(error) => {
+                            if self.selected_session_id.as_deref() == Some(&session_id) {
                                 self.history_loading = false;
                                 self.history_message =
                                     format!("History unavailable: {}", short_error(&error));
                             }
                         }
-                    } else {
+                    }
+                    if self.selected_session_id.as_deref() != Some(&session_id)
+                        && (self.history_offset > 0
+                            || self.selected_session().is_some_and(|session| session.dead))
+                    {
                         self.request_history();
                     }
                 }
@@ -1058,6 +1287,29 @@ impl App {
                     }
                     Err(error) => {
                         self.status_message = format!("Launch failed: {}", short_error(&error))
+                    }
+                }
+            }
+            Event::Installed {
+                target_id,
+                kind,
+                result,
+            } => {
+                self.busy_operations = self.busy_operations.saturating_sub(1);
+                match result {
+                    Ok(message) => {
+                        self.status_message = message;
+                        self.refresh_target(&target_id);
+                        if let Some((launch, resume_id)) = self.pending_install_launch.take()
+                            && launch.target.id == target_id
+                            && launch.kind == kind
+                        {
+                            self.submit_launch(launch, resume_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_install_launch = None;
+                        self.status_message = format!("Install failed: {}", short_error(&error));
                     }
                 }
             }
@@ -1086,6 +1338,7 @@ impl App {
                 {
                     form.loading = false;
                     form.results = results;
+                    form.result_rows.clear();
                     form.selected = 0;
                     form.error = if form.results.is_empty() {
                         Some("No matching agent name, recap, or history".into())
@@ -1129,14 +1382,61 @@ impl App {
                     && form.launch.path == path
                 {
                     form.loading = false;
-                    match result {
+                    match &result {
                         Ok(candidates) => {
-                            form.candidates = candidates;
+                            form.candidates = candidates.clone();
                             form.selected = 0;
                             form.error = None;
                         }
                         Err(error) => {
-                            form.error = Some(short_error(&error));
+                            form.error = Some(short_error(error));
+                        }
+                    }
+                }
+                let pending_matches =
+                    self.pending_archived_resume
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.launch.target.id == target_id
+                                && pending.launch.kind == kind
+                                && pending.launch.path == path
+                                && self.selected_session_id.as_deref()
+                                    == Some(&pending.source_session_id)
+                        });
+                if pending_matches {
+                    let pending = self
+                        .pending_archived_resume
+                        .take()
+                        .expect("matched pending archived resume");
+                    match result {
+                        Ok(candidates) => {
+                            if let Some(candidate) = candidates.first() {
+                                debug::log(
+                                    "resume",
+                                    format!(
+                                        "archived match source={} resume_id={} candidates={}",
+                                        pending.source_session_id,
+                                        candidate.id,
+                                        candidates.len()
+                                    ),
+                                );
+                                self.confirm_or_submit_launch(
+                                    pending.launch,
+                                    Some(candidate.id.clone()),
+                                );
+                            } else {
+                                self.request_history();
+                                self.status_message = format!(
+                                    "No resumable {kind} history found; archived output is read-only"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            self.request_history();
+                            self.status_message = format!(
+                                "Could not find resumable {kind} history: {}",
+                                short_error(&error)
+                            );
                         }
                     }
                 }
@@ -1186,6 +1486,7 @@ impl App {
                 .command_for(id, AgentKind::Claude)
                 .command
                 .clone(),
+            environment: self.config.environment_for(id).unwrap_or_default(),
             attention_patterns: self.config.attention_patterns_for(id).to_vec(),
         };
         if self.worker.requests.send(Request::Scan(request)).is_ok() {
@@ -1253,26 +1554,112 @@ impl App {
         }
     }
 
-    fn focus_left(&mut self) {
-        self.focus = match self.focus {
-            Focus::Machines => Focus::Machines,
-            Focus::Agents if self.state.flatten => Focus::Agents,
-            Focus::Agents => Focus::Machines,
-            Focus::Recap => Focus::Agents,
+    fn move_focus(&mut self, direction: FocusDirection) {
+        let previous = self.focus;
+        let next = self
+            .geometric_focus(direction)
+            .or_else(|| self.compact_focus(direction));
+        let Some(next) = next else {
+            debug::log(
+                "focus",
+                format!(
+                    "no neighbor direction={direction:?} from={previous:?} machines={:?} agents={:?} terminal={:?}",
+                    self.pane_layout.machines, self.pane_layout.agents, self.pane_layout.recap
+                ),
+            );
+            self.status_message = if self.state.flatten
+                && self
+                    .layout_debug_signature
+                    .is_some_and(|(_, _, _, _, portrait, _)| portrait)
+                && matches!(direction, FocusDirection::Left | FocusDirection::Right)
+            {
+                "Flatten mode has no Machine pane; press f to restore grouped panes".into()
+            } else {
+                "No pane in that direction; follow the visible layout".into()
+            };
+            return;
         };
-        if self.focus != Focus::Recap {
-            self.interactive = false;
+        debug::log(
+            "focus",
+            format!("moved direction={direction:?} from={previous:?} to={next:?}"),
+        );
+        self.focus = next;
+        if next == Focus::Recap {
+            self.activate_terminal();
+        } else {
+            self.release_terminal_input("Terminal remains attached; focus moved to a sidebar");
         }
     }
 
-    fn focus_right(&mut self) {
-        self.focus = match self.focus {
-            Focus::Machines => Focus::Agents,
-            Focus::Agents => Focus::Recap,
-            Focus::Recap => Focus::Recap,
+    fn focus_direction_for_key(&mut self, key: KeyEvent) -> Option<FocusDirection> {
+        const MODIFIER_LATCH: Duration = Duration::from_millis(700);
+
+        if let Some(direction) = focus_navigation_direction(key) {
+            self.focus_modifier_latched_until = Some(Instant::now() + MODIFIER_LATCH);
+            return Some(direction);
+        }
+        let continuation = if key.modifiers == KeyModifiers::NONE {
+            arrow_direction(key.code)
+        } else {
+            None
         };
-        if self.focus == Focus::Recap {
-            self.activate_terminal();
+        if let Some(direction) = continuation
+            && self
+                .focus_modifier_latched_until
+                .is_some_and(|deadline| Instant::now() <= deadline)
+        {
+            self.focus_modifier_latched_until = Some(Instant::now() + MODIFIER_LATCH);
+            debug::log(
+                "focus",
+                format!("continued latched modifier direction={direction:?}"),
+            );
+            return Some(direction);
+        }
+        self.focus_modifier_latched_until = None;
+        None
+    }
+
+    fn geometric_focus(&self, direction: FocusDirection) -> Option<Focus> {
+        let current = self.focus_area(self.focus)?;
+        [Focus::Machines, Focus::Agents, Focus::Recap]
+            .into_iter()
+            .filter(|candidate| *candidate != self.focus)
+            .filter_map(|candidate| {
+                let area = self.focus_area(candidate)?;
+                focus_distance(current, area, direction).map(|score| (score, candidate))
+            })
+            .min_by_key(|(score, _)| *score)
+            .map(|(_, focus)| focus)
+    }
+
+    fn focus_area(&self, focus: Focus) -> Option<Rect> {
+        match focus {
+            Focus::Machines => self.pane_layout.machines,
+            Focus::Agents => self.pane_layout.agents,
+            Focus::Recap => self.pane_layout.recap,
+        }
+    }
+
+    fn compact_focus(&self, direction: FocusDirection) -> Option<Focus> {
+        let (_, _, _, _, portrait, compact) = self.layout_debug_signature?;
+        if !compact {
+            return None;
+        }
+        match (portrait, self.focus, direction) {
+            (true, Focus::Recap, FocusDirection::Down) => Some(Focus::Agents),
+            (true, Focus::Agents, FocusDirection::Up) => Some(Focus::Recap),
+            (true, Focus::Agents, FocusDirection::Left) if !self.state.flatten => {
+                Some(Focus::Machines)
+            }
+            (true, Focus::Machines, FocusDirection::Up) => Some(Focus::Recap),
+            (true, Focus::Machines, FocusDirection::Right) => Some(Focus::Agents),
+            (false, Focus::Machines, FocusDirection::Right) => Some(Focus::Agents),
+            (false, Focus::Agents, FocusDirection::Left) if !self.state.flatten => {
+                Some(Focus::Machines)
+            }
+            (false, Focus::Agents, FocusDirection::Right) => Some(Focus::Recap),
+            (false, Focus::Recap, FocusDirection::Left) => Some(Focus::Agents),
+            _ => None,
         }
     }
 
@@ -1372,7 +1759,9 @@ impl App {
         if self.selected_session_id.as_deref() == Some(&id) {
             return;
         }
+        self.pending_archived_resume = None;
         self.interactive = false;
+        self.terminal_selection = None;
         self.clear_pending_terminal();
         self.terminal_retry_at = None;
         self.terminal_failures = 0;
@@ -1420,10 +1809,58 @@ impl App {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        let desired_offset = self.history_offset;
+        let viewport_lines = self.agent_viewport_height.max(1) as usize;
+        let chunk_lines = self.config.history_chunk_lines.max(viewport_lines + 50);
+        let capture_offset = history_capture_offset(desired_offset, chunk_lines, viewport_lines);
+        if let Some(page) = self.cached_history_page(
+            &session.target_id,
+            &session.id,
+            desired_offset,
+            viewport_lines,
+        ) {
+            self.show_history_page(page);
+            let stride = history_capture_stride(chunk_lines, viewport_lines);
+            let next_capture = capture_offset.saturating_add(stride);
+            if desired_offset.saturating_sub(capture_offset) > stride / 2
+                && self.pending_capture.is_none()
+                && next_capture <= self.history.history_size
+            {
+                self.send_history_capture(&session, next_capture, chunk_lines, false);
+            }
+            return;
+        }
+        let can_use_disk_cache = self
+            .targets
+            .iter()
+            .find(|target| target.target.id == session.target_id)
+            .is_none_or(|target| target.state != ConnectionState::Online);
+        if can_use_disk_cache
+            && self.load_history_page(&session.target_id, &session.id, capture_offset)
+            && let Some(page) = self.cached_history_page(
+                &session.target_id,
+                &session.id,
+                desired_offset,
+                viewport_lines,
+            )
+        {
+            self.show_history_page(page);
+            return;
+        }
         if self.pending_capture.is_some() {
             self.history_loading = true;
             return;
         }
+        self.send_history_capture(&session, capture_offset, chunk_lines, true);
+    }
+
+    fn send_history_capture(
+        &mut self,
+        session: &AgentSession,
+        offset: usize,
+        lines: usize,
+        loading: bool,
+    ) {
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
@@ -1433,16 +1870,109 @@ impl App {
             .send(Request::Capture {
                 target,
                 session_id: session.id.clone(),
-                offset_from_bottom: self.history_offset,
-                lines: self.config.history_chunk_lines.max(50),
+                offset_from_bottom: offset,
+                lines,
                 width: self.agent_viewport_width,
                 height: self.agent_viewport_height,
             })
             .is_ok()
         {
-            self.pending_capture = Some(session.id);
-            self.history_loading = true;
+            self.pending_capture = Some((session.target_id.clone(), session.id.clone(), offset));
+            self.history_loading = loading;
         }
+    }
+
+    fn cached_history_page(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        desired_offset: usize,
+        viewport_lines: usize,
+    ) -> Option<HistoryPage> {
+        self.history_cache
+            .get(&history_cache_key(target_id, session_id))?
+            .iter()
+            .filter(|page| {
+                self.history.total_lines() == 0 || page.total_lines() == self.history.total_lines()
+            })
+            .filter_map(|page| materialize_history_page(page, desired_offset, viewport_lines))
+            .max_by_key(|page| page.offset_from_bottom)
+    }
+
+    fn show_history_page(&mut self, page: HistoryPage) {
+        self.history = page;
+        self.history_message = if self.history.text.is_empty() {
+            "No terminal output yet.".into()
+        } else {
+            String::new()
+        };
+        self.history_loading = false;
+    }
+
+    fn store_history_page(&mut self, target_id: &str, session_id: &str, page: HistoryPage) {
+        let pages = self
+            .history_cache
+            .entry(history_cache_key(target_id, session_id))
+            .or_default();
+        if let Some(existing) = pages
+            .iter_mut()
+            .find(|existing| existing.offset_from_bottom == page.offset_from_bottom)
+        {
+            *existing = page.clone();
+        } else {
+            pages.push(page.clone());
+        }
+        let path = self.history_cache_path(target_id, session_id, page.offset_from_bottom);
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            debug::log("history", format!("cache directory failed: {error}"));
+            return;
+        }
+        match serde_json::to_vec(&page) {
+            Ok(data) => {
+                if let Err(error) = fs::write(&path, data) {
+                    debug::log(
+                        "history",
+                        format!("cache write {}: {error}", path.display()),
+                    );
+                }
+            }
+            Err(error) => debug::log("history", format!("cache encode failed: {error}")),
+        }
+    }
+
+    fn load_history_page(&mut self, target_id: &str, session_id: &str, offset: usize) -> bool {
+        let path = self.history_cache_path(target_id, session_id, offset);
+        let Ok(data) = fs::read(&path) else {
+            return false;
+        };
+        match serde_json::from_slice::<HistoryPage>(&data) {
+            Ok(page) => {
+                let pages = self
+                    .history_cache
+                    .entry(history_cache_key(target_id, session_id))
+                    .or_default();
+                if !pages
+                    .iter()
+                    .any(|cached| cached.offset_from_bottom == page.offset_from_bottom)
+                {
+                    pages.push(page);
+                }
+                true
+            }
+            Err(error) => {
+                debug::log("history", format!("cache read {}: {error}", path.display()));
+                false
+            }
+        }
+    }
+
+    fn history_cache_path(&self, target_id: &str, session_id: &str, offset: usize) -> PathBuf {
+        self.history_cache_dir
+            .join(cache_path_component(target_id))
+            .join(session_id)
+            .join(format!("{offset}.json"))
     }
 
     fn page_history(&mut self, older: bool) {
@@ -1450,13 +1980,45 @@ impl App {
             return;
         }
         let page = self.agent_viewport_height.saturating_sub(2).max(1) as usize;
-        if older {
-            let max_offset = self.history.total_lines().saturating_sub(1);
-            self.history_offset = self.history_offset.saturating_add(page).min(max_offset);
-        } else {
-            self.history_offset = self.history_offset.saturating_sub(page);
+        self.scroll_history(older, page);
+    }
+
+    fn scroll_history(&mut self, older: bool, lines: usize) {
+        if older
+            && self.history_offset == 0
+            && let Some(session) = self.selected_session().cloned()
+            && !session.dead
+        {
+            self.history_cache
+                .remove(&history_cache_key(&session.target_id, &session.id));
+            self.history = HistoryPage::default();
         }
-        self.request_history();
+        if older {
+            let next = self.history_offset.saturating_add(lines.max(1));
+            self.history_offset = if self.history.total_lines() > 0 {
+                let maximum = self.history.history_size;
+                if next > maximum {
+                    self.status_message = if maximum == 0 {
+                        "This terminal has no older scrollback".into()
+                    } else {
+                        format!("Reached the oldest available history ({maximum} lines)")
+                    };
+                }
+                next.min(maximum)
+            } else {
+                next
+            };
+        } else {
+            self.history_offset = self.history_offset.saturating_sub(lines.max(1));
+        }
+        self.terminal_selection = None;
+        if self.history_offset == 0 && self.selected_session().is_some_and(|session| !session.dead)
+        {
+            self.history_loading = false;
+            self.history_message.clear();
+        } else {
+            self.request_history();
+        }
     }
 
     fn open_launch(&mut self) {
@@ -1578,13 +2140,19 @@ impl App {
                 self.config.history_limit.to_string(),
                 self.config.history_chunk_lines.to_string(),
                 self.config.ssh_config.clone(),
+                self.config.environment.clone(),
+                self.config.reverse_tunnel.clone(),
                 self.config.agents.codex.command.clone(),
-                serde_json::to_string(&self.config.agents.codex.args).unwrap_or_default(),
+                format_shell_list(&self.config.agents.codex.args),
+                self.config.agents.codex.install.clone(),
+                format_shell_list(&self.config.agents.codex.sync_files),
                 self.config.agents.claude.command.clone(),
-                serde_json::to_string(&self.config.agents.claude.args).unwrap_or_default(),
+                format_shell_list(&self.config.agents.claude.args),
+                self.config.agents.claude.install.clone(),
+                format_shell_list(&self.config.agents.claude.sync_files),
                 self.config.agents.terminal.command.clone(),
-                serde_json::to_string(&self.config.agents.terminal.args).unwrap_or_default(),
-                serde_json::to_string(&self.config.attention_patterns).unwrap_or_default(),
+                format_shell_list(&self.config.agents.terminal.args),
+                format_shell_list(&self.config.attention_patterns),
             ],
             selected: 0,
             error: None,
@@ -1619,14 +2187,27 @@ impl App {
         self.modal = Some(Modal::Settings(SettingsForm {
             scope: SettingsScope::Host(target_id.clone()),
             values: vec![
+                self.config
+                    .hosts
+                    .get(&target_id)
+                    .and_then(|host| host.environment.clone())
+                    .unwrap_or_else(|| self.config.environment.clone()),
+                self.config
+                    .hosts
+                    .get(&target_id)
+                    .and_then(|host| host.reverse_tunnel.clone())
+                    .unwrap_or_else(|| self.config.reverse_tunnel.clone()),
                 codex.command,
-                serde_json::to_string(&codex.args).unwrap_or_default(),
+                format_shell_list(&codex.args),
+                codex.install,
+                format_shell_list(&codex.sync_files),
                 claude.command,
-                serde_json::to_string(&claude.args).unwrap_or_default(),
+                format_shell_list(&claude.args),
+                claude.install,
+                format_shell_list(&claude.sync_files),
                 terminal.command,
-                serde_json::to_string(&terminal.args).unwrap_or_default(),
-                serde_json::to_string(self.config.attention_patterns_for(&target_id))
-                    .unwrap_or_default(),
+                format_shell_list(&terminal.args),
+                format_shell_list(self.config.attention_patterns_for(&target_id)),
             ],
             selected: 0,
             error: None,
@@ -1638,9 +2219,11 @@ impl App {
             query: String::new(),
             submitted_query: String::new(),
             results: Vec::new(),
+            result_rows: Vec::new(),
             selected: 0,
             loading: false,
             error: None,
+            edited_at: Instant::now(),
         }));
     }
 
@@ -1663,6 +2246,7 @@ impl App {
         form.query = query.clone();
         form.submitted_query = query.clone();
         form.results.clear();
+        form.result_rows.clear();
         form.selected = 0;
         form.loading = true;
         form.error = None;
@@ -1676,6 +2260,20 @@ impl App {
             form.error = Some("Search worker is unavailable".into());
         }
         self.modal = Some(Modal::Search(form));
+    }
+
+    fn maybe_auto_submit_search(&mut self) {
+        let should_submit = matches!(self.modal.as_ref(), Some(Modal::Search(form))
+            if !form.loading
+                && form.query.trim().chars().count() >= 2
+                && form.submitted_query != form.query.trim()
+                && form.edited_at.elapsed() >= Duration::from_millis(350));
+        if !should_submit {
+            return;
+        }
+        if let Some(Modal::Search(form)) = self.modal.take() {
+            self.submit_search(form);
+        }
     }
 
     fn open_search_result(&mut self, result: SearchResult) {
@@ -1811,18 +2409,12 @@ impl App {
                 KeyCode::Enter => self.submit_search(form),
                 KeyCode::Backspace => {
                     form.query.pop();
-                    form.submitted_query.clear();
-                    form.results.clear();
-                    form.selected = 0;
-                    form.error = None;
+                    mark_search_edited(&mut form);
                     self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     form.query.clear();
-                    form.submitted_query.clear();
-                    form.results.clear();
-                    form.selected = 0;
-                    form.error = None;
+                    mark_search_edited(&mut form);
                     self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Char(character)
@@ -1831,10 +2423,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     form.query.push(character);
-                    form.submitted_query.clear();
-                    form.results.clear();
-                    form.selected = 0;
-                    form.error = None;
+                    mark_search_edited(&mut form);
                     self.modal = Some(Modal::Search(form));
                 }
                 _ => self.modal = Some(Modal::Search(form)),
@@ -1892,7 +2481,9 @@ impl App {
             },
             Modal::Resume(mut form) => match key.code {
                 KeyCode::Esc | KeyCode::Left => self.modal = Some(Modal::Launch(form.launch)),
-                KeyCode::Enter if form.selected == 0 => self.submit_launch(form.launch, None),
+                KeyCode::Enter if form.selected == 0 => {
+                    self.confirm_or_submit_launch(form.launch, None)
+                }
                 KeyCode::Up | KeyCode::Char('k') if !form.loading => {
                     form.selected = shifted(form.selected, form.candidates.len() + 1, -1);
                     self.modal = Some(Modal::Resume(form));
@@ -1907,7 +2498,7 @@ impl App {
                         .checked_sub(1)
                         .and_then(|index| form.candidates.get(index))
                         .map(|candidate| candidate.id.clone());
-                    self.submit_launch(form.launch, resume_id);
+                    self.confirm_or_submit_launch(form.launch, resume_id);
                 }
                 _ => self.modal = Some(Modal::Resume(form)),
             },
@@ -1915,6 +2506,11 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Enter => self.delete_session(&session_id),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.modal = Some(Modal::ConfirmKill { session_id, label }),
+            },
+            Modal::ConfirmInstall { launch, resume_id } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.install_and_launch(launch, resume_id),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.modal = Some(Modal::ConfirmInstall { launch, resume_id }),
             },
             Modal::Launch(mut form) => match key.code {
                 KeyCode::Esc => {}
@@ -1991,44 +2587,66 @@ impl App {
                         );
                     }
                     config.ssh_config = form.values[4].clone();
-                    config.agents.codex.command = form.values[5].clone();
+                    config.environment = form.values[5].clone();
+                    config.reverse_tunnel = form.values[6].clone();
+                    config.agents.codex.command = form.values[7].clone();
                     config.agents.codex.args =
-                        parse_json_array(&form.values[6], SETTING_LABELS[6])?;
-                    config.agents.claude.command = form.values[7].clone();
+                        parse_shell_list(&form.values[8], SETTING_LABELS[8])?;
+                    config.agents.codex.install = form.values[9].clone();
+                    config.agents.codex.sync_files =
+                        parse_shell_list(&form.values[10], SETTING_LABELS[10])?;
+                    config.agents.claude.command = form.values[11].clone();
                     config.agents.claude.args =
-                        parse_json_array(&form.values[8], SETTING_LABELS[8])?;
-                    config.agents.terminal.command = form.values[9].clone();
+                        parse_shell_list(&form.values[12], SETTING_LABELS[12])?;
+                    config.agents.claude.install = form.values[13].clone();
+                    config.agents.claude.sync_files =
+                        parse_shell_list(&form.values[14], SETTING_LABELS[14])?;
+                    config.agents.terminal.command = form.values[15].clone();
                     config.agents.terminal.args =
-                        parse_json_array(&form.values[10], SETTING_LABELS[10])?;
+                        parse_shell_list(&form.values[16], SETTING_LABELS[16])?;
                     config.attention_patterns =
-                        parse_json_array(&form.values[11], SETTING_LABELS[11])?;
+                        parse_shell_list(&form.values[17], SETTING_LABELS[17])?;
                 }
                 SettingsScope::Host(target_id) => {
                     let codex = CommandConfig {
-                        command: form.values[0].clone(),
-                        args: parse_json_array(&form.values[1], HOST_SETTING_LABELS[1])?,
+                        command: form.values[2].clone(),
+                        args: parse_shell_list(&form.values[3], HOST_SETTING_LABELS[3])?,
+                        install: form.values[4].clone(),
+                        sync_files: parse_shell_list(&form.values[5], HOST_SETTING_LABELS[5])?,
                     };
                     let claude = CommandConfig {
-                        command: form.values[2].clone(),
-                        args: parse_json_array(&form.values[3], HOST_SETTING_LABELS[3])?,
+                        command: form.values[6].clone(),
+                        args: parse_shell_list(&form.values[7], HOST_SETTING_LABELS[7])?,
+                        install: form.values[8].clone(),
+                        sync_files: parse_shell_list(&form.values[9], HOST_SETTING_LABELS[9])?,
                     };
                     let terminal = CommandConfig {
-                        command: form.values[4].clone(),
-                        args: parse_json_array(&form.values[5], HOST_SETTING_LABELS[5])?,
+                        command: form.values[10].clone(),
+                        args: parse_shell_list(&form.values[11], HOST_SETTING_LABELS[11])?,
+                        ..CommandConfig::default()
                     };
                     let attention_patterns =
-                        parse_json_array(&form.values[6], HOST_SETTING_LABELS[6])?;
+                        parse_shell_list(&form.values[12], HOST_SETTING_LABELS[12])?;
                     config.hosts.insert(
                         target_id.clone(),
                         HostConfig {
                             codex: Some(codex),
                             claude: Some(claude),
                             terminal: Some(terminal),
+                            environment: Some(form.values[0].clone()),
+                            reverse_tunnel: Some(form.values[1].clone()),
                             attention_patterns: Some(attention_patterns),
                         },
                     );
                 }
             }
+            config
+                .environment_for(match &form.scope {
+                    SettingsScope::Global => LOCAL_TARGET_ID,
+                    SettingsScope::Host(target_id) => target_id,
+                })
+                .map_err(|error| error.to_string())?;
+            config.validate().map_err(|error| error.to_string())?;
             let effective_host = match &form.scope {
                 SettingsScope::Global => None,
                 SettingsScope::Host(target_id) => Some(target_id.as_str()),
@@ -2127,6 +2745,10 @@ impl App {
             return;
         }
         let command = self.config.command_for(&form.target.id, form.kind).clone();
+        let environment = self
+            .config
+            .environment_for(&form.target.id)
+            .unwrap_or_default();
         let request = LaunchRequest {
             target: form.target,
             kind: form.kind,
@@ -2137,11 +2759,58 @@ impl App {
         if self
             .worker
             .requests
-            .send(Request::Launch { request, command })
+            .send(Request::Launch {
+                request,
+                command,
+                environment,
+            })
             .is_ok()
         {
             self.busy_operations += 1;
             self.status_message = "Launching agent...".into();
+        }
+    }
+
+    fn confirm_or_submit_launch(&mut self, form: LaunchForm, resume_id: Option<String>) {
+        let available = self
+            .targets
+            .iter()
+            .find(|target| target.target.id == form.target.id)
+            .is_some_and(|target| match form.kind {
+                AgentKind::Codex => target.probe.codex,
+                AgentKind::Claude => target.probe.claude,
+                AgentKind::Terminal => true,
+            });
+        if available || form.kind == AgentKind::Terminal {
+            self.submit_launch(form, resume_id);
+        } else {
+            self.modal = Some(Modal::ConfirmInstall {
+                launch: form,
+                resume_id,
+            });
+        }
+    }
+
+    fn install_and_launch(&mut self, launch: LaunchForm, resume_id: Option<String>) {
+        let command = self
+            .config
+            .command_for(&launch.target.id, launch.kind)
+            .clone();
+        let environment = self
+            .config
+            .environment_for(&launch.target.id)
+            .unwrap_or_default();
+        let request = Request::Install {
+            target: launch.target.clone(),
+            kind: launch.kind,
+            command,
+            environment,
+        };
+        if self.worker.requests.send(request).is_ok() {
+            self.pending_install_launch = Some((launch.clone(), resume_id));
+            self.busy_operations += 1;
+            self.status_message =
+                format!("Installing {} on {}...", launch.kind, launch.target.label);
         }
     }
 
@@ -2171,21 +2840,34 @@ impl App {
     }
 
     fn on_divider(&mut self, column: u16, row: u16) -> bool {
-        if !self.pane_layout.recap.is_some_and(|area| row_in(area, row)) {
-            return false;
+        if self
+            .pane_layout
+            .portrait_terminal_divider
+            .is_some_and(|area| near_divider(area, column, row))
+        {
+            self.dragging = Some(DragDivider::PortraitTerminal);
+            return true;
         }
         if self
             .pane_layout
-            .machine_divider_x
-            .is_some_and(|x| column.abs_diff(x) <= 1)
+            .portrait_machine_divider
+            .is_some_and(|area| near_divider(area, column, row))
+        {
+            self.dragging = Some(DragDivider::PortraitMachines);
+            return true;
+        }
+        if self
+            .pane_layout
+            .machine_divider
+            .is_some_and(|area| near_divider(area, column, row))
         {
             self.dragging = Some(DragDivider::Machines);
             return true;
         }
         if self
             .pane_layout
-            .agents_divider_x
-            .is_some_and(|x| column.abs_diff(x) <= 1)
+            .agents_divider
+            .is_some_and(|area| near_divider(area, column, row))
         {
             self.dragging = Some(DragDivider::Agents);
             return true;
@@ -2193,7 +2875,7 @@ impl App {
         false
     }
 
-    fn drag_divider(&mut self, column: u16) {
+    fn drag_divider(&mut self, column: u16, row: u16) {
         match self.dragging {
             Some(DragDivider::Machines) => {
                 let Some(area) = self.pane_layout.machines else {
@@ -2216,6 +2898,45 @@ impl App {
                     .saturating_add(1)
                     .saturating_sub(focused_bonus)
                     .clamp(24, 72);
+            }
+            Some(DragDivider::PortraitMachines) => {
+                let (Some(machines), Some(agents)) =
+                    (self.pane_layout.machines, self.pane_layout.agents)
+                else {
+                    return;
+                };
+                let total = machines.width.saturating_add(agents.width).max(1);
+                let display_percent = column
+                    .saturating_sub(machines.x)
+                    .saturating_add(1)
+                    .saturating_mul(100)
+                    / total;
+                let focus_adjustment: i16 = match self.focus {
+                    Focus::Machines => 10,
+                    Focus::Agents => -10,
+                    Focus::Recap => 0,
+                };
+                self.state.portrait_machine_percent =
+                    (i16::try_from(display_percent).unwrap_or(i16::MAX) - focus_adjustment)
+                        .clamp(25, 75) as u16;
+            }
+            Some(DragDivider::PortraitTerminal) => {
+                let Some(recap) = self.pane_layout.recap else {
+                    return;
+                };
+                let lower_height = self
+                    .pane_layout
+                    .machines
+                    .or(self.pane_layout.agents)
+                    .map_or(0, |area| area.height);
+                let total = recap.height.saturating_add(lower_height).max(1);
+                self.state.portrait_terminal_percent = row
+                    .saturating_sub(recap.y)
+                    .saturating_add(1)
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(65)
+                    .clamp(45, 82);
             }
             None => {}
         }
@@ -2337,6 +3058,123 @@ impl App {
         }
     }
 
+    fn terminal_cell_at(&self, column: u16, row: u16) -> Option<TerminalPoint> {
+        let area = self.pane_layout.recap?;
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        inside(inner, column, row).then_some(TerminalPoint {
+            row: row.saturating_sub(inner.y),
+            column: column.saturating_sub(inner.x),
+        })
+    }
+
+    fn begin_terminal_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.terminal_cell_at(column, row) else {
+            return false;
+        };
+        self.focus = Focus::Recap;
+        self.terminal_selection = Some(TerminalSelection {
+            anchor: point,
+            cursor: point,
+            dragging: true,
+        });
+        self.status_message = "Selecting terminal text...".into();
+        true
+    }
+
+    fn update_terminal_selection(&mut self, column: u16, row: u16) {
+        let Some(point) = self.terminal_cell_at(column, row) else {
+            return;
+        };
+        if let Some(selection) = self.terminal_selection.as_mut() {
+            selection.cursor = point;
+        }
+    }
+
+    fn finish_terminal_selection(&mut self, mouse: MouseEvent) {
+        if let Some(selection) = self.terminal_selection.as_mut() {
+            selection.dragging = false;
+        }
+        if self.copy_terminal_selection() {
+            return;
+        }
+
+        self.terminal_selection = None;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..mouse
+        };
+        let forwarded = self.forward_terminal_mouse(down);
+        let released = self.forward_terminal_mouse(mouse);
+        if !forwarded && !released {
+            self.click_pane(mouse.column, mouse.row);
+        }
+    }
+
+    fn copy_terminal_selection(&mut self) -> bool {
+        let Some(text) = self.selected_terminal_text() else {
+            return false;
+        };
+        let characters = text.chars().count();
+        self.clipboard_request = Some(text);
+        self.status_message = format!("Copied {characters} characters to clipboard");
+        true
+    }
+
+    fn selected_terminal_text(&self) -> Option<String> {
+        let selection = self.terminal_selection?;
+        if selection.anchor == selection.cursor {
+            return None;
+        }
+        let (start, end) = selection.normalized();
+        let text = if self.history_offset == 0 {
+            let screen = self.terminal.as_ref()?.screen();
+            let (rows, columns) = screen.size();
+            if rows == 0 || columns == 0 {
+                return None;
+            }
+            screen.contents_between(
+                start.row.min(rows - 1),
+                start.column.min(columns - 1),
+                end.row.min(rows - 1),
+                end.column.saturating_add(1).min(columns),
+            )
+        } else {
+            self.selected_history_text(start, end)
+        };
+        let text = text.trim_end_matches([' ', '\n', '\r']).to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn selected_history_text(&self, start: TerminalPoint, end: TerminalPoint) -> String {
+        let body = if self.history_message.is_empty() {
+            self.history.text.as_str()
+        } else {
+            self.history_message.as_str()
+        };
+        let lines: Vec<_> = body.lines().collect();
+        let height = usize::from(self.agent_viewport_height);
+        let scroll = lines.len().saturating_sub(height);
+        let mut selected = Vec::new();
+        for row in start.row..=end.row {
+            let Some(line) = lines.get(scroll + usize::from(row)) else {
+                continue;
+            };
+            let range_start = if row == start.row { start.column } else { 0 };
+            let range_end = if row == end.row {
+                end.column.saturating_add(1)
+            } else {
+                self.agent_viewport_width
+            };
+            selected.push(display_column_slice(line, range_start, range_end));
+        }
+        selected.join("\n")
+    }
+
     fn scroll_at(&mut self, column: u16, row: u16, up: bool) {
         if self
             .pane_layout
@@ -2344,8 +3182,10 @@ impl App {
             .is_some_and(|area| inside(area, column, row))
         {
             self.focus = Focus::Recap;
-            self.activate_terminal();
-            self.page_history(up);
+            if self.history_offset == 0 {
+                self.activate_terminal();
+            }
+            self.scroll_history(up, 3);
             return;
         }
         if let Some(area) = self
@@ -2382,6 +3222,157 @@ fn shifted(current: usize, length: usize, delta: isize) -> usize {
         return 0;
     }
     (current as isize + delta).rem_euclid(length as isize) as usize
+}
+
+fn focus_navigation_direction(key: KeyEvent) -> Option<FocusDirection> {
+    if !has_pane_focus_modifier(key.modifiers)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+    {
+        return None;
+    }
+    if cfg!(target_os = "macos") && key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            // macOS Terminal commonly translates physical Option+Left/Right
+            // into the readline word-navigation sequences Esc-b / Esc-f.
+            KeyCode::Char('b') => return Some(FocusDirection::Left),
+            KeyCode::Char('f') => return Some(FocusDirection::Right),
+            _ => {}
+        }
+    }
+    arrow_direction(key.code)
+}
+
+fn arrow_direction(code: KeyCode) -> Option<FocusDirection> {
+    match code {
+        KeyCode::Left => Some(FocusDirection::Left),
+        KeyCode::Right => Some(FocusDirection::Right),
+        KeyCode::Up => Some(FocusDirection::Up),
+        KeyCode::Down => Some(FocusDirection::Down),
+        _ => None,
+    }
+}
+
+fn has_pane_focus_modifier(modifiers: KeyModifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
+    } else {
+        modifiers.contains(KeyModifiers::ALT)
+    }
+}
+
+#[cfg(test)]
+fn pane_focus_modifier() -> KeyModifiers {
+    if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::ALT
+    }
+}
+
+fn focus_distance(current: Rect, candidate: Rect, direction: FocusDirection) -> Option<(u32, u32)> {
+    let current_x = u32::from(current.x) * 2 + u32::from(current.width);
+    let current_y = u32::from(current.y) * 2 + u32::from(current.height);
+    let candidate_x = u32::from(candidate.x) * 2 + u32::from(candidate.width);
+    let candidate_y = u32::from(candidate.y) * 2 + u32::from(candidate.height);
+    match direction {
+        FocusDirection::Left
+            if candidate_x < current_x
+                && ranges_overlap(current.y, current.height, candidate.y, candidate.height) =>
+        {
+            Some((current_x - candidate_x, current_y.abs_diff(candidate_y)))
+        }
+        FocusDirection::Right
+            if candidate_x > current_x
+                && ranges_overlap(current.y, current.height, candidate.y, candidate.height) =>
+        {
+            Some((candidate_x - current_x, current_y.abs_diff(candidate_y)))
+        }
+        FocusDirection::Up
+            if candidate_y < current_y
+                && ranges_overlap(current.x, current.width, candidate.x, candidate.width) =>
+        {
+            Some((current_y - candidate_y, current_x.abs_diff(candidate_x)))
+        }
+        FocusDirection::Down
+            if candidate_y > current_y
+                && ranges_overlap(current.x, current.width, candidate.x, candidate.width) =>
+        {
+            Some((candidate_y - current_y, current_x.abs_diff(candidate_x)))
+        }
+        _ => None,
+    }
+}
+
+fn ranges_overlap(
+    first_start: u16,
+    first_length: u16,
+    second_start: u16,
+    second_length: u16,
+) -> bool {
+    let first_end = first_start.saturating_add(first_length);
+    let second_end = second_start.saturating_add(second_length);
+    first_start < second_end && second_start < first_end
+}
+
+fn history_capture_stride(chunk_lines: usize, viewport_lines: usize) -> usize {
+    chunk_lines
+        .saturating_sub(viewport_lines)
+        .saturating_sub(20)
+        .max(1)
+}
+
+fn history_cache_key(target_id: &str, session_id: &str) -> String {
+    format!("{target_id}\0{session_id}")
+}
+
+fn cache_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn history_capture_offset(
+    desired_offset: usize,
+    chunk_lines: usize,
+    viewport_lines: usize,
+) -> usize {
+    let stride = history_capture_stride(chunk_lines, viewport_lines);
+    desired_offset / stride * stride
+}
+
+fn materialize_history_page(
+    source: &HistoryPage,
+    desired_offset: usize,
+    viewport_lines: usize,
+) -> Option<HistoryPage> {
+    if source.offset_from_bottom > source.history_size || desired_offset > source.history_size {
+        return None;
+    }
+    let delta = desired_offset.checked_sub(source.offset_from_bottom)?;
+    let lines: Vec<_> = source.text.lines().collect();
+    if delta > lines.len() {
+        return None;
+    }
+    let end = lines.len().saturating_sub(delta);
+    if desired_offset > source.offset_from_bottom && end < viewport_lines.min(lines.len()) {
+        return None;
+    }
+    Some(HistoryPage {
+        text: lines[..end].join("\n"),
+        history_size: source.history_size,
+        pane_height: source.pane_height,
+        pane_width: source.pane_width,
+        offset_from_bottom: desired_offset,
+    })
 }
 
 fn next_field(field: LaunchField) -> LaunchField {
@@ -2461,8 +3452,48 @@ fn inside(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn row_in(area: Rect, row: u16) -> bool {
-    row >= area.y && row < area.y.saturating_add(area.height)
+fn near_divider(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x.saturating_sub(1)
+        && column <= area.x.saturating_add(area.width)
+        && row >= area.y.saturating_sub(1)
+        && row <= area.y.saturating_add(area.height)
+}
+
+fn is_copy_shortcut(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c')
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn mark_search_edited(form: &mut SearchForm) {
+    form.submitted_query.clear();
+    form.results.clear();
+    form.result_rows.clear();
+    form.selected = 0;
+    form.loading = false;
+    form.error = None;
+    form.edited_at = Instant::now();
+}
+
+fn display_column_slice(value: &str, start: u16, end: u16) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut column = 0_u16;
+    for character in value.chars() {
+        let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX);
+        let next = column.saturating_add(width);
+        if next > start && column < end {
+            output.push(character);
+        }
+        if column >= end {
+            break;
+        }
+        column = next;
+    }
+    output
 }
 
 fn parent_path(path: &str) -> String {
@@ -2544,8 +3575,12 @@ where
         .map_err(|error| format!("Invalid {label}: {error}"))
 }
 
-fn parse_json_array(value: &str, label: &str) -> Result<Vec<String>, String> {
-    serde_json::from_str(value).map_err(|error| format!("Invalid {label}: {error}"))
+fn parse_shell_list(value: &str, label: &str) -> Result<Vec<String>, String> {
+    shell_words::split(value).map_err(|error| format!("Invalid {label}: {error}"))
+}
+
+fn format_shell_list(values: &[String]) -> String {
+    shell_words::join(values.iter().map(String::as_str))
 }
 
 #[cfg(test)]
@@ -2643,6 +3678,135 @@ mod tests {
     }
 
     #[test]
+    fn modified_arrows_follow_the_rendered_pane_geometry() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.pane_layout = PaneLayout {
+            recap: Some(Rect::new(0, 0, 100, 60)),
+            machines: Some(Rect::new(0, 60, 45, 40)),
+            agents: Some(Rect::new(45, 60, 55, 40)),
+            ..PaneLayout::default()
+        };
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Up, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Recap);
+        app.handle_key(KeyEvent::new(KeyCode::Down, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Agents);
+        app.handle_key(KeyEvent::new(KeyCode::Left, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Machines);
+
+        app.pane_layout = PaneLayout {
+            machines: Some(Rect::new(0, 0, 25, 40)),
+            agents: Some(Rect::new(25, 0, 35, 40)),
+            recap: Some(Rect::new(60, 0, 60, 40)),
+            ..PaneLayout::default()
+        };
+        app.focus = Focus::Machines;
+        app.handle_key(KeyEvent::new(KeyCode::Down, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Machines);
+        app.handle_key(KeyEvent::new(KeyCode::Right, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Agents);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn option_arrows_are_a_macos_focus_fallback() {
+        assert_eq!(
+            focus_navigation_direction(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            Some(FocusDirection::Left)
+        );
+        assert_eq!(
+            focus_navigation_direction(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+            Some(FocusDirection::Left)
+        );
+        assert_eq!(
+            focus_navigation_direction(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(FocusDirection::Right)
+        );
+    }
+
+    #[test]
+    fn modified_arrow_latch_covers_unmodified_continuation_events() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        assert_eq!(
+            app.focus_direction_for_key(KeyEvent::new(KeyCode::Down, pane_focus_modifier())),
+            Some(FocusDirection::Down)
+        );
+        assert_eq!(
+            app.focus_direction_for_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(FocusDirection::Left)
+        );
+        app.focus_modifier_latched_until = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            app.focus_direction_for_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn unmodified_terminal_arrows_are_not_used_for_focus() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.focus = Focus::Recap;
+        app.interactive = true;
+        app.pane_layout = PaneLayout {
+            agents: Some(Rect::new(0, 0, 40, 30)),
+            recap: Some(Rect::new(40, 0, 60, 30)),
+            ..PaneLayout::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Recap);
+        assert!(app.interactive);
+        app.handle_key(KeyEvent::new(KeyCode::Left, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(!app.interactive);
+    }
+
+    #[test]
+    fn compact_portrait_focus_has_a_keyboard_exit_from_terminal() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.focus = Focus::Recap;
+        app.pane_layout.recap = Some(Rect::new(0, 0, 40, 20));
+        app.layout_debug_signature = Some((40, 20, 0, 0, true, true));
+        app.handle_key(KeyEvent::new(KeyCode::Down, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Agents);
+    }
+
+    #[test]
     fn mouse_drag_changes_sidebar_width() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
@@ -2660,8 +3824,9 @@ mod tests {
             machines: Some(Rect::new(0, 2, 32, 20)),
             agents: Some(Rect::new(32, 2, 40, 20)),
             recap: Some(Rect::new(72, 2, 50, 20)),
-            machine_divider_x: Some(31),
-            agents_divider_x: Some(71),
+            machine_divider: Some(Rect::new(31, 2, 1, 20)),
+            agents_divider: Some(Rect::new(71, 2, 1, 20)),
+            ..PaneLayout::default()
         };
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -2676,6 +3841,138 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.state.machine_width, 33);
+    }
+
+    #[test]
+    fn portrait_divider_drag_persists_independently() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_path = std::env::temp_dir().join(format!("muxloom-divider-{nonce}.json"));
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.pane_layout = PaneLayout {
+            recap: Some(Rect::new(0, 0, 80, 60)),
+            machines: Some(Rect::new(0, 60, 36, 40)),
+            agents: Some(Rect::new(36, 60, 44, 40)),
+            portrait_terminal_divider: Some(Rect::new(0, 59, 80, 1)),
+            portrait_machine_divider: Some(Rect::new(35, 60, 1, 40)),
+            ..PaneLayout::default()
+        };
+        for event in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind: event,
+                column: 40,
+                row: if matches!(event, MouseEventKind::Down(_)) {
+                    59
+                } else {
+                    69
+                },
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(app.state.portrait_terminal_percent, 70);
+        assert_eq!(app.state.machine_width, 24);
+        let reloaded = State::load(&state_path).unwrap();
+        assert_eq!(reloaded.portrait_terminal_percent, 70);
+        assert_eq!(reloaded.machine_width, 24);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn direct_terminal_drag_copies_visible_history() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.pane_layout.recap = Some(Rect::new(0, 0, 10, 5));
+        app.agent_viewport_width = 8;
+        app.agent_viewport_height = 3;
+        app.history_offset = 3;
+        app.history.text = "one\ntwo\nthree".into();
+        app.history_message.clear();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn history_windows_materialize_small_scroll_steps() {
+        let source = HistoryPage {
+            text: (0..100)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            history_size: 1_000,
+            pane_height: 20,
+            pane_width: 80,
+            offset_from_bottom: 0,
+        };
+        let page = materialize_history_page(&source, 3, 20).unwrap();
+        assert!(page.text.ends_with("line-96"));
+        assert_eq!(page.offset_from_bottom, 3);
+        assert!(materialize_history_page(&source, 81, 20).is_none());
+        assert!(materialize_history_page(&source, 1_001, 20).is_none());
+        assert_eq!(history_capture_offset(481, 500, 20), 460);
+    }
+
+    #[test]
+    fn history_scroll_stops_at_tmux_scrollback_boundary() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.history = HistoryPage {
+            text: "oldest\nnewest".into(),
+            history_size: 12,
+            pane_height: 24,
+            pane_width: 80,
+            offset_from_bottom: 10,
+        };
+        app.history_offset = 10;
+        app.scroll_history(true, 20);
+        assert_eq!(app.history_offset, 12);
     }
 
     #[test]
@@ -2735,7 +4032,7 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        form.values[9] = "/bin/zsh".into();
+        form.values[15] = "/bin/zsh".into();
         app.apply_settings(form);
 
         assert_eq!(app.config.refresh_interval_ms, 1500);
@@ -2795,10 +4092,89 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
         });
+        app.sessions.push(AgentSession {
+            id: "muxloom-terminal-dead".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Terminal,
+            path: "/work".into(),
+            label: "finished shell".into(),
+            created_at: 2,
+            dead: true,
+            pid: None,
+            needs_attention: false,
+            attention_reason: None,
+        });
         assert!(app.visible_sessions().is_empty());
         assert_eq!(app.archived_count(), 1);
         app.state.show_archived = true;
         assert_eq!(app.visible_sessions().len(), 1);
+    }
+
+    #[test]
+    fn opening_an_archived_agent_resumes_its_latest_history() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].probe.codex = true;
+        app.sessions.push(AgentSession {
+            id: "muxloom-codex-dead".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "fix renderer".into(),
+            created_at: 1,
+            dead: true,
+            pid: None,
+            needs_attention: false,
+            attention_reason: None,
+        });
+        app.selected_session_id = Some("muxloom-codex-dead".into());
+        app.focus = Focus::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match request_rx.recv().unwrap() {
+            Request::ScanResumes { target, kind, path } => {
+                assert_eq!(target.id, "local");
+                assert_eq!(kind, AgentKind::Codex);
+                assert_eq!(path, "/work/project");
+            }
+            request => panic!("expected archived resume scan, got {request:?}"),
+        }
+
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            result: Ok(vec![ResumeCandidate {
+                id: "thread-id".into(),
+                recap: Some("Fix the renderer".into()),
+                first_message: None,
+                last_message: None,
+                updated_at: "2026-07-22T12:00:00Z".into(),
+            }]),
+        });
+        match request_rx.recv().unwrap() {
+            Request::Launch { request, .. } => {
+                assert_eq!(request.target.id, "local");
+                assert_eq!(request.kind, AgentKind::Codex);
+                assert_eq!(request.path, "/work/project");
+                assert_eq!(request.label, "fix renderer");
+                assert_eq!(request.resume_id.as_deref(), Some("thread-id"));
+            }
+            request => panic!("expected archived resume launch, got {request:?}"),
+        }
     }
 
     #[test]
@@ -2877,9 +4253,11 @@ mod tests {
             panic!("machine settings modal did not open");
         };
         assert_eq!(form.scope, SettingsScope::Host("gpu".into()));
-        form.values[0] = "/opt/codex".into();
-        form.values[1] = "[\"--full-auto\"]".into();
-        form.values[6] = "[\"gpu approval\"]".into();
+        form.values[0] = "HTTP_PROXY=http://proxy:8080".into();
+        form.values[1] = "18118:127.0.0.1:8080".into();
+        form.values[2] = "/opt/codex".into();
+        form.values[3] = "--full-auto".into();
+        form.values[12] = "'gpu approval'".into();
         app.apply_settings(form);
 
         let reloaded = Config::load(&config_path).unwrap();
@@ -2892,6 +4270,11 @@ mod tests {
             ["--full-auto"]
         );
         assert_eq!(reloaded.attention_patterns_for("gpu"), ["gpu approval"]);
+        assert_eq!(reloaded.reverse_tunnel_for("gpu"), "18118:127.0.0.1:8080");
+        assert_eq!(
+            reloaded.environment_for("gpu").unwrap(),
+            [("HTTP_PROXY".into(), "http://proxy:8080".into())]
+        );
         assert_eq!(
             reloaded.command_for("local", AgentKind::Codex).command,
             "codex"
@@ -2937,6 +4320,43 @@ mod tests {
                 ref launch,
                 ..
             })) if launch.path == "/tmp/project" && launch.kind == AgentKind::Terminal
+        ));
+    }
+
+    #[test]
+    fn new_agent_prompts_before_installing_a_missing_runtime() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.modal = Some(Modal::Resume(ResumeForm {
+            launch: LaunchForm {
+                target: Target::local(),
+                kind: AgentKind::Codex,
+                path: "/tmp/project".into(),
+                label: String::new(),
+                field: LaunchField::Path,
+            },
+            candidates: Vec::new(),
+            selected: 0,
+            loading: false,
+            error: None,
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmInstall {
+                ref launch,
+                resume_id: None,
+            }) if launch.kind == AgentKind::Codex && launch.target.id == "local"
         ));
     }
 

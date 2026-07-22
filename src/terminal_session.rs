@@ -11,7 +11,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::{
     debug,
     model::{Target, Transport},
-    runtime::{is_managed_session_id, ssh_control_path},
+    runtime::{
+        SSH_CONNECTION_ATTEMPTS_OPTION, SSH_CONTROL_PERSIST_OPTION, SSH_SERVER_ALIVE_COUNT_OPTION,
+        SSH_SERVER_ALIVE_INTERVAL_OPTION, is_managed_session_id, ssh_control_path,
+    },
 };
 
 enum TerminalEvent {
@@ -84,13 +87,15 @@ impl TerminalSession {
                     "-o",
                     "ControlMaster=auto",
                     "-o",
-                    "ControlPersist=60",
+                    SSH_CONTROL_PERSIST_OPTION,
                     "-o",
                     &control_option,
                     "-o",
-                    "ServerAliveInterval=15",
+                    SSH_SERVER_ALIVE_INTERVAL_OPTION,
                     "-o",
-                    "ServerAliveCountMax=3",
+                    SSH_SERVER_ALIVE_COUNT_OPTION,
+                    "-o",
+                    SSH_CONNECTION_ATTEMPTS_OPTION,
                     alias,
                     &remote,
                 ]);
@@ -382,6 +387,15 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
 
     let modifiers = xterm_modifier(key.modifiers);
     let sequence = match key.code {
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            // Ctrl-J is the portable terminal newline used by Codex, Claude,
+            // and shells without triggering their normal Enter submission.
+            "\n".into()
+        }
         KeyCode::Enter => "\r".into(),
         KeyCode::Esc => "\x1b".into(),
         KeyCode::Backspace => "\x7f".into(),
@@ -513,6 +527,33 @@ mod tests {
         assert_eq!(
             encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), false),
             Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn modified_enter_inserts_a_newline() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn non_ascii_input_is_forwarded_as_utf8() {
+        assert_eq!(
+            encode_key(
+                KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE),
+                false
+            ),
+            Some("中".as_bytes().to_vec())
         );
     }
 }

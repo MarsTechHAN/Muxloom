@@ -15,7 +15,8 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Attribute, ResetColor, SetAttribute},
@@ -39,6 +40,7 @@ use muxloom::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     install_panic_hook();
@@ -132,13 +134,32 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
         for notification in app.take_notifications() {
             emit_terminal_notification(terminal, &notification)?;
         }
+        if let Some(text) = app.take_clipboard_request()
+            && let Err(error) = emit_clipboard_copy(terminal, &text)
+        {
+            app.status_message = format!("Clipboard copy failed: {error}");
+        }
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         let action = match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                log_navigation_key(key);
+                app.handle_key(key)
+            }
             Event::Mouse(mouse) => app.handle_mouse(mouse),
             Event::Paste(text) => {
+                if debug::enabled() {
+                    debug::log(
+                        "input",
+                        format!(
+                            "committed text chars={} bytes={} interactive={}",
+                            text.chars().count(),
+                            text.len(),
+                            app.interactive
+                        ),
+                    );
+                }
                 app.handle_paste(text);
                 Action::Continue
             }
@@ -147,6 +168,43 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
         if matches!(action, Action::Quit) {
             return Ok(());
         }
+    }
+}
+
+fn log_navigation_key(key: KeyEvent) {
+    if !debug::enabled() {
+        return;
+    }
+    if matches!(
+        key.code,
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Enter
+    ) {
+        debug::log(
+            "input",
+            format!(
+                "key={:?} modifiers={:?} kind={:?}",
+                key.code, key.modifiers, key.kind
+            ),
+        );
+    } else if cfg!(target_os = "macos")
+        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('b' | 'f'))
+    {
+        debug::log(
+            "input",
+            format!(
+                "key=OptionHorizontalAlias modifiers={:?} kind={:?}",
+                key.modifiers, key.kind
+            ),
+        );
+    } else if matches!(key.code, KeyCode::Char(character) if !character.is_ascii()) {
+        debug::log(
+            "input",
+            format!(
+                "key=Char(non-ascii) modifiers={:?} kind={:?}",
+                key.modifiers, key.kind
+            ),
+        );
     }
 }
 
@@ -163,6 +221,79 @@ fn emit_terminal_notification(terminal: &mut Tui, message: &str) -> Result<()> {
     Ok(())
 }
 
+fn emit_clipboard_copy(terminal: &mut Tui, text: &str) -> Result<()> {
+    let native = copy_native_clipboard(text);
+    let encoded = base64_encode(text.as_bytes());
+    write!(terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
+    terminal.backend_mut().flush()?;
+    debug::log(
+        "clipboard",
+        format!(
+            "copied characters={} native={native} osc52=true",
+            text.chars().count()
+        ),
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_native_clipboard(text: &str) -> bool {
+    write_clipboard_command("pbcopy", &[], text)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_native_clipboard(text: &str) -> bool {
+    write_clipboard_command("clip.exe", &[], text)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn copy_native_clipboard(_text: &str) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn write_clipboard_command(program: &str, arguments: &[&str], text: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    wrote && child.wait().is_ok_and(|status| status.success())
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[usize::from(first >> 2)] as char);
+        output.push(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
 fn enter_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -171,13 +302,21 @@ fn enter_terminal() -> Result<Tui> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+        ),
         Hide
     )?;
+    KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::Relaxed);
     Terminal::new(CrosstermBackend::new(stdout)).context("failed to initialize terminal")
 }
 
 fn leave_terminal(terminal: &mut Tui) -> Result<()> {
     let raw_result = disable_raw_mode();
+    if KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::Relaxed) {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -195,6 +334,9 @@ fn leave_terminal(terminal: &mut Tui) -> Result<()> {
 fn restore_terminal_best_effort() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    if KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::Relaxed) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         stdout,
         DisableBracketedPaste,

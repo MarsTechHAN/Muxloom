@@ -236,7 +236,7 @@ impl ResumeCandidate {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub text: String,
     pub history_size: usize,
@@ -251,6 +251,6 @@ impl HistoryPage {
     }
 
     pub fn has_older(&self) -> bool {
-        self.offset_from_bottom + 1 < self.total_lines()
+        self.offset_from_bottom < self.history_size
     }
 }

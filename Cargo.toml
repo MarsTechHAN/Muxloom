@@ -1,6 +1,6 @@
 [package]
 name = "muxloom"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A terminal loom for persistent Codex and Claude Code sessions across machines"
@@ -16,6 +16,8 @@ portable-pty = "0.8"
 ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+shell-words = "1.1"
 signal-hook = "0.3"
 toml = "0.8"
 unicode-width = "0.2"

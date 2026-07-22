@@ -18,6 +18,8 @@ pub struct Config {
     pub history_chunk_lines: usize,
     pub attention_patterns: Vec<String>,
     pub ssh_config: String,
+    pub environment: String,
+    pub reverse_tunnel: String,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
 }
@@ -38,6 +40,8 @@ impl Default for Config {
                 "press enter to confirm".into(),
             ],
             ssh_config: "~/.ssh/config".into(),
+            environment: String::new(),
+            reverse_tunnel: String::new(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
         }
@@ -58,10 +62,14 @@ impl Default for AgentCommands {
             codex: CommandConfig {
                 command: "codex".into(),
                 args: Vec::new(),
+                install: "curl -fsSL https://chatgpt.com/codex/install.sh | sh".into(),
+                sync_files: vec!["~/.codex/config.toml".into(), "~/.codex/auth.json".into()],
             },
             claude: CommandConfig {
                 command: "claude".into(),
                 args: Vec::new(),
+                install: "curl -fsSL https://claude.ai/install.sh | bash".into(),
+                sync_files: vec!["~/.claude/settings.json".into()],
             },
             terminal: CommandConfig::default(),
         }
@@ -83,6 +91,8 @@ impl AgentCommands {
 pub struct CommandConfig {
     pub command: String,
     pub args: Vec<String>,
+    pub install: String,
+    pub sync_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +101,8 @@ pub struct HostConfig {
     pub codex: Option<CommandConfig>,
     pub claude: Option<CommandConfig>,
     pub terminal: Option<CommandConfig>,
+    pub environment: Option<String>,
+    pub reverse_tunnel: Option<String>,
     pub attention_patterns: Option<Vec<String>>,
 }
 
@@ -101,7 +113,27 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut parsed = BTreeMap::new();
+        parse_environment(&self.environment, &mut parsed)?;
+        validate_reverse_tunnel(&self.reverse_tunnel)?;
+        for (host, host_config) in &self.hosts {
+            if let Some(environment) = &host_config.environment {
+                parse_environment(environment, &mut parsed)
+                    .with_context(|| format!("invalid environment for host {host}"))?;
+            }
+            if let Some(tunnel) = &host_config.reverse_tunnel {
+                validate_reverse_tunnel(tunnel)
+                    .with_context(|| format!("invalid reverse tunnel for host {host}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn command_for(&self, host: &str, kind: AgentKind) -> &CommandConfig {
@@ -120,6 +152,26 @@ impl Config {
             .unwrap_or(&self.attention_patterns)
     }
 
+    pub fn environment_for(&self, host: &str) -> Result<Vec<(String, String)>> {
+        let mut environment = BTreeMap::new();
+        parse_environment(&self.environment, &mut environment)?;
+        if let Some(host_environment) = self
+            .hosts
+            .get(host)
+            .and_then(|config| config.environment.as_deref())
+        {
+            parse_environment(host_environment, &mut environment)?;
+        }
+        Ok(environment.into_iter().collect())
+    }
+
+    pub fn reverse_tunnel_for(&self, host: &str) -> &str {
+        self.hosts
+            .get(host)
+            .and_then(|config| config.reverse_tunnel.as_deref())
+            .unwrap_or(&self.reverse_tunnel)
+    }
+
     pub fn ssh_config_path(&self) -> PathBuf {
         expand_tilde(&self.ssh_config)
     }
@@ -135,6 +187,48 @@ impl Config {
     }
 }
 
+fn parse_environment(value: &str, output: &mut BTreeMap<String, String>) -> Result<()> {
+    for assignment in shell_words::split(value).context("invalid environment quoting")? {
+        let Some((name, value)) = assignment.split_once('=') else {
+            anyhow::bail!("environment entry must use NAME=value: {assignment}");
+        };
+        if !valid_environment_name(name) {
+            anyhow::bail!("invalid environment variable name: {name}");
+        }
+        output.insert(name.to_string(), value.to_string());
+    }
+    Ok(())
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn validate_reverse_tunnel(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let fields: Vec<_> = value.split(':').collect();
+    if fields.len() != 3 {
+        anyhow::bail!("reverse tunnel must use REMOTE_PORT:LOCAL_HOST:LOCAL_PORT");
+    }
+    let remote_port: u16 = fields[0]
+        .parse()
+        .context("invalid reverse tunnel remote port")?;
+    let local_port: u16 = fields[2]
+        .parse()
+        .context("invalid reverse tunnel local port")?;
+    if remote_port == 0 || local_port == 0 || fields[1].trim().is_empty() {
+        anyhow::bail!("reverse tunnel ports and local host must be non-empty");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -143,6 +237,8 @@ pub struct State {
     pub hide_disabled: bool,
     pub machine_width: u16,
     pub agents_width: u16,
+    pub portrait_terminal_percent: u16,
+    pub portrait_machine_percent: u16,
     pub show_archived: bool,
 }
 
@@ -154,6 +250,8 @@ impl Default for State {
             hide_disabled: false,
             machine_width: 24,
             agents_width: 40,
+            portrait_terminal_percent: 65,
+            portrait_machine_percent: 45,
             show_archived: false,
         }
     }
@@ -244,22 +342,32 @@ history_limit = 1000000
 history_chunk_lines = 500
 attention_patterns = ["do you want to", "would you like to", "allow command", "approve", "waiting for your input", "press enter to confirm"]
 ssh_config = "~/.ssh/config"
+environment = ""
+reverse_tunnel = ""
 
 [agents.codex]
 command = "codex"
 args = []
+install = "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+sync_files = ["~/.codex/config.toml", "~/.codex/auth.json"]
 
 [agents.claude]
 command = "claude"
 args = []
+install = "curl -fsSL https://claude.ai/install.sh | bash"
+sync_files = ["~/.claude/settings.json"]
 
 # Empty command means the user's login shell.
 [agents.terminal]
 command = ""
 args = []
+install = ""
+sync_files = []
 
 # Commands can be overridden per SSH alias. Arguments are passed literally.
 # [hosts.gpu-box]
+# environment = 'HTTP_PROXY=http://proxy:8118 HTTPS_PROXY=http://proxy:8118 NO_PROXY="localhost,.internal"'
+# reverse_tunnel = "18118:127.0.0.1:8118"
 # attention_patterns = ["approve", "do you want to proceed"]
 
 # [hosts.gpu-box.claude]
@@ -280,9 +388,12 @@ mod tests {
                 codex: Some(CommandConfig {
                     command: "/opt/codex".into(),
                     args: vec!["--yolo".into()],
+                    ..CommandConfig::default()
                 }),
                 claude: None,
                 terminal: None,
+                environment: None,
+                reverse_tunnel: None,
                 attention_patterns: None,
             },
         );
@@ -322,5 +433,61 @@ mod tests {
         assert!(!migrate_legacy_file(&legacy, &current).unwrap());
         assert_eq!(fs::read_to_string(&current).unwrap(), "current-state");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn machine_environment_overrides_global_shell_assignments() {
+        let mut config = Config {
+            environment: "HTTP_PROXY=http://global TOKEN='two words'".into(),
+            reverse_tunnel: "18118:127.0.0.1:8118".into(),
+            ..Config::default()
+        };
+        config.hosts.insert(
+            "gpu".into(),
+            HostConfig {
+                environment: Some("HTTP_PROXY=http://gpu EXTRA=yes".into()),
+                reverse_tunnel: None,
+                ..HostConfig::default()
+            },
+        );
+        assert_eq!(
+            config.environment_for("gpu").unwrap(),
+            [
+                ("EXTRA".into(), "yes".into()),
+                ("HTTP_PROXY".into(), "http://gpu".into()),
+                ("TOKEN".into(), "two words".into()),
+            ]
+        );
+        config.environment = "NOT_AN_ASSIGNMENT".into();
+        assert!(config.environment_for("gpu").is_err());
+    }
+
+    #[test]
+    fn validates_and_overrides_reverse_tunnels() {
+        let mut config = Config {
+            reverse_tunnel: "18118:127.0.0.1:8118".into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.reverse_tunnel_for("gpu"), "18118:127.0.0.1:8118");
+        config.hosts.insert(
+            "gpu".into(),
+            HostConfig {
+                reverse_tunnel: Some("28118:proxy.local:8118".into()),
+                ..HostConfig::default()
+            },
+        );
+        assert_eq!(config.reverse_tunnel_for("gpu"), "28118:proxy.local:8118");
+        config.hosts.get_mut("gpu").unwrap().reverse_tunnel = Some("bad tunnel".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn old_state_files_receive_new_portrait_divider_defaults() {
+        let state: State =
+            serde_json::from_str(r#"{"enabled_hosts":[],"machine_width":30,"agents_width":44}"#)
+                .unwrap();
+        assert_eq!(state.portrait_terminal_percent, 65);
+        assert_eq!(state.portrait_machine_percent, 45);
     }
 }

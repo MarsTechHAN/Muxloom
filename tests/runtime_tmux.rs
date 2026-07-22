@@ -43,9 +43,10 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
     let command = CommandConfig {
         command: "sh".into(),
         args: vec!["-c".into(), "printf 'muxloom-smoke\\n'; sleep 0.1".into()],
+        ..CommandConfig::default()
     };
 
-    let session_id = runtime.launch(&request, &command).unwrap();
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
     let _guard = SessionGuard {
         runtime: &runtime,
         target: &target,
@@ -55,7 +56,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
     let mut found = None;
     for _ in 0..20 {
         let (_, sessions) = runtime
-            .probe_and_discover(&target, "sh", "definitely-not-an-agent-command")
+            .probe_and_discover(&target, "sh", "definitely-not-an-agent-command", &[])
             .unwrap();
         found = sessions
             .into_iter()
@@ -112,7 +113,9 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
         assert!(status.success());
     }
 
-    let (_, sessions) = runtime.probe_and_discover(&target, "sh", "sh").unwrap();
+    let (_, sessions) = runtime
+        .probe_and_discover(&target, "sh", "sh", &[])
+        .unwrap();
     let session = sessions
         .iter()
         .find(|session| session.id == session_id)
@@ -152,9 +155,10 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
             )
             .into(),
         ],
+        ..CommandConfig::default()
     };
 
-    let session_id = runtime.launch(&request, &command).unwrap();
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
     let _guard = SessionGuard {
         runtime: &runtime,
         target: &target,
@@ -192,7 +196,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
         resume_id: None,
     };
     let session_id = runtime
-        .launch(&request, config.agents.get(AgentKind::Terminal))
+        .launch(&request, config.agents.get(AgentKind::Terminal), &[])
         .unwrap();
     let _guard = SessionGuard {
         runtime: &runtime,
@@ -200,13 +204,62 @@ fn ordinary_terminal_with_empty_command_stays_running() {
         session_id: session_id.clone(),
     };
     thread::sleep(Duration::from_millis(150));
-    let (_, sessions) = runtime.probe_and_discover(&target, "sh", "sh").unwrap();
+    let (_, sessions) = runtime
+        .probe_and_discover(&target, "sh", "sh", &[])
+        .unwrap();
     let session = sessions
         .iter()
         .find(|session| session.id == session_id)
         .expect("ordinary terminal should be discoverable");
     assert_eq!(session.kind, AgentKind::Terminal);
     assert!(!session.dead, "login shell should remain interactive");
+}
+
+#[test]
+fn exited_terminal_is_removed_instead_of_archived() {
+    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux is not installed; skipping integration check");
+        return;
+    }
+    let config = Config::default();
+    let runtime = Runtime::new(&config);
+    let target = Target::local();
+    let request = LaunchRequest {
+        target: target.clone(),
+        kind: AgentKind::Terminal,
+        path: std::env::temp_dir().display().to_string(),
+        label: "short terminal".into(),
+        resume_id: None,
+    };
+    let command = CommandConfig {
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..CommandConfig::default()
+    };
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
+    let _guard = SessionGuard {
+        runtime: &runtime,
+        target: &target,
+        session_id: session_id.clone(),
+    };
+
+    let mut removed = false;
+    for _ in 0..20 {
+        let (_, sessions) = runtime
+            .probe_and_discover(&target, "sh", "sh", &[])
+            .unwrap();
+        let tmux_exists = Command::new("tmux")
+            .args(["has-session", "-t", &session_id])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !sessions.iter().any(|session| session.id == session_id) && !tmux_exists {
+            removed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(removed, "dead terminal tmux session was not cleaned up");
 }
 
 #[test]
@@ -233,8 +286,9 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
             "i=0; while [ $i -lt 80 ]; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done; printf 'full-history-needle\\nREADY\\n'; IFS= read -r line"
                 .into(),
         ],
+        ..CommandConfig::default()
     };
-    let session_id = runtime.launch(&request, &command).unwrap();
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
     let _guard = SessionGuard {
         runtime: &runtime,
         target: &target,
@@ -248,6 +302,9 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
     let page = runtime
         .capture_page(&target, &session_id, 0, 50, 140, 40)
         .unwrap();
+    let oldest = runtime
+        .capture_page(&target, &session_id, 1_000_000_000, 50, 140, 40)
+        .unwrap();
     let matches = runtime
         .search_history(&target, &session_id, "full-history-needle", 8)
         .unwrap();
@@ -255,6 +312,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
 
     assert_eq!(before, after, "history capture changed the tmux pane size");
     assert!(page.text.contains("READY"));
+    assert_eq!(oldest.offset_from_bottom, oldest.history_size);
     assert!(
         matches
             .iter()

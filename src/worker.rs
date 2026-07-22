@@ -4,7 +4,7 @@ use crate::{
     config::CommandConfig,
     debug,
     model::{
-        AgentKind, AgentSession, DirectoryListing, HistoryPage, LaunchRequest, Probe,
+        AgentKind, AgentSession, DirectoryListing, HistoryMatch, HistoryPage, LaunchRequest, Probe,
         ResumeCandidate, SearchMatchKind, SearchResult, Target,
     },
     runtime::Runtime,
@@ -15,6 +15,7 @@ pub struct ScanRequest {
     pub target: Target,
     pub codex_command: String,
     pub claude_command: String,
+    pub environment: Vec<(String, String)>,
     pub attention_patterns: Vec<String>,
 }
 
@@ -32,6 +33,13 @@ pub enum Request {
     Launch {
         request: LaunchRequest,
         command: CommandConfig,
+        environment: Vec<(String, String)>,
+    },
+    Install {
+        target: Target,
+        kind: AgentKind,
+        command: CommandConfig,
+        environment: Vec<(String, String)>,
     },
     Kill {
         target: Target,
@@ -59,11 +67,17 @@ pub enum Event {
         result: Result<(Probe, Vec<AgentSession>), String>,
     },
     Captured {
+        target_id: String,
         session_id: String,
         result: Result<HistoryPage, String>,
     },
     Launched {
         target_id: String,
+        result: Result<String, String>,
+    },
+    Installed {
+        target_id: String,
+        kind: AgentKind,
         result: Result<String, String>,
     },
     Killed {
@@ -109,6 +123,7 @@ impl Worker {
                                 &request.target,
                                 &request.codex_command,
                                 &request.claude_command,
+                                &request.environment,
                             )
                             .map_err(|error| error.to_string());
                         if let Ok((_, sessions)) = &mut result {
@@ -152,6 +167,7 @@ impl Worker {
                         width,
                         height,
                     } => {
+                        let target_id = target.id.clone();
                         let result = runtime
                             .capture_page(
                                 &target,
@@ -168,12 +184,20 @@ impl Worker {
                                 format!("capture failed session={session_id}: {error}"),
                             );
                         }
-                        let _ = events.send(Event::Captured { session_id, result });
+                        let _ = events.send(Event::Captured {
+                            target_id,
+                            session_id,
+                            result,
+                        });
                     }
-                    Request::Launch { request, command } => {
+                    Request::Launch {
+                        request,
+                        command,
+                        environment,
+                    } => {
                         let target_id = request.target.id.clone();
                         let result = runtime
-                            .launch(&request, &command)
+                            .launch(&request, &command, &environment)
                             .map_err(|error| error.to_string());
                         if let Err(error) = &result {
                             debug::log(
@@ -182,6 +206,28 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::Launched { target_id, result });
+                    }
+                    Request::Install {
+                        target,
+                        kind,
+                        command,
+                        environment,
+                    } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .install_runtime(&target, kind, &command, &environment)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("install failed target={target_id} kind={kind}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::Installed {
+                            target_id,
+                            kind,
+                            result,
+                        });
                     }
                     Request::Kill { target, session_id } => {
                         let target_id = target.id.clone();
@@ -197,66 +243,51 @@ impl Worker {
                         let _ = events.send(Event::Killed { target_id, result });
                     }
                     Request::Search { query, sessions } => {
-                        let lowered = query.to_lowercase();
                         let mut results = Vec::new();
+                        let mut history_jobs = Vec::new();
                         for (target, session) in sessions {
-                            let label = session.display_label().to_string();
-                            let name_match = label.to_lowercase().contains(&lowered)
-                                || session.path.to_lowercase().contains(&lowered);
-                            let matches =
-                                match runtime.search_history(&target, &session.id, &query, 8) {
-                                    Ok(matches) => matches,
-                                    Err(error) => {
-                                        debug::log(
-                                            "search",
-                                            format!(
-                                                "history search failed session={}: {error}",
-                                                session.id
-                                            ),
-                                        );
-                                        Vec::new()
-                                    }
-                                };
-                            let best_match = matches
-                                .iter()
-                                .find(|item| item.recap)
-                                .or_else(|| matches.first());
-                            let (match_kind, snippet, line_number) = if name_match {
-                                (SearchMatchKind::Name, label.clone(), None)
-                            } else if let Some(item) = best_match {
-                                (
-                                    if item.recap {
-                                        SearchMatchKind::Recap
-                                    } else {
-                                        SearchMatchKind::History
-                                    },
-                                    item.text.clone(),
-                                    Some(item.line_number),
-                                )
+                            if let Some((score, snippet)) = best_name_match(&session, &query) {
+                                results.push((
+                                    search_result(&session, SearchMatchKind::Name, snippet, None),
+                                    score,
+                                ));
                             } else {
-                                continue;
-                            };
-                            results.push(SearchResult {
-                                session_id: session.id,
-                                target_id: session.target_id,
-                                kind: session.kind,
-                                label,
-                                path: session.path,
-                                match_kind,
-                                snippet,
-                                line_number,
-                                created_at: session.created_at,
-                                dead: session.dead,
+                                history_jobs.push((target, session));
+                            }
+                        }
+                        // Multiplex a bounded number of SSH/tmux searches at once. This keeps
+                        // large fleets responsive without opening an unbounded connection burst.
+                        for jobs in history_jobs.chunks(8) {
+                            let batch = thread::scope(|scope| {
+                                let mut handles = Vec::new();
+                                for (target, session) in jobs {
+                                    let runtime = runtime.clone();
+                                    let target = target.clone();
+                                    let session = session.clone();
+                                    let query = query.clone();
+                                    handles.push(scope.spawn(move || {
+                                        search_session_history(&runtime, target, session, &query)
+                                    }));
+                                }
+                                handles
+                                    .into_iter()
+                                    .filter_map(|handle| handle.join().ok().flatten())
+                                    .collect::<Vec<_>>()
                             });
+                            results.extend(batch);
                         }
                         results.sort_by(|left, right| {
                             right
+                                .0
                                 .match_kind
-                                .cmp(&left.match_kind)
-                                .then_with(|| right.created_at.cmp(&left.created_at))
-                                .then_with(|| left.target_id.cmp(&right.target_id))
+                                .cmp(&left.0.match_kind)
+                                .then_with(|| left.1.cmp(&right.1))
+                                .then_with(|| right.0.created_at.cmp(&left.0.created_at))
+                                .then_with(|| left.0.target_id.cmp(&right.0.target_id))
                         });
                         results.truncate(100);
+                        let results: Vec<_> =
+                            results.into_iter().map(|(result, _)| result).collect();
                         debug::log(
                             "search",
                             format!("query completed results={}", results.len()),
@@ -295,5 +326,160 @@ impl Worker {
             requests: request_tx,
             events: event_rx,
         }
+    }
+}
+
+fn best_name_match(session: &AgentSession, query: &str) -> Option<(usize, String)> {
+    let mut candidates = Vec::new();
+    if !session.label.trim().is_empty()
+        && let Some(score) = search_match_score(&session.label, query)
+    {
+        candidates.push((score, session.label.clone()));
+    }
+    let display = session.display_label();
+    if let Some(score) = search_match_score(display, query) {
+        candidates.push((score.saturating_add(10), display.to_string()));
+    }
+    if let Some(score) = search_match_score(&session.path, query) {
+        candidates.push((score.saturating_add(25), session.path.clone()));
+    }
+    candidates.into_iter().min_by_key(|(score, _)| *score)
+}
+
+fn search_session_history(
+    runtime: &Runtime,
+    target: Target,
+    session: AgentSession,
+    query: &str,
+) -> Option<(SearchResult, usize)> {
+    let matches = match runtime.search_history(&target, &session.id, query, 12) {
+        Ok(matches) => matches,
+        Err(error) => {
+            debug::log(
+                "search",
+                format!("history search failed session={}: {error}", session.id),
+            );
+            return None;
+        }
+    };
+    let (item, score) = best_history_match(&matches, query)?;
+    let match_kind = if item.recap {
+        SearchMatchKind::Recap
+    } else {
+        SearchMatchKind::History
+    };
+    Some((
+        search_result(
+            &session,
+            match_kind,
+            item.text.clone(),
+            Some(item.line_number),
+        ),
+        score,
+    ))
+}
+
+fn search_result(
+    session: &AgentSession,
+    match_kind: SearchMatchKind,
+    snippet: String,
+    line_number: Option<usize>,
+) -> SearchResult {
+    SearchResult {
+        session_id: session.id.clone(),
+        target_id: session.target_id.clone(),
+        kind: session.kind,
+        label: session.display_label().to_string(),
+        path: session.path.clone(),
+        match_kind,
+        snippet,
+        line_number,
+        created_at: session.created_at,
+        dead: session.dead,
+    }
+}
+
+fn best_history_match<'a>(
+    matches: &'a [HistoryMatch],
+    query: &str,
+) -> Option<(&'a HistoryMatch, usize)> {
+    best_history_kind(matches, query, true).or_else(|| best_history_kind(matches, query, false))
+}
+
+fn best_history_kind<'a>(
+    matches: &'a [HistoryMatch],
+    query: &str,
+    recap: bool,
+) -> Option<(&'a HistoryMatch, usize)> {
+    matches
+        .iter()
+        .filter(|item| item.recap == recap)
+        .filter_map(|item| search_match_score(&item.text, query).map(|score| (item, score)))
+        .min_by(|(left, left_score), (right, right_score)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right.line_number.cmp(&left.line_number))
+        })
+}
+
+fn search_match_score(value: &str, query: &str) -> Option<usize> {
+    let value = value.to_lowercase();
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    if value == query {
+        return Some(0);
+    }
+    if value.starts_with(&query) {
+        return Some(1 + value.len().saturating_sub(query.len()));
+    }
+    if let Some(position) = value.find(&query) {
+        let word_boundary = position == 0
+            || value[..position]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric());
+        return Some(if word_boundary { 20 } else { 100 } + position);
+    }
+
+    let mut positions = Vec::new();
+    for term in query.split_whitespace() {
+        positions.push(value.find(term)?);
+    }
+    let first = positions.iter().copied().min().unwrap_or_default();
+    let last = positions.iter().copied().max().unwrap_or_default();
+    Some(500 + first + last.saturating_sub(first))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_ranking_prefers_exact_prefix_and_compact_multi_term_matches() {
+        assert!(
+            search_match_score("renderer", "renderer")
+                < search_match_score("renderer work", "render")
+        );
+        assert!(search_match_score("fix remote renderer", "remote fix").is_some());
+        assert!(search_match_score("unrelated", "remote fix").is_none());
+    }
+
+    #[test]
+    fn recap_is_preferred_and_newer_equal_history_wins() {
+        let matches = vec![
+            HistoryMatch {
+                recap: false,
+                line_number: 10,
+                text: "fix renderer".into(),
+            },
+            HistoryMatch {
+                recap: true,
+                line_number: 2,
+                text: "fix renderer".into(),
+            },
+        ];
+        assert!(best_history_match(&matches, "renderer").unwrap().0.recap);
     }
 }

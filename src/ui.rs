@@ -92,7 +92,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .filter(|session| !session.dead && session.needs_attention)
         .count();
-    let archived = app.sessions.iter().filter(|session| session.dead).count();
+    let archived = app
+        .sessions
+        .iter()
+        .filter(|session| session.dead && session.kind != AgentKind::Terminal)
+        .count();
     let launch_target = app
         .targets
         .get(app.selected_target)
@@ -188,6 +192,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, portrait: bool
     if let Some(recap_area) = panes.recap {
         draw_terminal_panel(frame, app, recap_area);
     }
+    draw_divider_handles(frame, &panes);
 }
 
 fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneLayout {
@@ -204,11 +209,17 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
             _ => {
                 let split = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .constraints([
+                        Constraint::Percentage(app.state.portrait_terminal_percent.clamp(45, 82)),
+                        Constraint::Percentage(
+                            100 - app.state.portrait_terminal_percent.clamp(45, 82),
+                        ),
+                    ])
                     .split(area);
                 PaneLayout {
-                    agents: Some(split[0]),
-                    recap: Some(split[1]),
+                    recap: Some(split[0]),
+                    agents: Some(split[1]),
+                    portrait_terminal_divider: Some(horizontal_divider(area, split[0])),
                     ..PaneLayout::default()
                 }
             }
@@ -216,22 +227,29 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
     }
 
     if portrait {
+        let terminal_percent = app.state.portrait_terminal_percent.clamp(45, 82);
         let vertical = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .constraints([
+                Constraint::Percentage(terminal_percent),
+                Constraint::Percentage(100 - terminal_percent),
+            ])
             .split(area);
         if app.state.flatten {
             return PaneLayout {
                 recap: Some(vertical[0]),
                 agents: Some(vertical[1]),
+                portrait_terminal_divider: Some(horizontal_divider(area, vertical[0])),
                 ..PaneLayout::default()
             };
         }
+        let base_machine_percent = app.state.portrait_machine_percent.clamp(25, 75);
         let machine_percent = match app.focus {
-            Focus::Machines => 58,
-            Focus::Agents => 38,
-            Focus::Recap => 45,
-        };
+            Focus::Machines => base_machine_percent.saturating_add(10),
+            Focus::Agents => base_machine_percent.saturating_sub(10),
+            Focus::Recap => base_machine_percent,
+        }
+        .clamp(20, 80);
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -243,6 +261,8 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
             recap: Some(vertical[0]),
             machines: Some(bottom[0]),
             agents: Some(bottom[1]),
+            portrait_machine_divider: Some(vertical_divider(vertical[1], bottom[0])),
+            portrait_terminal_divider: Some(horizontal_divider(area, vertical[0])),
             ..PaneLayout::default()
         };
     }
@@ -258,7 +278,7 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
         return PaneLayout {
             agents: Some(split[0]),
             recap: Some(split[1]),
-            agents_divider_x: Some(split[0].x + split[0].width.saturating_sub(1)),
+            agents_divider: Some(vertical_divider(area, split[0])),
             ..PaneLayout::default()
         };
     }
@@ -286,8 +306,52 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
         machines: Some(split[0]),
         agents: Some(split[1]),
         recap: Some(split[2]),
-        machine_divider_x: Some(split[0].x + split[0].width.saturating_sub(1)),
-        agents_divider_x: Some(split[1].x + split[1].width.saturating_sub(1)),
+        machine_divider: Some(vertical_divider(area, split[0])),
+        agents_divider: Some(vertical_divider(area, split[1])),
+        ..PaneLayout::default()
+    }
+}
+
+fn vertical_divider(area: Rect, left: Rect) -> Rect {
+    Rect::new(
+        left.x.saturating_add(left.width.saturating_sub(1)),
+        area.y,
+        1,
+        area.height,
+    )
+}
+
+fn horizontal_divider(area: Rect, top: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        top.y.saturating_add(top.height.saturating_sub(1)),
+        area.width,
+        1,
+    )
+}
+
+fn draw_divider_handles(frame: &mut Frame<'_>, panes: &PaneLayout) {
+    let style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    for divider in [
+        panes.machine_divider,
+        panes.agents_divider,
+        panes.portrait_machine_divider,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let y = divider.y.saturating_add(divider.height / 2);
+        frame.render_widget(
+            Paragraph::new("│").style(style),
+            Rect::new(divider.x, y, 1, 1),
+        );
+    }
+    if let Some(divider) = panes.portrait_terminal_divider {
+        let x = divider.x.saturating_add(divider.width / 2);
+        frame.render_widget(
+            Paragraph::new("─").style(style),
+            Rect::new(x, divider.y, 1, 1),
+        );
     }
 }
 
@@ -412,7 +476,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
         let (icon, runtime_name, color) = agent_visual(session.kind);
         let state = if session.dead {
-            "archived"
+            "archived - Enter to resume"
         } else if session.needs_attention {
             "waiting for input"
         } else {
@@ -555,12 +619,17 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.history_offset,
         )
     } else if let Some(session) = &selected {
-        format!(
-            " {} / {} / {}{loading} ",
-            session.kind,
-            session.target_id,
-            if session.dead { "exited" } else { "running" }
-        )
+        if session.dead {
+            format!(
+                " {} / {} / archived - Enter to resume{loading} ",
+                session.kind, session.target_id
+            )
+        } else {
+            format!(
+                " {} / {} / running{loading} ",
+                session.kind, session.target_id
+            )
+        }
     } else {
         " Agent terminal ".into()
     };
@@ -587,10 +656,11 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     app.resize_agent_viewport(inner.width, inner.height);
 
-    if app.history_offset == 0
+    if (app.history_offset == 0 || (app.history_loading && app.history.text.is_empty()))
         && let Some(terminal) = app.terminal.as_ref()
     {
         render_vt_screen(frame, terminal.screen(), inner, app.interactive);
+        highlight_terminal_selection(frame, inner, app.terminal_selection);
         return;
     }
 
@@ -603,6 +673,27 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let scroll = line_count.saturating_sub(inner.height);
     let paragraph = Paragraph::new(Text::raw(body)).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
+    highlight_terminal_selection(frame, inner, app.terminal_selection);
+}
+
+fn highlight_terminal_selection(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selection: Option<crate::app::TerminalSelection>,
+) {
+    let Some(selection) = selection else {
+        return;
+    };
+    let buffer = frame.buffer_mut();
+    for row in 0..area.height {
+        for column in 0..area.width {
+            if selection.contains(row, column) {
+                buffer[(area.x + column, area.y + row)]
+                    .set_bg(Color::Rgb(62, 82, 112))
+                    .set_fg(Color::White);
+            }
+        }
+    }
 }
 
 fn render_vt_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, area: Rect, show_cursor: bool) {
@@ -666,24 +757,24 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ""
     };
     let help = if app.interactive {
-        "  Left back  PgUp history  Ctrl-c/d agent"
+        "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
-        "  n new  Right open  / search  q quit  ? more"
+        "  n new  Enter open  / search  q quit  ? more"
     } else {
         match app.focus {
             Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
-                        "  Right open  a collapse  / search  n new  q quit  ? more"
+                        "  Enter open  a collapse  / search  n new  q quit  ? more"
                     } else {
-                        "  Right open  a expand  / search  n new  q quit  ? more"
+                        "  Enter open  a expand  / search  n new  q quit  ? more"
                     }
                 } else {
-                    "  Right open  / search  n new  q quit  ? more"
+                    "  Enter open  / search  n new  q quit  ? more"
                 }
             }
-            Focus::Recap => "  Left agents  PgUp history  / search  q quit  ? more",
+            Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
         }
     };
     let help_width = UnicodeWidthStr::width(help);
@@ -719,6 +810,38 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                 area,
             );
         }
+        Modal::ConfirmInstall { launch, .. } => {
+            let area = centered_rect(68, 11, outer);
+            frame.render_widget(Clear, area);
+            let text = vec![
+                Line::raw(""),
+                Line::raw(format!(
+                    "{} was not detected on {}.",
+                    launch.kind, launch.target.label
+                )),
+                Line::raw(""),
+                Line::raw("Install it now, then continue launching this agent?"),
+                Line::styled(
+                    "Uses a compatible local binary or downloads the checked target package locally.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::styled(
+                    "The target needs no internet; its configured installer is only the final fallback.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Enter/y install    Esc/n cancel",
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .block(panel(" Install agent runtime ", true)),
+                area,
+            );
+        }
         Modal::Help(form) => draw_help_modal(frame, form, outer),
         Modal::Settings(form) => draw_settings_modal(frame, form, outer),
         Modal::Search(form) => draw_search_modal(frame, form, outer),
@@ -730,13 +853,19 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
 fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
     let lines = vec![
         help_header("Navigation"),
-        help_row("Left / h", "Move to the pane on the left"),
-        help_row("Right / l", "Move right; open the selected terminal"),
-        help_row("Tab / Shift-Tab", "Move to the next / previous pane"),
+        help_row(
+            "Cmd / Option / Alt + Left/Right",
+            "macOS Cmd or Option; Windows/Linux Alt; horizontal neighbor",
+        ),
+        help_row(
+            "Cmd/Option/Alt + Up/Down",
+            "Move to a visible vertical neighbor",
+        ),
+        help_row("Arrows in terminal", "Forward directly to the agent editor"),
         help_row("Up/Down / j/k", "Move the current selection"),
         help_row("Alt-1 / 2 / 3", "Jump directly to a pane"),
         help_row("Mouse click", "Focus and select an item"),
-        help_row("Drag divider", "Resize a sidebar"),
+        help_row("Drag divider", "Resize and save the current layout split"),
         Line::raw(""),
         help_header("Launch"),
         help_row("n / Ctrl-n", "Start the runtime and path flow"),
@@ -746,9 +875,23 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("Enter in picker", "Confirm folder; choose New or Resume"),
         Line::raw(""),
         help_header("Sessions"),
-        help_row("Right / click", "Focus the terminal and type"),
-        help_row("Left", "Return to agents; keep the PTY attached"),
+        help_row(
+            "Enter / click",
+            "Focus a running terminal or resume an archived agent",
+        ),
+        help_row(
+            "Cmd/Option/Alt + arrow",
+            "Leave terminal by the visible layout",
+        ),
+        help_row(
+            "Shift/Option + Enter",
+            "Insert a newline without submitting",
+        ),
         help_row("Ctrl-c / Ctrl-d", "Forward directly to the focused session"),
+        help_row(
+            "Mouse drag",
+            "Select and copy terminal text; Alt-drag forwards",
+        ),
         help_row("x", "Close the selected tmux session"),
         help_row("a", "Expand or collapse Archived sessions"),
         help_row("Up twice at top", "Open the first agent waiting for input"),
@@ -759,7 +902,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
         Line::raw(""),
         help_header("History And Search"),
-        help_row("Wheel / PageUp", "Load older terminal history"),
+        help_row(
+            "Wheel / PageUp",
+            "Scroll three lines / move one history page",
+        ),
         help_row("PageDown", "Move back toward the live terminal"),
         help_row("/ / Ctrl-p", "Search every discovered agent history"),
         help_row("Enter in search", "Open the selected match"),
@@ -1050,8 +1196,8 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     );
 }
 
-fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
-    let area = centered_rect(100, 25, outer);
+fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) {
+    let area = centered_rect(104, 31, outer);
     frame.render_widget(Clear, area);
     let block = panel(" Search all agent history ", true);
     let inner = block.inner(area);
@@ -1072,11 +1218,13 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
         error.clone()
     } else if !form.results.is_empty() {
         format!(
-            "{} matches; ranked name > recap > history",
+            "{} matches; exact optional name/path, recap, then newest history",
             form.results.len()
         )
+    } else if form.query.trim().chars().count() >= 2 {
+        "Search starts after a short typing pause; Enter runs it now".into()
     } else {
-        "Enter searches; Up/Down selects; Enter opens result".into()
+        "Type at least two characters for live search, or press Enter".into()
     };
     frame.render_widget(
         Paragraph::new(truncate(&status, inner.width as usize)).style(Style::default().fg(
@@ -1089,12 +1237,13 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
-    let visible_results = inner.height.saturating_sub(3) as usize / 2;
+    let visible_results = inner.height.saturating_sub(3) as usize / 3;
     let start = if form.selected >= visible_results && visible_results > 0 {
         form.selected + 1 - visible_results
     } else {
         0
     };
+    let mut result_rows = Vec::new();
     for (visible_index, (index, result)) in form
         .results
         .iter()
@@ -1103,7 +1252,7 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
         .take(visible_results)
         .enumerate()
     {
-        let y = inner.y + 2 + (visible_index * 2) as u16;
+        let y = inner.y + 2 + (visible_index * 3) as u16;
         let selected = index == form.selected;
         let match_color = match result.match_kind {
             SearchMatchKind::Name => ACCENT,
@@ -1123,7 +1272,8 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
             .line_number
             .map(|line| format!(" line {line}"))
             .unwrap_or_default();
-        let second = format!("  [{}{}] {}", result.match_kind, line, result.snippet);
+        let second = format!("  {}", result.path);
+        let third = format!("  [{}{}] {}", result.match_kind, line, result.snippet);
         let background = if selected {
             Color::Rgb(42, 48, 58)
         } else {
@@ -1136,12 +1286,19 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
         );
         frame.render_widget(
             Paragraph::new(truncate(&second, inner.width as usize))
-                .style(Style::default().fg(match_color).bg(background)),
+                .style(Style::default().fg(MUTED).bg(background)),
             Rect::new(inner.x, y + 1, inner.width, 1),
         );
+        frame.render_widget(
+            Paragraph::new(truncate(&third, inner.width as usize))
+                .style(Style::default().fg(match_color).bg(background)),
+            Rect::new(inner.x, y + 2, inner.width, 1),
+        );
+        result_rows.push((index, Rect::new(inner.x, y, inner.width, 3)));
     }
+    form.result_rows = result_rows;
     frame.render_widget(
-        Paragraph::new("Ctrl-u clear   Enter search/open   Esc close")
+        Paragraph::new("Type to search   Up/Down or wheel select   Enter open   Esc close")
             .style(Style::default().fg(MUTED)),
         Rect::new(
             inner.x,
@@ -1161,7 +1318,7 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &SearchForm, outer: Rect) {
 }
 
 fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) {
-    let area = centered_rect(92, 19, outer);
+    let area = centered_rect(92, 23, outer);
     frame.render_widget(Clear, area);
     let title = match &form.scope {
         SettingsScope::Global => " Global settings ".to_string(),
@@ -1175,11 +1332,21 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     frame.render_widget(block, area);
     let label_width = 27u16.min(inner.width / 2);
     let value_width = inner.width.saturating_sub(label_width + 1) as usize;
-    for (index, (label, value)) in form.labels().iter().zip(&form.values).enumerate() {
-        if index as u16 >= inner.height.saturating_sub(3) {
-            break;
-        }
-        let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+    let visible_fields = inner.height.saturating_sub(3) as usize;
+    let start = form
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible_fields);
+    for (visible_index, (index, (label, value))) in form
+        .labels()
+        .iter()
+        .zip(&form.values)
+        .enumerate()
+        .skip(start)
+        .take(visible_fields)
+        .enumerate()
+    {
+        let row = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
         let active = index == form.selected;
         let shown = tail_display(value, value_width);
         frame.render_widget(
@@ -1210,8 +1377,10 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
         );
     }
     frame.render_widget(
-        Paragraph::new("Tab/Up/Down field   Ctrl-u clear   Enter/Ctrl-s save   Esc cancel")
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(
+            "Shell syntax: --flag 'value' / A=value   Tab field   Enter save   Esc cancel",
+        )
+        .style(Style::default().fg(MUTED)),
         Rect::new(
             inner.x,
             inner.y + inner.height.saturating_sub(1),
@@ -1219,14 +1388,14 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
             1,
         ),
     );
-    if form.selected < form.values.len() && form.selected as u16 + 3 < inner.height {
+    if form.selected < form.values.len() {
         let shown = tail_display(&form.values[form.selected], value_width);
         let cursor = inner
             .x
             .saturating_add(label_width + 1)
             .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
             .min(inner.x + inner.width.saturating_sub(1));
-        frame.set_cursor_position((cursor, inner.y + form.selected as u16));
+        frame.set_cursor_position((cursor, inner.y + form.selected.saturating_sub(start) as u16));
     }
 }
 
@@ -1637,9 +1806,11 @@ mod tests {
                 created_at: 1,
                 dead: true,
             }],
+            result_rows: Vec::new(),
             selected: 0,
             loading: false,
             error: None,
+            edited_at: std::time::Instant::now(),
         }));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal
@@ -1650,7 +1821,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(rendered.contains("Search all agent history"));
-        assert!(rendered.contains("ranked name > recap > history"));
+        assert!(rendered.contains("exact optional name/path, recap, then newest history"));
         assert!(rendered.contains("optional-name"));
 
         app.modal = Some(Modal::PathPicker(PathPickerForm {
