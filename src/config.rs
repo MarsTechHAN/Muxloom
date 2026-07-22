@@ -237,6 +237,7 @@ pub struct State {
     pub hide_disabled: bool,
     pub machine_width: u16,
     pub agents_width: u16,
+    pub file_width: u16,
     pub portrait_terminal_percent: u16,
     pub portrait_machine_percent: u16,
     pub show_archived: bool,
@@ -250,6 +251,7 @@ impl Default for State {
             hide_disabled: false,
             machine_width: 24,
             agents_width: 40,
+            file_width: 34,
             portrait_terminal_percent: 65,
             portrait_machine_percent: 45,
             show_archived: false,
@@ -489,5 +491,6 @@ mod tests {
                 .unwrap();
         assert_eq!(state.portrait_terminal_percent, 65);
         assert_eq!(state.portrait_machine_percent, 45);
+        assert_eq!(state.file_width, 34);
     }
 }

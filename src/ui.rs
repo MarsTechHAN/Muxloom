@@ -268,8 +268,12 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
     }
 
     if app.state.flatten {
-        let mut agents_width =
-            app.state.agents_width.clamp(24, 72) + if app.focus == Focus::Agents { 10 } else { 0 };
+        let base_width = if app.file_manager.is_some() {
+            app.state.file_width.clamp(22, 72)
+        } else {
+            app.state.agents_width.clamp(24, 72)
+        };
+        let mut agents_width = base_width + if app.focus == Focus::Agents { 10 } else { 0 };
         agents_width = agents_width.min(area.width.saturating_sub(28));
         let split = Layout::default()
             .direction(Direction::Horizontal)
@@ -285,8 +289,12 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
 
     let mut machine_width =
         app.state.machine_width.clamp(16, 52) + if app.focus == Focus::Machines { 8 } else { 0 };
-    let mut agents_width =
-        app.state.agents_width.clamp(24, 72) + if app.focus == Focus::Agents { 10 } else { 0 };
+    let base_agents_width = if app.file_manager.is_some() {
+        app.state.file_width.clamp(22, 72)
+    } else {
+        app.state.agents_width.clamp(24, 72)
+    };
+    let mut agents_width = base_agents_width + if app.focus == Focus::Agents { 10 } else { 0 };
     let available = area.width.saturating_sub(28);
     while machine_width + agents_width > available && agents_width > 24 {
         agents_width -= 1;
@@ -459,6 +467,12 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if let Some(form) = app.file_manager.as_mut() {
+        app.agent_rows.clear();
+        app.archive_row = None;
+        draw_file_browser(frame, form, area, app.focus == Focus::Agents);
+        return;
+    }
     let sessions: Vec<_> = app.visible_sessions().into_iter().cloned().collect();
     let archived_count = app.archived_count();
     let mut items = Vec::new();
@@ -510,8 +524,10 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             MUTED
         } else if session.needs_attention {
             Color::Yellow
-        } else {
+        } else if session.working {
             Color::Green
+        } else {
+            Color::Gray
         };
         let selected = app.selected_session_id.as_deref() == Some(&session.id);
         let activity = if session.needs_attention {
@@ -626,6 +642,15 @@ fn archive_item(count: usize, expanded: bool) -> ListItem<'static> {
 }
 
 fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app
+        .file_manager
+        .as_ref()
+        .is_some_and(|form| form.preview_path.is_some())
+    {
+        app.terminal_back = None;
+        draw_file_preview_panel(frame, app, area);
+        return;
+    }
     let selected = app.selected_session().cloned();
     let current_matches = app.terminal_session_id.as_deref() == app.selected_session_id.as_deref();
     let pending_matches =
@@ -1028,48 +1053,49 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
         Modal::Search(form) => draw_search_modal(frame, form, outer),
         Modal::PathPicker(form) => draw_path_picker(frame, form, outer),
         Modal::Resume(form) => draw_resume_modal(frame, form, outer),
-        Modal::Files(form) => draw_file_manager(frame, form, outer),
     }
 }
 
-fn draw_file_manager(frame: &mut Frame<'_>, form: &mut FileManagerForm, outer: Rect) {
-    frame.render_widget(Clear, outer);
+fn draw_file_browser(
+    frame: &mut Frame<'_>,
+    form: &mut FileManagerForm,
+    outer: Rect,
+    focused: bool,
+) {
     let title = format!(
-        " Files  {}:{} ",
+        " Files{}  {}:{} ",
+        if form.loading {
+            " [loading]"
+        } else if form.error.is_some() {
+            " [error]"
+        } else {
+            ""
+        },
         form.target.label,
         truncate(&form.path, outer.width.saturating_sub(20) as usize)
     );
-    let block = panel(&title, true);
+    let block = panel(&title, focused);
     let inner = block.inner(outer);
     frame.render_widget(block, outer);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(1)])
         .split(inner);
-    let panes = if rows[0].width >= 80 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(rows[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(rows[0])
-    };
-    let list_area = panes[0];
-    let preview_area = panes[1];
+    let list_area = rows[0];
     form.list_area = Some(list_area);
-    form.preview_area = Some(preview_area);
+    if form.preview_path.is_none() {
+        form.preview_area = None;
+    }
 
-    let list_block = panel(" Browser ", true);
-    let list_inner = list_block.inner(list_area);
-    let items: Vec<_> = if form.loading {
+    let list_inner = list_area;
+    let items: Vec<_> = if form.loading && form.entries.is_empty() {
         vec![ListItem::new(Line::styled(
             "Loading...",
             Style::default().fg(MUTED),
         ))]
-    } else if let Some(error) = &form.error {
+    } else if let Some(error) = &form.error
+        && form.entries.is_empty()
+    {
         vec![ListItem::new(Line::styled(
             error.clone(),
             Style::default().fg(Color::Red),
@@ -1107,11 +1133,10 @@ fn draw_file_manager(frame: &mut Frame<'_>, form: &mut FileManagerForm, outer: R
             .collect()
     };
     let mut state = ratatui::widgets::ListState::default();
-    if !form.entries.is_empty() && !form.loading {
+    if !form.entries.is_empty() {
         state.select(Some(form.selected.min(form.entries.len() - 1)));
     }
     let list = List::new(items)
-        .block(list_block)
         .highlight_style(Style::default().bg(Color::Rgb(42, 48, 58)))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, list_area, &mut state);
@@ -1138,10 +1163,38 @@ fn draw_file_manager(frame: &mut Frame<'_>, form: &mut FileManagerForm, outer: R
             .collect()
     };
 
-    let preview_block = panel(" Preview ", false);
-    let preview_inner = preview_block.inner(preview_area);
-    frame.render_widget(preview_block, preview_area);
-    let selected = form.entries.get(form.selected);
+    let footer = if form.preview_path.is_some() {
+        "Enter close preview  PgUp/PgDn scroll"
+    } else if form.loading {
+        "← parent  → previous child  loading in background"
+    } else {
+        "↑↓ select  ← parent  Enter open  c copy  d download"
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
+        rows[1],
+    );
+}
+
+fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let path = app
+        .file_manager
+        .as_ref()
+        .and_then(|form| form.preview_path.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    let title = format!(
+        " Preview  {} ",
+        truncate(&path, area.width.saturating_sub(14) as usize)
+    );
+    let block = panel(&title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let form = app
+        .file_manager
+        .as_mut()
+        .expect("preview requires file manager");
+    form.preview_area = Some(area);
     let preview = if let Some(error) = &form.preview_error {
         Text::from(Line::styled(error.clone(), Style::default().fg(Color::Red)))
     } else if form.preview_loading {
@@ -1151,42 +1204,22 @@ fn draw_file_manager(frame: &mut Frame<'_>, form: &mut FileManagerForm, outer: R
         ))
     } else if let Some(preview) = &form.preview {
         file_preview_text(preview)
-    } else if let Some(entry) = selected {
-        let kind = match entry.kind {
-            FileEntryKind::Directory => "directory",
-            FileEntryKind::File => "file",
-            FileEntryKind::Symlink => "symbolic link",
-            FileEntryKind::Other => "special file",
-        };
-        Text::from(vec![
-            Line::styled(entry.name.clone(), Style::default().fg(ACCENT).bold()),
-            Line::raw(""),
-            Line::styled(kind, Style::default().fg(MUTED)),
-            Line::raw(entry.path.clone()),
-        ])
     } else {
-        Text::from(Line::styled("No file selected", Style::default().fg(MUTED)))
+        Text::from(Line::styled(
+            "No preview output",
+            Style::default().fg(MUTED),
+        ))
     };
     let preview_lines = preview.height();
     form.preview_max_scroll = preview_lines
-        .saturating_sub(preview_inner.height as usize)
+        .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     form.preview_scroll = form.preview_scroll.min(form.preview_max_scroll);
     frame.render_widget(
         Paragraph::new(preview)
             .scroll((form.preview_scroll, 0))
             .wrap(Wrap { trim: false }),
-        preview_inner,
-    );
-
-    let footer = if form.loading {
-        "Loading directory..."
-    } else {
-        "↑↓ select   ← parent   →/Enter open   c copy path   d download   drop files upload   Ctrl-f close"
-    };
-    frame.render_widget(
-        Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
-        rows[1],
+        inner,
     );
 }
 
@@ -1223,52 +1256,192 @@ fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
 }
 
 fn markdown_lines(content: &str) -> Vec<Line<'static>> {
+    let source: Vec<_> = content.lines().collect();
     let mut lines = Vec::new();
     let mut code = false;
-    for raw in content.lines() {
+    let mut index = 0;
+    while index < source.len() {
+        let raw = source[index];
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             code = !code;
-            continue;
-        }
-        if code {
+            index += 1;
+        } else if code {
             lines.push(Line::styled(
                 format!("  {raw}"),
                 Style::default()
                     .fg(Color::Rgb(180, 210, 190))
                     .bg(Color::Rgb(28, 34, 32)),
             ));
-        } else if let Some(heading) = trimmed.strip_prefix("### ") {
-            lines.push(Line::styled(
-                heading.to_string(),
-                Style::default().fg(Color::Yellow).bold(),
-            ));
-        } else if let Some(heading) = trimmed
-            .strip_prefix("## ")
-            .or_else(|| trimmed.strip_prefix("# "))
+            index += 1;
+        } else if index + 1 < source.len()
+            && markdown_table_cells(raw).is_some()
+            && is_markdown_table_separator(source[index + 1])
         {
+            let mut rows = vec![markdown_table_cells(raw).unwrap_or_default()];
+            index += 2;
+            while index < source.len() {
+                let Some(row) = markdown_table_cells(source[index]) else {
+                    break;
+                };
+                rows.push(row);
+                index += 1;
+            }
+            lines.extend(markdown_table_lines(&rows));
+        } else if let Some((level, heading)) = markdown_heading(trimmed) {
+            let style = match level {
+                1 => Style::default().fg(ACCENT).bold().underlined(),
+                2 => Style::default().fg(Color::Yellow).bold(),
+                3 => Style::default().fg(Color::Cyan).bold(),
+                _ => Style::default().fg(Color::Gray).bold(),
+            };
+            lines.push(markdown_inline(heading, style));
+            index += 1;
+        } else if is_markdown_rule(trimmed) {
             lines.push(Line::styled(
-                heading.to_string(),
-                Style::default().fg(ACCENT).bold(),
+                "─".repeat(48),
+                Style::default().fg(Color::DarkGray),
             ));
+            index += 1;
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            lines.push(Line::from(vec![
-                Span::styled(" • ", Style::default().fg(ACCENT)),
-                Span::raw(item.to_string()),
-            ]));
+            let mut spans = vec![Span::styled(" • ", Style::default().fg(ACCENT))];
+            spans.extend(markdown_inline_spans(item, Style::default()));
+            lines.push(Line::from(spans));
+            index += 1;
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
-            lines.push(Line::styled(
-                format!("│ {quote}"),
-                Style::default().fg(Color::Gray).italic(),
-            ));
+            let style = Style::default().fg(Color::Gray).italic();
+            let mut spans = vec![Span::styled("│ ", style)];
+            spans.extend(markdown_inline_spans(quote, style));
+            lines.push(Line::from(spans));
+            index += 1;
         } else {
-            lines.push(Line::raw(raw.to_string()));
+            lines.push(markdown_inline(raw, Style::default()));
+            index += 1;
         }
     }
     lines
+}
+
+fn markdown_heading(value: &str) -> Option<(usize, &str)> {
+    for level in (1..=4).rev() {
+        let prefix = format!("{} ", "#".repeat(level));
+        if let Some(heading) = value.strip_prefix(&prefix) {
+            return Some((level, heading));
+        }
+    }
+    None
+}
+
+fn markdown_inline(value: &str, style: Style) -> Line<'static> {
+    Line::from(markdown_inline_spans(value, style))
+}
+
+fn markdown_inline_spans(value: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("**") {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), style));
+        }
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("**") else {
+            spans.push(Span::styled(rest[start..].to_string(), style));
+            rest = "";
+            break;
+        };
+        spans.push(Span::styled(
+            after[..end].to_string(),
+            style.add_modifier(Modifier::BOLD),
+        ));
+        rest = &after[end + 2..];
+    }
+    if !rest.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(rest.to_string(), style));
+    }
+    spans
+}
+
+fn markdown_table_cells(value: &str) -> Option<Vec<String>> {
+    if !value.contains('|') {
+        return None;
+    }
+    let value = value.trim().trim_matches('|');
+    let cells: Vec<_> = value
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn is_markdown_table_separator(value: &str) -> bool {
+    markdown_table_cells(value).is_some_and(|cells| {
+        cells.iter().all(|cell| {
+            let cell = cell.trim_matches(':').trim();
+            cell.len() >= 3 && cell.chars().all(|character| character == '-')
+        })
+    })
+}
+
+fn markdown_table_lines(rows: &[Vec<String>]) -> Vec<Line<'static>> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![1; columns];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index]
+                .max(UnicodeWidthStr::width(cell.as_str()))
+                .min(32);
+        }
+    }
+    let mut lines = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut spans = vec![Span::styled("│", Style::default().fg(MUTED))];
+        for (column, width) in widths.iter().enumerate() {
+            let cell = row.get(column).map(String::as_str).unwrap_or("");
+            let cell = truncate(cell, *width);
+            let padding = width.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
+            let style = if row_index == 0 {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(
+                format!(" {cell}{} ", " ".repeat(padding)),
+                style,
+            ));
+            spans.push(Span::styled("│", Style::default().fg(MUTED)));
+        }
+        lines.push(Line::from(spans));
+        if row_index == 0 {
+            let separator = widths
+                .iter()
+                .map(|width| "─".repeat(width + 2))
+                .collect::<Vec<_>>()
+                .join("┼");
+            lines.push(Line::styled(
+                format!("├{separator}┤"),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+    lines
+}
+
+fn is_markdown_rule(value: &str) -> bool {
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.len() >= 3
+        && compact
+            .chars()
+            .next()
+            .is_some_and(|marker| matches!(marker, '-' | '*' | '_'))
+        && compact
+            .chars()
+            .all(|character| character == compact.chars().next().unwrap())
 }
 
 fn format_bytes(size: u64) -> String {
@@ -1341,10 +1514,7 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
         Line::raw(""),
         help_header("History And Search"),
-        help_row(
-            "Wheel / PageUp",
-            "Scroll three lines / move one history page",
-        ),
+        help_row("Wheel / PageUp", "Scroll one line / move one history page"),
         help_row("PageDown", "Move back toward the live terminal"),
         help_row("/ / Ctrl-p", "Search every discovered agent history"),
         help_row("Enter in search", "Open the selected match"),
@@ -1939,7 +2109,7 @@ fn runtime_capability(
     Span::styled(
         label,
         Style::default()
-            .fg(if available { color } else { MUTED })
+            .fg(if available || working { color } else { MUTED })
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2101,6 +2271,7 @@ mod tests {
                 working: false,
                 needs_attention: true,
                 attention_reason: Some("approve".into()),
+                recap: None,
             });
             app.selected_session_id = Some("ad-codex-1-1-1".into());
 
@@ -2151,6 +2322,38 @@ mod tests {
             running_agent_effect(AgentKind::Codex, 0),
             running_agent_effect(AgentKind::Codex, 5)
         );
+    }
+
+    #[test]
+    fn markdown_preview_renders_headings_bold_tables_and_rules() {
+        let lines = markdown_lines(concat!(
+            "# One\n## Two\n### Three\n#### Four\n",
+            "plain **bold** text\n\n",
+            "| Name | Value |\n| --- | ---: |\n| alpha | 1 |\n",
+            "---\n"
+        ));
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content == "One"
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            })
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+            })
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.spans.iter().any(|span| span.content.contains('┼')) })
+        );
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.starts_with("────────────────"))
+        }));
     }
 
     #[test]
@@ -2264,6 +2467,7 @@ mod tests {
             working: false,
             needs_attention: false,
             attention_reason: None,
+            recap: None,
         });
         let backend = TestBackend::new(150, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2374,7 +2578,8 @@ mod tests {
         assert!(rendered.contains("New session"));
         assert!(rendered.contains("first user message"));
 
-        app.modal = Some(Modal::Files(FileManagerForm {
+        app.modal = None;
+        app.file_manager = Some(FileManagerForm {
             target: Target::local(),
             path: "/work".into(),
             entries: vec![crate::model::FileEntry {
@@ -2386,6 +2591,9 @@ mod tests {
             selected: 0,
             loading: false,
             error: None,
+            directory_cache: std::collections::HashMap::new(),
+            return_path: None,
+            preview_path: Some("/work/README.md".into()),
             preview: Some(crate::model::FilePreview {
                 path: "/work/README.md".into(),
                 mime: "text/markdown".into(),
@@ -2402,7 +2610,7 @@ mod tests {
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
-        }));
+        });
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal
             .backend()
@@ -2414,7 +2622,7 @@ mod tests {
         assert!(rendered.contains("Files  This machine:/work"));
         assert!(rendered.contains("README.md"));
         assert!(rendered.contains("File preview"));
-        assert!(rendered.contains("copy path"));
+        assert!(rendered.contains("Enter close preview"));
 
         app.modal = Some(Modal::Help(HelpForm {
             offset: HELP_CONTENT_ROWS - 1,

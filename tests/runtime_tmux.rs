@@ -334,6 +334,7 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::create_dir_all(&source_root).unwrap();
     std::fs::write(root.join("README.md"), "# Preview\n\n- item\n").unwrap();
+    std::fs::write(root.join("script_without_extension"), "print('preview')\n").unwrap();
     let upload = source_root.join("upload.txt");
     std::fs::write(&upload, "uploaded").unwrap();
 
@@ -354,6 +355,14 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
         .unwrap();
     assert_eq!(preview.kind, muxloom::model::FilePreviewKind::Markdown);
     assert!(preview.content.contains("# Preview"));
+    let extensionless = runtime
+        .preview_file(
+            &target,
+            &root.join("script_without_extension").display().to_string(),
+        )
+        .unwrap();
+    assert_eq!(extensionless.kind, muxloom::model::FilePreviewKind::Text);
+    assert!(extensionless.content.contains("print('preview')"));
 
     assert_eq!(
         runtime

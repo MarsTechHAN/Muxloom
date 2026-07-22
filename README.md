@@ -626,32 +626,44 @@ field when needed. Session/history directories are never part of this sync.
 
 Press `Ctrl-f` to open the file manager. It starts in the selected agent's
 folder; when no agent is selected, it starts at `.` on the selected machine.
-The browser works the same way for local and SSH targets:
+The Agents-by-folder pane becomes a Files sidebar while the terminal remains
+visible. Opening a file switches the terminal pane to Preview; opening the same
+file again restores the live terminal. The browser works the same way for local
+and SSH targets:
 
 | Key or gesture | Action |
 | --- | --- |
 | `Up` / `Down`, `j` / `k` | Select a directory or file |
-| `Right`, `Enter` | Enter a directory or preview the selected file |
+| `Right`, `Enter` | Enter a directory; on a file, toggle its preview |
 | `Left` | Go to the parent directory |
 | `PageUp` / `PageDown` | Scroll the preview |
 | `c` | Copy the selected file's full target-side path to the clipboard |
 | `d` | Download the selected file to the controller's `~/Downloads` directory |
 | Drag local files into the terminal | Upload them to the directory currently being browsed |
+| Drag the Files/Preview divider | Resize and persist the file-sidebar split independently |
 | `r`, `F5` | Refresh the directory |
 | `Esc`, `Ctrl-f` | Close the file manager |
 
 Directory enumeration, MIME detection, bounded text reads, and media metadata
-inspection all execute on the target machine. Text and Markdown previews are
-limited to 256 KiB; Markdown headings, lists, quotes, and code blocks receive
-basic TUI styling. Audio and video files show `ffprobe` metadata when `ffprobe`
-is installed on the target, otherwise the target's `file` description is shown.
-Binary files are never rendered as terminal bytes.
+inspection all execute on the target machine. Text detection is content-based,
+so Python files and extensionless scripts still preview; a missing target-side
+`file` utility produces no placeholder noise. Text and Markdown previews are
+limited to 256 KiB. Markdown renders `#` through `####`, `**bold**`, lists,
+quotes, fenced code, tables, and horizontal rules. Audio and video files show
+`ffprobe` metadata when available. Binary files are never rendered as terminal
+bytes.
 
 Opening a preview does not create a local copy. A transfer happens only after
 `d`, or when local paths pasted by the outer terminal's file-drop operation are
 uploaded through SCP. The `c` action copies the canonical path reported by the
 target, using the native clipboard on macOS/Windows and OSC 52 as the portable
 terminal fallback.
+
+Directory requests do not lock navigation. Cached entries remain selectable
+while Loading is visible; Left can move to the parent and Right can return to
+the child just left. Results from stale paths are ignored, and every selection,
+directory, refresh, or preview close clears the old preview state.
+
 
 <a id="en-history"></a>
 
@@ -719,8 +731,10 @@ When a session newly needs input:
 - the outer terminal receives a bell and OSC 9 notification;
 - the event is deduplicated until the prompt clears and reappears.
 
-While a live Codex or Claude process is running, its row shows a compact
-`*`/`✽` activity animation. Terminal sessions and Archived agents do not animate.
+Only a Codex or Claude agent whose current screen reports active work animates.
+Codex uses a cyan single-cell cycle and Claude uses its yellow `✻`/`✽`/`✶`/`✳`
+cycle; the same runtime indicator animates in Machines. Idle, Terminal, waiting,
+and Archived sessions do not animate.
 
 <a id="en-runtime-model"></a>
 
@@ -1478,29 +1492,38 @@ TUI 内配置：
 ### 文件管理器
 
 按 `Ctrl-f` 打开文件管理器。默认从当前 Agent 的目录开始；没有选中 Agent 时，
-从当前机器的 `.` 开始。本地和 SSH 目标使用同一套操作：
+从当前机器的 `.` 开始。原来的 Agents by folder Pane 会切换成 Files 侧栏，Terminal
+仍然可见；打开文件后右侧才切换成 Preview，再次打开同一个文件会恢复实时 Terminal。
+本地和 SSH 目标使用同一套操作：
 
 | 按键或操作 | 行为 |
 | --- | --- |
 | `Up` / `Down`、`j` / `k` | 选择目录或文件 |
-| `Right`、`Enter` | 进入目录，或预览当前文件 |
+| `Right`、`Enter` | 进入目录；选中文件时切换 Preview 的展开/收起 |
 | `Left` | 返回父目录 |
 | `PageUp` / `PageDown` | 滚动预览 |
 | `c` | 将当前文件在目标机器上的完整路径复制到剪贴板 |
 | `d` | 下载到控制机的 `~/Downloads` |
 | 将本地文件拖入终端 | 上传到当前正在浏览的目录 |
+| 拖动 Files/Preview 分隔线 | 独立调整并持久化文件侧栏宽度 |
 | `r`、`F5` | 刷新目录 |
 | `Esc`、`Ctrl-f` | 关闭文件管理器 |
 
-目录枚举、MIME 判断、限量文本读取和媒体元数据提取都在目标机器执行。文本与
-Markdown 最多预览 256 KiB；Markdown 的标题、列表、引用和代码块会做基础 TUI
-渲染。Audio/Video 在目标机存在 `ffprobe` 时展示媒体信息，否则展示目标机 `file`
-命令的描述。二进制内容不会作为终端文本输出。
+目录枚举、MIME 判断、限量文本读取和媒体元数据提取都在目标机器执行。文本按内容
+识别，因此 `.py` 和无后缀脚本也能预览；目标机缺少 `file` 时不会显示无意义的工具
+缺失占位。文本与 Markdown 最多预览 256 KiB。Markdown 支持 `#` 到 `####`、
+`**bold**`、列表、引用、代码块、表格和 `---` 分隔线。Audio/Video 在目标机存在
+`ffprobe` 时展示媒体信息；二进制内容不会作为终端文本输出。
 
 只打开 Preview 不会在本机产生文件；只有按 `d` 才会下载。把文件拖入外层终端时，
 Muxloom 接收终端产生的路径 Paste，并通过 SCP 上传。按 `c` 复制的是目标机器返回的
 Canonical Path；macOS/Windows 优先使用系统剪贴板，其余环境使用 OSC 52 作为终端
 剪贴板回退。
+
+目录 Loading 不会锁住导航：已有缓存仍可选择，Left 可以立即到上级，Right 可以回到
+刚离开的下级；过期路径的迟到结果会被忽略。切换选择、目录、刷新或关闭 Preview
+都会清空旧 Preview，不会残留脏数据。
+
 
 <a id="zh-history"></a>
 
@@ -1560,8 +1583,9 @@ Pattern。普通空闲提示（例如 `› Explain this codebase`）本身不会
 - 外层终端收到 Bell 和 OSC 9 通知；
 - 同一个 Prompt 在每次刷新时不会重复通知。
 
-Live Codex/Claude 运行期间，列表行会显示紧凑的 `*`/`✽` 活动效果；Terminal 和
-Archived Agent 不显示该动画。
+只有当前屏幕真实处于 Working 的 Codex/Claude 才显示动画：Codex 使用青色单 Cell
+循环，Claude 使用黄色 `✻`/`✽`/`✶`/`✳` 循环；Machines 中对应 Runtime 同步显示。
+Idle、Terminal、Waiting 和 Archived 都不播放动画。
 
 <a id="zh-runtime-model"></a>
 

@@ -24,6 +24,7 @@ use crate::{
         FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LaunchRequest, Probe,
         ResumeCandidate, Target, Transport,
     },
+    recap::extract_recap,
 };
 
 const SESSION_PREFIX: &str = "muxloom-";
@@ -994,14 +995,15 @@ impl Runtime {
         session_id: &str,
         kind: AgentKind,
         patterns: &[String],
-    ) -> Result<(bool, Option<String>)> {
+    ) -> Result<(bool, Option<String>, Option<String>)> {
         validate_session_id(session_id)?;
-        let script = shell_join(&["tmux", "capture-pane", "-p", "-t", session_id]);
+        let script = shell_join(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "inspect agent state")?;
         let screen = String::from_utf8_lossy(&output.stdout);
         let attention = attention_reason(kind, &screen, patterns);
         let working = attention.is_none() && agent_is_working(kind, &screen);
+        let recap = extract_recap(kind, &screen);
         if let Some(reason) = &attention {
             debug::log(
                 "attention",
@@ -1026,7 +1028,7 @@ impl Runtime {
                 attention.is_some()
             ),
         );
-        Ok((working, attention))
+        Ok((working, attention, recap))
     }
 
     pub fn search_history(
@@ -1161,12 +1163,14 @@ END {
                 mime=$(file -b --mime-type -- "$path" 2>/dev/null || printf application/octet-stream)
                 description=$(file -b -- "$path" 2>/dev/null || true)
             else
-                mime=application/octet-stream
-                description='file utility unavailable'
+                mime=
+                description=
             fi
             lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
             case "$lower" in
                 *.md|*.markdown|*.mdown|*.mkd) kind=markdown ;;
+                *.mp3|*.wav|*.flac|*.aac|*.m4a|*.ogg|*.opus) kind=audio ;;
+                *.mp4|*.m4v|*.mov|*.mkv|*.webm|*.avi|*.mpeg|*.mpg) kind=video ;;
                 *) case "$mime" in
                     text/*|application/json|application/xml|application/javascript|application/x-sh|application/toml) kind=text ;;
                     audio/*) kind=audio ;;
@@ -1174,6 +1178,10 @@ END {
                     *) kind=binary ;;
                 esac ;;
             esac
+            if [ "$kind" = binary ] && {{ [ ! -s "$path" ] || {{ command -v grep >/dev/null 2>&1 && LC_ALL=C grep -Iq . "$path"; }}; }}; then
+                kind=text
+                [ -n "$mime" ] || mime=text/plain
+            fi
             if [ "$size" -gt {LIMIT} ]; then truncated=1; else truncated=0; fi
             printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
             case "$kind" in
@@ -2271,6 +2279,7 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     working: false,
                     needs_attention: false,
                     attention_reason: None,
+                    recap: None,
                 });
             }
             _ => {}

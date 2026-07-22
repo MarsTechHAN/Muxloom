@@ -186,6 +186,7 @@ pub struct AgentSession {
     pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,
+    pub recap: Option<String>,
 }
 
 impl AgentSession {

@@ -181,10 +181,11 @@ impl Worker {
                                     session.kind,
                                     &request.attention_patterns,
                                 ) {
-                                    Ok((working, attention)) => {
+                                    Ok((working, attention, recap)) => {
                                         session.working = working;
                                         session.needs_attention = attention.is_some();
                                         session.attention_reason = attention;
+                                        session.recap = recap;
                                     }
                                     Err(error) => debug::log(
                                         "worker",
@@ -311,6 +312,13 @@ impl Worker {
                             if let Some((score, snippet)) = best_name_match(&session, &query) {
                                 results.push((
                                     search_result(&session, SearchMatchKind::Name, snippet, None),
+                                    score,
+                                ));
+                            } else if let Some((score, snippet)) =
+                                best_recap_match(&session, &query)
+                            {
+                                results.push((
+                                    search_result(&session, SearchMatchKind::Recap, snippet, None),
                                     score,
                                 ));
                             } else {
@@ -454,6 +462,11 @@ fn best_name_match(session: &AgentSession, query: &str) -> Option<(usize, String
         candidates.push((score.saturating_add(25), session.path.clone()));
     }
     candidates.into_iter().min_by_key(|(score, _)| *score)
+}
+
+fn best_recap_match(session: &AgentSession, query: &str) -> Option<(usize, String)> {
+    let recap = session.recap.as_deref()?.trim();
+    search_match_score(recap, query).map(|score| (score, recap.to_string()))
 }
 
 fn search_session_history(
