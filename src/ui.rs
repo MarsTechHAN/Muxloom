@@ -27,7 +27,7 @@ use crate::{
 
 const ACCENT: Color = Color::Rgb(112, 184, 255);
 const CODEX: Color = Color::Cyan;
-const CLAUDE: Color = Color::Yellow;
+const CLAUDE: Color = Color::Rgb(215, 119, 87);
 const TERMINAL: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -1358,24 +1358,120 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Style::default().fg(MUTED),
         ))
     };
-    let preview_lines = wrapped_text_height(&preview, inner.width);
-    let paragraph = Paragraph::new(preview)
-        .scroll((form.preview_scroll, 0))
-        .wrap(Wrap { trim: false });
-    form.preview_max_scroll = preview_lines
+    let total_rows = wrapped_text_height(&preview, inner.width);
+    form.preview_max_scroll = total_rows
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     form.preview_page_rows = inner.height.max(1);
     form.preview_scroll = form.preview_scroll.min(form.preview_max_scroll);
-    frame.render_widget(paragraph.scroll((form.preview_scroll, 0)), inner);
+    // Wrap and window the preview ourselves instead of leaning on ratatui's
+    // Paragraph scroll+wrap. That path miscounts wrapped rows for the very long
+    // lines in JSON/JSONL session dumps and, once scrolled, leaves stray glyphs
+    // on otherwise-empty rows. Emitting exactly the visible rows keeps scroll
+    // bounds accurate and drops control characters that would shift columns.
+    let window = preview_window(
+        &preview,
+        inner.width,
+        form.preview_scroll as usize,
+        inner.height as usize,
+    );
+    frame.render_widget(Paragraph::new(Text::from(window)), inner);
+}
+
+/// Rows a single logical line occupies when hard-wrapped to `width` display
+/// columns. Must mirror `split_line` exactly so scroll bounds line up with what
+/// is actually rendered. Zero-width and control characters are ignored.
+fn wrapped_row_count(line: &Line<'_>, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+            if advance == 0 {
+                continue;
+            }
+            if column > 0 && column + advance > width {
+                rows += 1;
+                column = 0;
+            }
+            column += advance;
+        }
+    }
+    rows
 }
 
 fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
     let width = width.max(1) as usize;
     text.lines
         .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
+        .map(|line| wrapped_row_count(line, width))
         .sum()
+}
+
+/// Hard-wrap one logical line into visual rows no wider than `width`, splitting
+/// styled spans at the wrap points and folding the line-level style into each
+/// span so highlighting survives. Kept consistent with `wrapped_row_count`.
+fn split_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut buffer = String::new();
+    let mut column = 0usize;
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for character in span.content.chars() {
+            let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+            if advance == 0 {
+                continue;
+            }
+            if column > 0 && column + advance > width {
+                if !buffer.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut buffer), style));
+                }
+                rows.push(Line::from(std::mem::take(&mut current)));
+                column = 0;
+            }
+            buffer.push(character);
+            column += advance;
+        }
+        if !buffer.is_empty() {
+            current.push(Span::styled(std::mem::take(&mut buffer), style));
+        }
+    }
+    rows.push(Line::from(current));
+    rows
+}
+
+/// The visual rows visible in a `height`-row viewport that starts at wrapped
+/// row `start`. Only lines overlapping the window are materialised, so large
+/// files stay off the allocation-heavy part of the render path.
+fn preview_window(text: &Text<'_>, width: u16, start: usize, height: usize) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1) as usize;
+    let end = start.saturating_add(height);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(height);
+    let mut row = 0usize;
+    for line in &text.lines {
+        if out.len() >= height {
+            break;
+        }
+        let count = wrapped_row_count(line, width);
+        if row + count <= start {
+            row += count;
+            continue;
+        }
+        for (index, visual) in split_line(line, width).into_iter().enumerate() {
+            let global = row + index;
+            if global >= start && global < end {
+                out.push(visual);
+            }
+        }
+        row += count;
+    }
+    out
 }
 
 fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
@@ -2510,11 +2606,16 @@ fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
 }
 
 fn running_agent_effect(kind: AgentKind, frame: u64) -> &'static str {
-    const CODEX_FRAMES: [&str; 2] = ["•", "◦"];
-    const CLAUDE_FRAMES: [&str; 4] = ["✻", "✽", "✶", "✳"];
+    // Codex is a cyan rotating braille spinner (single-column, so it keeps a
+    // stable footprint); Claude keeps its own orange sparkle, matching the
+    // asterisk glyphs Claude Code itself cycles through. Both advance one frame
+    // per `frame`, so with a time-based counter they animate at a constant rate
+    // regardless of how often the UI redraws.
+    const CODEX_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
+    const CLAUDE_FRAMES: [&str; 6] = ["✻", "✽", "✶", "✳", "✶", "✽"];
     match kind {
-        AgentKind::Codex => CODEX_FRAMES[(frame / 18 % CODEX_FRAMES.len() as u64) as usize],
-        AgentKind::Claude => CLAUDE_FRAMES[(frame / 4 % CLAUDE_FRAMES.len() as u64) as usize],
+        AgentKind::Codex => CODEX_FRAMES[(frame % CODEX_FRAMES.len() as u64) as usize],
+        AgentKind::Claude => CLAUDE_FRAMES[(frame % CLAUDE_FRAMES.len() as u64) as usize],
         AgentKind::Terminal => "▣",
     }
 }
@@ -2753,7 +2854,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(machines.contains('•'));
+        assert!(machines.contains('⠋'));
         assert!(machines.contains('✻'));
 
         terminal
@@ -2766,7 +2867,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(folders.contains("/work/project • ✻"));
+        assert!(folders.contains("/work/project ⠋ ✻"));
 
         app.animation_frame = 20;
         terminal
@@ -2779,8 +2880,74 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(next_frame.contains('◦'));
-        assert!(next_frame.contains('✽'));
+        assert!(next_frame.contains('⠼'));
+        assert!(next_frame.contains('✶'));
+    }
+
+    #[test]
+    fn running_agent_effect_glyphs_are_single_column() {
+        for kind in [AgentKind::Codex, AgentKind::Claude] {
+            for frame in 0..16 {
+                let glyph = running_agent_effect(kind, frame);
+                assert_eq!(
+                    UnicodeWidthStr::width(glyph),
+                    1,
+                    "spinner glyph {glyph:?} must occupy exactly one column"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preview_wrapping_windows_rows_and_drops_control_chars() {
+        // A single long logical line hard-wraps into ceil(len / width) rows and
+        // the height estimate matches what is rendered.
+        let long = "a".repeat(250);
+        let text = Text::from(vec![Line::raw(long)]);
+        assert_eq!(wrapped_row_count(&text.lines[0], 80), 4);
+        assert_eq!(wrapped_text_height(&text, 80), 4);
+
+        // The window returns exactly the visible rows, none wider than the pane.
+        let top = preview_window(&text, 80, 0, 2);
+        assert_eq!(top.len(), 2);
+        assert!(top.iter().all(|line| line.width() == 80));
+
+        // Scrolling past the full rows yields only the short trailing remainder.
+        let tail = preview_window(&text, 80, 3, 2);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].width(), 250 - 80 * 3);
+
+        // Control / zero-width characters are stripped so they cannot shift the
+        // column accounting and leave stray glyphs behind while scrolling.
+        let dirty = Text::from(vec![Line::raw("a\u{1b}b")]);
+        assert_eq!(wrapped_row_count(&dirty.lines[0], 80), 1);
+        let rendered: String = preview_window(&dirty, 80, 0, 1)[0]
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .collect();
+        assert_eq!(rendered, "ab");
+    }
+
+    #[test]
+    fn preview_window_scrolls_to_the_requested_row() {
+        let text = Text::from(
+            (0..6)
+                .map(|index| Line::raw(format!("line{index}")))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(wrapped_text_height(&text, 80), 6);
+        let window = preview_window(&text, 80, 2, 3);
+        let rendered: Vec<String> = window
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rendered, vec!["line2", "line3", "line4"]);
     }
 
     #[test]

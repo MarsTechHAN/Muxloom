@@ -243,8 +243,10 @@ shortcut or clickable Back control returns to navigation.
 | Archived | The agent exited or was stopped; metadata and history remain |
 
 Working indicators animate in both Machines and folder/session rows. Codex uses
-a cyan `•`/`◦` pulse; Claude uses a yellow `✻`/`✽`/`✶`/`✳` cycle. Terminal,
-Idle, Waiting, and Archived entries never animate.
+a cyan rotating braille spinner (`⠋⠙⠹…`); Claude uses its orange sparkle
+(`✻✽✶✳`), matching the glyphs Claude Code itself cycles through. Both advance on
+wall-clock time, so the animation speed stays constant regardless of redraw
+rate. Terminal, Idle, Waiting, and Archived entries never animate.
 
 <a id="en-controls"></a>
 
@@ -482,8 +484,10 @@ selected machine when no session is selected.
 - From Agents by folder, that pane becomes the file selector. Opening a file
   renders Preview in the large terminal pane.
 
-File mode owns keyboard input, so unbound text such as `n` cannot leak into
-global session actions.
+While the file pane holds focus it owns keyboard input, so unbound text such as
+`n` cannot leak into global session actions. Move focus to another pane (the
+pane-focus shortcut, or clicking it) to type or control there; Files stays open
+in its own pane. Entering or leaving a directory clears the match query.
 
 | Key or gesture | Action |
 | --- | --- |
@@ -798,8 +802,10 @@ Codex Resume 来源是 `~/.codex/sessions` 和 `~/.codex/session_index.jsonl`；
 | Idle | 进程存活并停在普通输入提示 |
 | Archived | Agent 已退出或被停止，元数据和历史仍保留 |
 
-Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色 `•`/`◦`，Claude
-使用黄色 `✻`/`✽`/`✶`/`✳`。Terminal、Idle、Waiting、Archived 不播放动画。
+Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色旋转盲文 spinner
+（`⠋⠙⠹…`），Claude 使用橙色 sparkle（`✻✽✶✳`），与 Claude Code 自身循环的字形一致。
+两者均按墙钟时间推进，速度不随重绘频率变化。Terminal、Idle、Waiting、Archived
+不播放动画。
 
 <a id="zh-controls"></a>
 
@@ -903,7 +909,9 @@ Waiting 状态、Bell 和 OSC 9，并对同一个 Prompt 去重。Attached Termi
 - Focus 在 Agents by folder 时，该 Pane 变成文件选择器；打开文件后在上方/右侧的大
   Terminal Pane 中显示 Preview。
 
-文件模式会捕捉文本和组合键，`n` 等不会泄漏成全局操作。
+Focus 在文件 Pane 时它会捕捉文本和组合键，`n` 等不会泄漏成全局操作。把 Focus 切到其他
+Pane（Pane-focus 快捷键或点击）即可在那里输入或操作，Files 仍停留在自己的 Pane。进入或
+离开目录会清空 Match Query。
 
 | 按键或操作 | 行为 |
 | --- | --- |

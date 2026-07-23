@@ -154,6 +154,11 @@ pub struct HelpForm {
 
 pub const HELP_CONTENT_ROWS: usize = 50;
 
+/// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
+/// frame index from elapsed time divided by this keeps the animation speed
+/// constant regardless of how frequently the UI redraws.
+const ANIMATION_FRAME_MS: u128 = 90;
+
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
     pub scope: SettingsScope,
@@ -331,6 +336,7 @@ pub struct App {
     pub pending_terminal_session_id: Option<String>,
     pub terminal_selection: Option<TerminalSelection>,
     pub animation_frame: u64,
+    animation_epoch: Instant,
     worker: Worker,
     pending_scans: HashSet<String>,
     pending_capture: Option<(String, String, usize)>,
@@ -409,6 +415,7 @@ impl App {
             pending_terminal_session_id: None,
             terminal_selection: None,
             animation_frame: 0,
+            animation_epoch: Instant::now(),
             worker,
             pending_scans: HashSet::new(),
             pending_capture: None,
@@ -437,7 +444,11 @@ impl App {
     }
 
     pub fn on_tick(&mut self) {
-        self.animation_frame = self.animation_frame.wrapping_add(1);
+        // Advance the spinner from wall-clock time, not per-iteration, so its
+        // speed stays constant no matter how often the loop redraws (e.g. a
+        // stream of mouse-move events must not make the animation race).
+        self.animation_frame =
+            (self.animation_epoch.elapsed().as_millis() / ANIMATION_FRAME_MS) as u64;
         self.drain_worker();
         self.poll_media();
         self.poll_terminal();
@@ -465,13 +476,24 @@ impl App {
             return self.handle_modal(key, modal);
         }
         if self.file_manager.is_some() {
+            // Ctrl+F toggles the browser closed regardless of which pane is focused.
             if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.open_file_manager();
-            } else {
-                self.focus = Focus::Agents;
-                self.handle_file_key(key);
+                return Action::Continue;
             }
-            return Action::Continue;
+            // Pane-focus shortcuts must still move focus between the browser and
+            // the other panes; otherwise the browser would trap every key.
+            if let Some(direction) = self.focus_direction_for_key(key) {
+                self.move_focus(direction);
+                return Action::Continue;
+            }
+            // The browser is modal only while its own pane (the agents column) is
+            // focused. When another pane holds focus, fall through so it can
+            // handle the key normally.
+            if self.focus == Focus::Agents {
+                self.handle_file_key(key);
+                return Action::Continue;
+            }
         }
         if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.open_file_manager();
@@ -954,7 +976,8 @@ impl App {
         if text.is_empty() {
             return;
         }
-        if let Some(form) = self.file_manager.take() {
+        if self.focus == Focus::Agents && self.file_manager.is_some() {
+            let form = self.file_manager.take().expect("file manager present");
             self.upload_dropped_files(&form, &text);
             self.file_manager = Some(form);
             return;
@@ -3016,6 +3039,9 @@ impl App {
         path: String,
         return_path: Option<String>,
     ) {
+        // Entering or leaving a directory resets the filter so the query does not
+        // silently follow the user into a folder where it no longer matches.
+        form.query.clear();
         if !form.entries.is_empty() {
             form.directory_cache
                 .insert(form.path.clone(), form.entries.clone());
@@ -5669,6 +5695,168 @@ mod tests {
             Request::UploadFiles { ref remote_directory, .. } if remote_directory == "/work/project"
         ));
         let _ = std::fs::remove_file(dropped);
+    }
+
+    #[test]
+    fn file_browser_captures_input_only_while_its_pane_is_focused() {
+        let config = Config::default();
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloom-codex-modal".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "modal".into(),
+            created_at: 1,
+            dead: false,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloom-codex-modal".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Agents);
+
+        // Focused browser pane: keys edit its filter.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.clone()),
+            Some("x".into())
+        );
+
+        // Focus another pane: the browser stays open but no longer swallows keys.
+        app.focus = Focus::Recap;
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.file_manager.is_some());
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.clone()),
+            Some("x".into())
+        );
+
+        // Refocusing the browser pane routes input back into it.
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.clone()),
+            Some("xz".into())
+        );
+    }
+
+    #[test]
+    fn entering_or_leaving_a_folder_clears_the_search_filter() {
+        let config = Config::default();
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloom-codex-nav".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "nav".into(),
+            created_at: 1,
+            dead: false,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloom-codex-nav".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work/project".into(),
+            result: Ok(FileListing {
+                path: "/work/project".into(),
+                entries: vec![FileEntry {
+                    name: "src".into(),
+                    path: "/work/project/src".into(),
+                    kind: FileEntryKind::Directory,
+                    size: 0,
+                }],
+            }),
+        });
+
+        // Filter, then descend into the directory: the filter resets.
+        app.file_manager.as_mut().unwrap().query = "src".into();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.path.as_str()),
+            Some("/work/project/src")
+        );
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.as_str()),
+            Some("")
+        );
+
+        // Filter again, then go back up to the parent: the filter resets again.
+        app.file_manager.as_mut().unwrap().query = "proj".into();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.path.as_str()),
+            Some("/work/project")
+        );
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn spinner_frame_advances_on_wall_clock_not_per_iteration() {
+        let config = Config::default();
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        // Many ticks in a tight loop (well under one frame window) must not
+        // advance the spinner once per iteration; a burst of redraws from mouse
+        // movement must not speed the animation up.
+        let start = app.animation_frame;
+        for _ in 0..64 {
+            app.on_tick();
+        }
+        assert!(app.animation_frame - start < 64);
     }
 
     #[test]
