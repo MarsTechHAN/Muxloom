@@ -1388,7 +1388,21 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         form.preview_scroll as usize,
         inner.height as usize,
     );
+    // Remember the plain text of the visible rows so a mouse selection over the
+    // preview can be copied, mirroring terminal selection.
+    form.preview_text_area = Some(inner);
+    form.preview_visible = window
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let selection = form.preview_selection;
     frame.render_widget(Paragraph::new(Text::from(window)), inner);
+    highlight_terminal_selection(frame, inner, selection);
 }
 
 /// Rows a single logical line occupies when hard-wrapped to `width` display
@@ -3255,6 +3269,9 @@ mod tests {
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
+            preview_text_area: None,
+            preview_visible: Vec::new(),
+            preview_selection: None,
             media_playback: None,
             media_frame: None,
             media_loading: false,

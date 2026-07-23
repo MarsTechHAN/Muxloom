@@ -112,6 +112,9 @@ pub struct FileManagerForm {
     pub entry_rows: Vec<(usize, Rect)>,
     pub list_area: Option<Rect>,
     pub preview_area: Option<Rect>,
+    pub preview_text_area: Option<Rect>,
+    pub preview_visible: Vec<String>,
+    pub preview_selection: Option<TerminalSelection>,
     pub media_playback: Option<MediaPlayback>,
     pub media_frame: Option<MediaFrame>,
     pub media_loading: bool,
@@ -469,7 +472,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if is_copy_shortcut(key) && self.copy_terminal_selection() {
+        if is_copy_shortcut(key)
+            && (self.copy_preview_selection() || self.copy_terminal_selection())
+        {
             return Action::Continue;
         }
         if let Some(modal) = self.modal.take() {
@@ -887,7 +892,10 @@ impl App {
         let in_preview = form
             .preview_area
             .is_some_and(|area| inside(area, mouse.column, mouse.row));
-        if !in_list && !in_preview {
+        let preview_dragging = form
+            .preview_selection
+            .is_some_and(|selection| selection.dragging);
+        if !in_list && !in_preview && !preview_dragging {
             return false;
         }
         let mut form = self.file_manager.take().expect("file form disappeared");
@@ -941,14 +949,42 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if in_preview => {
+                let mut closed = false;
                 if let Some(path) = form.preview_path.clone() {
                     let key = format!("preview:{path}");
                     if self.is_file_double_click(&key) {
                         self.last_file_click = None;
                         Self::clear_file_preview(&mut form);
                         self.status_message = "File preview closed; terminal restored".into();
+                        closed = true;
                     }
                 }
+                if !closed && let Some(point) = Self::preview_cell(&form, mouse) {
+                    form.preview_selection = Some(TerminalSelection {
+                        anchor: point,
+                        cursor: point,
+                        dragging: true,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if preview_dragging => {
+                if let Some(point) = Self::preview_cell(&form, mouse)
+                    && let Some(selection) = form.preview_selection.as_mut()
+                {
+                    selection.cursor = point;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if preview_dragging => {
+                if let Some(selection) = form.preview_selection.as_mut() {
+                    selection.dragging = false;
+                }
+                if let Some(text) = Self::selected_preview_text(&form) {
+                    let characters = text.chars().count();
+                    self.clipboard_request = Some(text);
+                    self.status_message = format!("Copied {characters} characters to clipboard");
+                }
+                self.file_manager = Some(form);
+                return true;
             }
             _ => {}
         }
@@ -970,6 +1006,39 @@ impl App {
             at: now,
         });
         double_click
+    }
+
+    /// Map a mouse position to a cell within the preview text area, clamped so a
+    /// drag that leaves the pane still resolves to an edge cell.
+    fn preview_cell(form: &FileManagerForm, mouse: MouseEvent) -> Option<TerminalPoint> {
+        let inner = form.preview_text_area?;
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        Some(TerminalPoint {
+            row: mouse.row.saturating_sub(inner.y).min(inner.height - 1),
+            column: mouse.column.saturating_sub(inner.x).min(inner.width - 1),
+        })
+    }
+
+    /// Extract the text covered by the preview selection from the rows currently
+    /// on screen.
+    fn selected_preview_text(form: &FileManagerForm) -> Option<String> {
+        selection_text(&form.preview_visible, form.preview_selection?)
+    }
+
+    fn copy_preview_selection(&mut self) -> bool {
+        let Some(text) = self
+            .file_manager
+            .as_ref()
+            .and_then(Self::selected_preview_text)
+        else {
+            return false;
+        };
+        let characters = text.chars().count();
+        self.clipboard_request = Some(text);
+        self.status_message = format!("Copied {characters} characters to clipboard");
+        true
     }
 
     pub fn handle_paste(&mut self, text: String) {
@@ -2949,6 +3018,9 @@ impl App {
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
+            preview_text_area: None,
+            preview_visible: Vec::new(),
+            preview_selection: None,
             media_playback: None,
             media_frame: None,
             media_loading: false,
@@ -2991,6 +3063,9 @@ impl App {
         form.preview_page_rows = 1;
         form.preview_rendered = None;
         form.preview_area = None;
+        form.preview_text_area = None;
+        form.preview_visible.clear();
+        form.preview_selection = None;
         form.media_playback = None;
         form.media_frame = None;
         form.media_loading = false;
@@ -4668,6 +4743,41 @@ fn display_column_slice(value: &str, start: u16, end: u16) -> String {
     output
 }
 
+/// Join the on-screen preview rows covered by a selection into copyable text.
+/// Rows are the plain text of what is currently visible; columns are character
+/// offsets. The end column is inclusive, matching the highlight.
+fn selection_text(lines: &[String], selection: TerminalSelection) -> Option<String> {
+    if selection.anchor == selection.cursor {
+        return None;
+    }
+    let (start, end) = selection.normalized();
+    let mut text = String::new();
+    for row in start.row..=end.row {
+        let characters: Vec<char> = lines
+            .get(row as usize)
+            .map(|line| line.chars().collect())
+            .unwrap_or_default();
+        let from = if row == start.row {
+            usize::from(start.column)
+        } else {
+            0
+        };
+        let to = if row == end.row {
+            (usize::from(end.column) + 1).min(characters.len())
+        } else {
+            characters.len()
+        };
+        if from < to {
+            text.extend(&characters[from..to]);
+        }
+        if row != end.row {
+            text.push('\n');
+        }
+    }
+    let text = text.trim_end_matches([' ', '\n', '\r']).to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 fn parent_path(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -4838,6 +4948,28 @@ mod tests {
         receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("expected worker request within two seconds")
+    }
+
+    #[test]
+    fn preview_selection_copies_the_covered_rows() {
+        let lines = vec!["hello world".to_string(), "second line".to_string()];
+        // Multi-row selection: mid first row through mid second row (inclusive end).
+        let span = TerminalSelection {
+            anchor: TerminalPoint { row: 0, column: 6 },
+            cursor: TerminalPoint { row: 1, column: 5 },
+            dragging: false,
+        };
+        assert_eq!(
+            selection_text(&lines, span).as_deref(),
+            Some("world\nsecond")
+        );
+        // A zero-width selection (a plain click) copies nothing.
+        let empty = TerminalSelection {
+            anchor: TerminalPoint { row: 0, column: 2 },
+            cursor: TerminalPoint { row: 0, column: 2 },
+            dragging: false,
+        };
+        assert_eq!(selection_text(&lines, empty), None);
     }
 
     #[test]
