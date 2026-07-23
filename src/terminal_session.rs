@@ -23,6 +23,14 @@ enum TerminalEvent {
     Closed,
 }
 
+/// Rows of rendered scrollback the embedded emulator retains. Scrolling reads
+/// from this buffer so back-scroll shows the emulator's actual lines instead of
+/// linearizing the raw output log, which mangles live-redrawing TUIs. vt100
+/// grows the buffer lazily, so this cap only bounds a long-lived session; on
+/// re-attach the daemon replays its retained output (up to 2 MiB) to refill it,
+/// so scrollback survives quitting and relaunching the controller.
+const SCROLLBACK_LINES: usize = 20_000;
+
 pub struct TerminalSession {
     parser: vt100::Parser,
     master: Option<Box<dyn MasterPty + Send>>,
@@ -165,7 +173,7 @@ impl TerminalSession {
         });
 
         Ok(Self {
-            parser: vt100::Parser::new(height, width, 0),
+            parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             master: Some(pair.master),
             writer: Some(writer),
             child: Some(child),
@@ -191,7 +199,7 @@ impl TerminalSession {
         let height = height.max(5);
         let stream = bridges.open_pty(target, session_id.into(), width, height)?;
         Ok(Self {
-            parser: vt100::Parser::new(height, width, 0),
+            parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             master: None,
             writer: None,
             child: None,
@@ -238,6 +246,18 @@ impl TerminalSession {
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Move the visible window `rows` lines up into rendered scrollback (0 is the
+    /// live bottom). vt100 clamps to what the buffer actually holds; read the
+    /// applied position back with [`Self::scrollback`].
+    pub fn set_scrollback(&mut self, rows: usize) {
+        self.parser.set_scrollback(rows);
+    }
+
+    /// The current scrollback offset in rows from the live bottom.
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -562,6 +582,27 @@ fn function_sequence(number: u8, modifier: u8) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrollback_buffer_retains_lines_and_clamps_the_offset() {
+        // Guards the emulator-scrollback behaviour the terminal scroll relies on.
+        let mut parser = vt100::Parser::new(2, 10, SCROLLBACK_LINES);
+        for index in 0..10 {
+            parser.process(format!("line{index}\r\n").as_bytes());
+        }
+        assert_eq!(parser.screen().scrollback(), 0, "starts at the live bottom");
+        parser.set_scrollback(3);
+        assert_eq!(parser.screen().scrollback(), 3);
+        parser.set_scrollback(usize::MAX);
+        let deepest = parser.screen().scrollback();
+        assert!(deepest >= 3, "output scrolled into scrollback: {deepest}");
+        parser.set_scrollback(0);
+        assert_eq!(
+            parser.screen().scrollback(),
+            0,
+            "returns to the live bottom"
+        );
+    }
 
     #[test]
     fn shrinking_after_a_wide_glyph_at_the_boundary_stays_valid() {

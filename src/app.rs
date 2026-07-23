@@ -1348,6 +1348,15 @@ impl App {
                 || self.pending_terminal_session_id.as_deref() == selected)
     }
 
+    /// True when a live emulator is attached for the currently selected session,
+    /// so scrolling and copying should read its rendered scrollback rather than
+    /// the linearized raw output log.
+    pub(crate) fn attached_terminal_for_selected(&self) -> bool {
+        self.terminal.is_some()
+            && self.selected_session_id.is_some()
+            && self.terminal_session_id.as_deref() == self.selected_session_id.as_deref()
+    }
+
     fn sync_terminal_size(&mut self) {
         let mut resize_error = None;
         if let Some(terminal) = self.terminal.as_mut()
@@ -2596,6 +2605,10 @@ impl App {
     }
 
     fn scroll_history(&mut self, older: bool, lines: usize) {
+        if self.attached_terminal_for_selected() {
+            self.scroll_attached_terminal(older, lines);
+            return;
+        }
         if older
             && self.history_offset == 0
             && let Some(session) = self.selected_session().cloned()
@@ -2631,6 +2644,35 @@ impl App {
         } else {
             self.request_history();
         }
+    }
+
+    /// Scroll a live attached terminal through the emulator's own rendered
+    /// scrollback. `history_offset` mirrors the emulator offset (rows up from the
+    /// live bottom); the emulator clamps to what its buffer holds.
+    fn scroll_attached_terminal(&mut self, older: bool, lines: usize) {
+        let step = lines.max(1);
+        let desired = if older {
+            self.history_offset.saturating_add(step)
+        } else {
+            self.history_offset.saturating_sub(step)
+        };
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.set_scrollback(desired);
+            self.history_offset = terminal.scrollback();
+        }
+        if older && self.history_offset < desired {
+            self.status_message = if self.history_offset == 0 {
+                "This terminal has no scrollback yet".into()
+            } else {
+                format!(
+                    "Reached the oldest buffered line ({} up)",
+                    self.history_offset
+                )
+            };
+        }
+        self.terminal_selection = None;
+        self.history_loading = false;
+        self.history_message.clear();
     }
 
     fn open_launch(&mut self) {
@@ -4174,6 +4216,14 @@ impl App {
     }
 
     fn copy_terminal_selection(&mut self) -> bool {
+        // Make sure the emulator is at the same scrollback position that is on
+        // screen, so a selection made while scrolled back copies what is shown.
+        if self.attached_terminal_for_selected() {
+            let offset = self.history_offset;
+            if let Some(terminal) = self.terminal.as_mut() {
+                terminal.set_scrollback(offset);
+            }
+        }
         let Some(text) = self.selected_terminal_text() else {
             return false;
         };
@@ -4189,7 +4239,7 @@ impl App {
             return None;
         }
         let (start, end) = selection.normalized();
-        let text = if self.history_offset == 0 {
+        let text = if self.attached_terminal_for_selected() {
             let screen = self.terminal.as_ref()?.screen();
             let (rows, columns) = screen.size();
             if rows == 0 || columns == 0 {

@@ -791,6 +791,19 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     app.resize_agent_viewport(inner.width, inner.height);
 
+    if app.attached_terminal_for_selected() {
+        // A live emulator scrolls through its own rendered scrollback, so
+        // back-scroll shows real lines instead of a mangled raw-log replay.
+        let offset = app.history_offset;
+        let show_cursor = app.interactive && offset == 0;
+        let selection = app.terminal_selection;
+        if let Some(terminal) = app.terminal.as_mut() {
+            terminal.set_scrollback(offset);
+            render_vt_screen(frame, terminal.screen(), inner, show_cursor);
+        }
+        highlight_terminal_selection(frame, inner, selection);
+        return;
+    }
     if (app.history_offset == 0 || (app.history_loading && app.history.text.is_empty()))
         && let Some(terminal) = app.terminal.as_ref()
     {
