@@ -40,7 +40,12 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
     };
     let agent = CommandConfig {
         command: "sh".into(),
-        args: vec!["-c".into(), format!("printf '{marker}\\n'; sleep 0.2")],
+        args: vec![
+            "-c".into(),
+            format!(
+                "printf '\\033[2J\\033[H• Working (1s • esc to interrupt)\\n{marker}\\n'; sleep 10"
+            ),
+        ],
         ..CommandConfig::default()
     };
 
@@ -65,10 +70,25 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(history.contains(&marker), "remote history: {history:?}");
-    let (_, sessions) = runtime
-        .probe_and_discover(&target, "sh", "sh", &[])
-        .unwrap();
+    let mut sessions = Vec::new();
+    let mut working_seen = false;
+    for _ in 0..40 {
+        (_, sessions) = runtime
+            .probe_and_discover(&target, "sh", "sh", &[])
+            .unwrap();
+        working_seen = sessions
+            .iter()
+            .any(|session| session.id == session_id && session.working);
+        if working_seen {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(sessions.iter().any(|session| session.id == session_id));
     assert_eq!(runtime.bridge_pool().connected_targets(), 1);
     runtime.kill(&target, &session_id).unwrap();
+    assert!(
+        working_seen,
+        "remote daemon never reported a working session"
+    );
 }

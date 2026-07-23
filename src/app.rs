@@ -18,7 +18,7 @@ use crate::{
         SearchResult, Target, TargetStatus,
     },
     recap::extract_recap,
-    runtime::Runtime,
+    runtime::{Runtime, agent_is_working, attention_reason},
     ssh_config,
     terminal_session::TerminalSession,
     worker::{Event, Request, ScanRequest, Worker},
@@ -1282,6 +1282,17 @@ impl App {
             .unwrap_or((false, false));
         if changed
             && !closed
+            && let (Some(session_id), Some(screen)) = (
+                self.terminal_session_id.clone(),
+                self.terminal
+                    .as_ref()
+                    .map(|terminal| terminal.screen().contents()),
+            )
+        {
+            self.sync_live_agent_activity(&session_id, &screen);
+        }
+        if changed
+            && !closed
             && self.terminal_session_id.as_deref() == self.selected_session_id.as_deref()
         {
             self.terminal_retry_at = None;
@@ -1350,6 +1361,43 @@ impl App {
             } else {
                 "Live terminal connected in background".into()
             };
+        }
+    }
+
+    fn sync_live_agent_activity(&mut self, session_id: &str, screen: &str) {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let (kind, target_id, dead) = {
+            let session = &self.sessions[index];
+            (session.kind, session.target_id.clone(), session.dead)
+        };
+        if dead || kind == AgentKind::Terminal {
+            return;
+        }
+
+        let attention =
+            attention_reason(kind, screen, self.config.attention_patterns_for(&target_id));
+        let working = attention.is_none() && agent_is_working(kind, screen);
+        let session = &mut self.sessions[index];
+        let changed = session.working != working
+            || session.needs_attention != attention.is_some()
+            || session.attention_reason != attention;
+        session.working = working;
+        session.needs_attention = attention.is_some();
+        session.attention_reason = attention;
+        if changed {
+            debug::log(
+                "activity",
+                format!(
+                    "source=live-terminal target={} session={} kind={} working={} attention={}",
+                    target_id, session_id, kind, session.working, session.needs_attention
+                ),
+            );
         }
     }
 
@@ -4473,6 +4521,45 @@ mod tests {
         );
         assert_eq!(styled, "\x1b[31;1mred\x1b[0m\nlink");
         assert_eq!(strip_terminal_styles(&styled), "red\nlink");
+    }
+
+    #[test]
+    fn live_terminal_frames_update_working_state_without_waiting_for_a_scan() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloomd-codex-live".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work".into(),
+            label: "live status".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+
+        app.sync_live_agent_activity("muxloomd-codex-live", "• Working (1s • esc to interrupt)");
+        assert!(app.sessions[0].working);
+
+        app.sync_live_agent_activity(
+            "muxloomd-codex-live",
+            "› Ask Codex anything\ngpt-5.6-sol xhigh · /work",
+        );
+        assert!(!app.sessions[0].working);
     }
 
     #[test]

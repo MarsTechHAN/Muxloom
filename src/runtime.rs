@@ -199,6 +199,29 @@ impl Runtime {
             for session_id in dead_terminals {
                 let _ = self.bridges.delete(target, session_id);
             }
+            debug::log(
+                "runtime",
+                format!(
+                    "probe done target={} backend=muxloomd codex={} claude={} sessions={}",
+                    target.id,
+                    available.iter().any(|item| item == codex_command),
+                    available.iter().any(|item| item == claude_command),
+                    sessions.len()
+                ),
+            );
+            for session in &sessions {
+                debug::log(
+                    "activity",
+                    format!(
+                        "source=muxloomd target={} session={} kind={} working={} attention={}",
+                        target.id,
+                        session.id,
+                        session.kind,
+                        session.working,
+                        session.needs_attention
+                    ),
+                );
+            }
             return Ok((
                 Probe {
                     tmux: false,
