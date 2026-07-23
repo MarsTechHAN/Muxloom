@@ -479,7 +479,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
 
 fn print_help() {
     println!(
-        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug]\n    muxloom init [--config PATH]\n\nOPTIONS:\n    -h, --help          Show this help\n    -V, --version       Show version\n        --config PATH   Use a custom TOML config\n        --debug         Write detailed diagnostics to the state directory\n        --debug-log PATH  Write diagnostics to a custom file\n",
+        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n",
         env!("CARGO_PKG_VERSION")
     );
 }
