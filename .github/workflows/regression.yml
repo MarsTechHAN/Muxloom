@@ -1,0 +1,85 @@
+name: Cross-platform regression
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  format:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rustfmt
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  regression:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-latest
+            install_tmux: true
+          - label: macOS Apple Silicon
+            os: macos-latest
+            install_tmux: true
+          - label: Windows x86_64
+            os: windows-latest
+            install_tmux: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup component add clippy
+
+      - name: Install tmux on Linux
+        if: runner.os == 'Linux' && matrix.install_tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS' && matrix.install_tmux
+        shell: bash
+        run: command -v tmux >/dev/null || brew install tmux
+
+      - name: Build all targets
+        run: cargo build --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run regression suite
+        run: cargo test --locked --all-targets -- --test-threads=1
