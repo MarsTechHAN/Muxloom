@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::mpsc, thread};
 
 use crate::{
+    bridge::BridgePool,
     config::CommandConfig,
     debug,
     model::{
@@ -149,10 +150,12 @@ pub enum Event {
 pub struct Worker {
     pub requests: mpsc::Sender<Request>,
     pub events: mpsc::Receiver<Event>,
+    pub bridges: BridgePool,
 }
 
 impl Worker {
     pub fn start(runtime: Runtime) -> Self {
+        let bridges = runtime.bridge_pool();
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
@@ -173,7 +176,9 @@ impl Worker {
                             .map_err(|error| error.to_string());
                         if let Ok((_, sessions)) = &mut result {
                             for session in sessions.iter_mut().filter(|session| {
-                                !session.dead && session.kind != crate::model::AgentKind::Terminal
+                                !session.dead
+                                    && session.kind != crate::model::AgentKind::Terminal
+                                    && !crate::runtime::is_daemon_session_id(&session.id)
                             }) {
                                 match runtime.inspect_agent(
                                     &request.target,
@@ -185,7 +190,9 @@ impl Worker {
                                         session.working = working;
                                         session.needs_attention = attention.is_some();
                                         session.attention_reason = attention;
-                                        session.recap = recap;
+                                        if recap.is_some() {
+                                            session.recap = recap;
+                                        }
                                     }
                                     Err(error) => debug::log(
                                         "worker",
@@ -443,6 +450,7 @@ impl Worker {
         Self {
             requests: request_tx,
             events: event_rx,
+            bridges,
         }
     }
 }

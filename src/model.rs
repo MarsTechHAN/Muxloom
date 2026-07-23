@@ -213,13 +213,13 @@ pub struct LaunchRequest {
     pub resume_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryListing {
     pub path: String,
     pub directories: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileEntryKind {
     Directory,
     File,
@@ -227,7 +227,7 @@ pub enum FileEntryKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
@@ -235,13 +235,13 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileListing {
     pub path: String,
     pub entries: Vec<FileEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilePreviewKind {
     Text,
     Markdown,
@@ -262,7 +262,7 @@ impl fmt::Display for FilePreviewKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePreview {
     pub path: String,
     pub mime: String,

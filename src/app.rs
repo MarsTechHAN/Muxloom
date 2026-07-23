@@ -153,7 +153,7 @@ pub struct SearchForm {
     pub edited_at: Instant,
 }
 
-pub const SETTING_LABELS: [&str; 18] = [
+pub const SETTING_LABELS: [&str; 19] = [
     "Refresh interval (ms)",
     "SSH timeout (sec)",
     "History limit",
@@ -161,6 +161,7 @@ pub const SETTING_LABELS: [&str; 18] = [
     "SSH config path",
     "Environment (A=x B=y)",
     "Tunnel RPORT:LHOST:LPORT",
+    "Companion command",
     "Codex command",
     "Codex args",
     "Codex install command",
@@ -174,9 +175,10 @@ pub const SETTING_LABELS: [&str; 18] = [
     "Attention patterns",
 ];
 
-pub const HOST_SETTING_LABELS: [&str; 13] = [
+pub const HOST_SETTING_LABELS: [&str; 14] = [
     "Environment (A=x B=y)",
     "Tunnel RPORT:LHOST:LPORT",
+    "Companion command",
     "Codex command",
     "Codex args",
     "Codex install command",
@@ -1111,12 +1113,23 @@ impl App {
                 target.id, session.id, self.agent_viewport_width, self.agent_viewport_height
             ),
         );
-        match TerminalSession::attach(
-            &target,
-            &session.id,
-            self.agent_viewport_width,
-            self.agent_viewport_height,
-        ) {
+        let terminal = if crate::runtime::is_daemon_session_id(&session.id) {
+            TerminalSession::attach_daemon(
+                self.worker.bridges.clone(),
+                &target,
+                &session.id,
+                self.agent_viewport_width,
+                self.agent_viewport_height,
+            )
+        } else {
+            TerminalSession::attach(
+                &target,
+                &session.id,
+                self.agent_viewport_width,
+                self.agent_viewport_height,
+            )
+        };
+        match terminal {
             Ok(terminal) => {
                 self.pending_terminal = Some(terminal);
                 self.pending_terminal_session_id = Some(session.id);
@@ -2387,6 +2400,7 @@ impl App {
                 self.config.ssh_config.clone(),
                 self.config.environment.clone(),
                 self.config.reverse_tunnel.clone(),
+                self.config.companion_command.clone(),
                 self.config.agents.codex.command.clone(),
                 format_shell_list(&self.config.agents.codex.args),
                 self.config.agents.codex.install.clone(),
@@ -2442,6 +2456,11 @@ impl App {
                     .get(&target_id)
                     .and_then(|host| host.reverse_tunnel.clone())
                     .unwrap_or_else(|| self.config.reverse_tunnel.clone()),
+                self.config
+                    .hosts
+                    .get(&target_id)
+                    .and_then(|host| host.companion_command.clone())
+                    .unwrap_or_else(|| self.config.companion_command.clone()),
                 codex.command,
                 format_shell_list(&codex.args),
                 codex.install,
@@ -3019,44 +3038,45 @@ impl App {
                     config.ssh_config = form.values[4].clone();
                     config.environment = form.values[5].clone();
                     config.reverse_tunnel = form.values[6].clone();
-                    config.agents.codex.command = form.values[7].clone();
+                    config.companion_command = form.values[7].clone();
+                    config.agents.codex.command = form.values[8].clone();
                     config.agents.codex.args =
-                        parse_shell_list(&form.values[8], SETTING_LABELS[8])?;
-                    config.agents.codex.install = form.values[9].clone();
+                        parse_shell_list(&form.values[9], SETTING_LABELS[9])?;
+                    config.agents.codex.install = form.values[10].clone();
                     config.agents.codex.sync_files =
-                        parse_shell_list(&form.values[10], SETTING_LABELS[10])?;
-                    config.agents.claude.command = form.values[11].clone();
+                        parse_shell_list(&form.values[11], SETTING_LABELS[11])?;
+                    config.agents.claude.command = form.values[12].clone();
                     config.agents.claude.args =
-                        parse_shell_list(&form.values[12], SETTING_LABELS[12])?;
-                    config.agents.claude.install = form.values[13].clone();
+                        parse_shell_list(&form.values[13], SETTING_LABELS[13])?;
+                    config.agents.claude.install = form.values[14].clone();
                     config.agents.claude.sync_files =
-                        parse_shell_list(&form.values[14], SETTING_LABELS[14])?;
-                    config.agents.terminal.command = form.values[15].clone();
+                        parse_shell_list(&form.values[15], SETTING_LABELS[15])?;
+                    config.agents.terminal.command = form.values[16].clone();
                     config.agents.terminal.args =
-                        parse_shell_list(&form.values[16], SETTING_LABELS[16])?;
-                    config.attention_patterns =
                         parse_shell_list(&form.values[17], SETTING_LABELS[17])?;
+                    config.attention_patterns =
+                        parse_shell_list(&form.values[18], SETTING_LABELS[18])?;
                 }
                 SettingsScope::Host(target_id) => {
                     let codex = CommandConfig {
-                        command: form.values[2].clone(),
-                        args: parse_shell_list(&form.values[3], HOST_SETTING_LABELS[3])?,
-                        install: form.values[4].clone(),
-                        sync_files: parse_shell_list(&form.values[5], HOST_SETTING_LABELS[5])?,
+                        command: form.values[3].clone(),
+                        args: parse_shell_list(&form.values[4], HOST_SETTING_LABELS[4])?,
+                        install: form.values[5].clone(),
+                        sync_files: parse_shell_list(&form.values[6], HOST_SETTING_LABELS[6])?,
                     };
                     let claude = CommandConfig {
-                        command: form.values[6].clone(),
-                        args: parse_shell_list(&form.values[7], HOST_SETTING_LABELS[7])?,
-                        install: form.values[8].clone(),
-                        sync_files: parse_shell_list(&form.values[9], HOST_SETTING_LABELS[9])?,
+                        command: form.values[7].clone(),
+                        args: parse_shell_list(&form.values[8], HOST_SETTING_LABELS[8])?,
+                        install: form.values[9].clone(),
+                        sync_files: parse_shell_list(&form.values[10], HOST_SETTING_LABELS[10])?,
                     };
                     let terminal = CommandConfig {
-                        command: form.values[10].clone(),
-                        args: parse_shell_list(&form.values[11], HOST_SETTING_LABELS[11])?,
+                        command: form.values[11].clone(),
+                        args: parse_shell_list(&form.values[12], HOST_SETTING_LABELS[12])?,
                         ..CommandConfig::default()
                     };
                     let attention_patterns =
-                        parse_shell_list(&form.values[12], HOST_SETTING_LABELS[12])?;
+                        parse_shell_list(&form.values[13], HOST_SETTING_LABELS[13])?;
                     config.hosts.insert(
                         target_id.clone(),
                         HostConfig {
@@ -3065,6 +3085,7 @@ impl App {
                             terminal: Some(terminal),
                             environment: Some(form.values[0].clone()),
                             reverse_tunnel: Some(form.values[1].clone()),
+                            companion_command: Some(form.values[2].clone()),
                             attention_patterns: Some(attention_patterns),
                         },
                     );
@@ -4624,7 +4645,7 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        form.values[15] = "/bin/zsh".into();
+        form.values[16] = "/bin/zsh".into();
         app.apply_settings(form);
 
         assert_eq!(app.config.refresh_interval_ms, 1500);
@@ -4714,6 +4735,7 @@ mod tests {
         let worker = Worker {
             requests: request_tx,
             events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
         };
         let mut app = App::new(
             config,
@@ -4783,6 +4805,7 @@ mod tests {
         let worker = Worker {
             requests: request_tx,
             events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
         };
         let mut app = App::new(
             config,
@@ -4837,6 +4860,7 @@ mod tests {
         let worker = Worker {
             requests: request_tx,
             events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
         };
         let mut app = App::new(
             config,
@@ -5029,9 +5053,10 @@ mod tests {
         assert_eq!(form.scope, SettingsScope::Host("gpu".into()));
         form.values[0] = "HTTP_PROXY=http://proxy:8080".into();
         form.values[1] = "18118:127.0.0.1:8080".into();
-        form.values[2] = "/opt/codex".into();
-        form.values[3] = "--full-auto".into();
-        form.values[12] = "'gpu approval'".into();
+        form.values[2] = "~/.local/bin/muxloomd".into();
+        form.values[3] = "/opt/codex".into();
+        form.values[4] = "--full-auto".into();
+        form.values[13] = "'gpu approval'".into();
         app.apply_settings(form);
 
         let reloaded = Config::load(&config_path).unwrap();

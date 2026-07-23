@@ -1,5 +1,8 @@
 pub mod app;
+pub mod bridge;
 pub mod config;
+pub mod daemon;
+pub mod daemon_protocol;
 pub mod debug;
 pub mod model;
 pub mod recap;

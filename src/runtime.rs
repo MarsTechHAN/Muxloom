@@ -17,7 +17,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    bridge::{BridgeOptions, BridgePool},
     config::{CommandConfig, Config},
+    daemon_protocol::DaemonSession,
     debug,
     model::{
         AgentKind, AgentSession, DirectoryListing, FileEntry, FileEntryKind, FileListing,
@@ -28,6 +30,7 @@ use crate::{
 };
 
 const SESSION_PREFIX: &str = "muxloom-";
+const DAEMON_SESSION_PREFIX: &str = "muxloomd-";
 const LEGACY_SESSION_PREFIX: &str = "ad-";
 pub const SSH_CONTROL_PERSIST_OPTION: &str = "ControlPersist=600";
 pub const SSH_SERVER_ALIVE_INTERVAL_OPTION: &str = "ServerAliveInterval=15";
@@ -97,17 +100,42 @@ impl TargetPlatform {
 #[derive(Debug, Clone)]
 pub struct Runtime {
     ssh_connect_timeout_secs: u64,
-    history_limit: usize,
     reverse_tunnel: String,
     host_reverse_tunnels: HashMap<String, String>,
     tunnel_checks: Arc<Mutex<HashMap<String, Instant>>>,
+    bridges: BridgePool,
+    bridge_failures: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl Runtime {
     pub fn new(config: &Config) -> Self {
+        let default_bridge = BridgeOptions {
+            connect_timeout_secs: config.ssh_connect_timeout_secs,
+            command: config.companion_command.clone(),
+            reverse_tunnel: config.reverse_tunnel.clone(),
+        };
+        let bridge_options = config
+            .hosts
+            .iter()
+            .map(|(host, host_config)| {
+                (
+                    host.clone(),
+                    BridgeOptions {
+                        connect_timeout_secs: config.ssh_connect_timeout_secs,
+                        command: host_config
+                            .companion_command
+                            .clone()
+                            .unwrap_or_else(|| config.companion_command.clone()),
+                        reverse_tunnel: host_config
+                            .reverse_tunnel
+                            .clone()
+                            .unwrap_or_else(|| config.reverse_tunnel.clone()),
+                    },
+                )
+            })
+            .collect();
         Self {
             ssh_connect_timeout_secs: config.ssh_connect_timeout_secs,
-            history_limit: config.history_limit.max(2_000),
             reverse_tunnel: config.reverse_tunnel.clone(),
             host_reverse_tunnels: config
                 .hosts
@@ -120,7 +148,13 @@ impl Runtime {
                 })
                 .collect(),
             tunnel_checks: Arc::new(Mutex::new(HashMap::new())),
+            bridges: BridgePool::new(default_bridge, bridge_options),
+            bridge_failures: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn bridge_pool(&self) -> BridgePool {
+        self.bridges.clone()
     }
 
     pub fn probe_and_discover(
@@ -131,6 +165,38 @@ impl Runtime {
         environment: &[(String, String)],
     ) -> Result<(Probe, Vec<AgentSession>)> {
         debug::log("runtime", format!("probe start target={}", target.id));
+        if let Ok(available) = self
+            .bridges
+            .probe_executables(target, vec![codex_command.into(), claude_command.into()])
+        {
+            let mut sessions = self
+                .bridges
+                .list_sessions(target)?
+                .into_iter()
+                .filter_map(|session| daemon_agent_session(&target.id, session))
+                .collect::<Vec<_>>();
+            let dead_terminals = sessions
+                .iter()
+                .filter(|session| session.dead && session.kind == AgentKind::Terminal)
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>();
+            sessions.retain(|session| !(session.dead && session.kind == AgentKind::Terminal));
+            for session_id in dead_terminals {
+                let _ = self.bridges.delete(target, session_id);
+            }
+            return Ok((
+                Probe {
+                    tmux: false,
+                    codex: available.iter().any(|item| item == codex_command),
+                    claude: available.iter().any(|item| item == claude_command),
+                },
+                sessions,
+            ));
+        }
+        self.bridge_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(target.id.clone(), Instant::now());
         let exports = environment_exports(environment);
         let codex_probe = login_shell_command(&format!(
             "{exports} command -v {} >/dev/null 2>&1",
@@ -232,116 +298,30 @@ impl Runtime {
             .as_secs();
         let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let session_id = format!(
-            "{SESSION_PREFIX}{}-{now}-{}-{sequence}",
+            "{DAEMON_SESSION_PREFIX}{}-{now}-{}-{sequence}",
             request.kind.as_str(),
             std::process::id()
         );
-        let exports = environment_exports(environment);
-        let agent_command =
-            if request.kind == AgentKind::Terminal && command.command.trim().is_empty() {
-                interactive_shell_command(&format!("{exports} exec \"${{SHELL:-/bin/sh}}\" -l"))
-            } else {
-                interactive_shell_command(&format!(
-                    "{exports} exec {}",
-                    command_line(command, request.kind, request.resume_id.as_deref())
-                ))
-            };
         let label = request.label.replace(['\t', '\n', '\r'], " ");
-        let metadata_path = request.path.replace(['\t', '\n', '\r'], " ");
-        let bootstrap = format!("{session_id}-bootstrap");
-        let agent_target = format!("{session_id}:agent");
-
-        let commands = [
-            shell_join(&[
-                "tmux",
-                "new-session",
-                "-d",
-                "-s",
-                &session_id,
-                "-n",
-                &bootstrap,
-            ]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-t",
-                &session_id,
-                "history-limit",
-                &self.history_limit.to_string(),
-            ]),
-            shell_join(&[
-                "tmux",
-                "new-window",
-                "-a",
-                "-d",
-                "-t",
-                &format!("{session_id}:"),
-                "-n",
-                "agent",
-                "-c",
-                &request.path,
-            ]),
-            shell_join(&[
-                "tmux",
-                "kill-window",
-                "-t",
-                &format!("{session_id}:{bootstrap}"),
-            ]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-w",
-                "-t",
-                &agent_target,
-                "remain-on-exit",
-                "on",
-            ]),
-            shell_join(&["tmux", "set-option", "-t", &session_id, "status", "off"]),
-            shell_join(&["tmux", "set-option", "-t", &session_id, "mouse", "on"]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-t",
-                &session_id,
-                "@muxloom_kind",
-                request.kind.as_str(),
-            ]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-t",
-                &session_id,
-                "@muxloom_path",
-                &metadata_path,
-            ]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-t",
-                &session_id,
-                "@muxloom_label",
-                &label,
-            ]),
-            shell_join(&[
-                "tmux",
-                "set-option",
-                "-t",
-                &session_id,
-                "@muxloom_created",
-                &now.to_string(),
-            ]),
-            shell_join(&[
-                "tmux",
-                "respawn-pane",
-                "-k",
-                "-t",
-                &agent_target,
-                &agent_command,
-            ]),
-        ];
-        let script = commands.join(" && ");
-        let output = self.run_shell(&request.target, &script, false)?;
-        ensure_success(&output, "launch agent")?;
+        let mut args = command.args.clone();
+        if let Some(resume_id) = request.resume_id.as_deref() {
+            match request.kind {
+                AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
+                AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
+                AgentKind::Terminal => {}
+            }
+        }
+        self.bridges.launch(
+            &request.target,
+            session_id.clone(),
+            request.kind.as_str().into(),
+            request.path.clone(),
+            label,
+            command.command.clone(),
+            args,
+            environment.to_vec(),
+            now,
+        )?;
         debug::log(
             "runtime",
             format!(
@@ -910,6 +890,21 @@ impl Runtime {
     ) -> Result<HistoryPage> {
         validate_session_id(session_id)?;
         let lines = lines.max(1);
+        if is_daemon_session_id(session_id) {
+            let history =
+                self.bridges
+                    .read_history(target, session_id.into(), offset_from_bottom, lines)?;
+            let pane_height = usize::from(history.rows);
+            return Ok(HistoryPage {
+                text: String::from_utf8_lossy(&history.bytes)
+                    .trim_end()
+                    .to_string(),
+                history_size: history.total_lines.saturating_sub(pane_height),
+                pane_height,
+                pane_width: usize::from(history.columns),
+                offset_from_bottom: history.offset_from_bottom,
+            });
+        }
         // Derive capture coordinates from the pane's actual height. History
         // reads must never resize the tmux window: doing so races the attached
         // PTY and produces the familiar vertical-bar/dot resize artifacts.
@@ -997,6 +992,9 @@ impl Runtime {
         patterns: &[String],
     ) -> Result<(bool, Option<String>, Option<String>)> {
         validate_session_id(session_id)?;
+        if is_daemon_session_id(session_id) {
+            return Ok((false, None, None));
+        }
         let script = shell_join(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "inspect agent state")?;
@@ -1044,6 +1042,18 @@ impl Runtime {
             return Ok(Vec::new());
         }
         let max_matches = max_matches.clamp(1, 50);
+        if is_daemon_session_id(session_id) {
+            return Ok(self
+                .bridges
+                .search_history(target, session_id.into(), query.into(), max_matches)?
+                .into_iter()
+                .map(|item| HistoryMatch {
+                    recap: item.recap,
+                    line_number: item.line_number,
+                    text: item.text,
+                })
+                .collect());
+        }
         let recap = shell_join(&["tmux", "capture-pane", "-p", "-J", "-t", session_id]);
         let history = shell_join(&[
             "tmux",
@@ -1109,6 +1119,11 @@ END {
 
     pub fn list_directory(&self, target: &Target, path: &str) -> Result<DirectoryListing> {
         let path = if path.trim().is_empty() { "." } else { path };
+        match self.bridges.list_directory(target, path.into()) {
+            Ok(listing) => return Ok(listing),
+            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+            Err(_) => {}
+        }
         let script = format!(
             "cd {} && pwd -P && find -L . -mindepth 1 -maxdepth 1 -type d -print0",
             shell_quote(path)
@@ -1120,6 +1135,11 @@ END {
 
     pub fn list_files(&self, target: &Target, path: &str) -> Result<FileListing> {
         let path = if path.trim().is_empty() { "." } else { path };
+        match self.bridges.list_files(target, path.into()) {
+            Ok(listing) => return Ok(listing),
+            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+            Err(_) => {}
+        }
         let collect = r#"for entry do
             if [ -L "$entry" ]; then kind=l; size=0;
             elif [ -d "$entry" ]; then kind=d; size=0;
@@ -1154,6 +1174,14 @@ END {
 
     pub fn preview_file(&self, target: &Target, path: &str) -> Result<FilePreview> {
         const LIMIT: u64 = 256 * 1024;
+        match self
+            .bridges
+            .preview_file(target, path.into(), LIMIT as usize)
+        {
+            Ok(preview) => return Ok(preview),
+            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+            Err(_) => {}
+        }
         let quoted = shell_quote(path);
         let script = format!(
             r#"path={quoted}
@@ -1229,10 +1257,19 @@ END {
                 })?;
             }
             Transport::Ssh { alias } => {
-                let check = format!("test -f {}", shell_quote(remote_path));
-                let output = self.run_shell(target, &check, false)?;
-                ensure_success(&output, "validate remote download")?;
-                self.scp_from(alias, remote_path, &destination)?;
+                match self
+                    .bridges
+                    .download_file(target, remote_path.into(), &destination)
+                {
+                    Ok(()) => {}
+                    Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                    Err(_) => {
+                        let check = format!("test -f {}", shell_quote(remote_path));
+                        let output = self.run_shell(target, &check, false)?;
+                        ensure_success(&output, "validate remote download")?;
+                        self.scp_from(alias, remote_path, &destination)?;
+                    }
+                }
             }
         }
         Ok(destination)
@@ -1247,9 +1284,23 @@ END {
         if local_paths.is_empty() {
             bail!("no local files were provided");
         }
-        let check = format!("test -d {}", shell_quote(remote_directory));
-        let output = self.run_shell(target, &check, false)?;
-        ensure_success(&output, "validate upload directory")?;
+        let daemon_upload = if matches!(target.transport, Transport::Ssh { .. }) {
+            match self.bridges.list_files(target, remote_directory.into()) {
+                Ok(_) => true,
+                Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                Err(_) => {
+                    let check = format!("test -d {}", shell_quote(remote_directory));
+                    let output = self.run_shell(target, &check, false)?;
+                    ensure_success(&output, "validate upload directory")?;
+                    false
+                }
+            }
+        } else {
+            if !Path::new(remote_directory).is_dir() {
+                bail!("upload directory does not exist: {remote_directory}");
+            }
+            false
+        };
         let mut uploaded = 0;
         for local_path in local_paths {
             if !local_path.is_file() {
@@ -1275,6 +1326,9 @@ END {
                             format!("failed to upload to {}", destination_path.display())
                         })?;
                     }
+                }
+                Transport::Ssh { .. } if daemon_upload => {
+                    self.bridges.upload_file(target, local_path, destination)?;
                 }
                 Transport::Ssh { alias } => self.scp_to(alias, local_path, &destination)?,
             }
@@ -1323,6 +1377,9 @@ END {
             format!("kill target={} session={session_id}", target.id),
         );
         validate_session_id(session_id)?;
+        if session_id.starts_with(DAEMON_SESSION_PREFIX) {
+            return self.bridges.delete(target, session_id.into());
+        }
         let script = shell_join(&["tmux", "kill-session", "-t", session_id]);
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "delete agent session")
@@ -1334,6 +1391,9 @@ END {
             format!("archive target={} session={session_id}", target.id),
         );
         validate_session_id(session_id)?;
+        if session_id.starts_with(DAEMON_SESSION_PREFIX) {
+            return self.bridges.archive(target, session_id.into());
+        }
         let script = format!(
             "{} && {}",
             shell_join(&[
@@ -1395,6 +1455,27 @@ END {
     }
 
     fn run_shell(&self, target: &Target, script: &str, interactive: bool) -> Result<Output> {
+        if let Transport::Ssh { alias } = &target.transport
+            && !interactive
+            && !self.bridge_recently_failed(&target.id)
+        {
+            match self.bridges.run_shell(&target.id, alias, script, &[]) {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    debug::log(
+                        "bridge",
+                        format!(
+                            "target={} companion unavailable, using legacy ssh temporarily: {error:#}",
+                            target.id
+                        ),
+                    );
+                    self.bridge_failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(target.id.clone(), Instant::now());
+                }
+            }
+        }
         self.ensure_reverse_tunnel(target)?;
         let mut command = match &target.transport {
             Transport::Local => {
@@ -1437,6 +1518,14 @@ END {
         command
             .output()
             .with_context(|| format!("failed to execute command on {}", target.id))
+    }
+
+    fn bridge_recently_failed(&self, target_id: &str) -> bool {
+        self.bridge_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(target_id)
+            .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30))
     }
 
     fn ensure_reverse_tunnel(&self, target: &Target) -> Result<()> {
@@ -1653,7 +1742,11 @@ fn parse_history_page(output: &str, offset_from_bottom: usize) -> Result<History
     })
 }
 
-fn attention_reason(kind: AgentKind, screen: &str, patterns: &[String]) -> Option<String> {
+pub(crate) fn attention_reason(
+    kind: AgentKind,
+    screen: &str,
+    patterns: &[String],
+) -> Option<String> {
     let screen = attention_tail(screen).to_lowercase();
     if let Some(pattern) = patterns.iter().find(|pattern| {
         let pattern = pattern.trim();
@@ -1716,7 +1809,7 @@ fn attention_reason(kind: AgentKind, screen: &str, patterns: &[String]) -> Optio
     None
 }
 
-fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
+pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     if kind == AgentKind::Terminal {
         return false;
     }
@@ -2146,6 +2239,7 @@ fn normalize_path(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str>) -> String {
     let mut values = Vec::with_capacity(command.args.len() + 3);
     values.push(command.command.as_str());
@@ -2158,10 +2252,6 @@ fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str
         }
     }
     shell_join(&values)
-}
-
-fn interactive_shell_command(command: &str) -> String {
-    format!("exec {}", login_shell_command(command))
 }
 
 fn login_shell_command(command: &str) -> String {
@@ -2245,6 +2335,24 @@ fn normalize_arch(value: &str) -> &'static str {
     }
 }
 
+fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<AgentSession> {
+    let kind = AgentKind::from_str(&session.kind).ok()?;
+    Some(AgentSession {
+        id: session.id,
+        target_id: target_id.into(),
+        kind,
+        path: session.path,
+        label: session.label,
+        created_at: session.created_at,
+        dead: session.dead || session.archived,
+        pid: session.pid,
+        working: session.working,
+        needs_attention: session.needs_attention,
+        attention_reason: session.attention_reason,
+        recap: session.recap,
+    })
+}
+
 fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSession>)> {
     let mut probe = Probe::default();
     let mut sessions = Vec::new();
@@ -2320,10 +2428,16 @@ fn validate_session_id(session_id: &str) -> Result<()> {
 }
 
 pub(crate) fn is_managed_session_id(session_id: &str) -> bool {
-    (session_id.starts_with(SESSION_PREFIX) || session_id.starts_with(LEGACY_SESSION_PREFIX))
+    (session_id.starts_with(SESSION_PREFIX)
+        || session_id.starts_with(LEGACY_SESSION_PREFIX)
+        || is_daemon_session_id(session_id))
         && session_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+pub fn is_daemon_session_id(session_id: &str) -> bool {
+    session_id.starts_with(DAEMON_SESSION_PREFIX)
 }
 
 pub fn shell_join(values: &[&str]) -> String {

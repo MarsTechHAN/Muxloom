@@ -20,6 +20,7 @@ pub struct Config {
     pub ssh_config: String,
     pub environment: String,
     pub reverse_tunnel: String,
+    pub companion_command: String,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
 }
@@ -42,6 +43,7 @@ impl Default for Config {
             ssh_config: "~/.ssh/config".into(),
             environment: String::new(),
             reverse_tunnel: String::new(),
+            companion_command: "muxloomd".into(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
         }
@@ -103,6 +105,7 @@ pub struct HostConfig {
     pub terminal: Option<CommandConfig>,
     pub environment: Option<String>,
     pub reverse_tunnel: Option<String>,
+    pub companion_command: Option<String>,
     pub attention_patterns: Option<Vec<String>>,
 }
 
@@ -123,6 +126,9 @@ impl Config {
         let mut parsed = BTreeMap::new();
         parse_environment(&self.environment, &mut parsed)?;
         validate_reverse_tunnel(&self.reverse_tunnel)?;
+        if self.companion_command.trim().is_empty() {
+            anyhow::bail!("companion command cannot be empty");
+        }
         for (host, host_config) in &self.hosts {
             if let Some(environment) = &host_config.environment {
                 parse_environment(environment, &mut parsed)
@@ -131,6 +137,13 @@ impl Config {
             if let Some(tunnel) = &host_config.reverse_tunnel {
                 validate_reverse_tunnel(tunnel)
                     .with_context(|| format!("invalid reverse tunnel for host {host}"))?;
+            }
+            if host_config
+                .companion_command
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty())
+            {
+                anyhow::bail!("companion command cannot be empty for host {host}");
             }
         }
         Ok(())
@@ -170,6 +183,13 @@ impl Config {
             .get(host)
             .and_then(|config| config.reverse_tunnel.as_deref())
             .unwrap_or(&self.reverse_tunnel)
+    }
+
+    pub fn companion_command_for(&self, host: &str) -> &str {
+        self.hosts
+            .get(host)
+            .and_then(|config| config.companion_command.as_deref())
+            .unwrap_or(&self.companion_command)
     }
 
     pub fn ssh_config_path(&self) -> PathBuf {
@@ -346,6 +366,7 @@ attention_patterns = ["do you want to", "would you like to", "allow command", "a
 ssh_config = "~/.ssh/config"
 environment = ""
 reverse_tunnel = ""
+companion_command = "muxloomd"
 
 [agents.codex]
 command = "codex"
@@ -359,7 +380,7 @@ args = []
 install = "curl -fsSL https://claude.ai/install.sh | bash"
 sync_files = ["~/.claude/settings.json"]
 
-# Empty command means the user's login shell.
+# Empty command means the user's SHELL (or /bin/sh).
 [agents.terminal]
 command = ""
 args = []
@@ -370,6 +391,7 @@ sync_files = []
 # [hosts.gpu-box]
 # environment = 'HTTP_PROXY=http://proxy:8118 HTTPS_PROXY=http://proxy:8118 NO_PROXY="localhost,.internal"'
 # reverse_tunnel = "18118:127.0.0.1:8118"
+# companion_command = "~/.local/bin/muxloomd"
 # attention_patterns = ["approve", "do you want to proceed"]
 
 # [hosts.gpu-box.claude]
@@ -396,6 +418,7 @@ mod tests {
                 terminal: None,
                 environment: None,
                 reverse_tunnel: None,
+                companion_command: None,
                 attention_patterns: None,
             },
         );

@@ -25,11 +25,6 @@ impl Drop for SessionGuard<'_> {
 #[test]
 fn local_session_survives_agent_exit_and_is_discoverable() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
-
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -47,6 +42,15 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
     };
 
     let session_id = runtime.launch(&request, &command, &[]).unwrap();
+    if Command::new("tmux").arg("-V").output().is_ok() {
+        assert!(
+            !Command::new("tmux")
+                .args(["has-session", "-t", &session_id])
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            "new muxloomd sessions must never appear in tmux ls"
+        );
+    }
     let _guard = SessionGuard {
         runtime: &runtime,
         target: &target,
@@ -67,7 +71,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
         thread::sleep(Duration::from_millis(50));
     }
     let session = found.expect("launched session should be discoverable");
-    assert!(session.dead, "tmux should preserve the exited pane");
+    assert!(session.dead, "muxloomd should preserve the exited session");
     assert_eq!(session.path, request.path);
     assert_eq!(session.label, request.label);
     let recap = runtime.capture(&target, &session_id, 20).unwrap();
@@ -85,7 +89,10 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
         return;
     }
 
-    let config = Config::default();
+    let config = Config {
+        companion_command: "definitely-missing-muxloomd".into(),
+        ..Config::default()
+    };
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let session_id = format!("ad-codex-legacy-{}", std::process::id());
@@ -141,11 +148,6 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
 #[test]
 fn embedded_pty_attaches_renders_and_accepts_input() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
-
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -176,7 +178,9 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
         target: &target,
         session_id: session_id.clone(),
     };
-    let mut terminal = TerminalSession::attach(&target, &session_id, 60, 12).unwrap();
+    let mut terminal =
+        TerminalSession::attach_daemon(runtime.bridge_pool(), &target, &session_id, 60, 12)
+            .unwrap();
 
     wait_for_screen(&mut terminal, "READY");
     for character in "hello".chars() {
@@ -193,10 +197,6 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
 #[test]
 fn ordinary_terminal_with_empty_command_stays_running() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -230,10 +230,6 @@ fn ordinary_terminal_with_empty_command_stays_running() {
 #[test]
 fn exited_terminal_is_removed_instead_of_archived() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -261,26 +257,18 @@ fn exited_terminal_is_removed_instead_of_archived() {
         let (_, sessions) = runtime
             .probe_and_discover(&target, "sh", "sh", &[])
             .unwrap();
-        let tmux_exists = Command::new("tmux")
-            .args(["has-session", "-t", &session_id])
-            .status()
-            .is_ok_and(|status| status.success());
-        if !sessions.iter().any(|session| session.id == session_id) && !tmux_exists {
+        if !sessions.iter().any(|session| session.id == session_id) {
             removed = true;
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(removed, "dead terminal tmux session was not cleaned up");
+    assert!(removed, "dead terminal daemon session was not cleaned up");
 }
 
 #[test]
 fn live_agent_can_be_archived_before_permanent_removal() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -398,10 +386,6 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
 #[test]
 fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
     let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux is not installed; skipping integration check");
-        return;
-    }
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -427,10 +411,11 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         target: &target,
         session_id: session_id.clone(),
     };
-    let mut terminal = TerminalSession::attach(&target, &session_id, 73, 17).unwrap();
+    let mut terminal =
+        TerminalSession::attach_daemon(runtime.bridge_pool(), &target, &session_id, 73, 17)
+            .unwrap();
     wait_for_screen(&mut terminal, "READY");
     thread::sleep(Duration::from_millis(100));
-    let before = pane_size(&session_id);
 
     let page = runtime
         .capture_page(&target, &session_id, 0, 50, 140, 40)
@@ -441,14 +426,12 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
     let matches = runtime
         .search_history(&target, &session_id, "full-history-needle", 8)
         .unwrap();
-    let after = pane_size(&session_id);
-
-    assert_eq!(before, after, "history capture changed the tmux pane size");
+    assert_eq!((page.pane_width, page.pane_height), (73, 17));
     assert!(page.text.contains("READY"));
     assert!(page.text.contains("styled-history"));
     assert!(
         page.text.contains("\x1b["),
-        "tmux history capture should retain SGR styling"
+        "daemon history capture should retain SGR styling"
     );
     assert_eq!(oldest.offset_from_bottom, oldest.history_size);
     assert!(
@@ -480,21 +463,6 @@ fn local_directory_listing_and_resume_scan_commands_execute() {
         .scan_resumes(&target, AgentKind::Codex, &cwd.display().to_string())
         .unwrap();
     std::fs::remove_dir_all(root).unwrap();
-}
-
-fn pane_size(session_id: &str) -> String {
-    let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            session_id,
-            "#{pane_width}x#{pane_height}",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn wait_for_screen(terminal: &mut TerminalSession, expected: &str) {

@@ -55,7 +55,7 @@ jobs:
         include:
           - label: Linux x86_64
             os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             executable: muxloom
             archive: tar.gz
           - label: macOS Apple Silicon
@@ -85,6 +85,13 @@ jobs:
           rustup default "$RUST_VERSION"
           rustup target add "${{ matrix.target }}"
 
+      - name: Install musl linker
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
@@ -106,6 +113,7 @@ jobs:
           package_dir="dist/$PACKAGE_NAME"
           mkdir -p "$package_dir"
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$package_dir/"
+          cp "target/${{ matrix.target }}/release/muxloomd" "$package_dir/"
           cp README.md LICENSE "$package_dir/"
           tar -C dist -czf "dist/$PACKAGE_NAME.tar.gz" "$PACKAGE_NAME"
           if command -v sha256sum >/dev/null 2>&1; then

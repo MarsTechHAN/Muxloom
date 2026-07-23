@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::{
+    bridge::{BridgePool, BridgeStream},
     debug,
     model::{Target, Transport},
     runtime::{
@@ -24,13 +25,21 @@ enum TerminalEvent {
 
 pub struct TerminalSession {
     parser: vt100::Parser,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    events: mpsc::Receiver<TerminalEvent>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    events: Option<mpsc::Receiver<TerminalEvent>>,
+    daemon: Option<DaemonTerminal>,
     closed: bool,
     width: u16,
     height: u16,
+}
+
+struct DaemonTerminal {
+    stream: BridgeStream,
+    bridges: BridgePool,
+    target: Target,
+    session_id: String,
 }
 
 impl TerminalSession {
@@ -157,10 +166,42 @@ impl TerminalSession {
 
         Ok(Self {
             parser: vt100::Parser::new(height, width, 0),
-            master: pair.master,
-            writer,
-            child,
-            events: event_rx,
+            master: Some(pair.master),
+            writer: Some(writer),
+            child: Some(child),
+            events: Some(event_rx),
+            daemon: None,
+            closed: false,
+            width,
+            height,
+        })
+    }
+
+    pub fn attach_daemon(
+        bridges: BridgePool,
+        target: &Target,
+        session_id: &str,
+        width: u16,
+        height: u16,
+    ) -> Result<Self> {
+        if !crate::runtime::is_daemon_session_id(session_id) {
+            bail!("refusing invalid muxloomd session id");
+        }
+        let width = width.max(20);
+        let height = height.max(5);
+        let stream = bridges.open_pty(target, session_id.into(), width, height)?;
+        Ok(Self {
+            parser: vt100::Parser::new(height, width, 0),
+            master: None,
+            writer: None,
+            child: None,
+            events: None,
+            daemon: Some(DaemonTerminal {
+                stream,
+                bridges,
+                target: target.clone(),
+                session_id: session_id.into(),
+            }),
             closed: false,
             width,
             height,
@@ -169,15 +210,26 @@ impl TerminalSession {
 
     pub fn drain(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(event) = self.events.try_recv() {
-            match event {
-                TerminalEvent::Output(bytes) => {
-                    self.parser.process(&bytes);
-                    changed = true;
-                }
-                TerminalEvent::Closed => {
-                    self.closed = true;
-                    changed = true;
+        if let Some(daemon) = &mut self.daemon {
+            while let Some(bytes) = daemon.stream.try_read() {
+                self.parser.process(&bytes);
+                changed = true;
+            }
+            if daemon.stream.is_closed() && !self.closed {
+                self.closed = true;
+                changed = true;
+            }
+        } else if let Some(events) = &self.events {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    TerminalEvent::Output(bytes) => {
+                        self.parser.process(&bytes);
+                        changed = true;
+                    }
+                    TerminalEvent::Closed => {
+                        self.closed = true;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -198,14 +250,20 @@ impl TerminalSession {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        self.master
-            .resize(PtySize {
-                rows: height,
-                cols: width,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to resize embedded PTY")?;
+        if let Some(daemon) = &self.daemon {
+            daemon
+                .bridges
+                .resize(&daemon.target, daemon.session_id.clone(), width, height)?;
+        } else if let Some(master) = &self.master {
+            master
+                .resize(PtySize {
+                    rows: height,
+                    cols: width,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("failed to resize embedded PTY")?;
+        }
         debug::log("pty", format!("resized to {width}x{height}"));
         resize_parser(&mut self.parser, height, width);
         self.width = width;
@@ -288,12 +346,18 @@ impl TerminalSession {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(bytes)
-            .context("failed to write to embedded terminal")?;
-        self.writer
-            .flush()
-            .context("failed to flush embedded terminal")
+        if let Some(daemon) = &self.daemon {
+            daemon.stream.write(bytes)
+        } else {
+            let writer = self
+                .writer
+                .as_mut()
+                .context("embedded terminal has no writer")?;
+            writer
+                .write_all(bytes)
+                .context("failed to write to embedded terminal")?;
+            writer.flush().context("failed to flush embedded terminal")
+        }
     }
 }
 
@@ -346,15 +410,18 @@ fn scrub_shrink_boundary(parser: &mut vt100::Parser, rows: u16, new_width: u16) 
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         debug::log(
             "pty",
             format!(
                 "dropping attached client child_pid={:?}",
-                self.child.process_id()
+                child.process_id()
             ),
         );
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
         debug::log("pty", "attached client stopped");
     }
 }
