@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{path::PathBuf, sync::mpsc, thread, time::Instant};
 
 use crate::{
     bridge::BridgePool,
@@ -71,10 +71,19 @@ pub enum Request {
         target: Target,
         path: String,
     },
+    PreloadDirectory {
+        target: Target,
+        path: String,
+    },
+    PreloadPreview {
+        target: Target,
+        path: String,
+    },
     DownloadFile {
         target: Target,
         remote_path: String,
         local_directory: PathBuf,
+        total_size: u64,
     },
     UploadFiles {
         target: Target,
@@ -96,6 +105,7 @@ pub enum Event {
     },
     Launched {
         target_id: String,
+        notice: Option<String>,
         result: Result<String, String>,
     },
     Installed {
@@ -136,6 +146,22 @@ pub enum Event {
         target_id: String,
         path: String,
         result: Result<FilePreview, String>,
+    },
+    DirectoryPreloaded {
+        target_id: String,
+        path: String,
+        result: Result<FileListing, String>,
+    },
+    PreviewPreloaded {
+        target_id: String,
+        path: String,
+        result: Result<FilePreview, String>,
+    },
+    FileDownloadProgress {
+        remote_path: String,
+        transferred: u64,
+        total_size: u64,
+        bytes_per_second: f64,
     },
     FileDownloaded {
         result: Result<PathBuf, String>,
@@ -252,13 +278,18 @@ impl Worker {
                         let result = runtime
                             .launch(&request, &command, &environment)
                             .map_err(|error| error.to_string());
+                        let notice = runtime.take_bridge_notice(&target_id);
                         if let Err(error) = &result {
                             debug::log(
                                 "worker",
                                 format!("launch failed target={target_id}: {error}"),
                             );
                         }
-                        let _ = events.send(Event::Launched { target_id, result });
+                        let _ = events.send(Event::Launched {
+                            target_id,
+                            notice,
+                            result,
+                        });
                     }
                     Request::Install {
                         target,
@@ -418,13 +449,62 @@ impl Worker {
                             result,
                         });
                     }
+                    Request::PreloadDirectory { target, path } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .list_files(&target, &path)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::DirectoryPreloaded {
+                            target_id,
+                            path,
+                            result,
+                        });
+                    }
+                    Request::PreloadPreview { target, path } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .preview_file(&target, &path)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::PreviewPreloaded {
+                            target_id,
+                            path,
+                            result,
+                        });
+                    }
                     Request::DownloadFile {
                         target,
                         remote_path,
                         local_directory,
+                        total_size,
                     } => {
+                        let progress_path = remote_path.clone();
+                        let progress_events = events.clone();
+                        let mut last_update = Instant::now();
+                        let mut last_bytes = 0u64;
                         let result = runtime
-                            .download_file(&target, &remote_path, &local_directory)
+                            .download_file_with_progress(
+                                &target,
+                                &remote_path,
+                                &local_directory,
+                                |transferred| {
+                                    if last_update.elapsed().as_millis() < 100
+                                        && transferred < total_size
+                                    {
+                                        return;
+                                    }
+                                    let elapsed = last_update.elapsed().as_secs_f64().max(0.001);
+                                    let bytes_per_second =
+                                        transferred.saturating_sub(last_bytes) as f64 / elapsed;
+                                    let _ = progress_events.send(Event::FileDownloadProgress {
+                                        remote_path: progress_path.clone(),
+                                        transferred,
+                                        total_size,
+                                        bytes_per_second,
+                                    });
+                                    last_update = Instant::now();
+                                    last_bytes = transferred;
+                                },
+                            )
                             .map_err(|error| error.to_string());
                         let _ = events.send(Event::FileDownloaded { result });
                     }

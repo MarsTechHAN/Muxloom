@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
-    fs,
-    io::Read,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     str::FromStr,
@@ -23,8 +23,8 @@ use crate::{
     debug,
     model::{
         AgentKind, AgentSession, DirectoryListing, FileEntry, FileEntryKind, FileListing,
-        FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LaunchRequest, Probe,
-        ResumeCandidate, Target, Transport,
+        FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
+        Probe, ResumeCandidate, Target, Transport,
     },
     recap::extract_recap,
 };
@@ -100,6 +100,7 @@ impl TargetPlatform {
 #[derive(Debug, Clone)]
 pub struct Runtime {
     ssh_connect_timeout_secs: u64,
+    history_limit: usize,
     reverse_tunnel: String,
     host_reverse_tunnels: HashMap<String, String>,
     tunnel_checks: Arc<Mutex<HashMap<String, Instant>>>,
@@ -109,10 +110,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: &Config) -> Self {
+        let default_download_environment =
+            Self::controller_environment_for_config(config, LOCAL_TARGET_ID);
         let default_bridge = BridgeOptions {
             connect_timeout_secs: config.ssh_connect_timeout_secs,
             command: config.companion_command.clone(),
             reverse_tunnel: config.reverse_tunnel.clone(),
+            bootstrap_binary: config.companion_binary.clone(),
+            download_environment: default_download_environment,
         };
         let bridge_options = config
             .hosts
@@ -130,12 +135,18 @@ impl Runtime {
                             .reverse_tunnel
                             .clone()
                             .unwrap_or_else(|| config.reverse_tunnel.clone()),
+                        bootstrap_binary: host_config
+                            .companion_binary
+                            .clone()
+                            .unwrap_or_else(|| config.companion_binary.clone()),
+                        download_environment: Self::controller_environment_for_config(config, host),
                     },
                 )
             })
             .collect();
         Self {
             ssh_connect_timeout_secs: config.ssh_connect_timeout_secs,
+            history_limit: config.history_limit,
             reverse_tunnel: config.reverse_tunnel.clone(),
             host_reverse_tunnels: config
                 .hosts
@@ -155,6 +166,10 @@ impl Runtime {
 
     pub fn bridge_pool(&self) -> BridgePool {
         self.bridges.clone()
+    }
+
+    pub fn take_bridge_notice(&self, target_id: &str) -> Option<String> {
+        self.bridges.take_notice(target_id)
     }
 
     pub fn probe_and_discover(
@@ -311,7 +326,7 @@ impl Runtime {
                 AgentKind::Terminal => {}
             }
         }
-        self.bridges.launch(
+        let daemon_launch = self.bridges.launch(
             &request.target,
             session_id.clone(),
             request.kind.as_str().into(),
@@ -321,11 +336,158 @@ impl Runtime {
             args,
             environment.to_vec(),
             now,
-        )?;
+        );
+        if let Err(daemon_error) = daemon_launch {
+            debug::log(
+                "runtime",
+                format!(
+                    "launch target={} muxloomd unavailable: {daemon_error:#}; trying explicit legacy tmux fallback",
+                    request.target.id
+                ),
+            );
+            self.bridge_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(request.target.id.clone(), Instant::now());
+            return self
+                .launch_legacy_tmux(request, command, environment, now)
+                .with_context(|| {
+                    format!(
+                        "muxloomd launch failed ({daemon_error:#}); legacy tmux fallback also failed"
+                    )
+                });
+        }
         debug::log(
             "runtime",
             format!(
                 "launch done target={} session={session_id}",
+                request.target.id
+            ),
+        );
+        Ok(session_id)
+    }
+
+    fn launch_legacy_tmux(
+        &self,
+        request: &LaunchRequest,
+        command: &CommandConfig,
+        environment: &[(String, String)],
+        now: u64,
+    ) -> Result<String> {
+        let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!(
+            "{SESSION_PREFIX}{}-{now}-{}-{sequence}",
+            request.kind.as_str(),
+            std::process::id()
+        );
+        let exports = environment_exports(environment);
+        let agent_command =
+            if request.kind == AgentKind::Terminal && command.command.trim().is_empty() {
+                interactive_shell_command(&format!("{exports} exec \"${{SHELL:-/bin/sh}}\" -l"))
+            } else {
+                interactive_shell_command(&format!(
+                    "{exports} exec {}",
+                    command_line(command, request.kind, request.resume_id.as_deref())
+                ))
+            };
+        let label = request.label.replace(['\t', '\n', '\r'], " ");
+        let metadata_path = request.path.replace(['\t', '\n', '\r'], " ");
+        let bootstrap = format!("{session_id}-bootstrap");
+        let agent_target = format!("{session_id}:agent");
+        let commands = [
+            shell_join(&[
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                &session_id,
+                "-n",
+                &bootstrap,
+            ]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-t",
+                &session_id,
+                "history-limit",
+                &self.history_limit.to_string(),
+            ]),
+            shell_join(&[
+                "tmux",
+                "new-window",
+                "-a",
+                "-d",
+                "-t",
+                &format!("{session_id}:"),
+                "-n",
+                "agent",
+                "-c",
+                &request.path,
+            ]),
+            shell_join(&[
+                "tmux",
+                "kill-window",
+                "-t",
+                &format!("{session_id}:{bootstrap}"),
+            ]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-w",
+                "-t",
+                &agent_target,
+                "remain-on-exit",
+                "on",
+            ]),
+            shell_join(&["tmux", "set-option", "-t", &session_id, "status", "off"]),
+            shell_join(&["tmux", "set-option", "-t", &session_id, "mouse", "on"]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-t",
+                &session_id,
+                "@muxloom_kind",
+                request.kind.as_str(),
+            ]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-t",
+                &session_id,
+                "@muxloom_path",
+                &metadata_path,
+            ]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-t",
+                &session_id,
+                "@muxloom_label",
+                &label,
+            ]),
+            shell_join(&[
+                "tmux",
+                "set-option",
+                "-t",
+                &session_id,
+                "@muxloom_created",
+                &now.to_string(),
+            ]),
+            shell_join(&[
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-t",
+                &agent_target,
+                &agent_command,
+            ]),
+        ];
+        let output = self.run_shell(&request.target, &commands.join(" && "), false)?;
+        ensure_success(&output, "launch agent with legacy tmux fallback")?;
+        debug::log(
+            "runtime",
+            format!(
+                "launch target={} session={session_id} backend=legacy-tmux",
                 request.target.id
             ),
         );
@@ -543,6 +705,18 @@ impl Runtime {
             .get(&target.id)
             .map(String::as_str)
             .unwrap_or(&self.reverse_tunnel);
+        Self::map_controller_proxy_environment(environment, tunnel)
+    }
+
+    fn controller_environment_for_config(config: &Config, host: &str) -> Vec<(String, String)> {
+        let environment = config.environment_for(host).unwrap_or_default();
+        Self::map_controller_proxy_environment(&environment, config.reverse_tunnel_for(host))
+    }
+
+    fn map_controller_proxy_environment(
+        environment: &[(String, String)],
+        tunnel: &str,
+    ) -> Vec<(String, String)> {
         let Some((remote_port, local_host, local_port)) = parse_reverse_tunnel(tunnel) else {
             return environment.to_vec();
         };
@@ -1235,6 +1409,16 @@ END {
         remote_path: &str,
         local_directory: &Path,
     ) -> Result<PathBuf> {
+        self.download_file_with_progress(target, remote_path, local_directory, |_| {})
+    }
+
+    pub fn download_file_with_progress(
+        &self,
+        target: &Target,
+        remote_path: &str,
+        local_directory: &Path,
+        mut progress: impl FnMut(u64),
+    ) -> Result<PathBuf> {
         let name = Path::new(remote_path)
             .file_name()
             .filter(|name| !name.is_empty())
@@ -1246,31 +1430,68 @@ END {
             )
         })?;
         let destination = unique_destination(local_directory, name);
-        match &target.transport {
+        let temporary = destination.with_file_name(format!(
+            ".{}.muxloom-part-{}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        let transfer_result = match &target.transport {
             Transport::Local => {
-                fs::copy(remote_path, &destination).with_context(|| {
-                    format!(
-                        "failed to copy {} to {}",
-                        remote_path,
-                        destination.display()
-                    )
-                })?;
+                let mut source = File::open(remote_path)
+                    .with_context(|| format!("failed to open {remote_path}"))?;
+                (|| -> Result<()> {
+                    let mut output = File::create(&temporary)
+                        .with_context(|| format!("failed to create {}", temporary.display()))?;
+                    let mut buffer = vec![0; 128 * 1024];
+                    let mut transferred = 0u64;
+                    loop {
+                        let read = source.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        output.write_all(&buffer[..read])?;
+                        transferred = transferred.saturating_add(read as u64);
+                        progress(transferred);
+                    }
+                    output.flush()?;
+                    Ok(())
+                })()
             }
             Transport::Ssh { alias } => {
-                match self
-                    .bridges
-                    .download_file(target, remote_path.into(), &destination)
-                {
-                    Ok(()) => {}
-                    Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
-                    Err(_) => {
+                match self.bridges.download_file(
+                    target,
+                    remote_path.into(),
+                    &temporary,
+                    &mut progress,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) if self.bridges.is_connected(&target.id) => Err(error),
+                    Err(_) => (|| -> Result<()> {
                         let check = format!("test -f {}", shell_quote(remote_path));
                         let output = self.run_shell(target, &check, false)?;
                         ensure_success(&output, "validate remote download")?;
-                        self.scp_from(alias, remote_path, &destination)?;
-                    }
+                        self.scp_from(alias, remote_path, &temporary)?;
+                        if let Ok(metadata) = fs::metadata(&temporary) {
+                            progress(metadata.len());
+                        }
+                        Ok(())
+                    })(),
                 }
             }
+        };
+        if let Err(error) = transfer_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to finalize download {} -> {}",
+                    temporary.display(),
+                    destination.display()
+                )
+            });
         }
         Ok(destination)
     }
@@ -2239,7 +2460,10 @@ fn normalize_path(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
+fn login_shell_command(command: &str) -> String {
+    format!("\"${{SHELL:-/bin/sh}}\" -lc {}", shell_quote(command))
+}
+
 fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str>) -> String {
     let mut values = Vec::with_capacity(command.args.len() + 3);
     values.push(command.command.as_str());
@@ -2254,8 +2478,8 @@ fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str
     shell_join(&values)
 }
 
-fn login_shell_command(command: &str) -> String {
-    format!("\"${{SHELL:-/bin/sh}}\" -lc {}", shell_quote(command))
+fn interactive_shell_command(command: &str) -> String {
+    format!("exec {}", login_shell_command(command))
 }
 
 fn environment_exports(environment: &[(String, String)]) -> String {

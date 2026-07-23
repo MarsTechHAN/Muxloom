@@ -1,9 +1,17 @@
+use std::{path::Path, sync::LazyLock};
+
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SyntaxStyle, Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -21,6 +29,17 @@ const CODEX: Color = Color::Cyan;
 const CLAUDE: Color = Color::Yellow;
 const TERMINAL: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SYNTAX_THEME: LazyLock<Theme> = LazyLock::new(|| {
+    let themes = ThemeSet::load_defaults();
+    themes
+        .themes
+        .get("base16-eighties.dark")
+        .or_else(|| themes.themes.get("base16-ocean.dark"))
+        .or_else(|| themes.themes.values().next())
+        .expect("syntect ships at least one default theme")
+        .clone()
+});
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -196,6 +215,20 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, portrait: bool
 }
 
 fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneLayout {
+    if app.file_manager.is_some() {
+        let maximum = area.width.saturating_sub(24).max(12);
+        let file_width = app.state.file_width.clamp(12, maximum);
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(file_width), Constraint::Min(24)])
+            .split(area);
+        return PaneLayout {
+            agents: Some(split[0]),
+            recap: Some(split[1]),
+            agents_divider: Some(vertical_divider(area, split[0])),
+            ..PaneLayout::default()
+        };
+    }
     if compact {
         return match app.focus {
             Focus::Machines if !app.state.flatten => PaneLayout {
@@ -1063,7 +1096,7 @@ fn draw_file_browser(
     focused: bool,
 ) {
     let title = format!(
-        " Files{}  {}:{} ",
+        " Files{}  {}:{}{} ",
         if form.loading {
             " [loading]"
         } else if form.error.is_some() {
@@ -1072,7 +1105,12 @@ fn draw_file_browser(
             ""
         },
         form.target.label,
-        truncate(&form.path, outer.width.saturating_sub(20) as usize)
+        truncate(&form.path, outer.width.saturating_sub(20) as usize),
+        if form.query.is_empty() {
+            String::new()
+        } else {
+            format!("  match: {}", form.query)
+        }
     );
     let block = panel(&title, focused);
     let inner = block.inner(outer);
@@ -1164,7 +1202,7 @@ fn draw_file_browser(
     };
 
     let footer = if form.preview_path.is_some() {
-        "Enter close preview  PgUp/PgDn scroll"
+        "Enter close  Arrows/PgUp/PgDn page  g/G first/last"
     } else if form.loading {
         "← parent  → previous child  loading in background"
     } else {
@@ -1195,6 +1233,9 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .as_mut()
         .expect("preview requires file manager");
     form.preview_area = Some(area);
+    if form.preview_rendered.is_none() {
+        form.preview_rendered = form.preview.as_ref().map(file_preview_text);
+    }
     let preview = if let Some(error) = &form.preview_error {
         Text::from(Line::styled(error.clone(), Style::default().fg(Color::Red)))
     } else if form.preview_loading {
@@ -1202,25 +1243,32 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             "Loading preview...",
             Style::default().fg(MUTED),
         ))
-    } else if let Some(preview) = &form.preview {
-        file_preview_text(preview)
+    } else if let Some(preview) = &form.preview_rendered {
+        preview.clone()
     } else {
         Text::from(Line::styled(
             "No preview output",
             Style::default().fg(MUTED),
         ))
     };
-    let preview_lines = preview.height();
+    let preview_lines = wrapped_text_height(&preview, inner.width);
+    let paragraph = Paragraph::new(preview)
+        .scroll((form.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
     form.preview_max_scroll = preview_lines
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
+    form.preview_page_rows = inner.height.max(1);
     form.preview_scroll = form.preview_scroll.min(form.preview_max_scroll);
-    frame.render_widget(
-        Paragraph::new(preview)
-            .scroll((form.preview_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+    frame.render_widget(paragraph.scroll((form.preview_scroll, 0)), inner);
+}
+
+fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
+    let width = width.max(1) as usize;
+    text.lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
@@ -1242,17 +1290,153 @@ fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
         ));
     }
     lines.push(Line::raw(""));
-    if preview.kind == FilePreviewKind::Markdown {
-        lines.extend(markdown_lines(&preview.content));
-    } else {
-        lines.extend(
-            preview
-                .content
-                .lines()
-                .map(|line| Line::raw(line.to_string())),
-        );
+    match preview.kind {
+        FilePreviewKind::Markdown => lines.extend(markdown_lines(&preview.content)),
+        FilePreviewKind::Text => lines.extend(text_preview_lines(preview)),
+        FilePreviewKind::Audio => lines.push(Line::styled(
+            "Encoded audio stream is ready for controller-side playback.",
+            Style::default().fg(MUTED),
+        )),
+        FilePreviewKind::Video => lines.push(Line::styled(
+            "Encoded video stream is ready for controller-side playback.",
+            Style::default().fg(MUTED),
+        )),
+        FilePreviewKind::Binary => lines.push(Line::styled(
+            "Binary content is not rendered.",
+            Style::default().fg(MUTED),
+        )),
     }
     Text::from(lines)
+}
+
+fn text_preview_lines(preview: &crate::model::FilePreview) -> Vec<Line<'static>> {
+    let extension = Path::new(&preview.path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "csv" => delimited_lines(&preview.content, b','),
+        "tsv" => delimited_lines(&preview.content, b'\t'),
+        "json" => parsed_json_lines(&preview.content)
+            .unwrap_or_else(|| syntax_lines(&preview.content, &preview.path, Some("json"))),
+        "jsonl" | "ndjson" => json_lines(&preview.content),
+        _ => syntax_lines(&preview.content, &preview.path, None),
+    }
+}
+
+fn parsed_json_lines(content: &str) -> Option<Vec<Line<'static>>> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let pretty = serde_json::to_string_pretty(&value).ok()?;
+    Some(syntax_lines(&pretty, "preview.json", Some("json")))
+}
+
+fn json_lines(content: &str) -> Vec<Line<'static>> {
+    let mut rendered = Vec::new();
+    for (index, source) in content.lines().enumerate() {
+        if source.trim().is_empty() {
+            continue;
+        }
+        rendered.push(Line::styled(
+            format!("record {}", index + 1),
+            Style::default().fg(ACCENT).bold(),
+        ));
+        match serde_json::from_str::<serde_json::Value>(source) {
+            Ok(value) => {
+                let pretty =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| source.to_string());
+                rendered.extend(syntax_lines(&pretty, "record.json", Some("json")));
+            }
+            Err(error) => {
+                rendered.push(Line::styled(
+                    format!("invalid JSON: {error}"),
+                    Style::default().fg(Color::Red),
+                ));
+                rendered.push(Line::raw(source.to_string()));
+            }
+        }
+        rendered.push(Line::raw(""));
+    }
+    rendered
+}
+
+fn delimited_lines(content: &str, delimiter: u8) -> Vec<Line<'static>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(content.as_bytes());
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        match record {
+            Ok(record) => rows.push(
+                record
+                    .iter()
+                    .map(|cell| cell.replace(['\r', '\n'], " "))
+                    .collect(),
+            ),
+            Err(error) => {
+                return vec![Line::styled(
+                    format!("Could not parse delimited data: {error}"),
+                    Style::default().fg(Color::Red),
+                )];
+            }
+        }
+    }
+    data_table_lines(&rows, false)
+}
+
+fn syntax_lines(content: &str, path: &str, token: Option<&str>) -> Vec<Line<'static>> {
+    let syntaxes = &*SYNTAX_SET;
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let file_name = Path::new(path).file_name().and_then(|name| name.to_str());
+    let first_line = content.lines().next().unwrap_or_default();
+    let syntax = token
+        .and_then(|token| syntaxes.find_syntax_by_token(token))
+        .or_else(|| extension.and_then(|extension| syntaxes.find_syntax_by_extension(extension)))
+        .or_else(|| file_name.and_then(|name| syntaxes.find_syntax_by_token(name)))
+        .or_else(|| syntaxes.find_syntax_by_first_line(first_line))
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, &SYNTAX_THEME);
+    let mut lines = Vec::new();
+    for source in LinesWithEndings::from(content) {
+        let Ok(regions) = highlighter.highlight_line(source, syntaxes) else {
+            lines.push(Line::raw(source.trim_end_matches(['\r', '\n']).to_string()));
+            continue;
+        };
+        let spans = regions
+            .into_iter()
+            .filter_map(|(style, value)| {
+                let value = value.trim_end_matches(['\r', '\n']);
+                (!value.is_empty()).then(|| Span::styled(value.to_string(), syntax_style(style)))
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn syntax_style(style: SyntaxStyle) -> Style {
+    let mut rendered = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+    if style.font_style.contains(FontStyle::BOLD) {
+        rendered = rendered.bold();
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        rendered = rendered.italic();
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        rendered = rendered.underlined();
+    }
+    rendered
 }
 
 fn markdown_lines(content: &str) -> Vec<Line<'static>> {
@@ -1287,7 +1471,7 @@ fn markdown_lines(content: &str) -> Vec<Line<'static>> {
                 rows.push(row);
                 index += 1;
             }
-            lines.extend(markdown_table_lines(&rows));
+            lines.extend(data_table_lines(&rows, true));
         } else if let Some((level, heading)) = markdown_heading(trimmed) {
             let style = match level {
                 1 => Style::default().fg(ACCENT).bold().underlined(),
@@ -1385,14 +1569,20 @@ fn is_markdown_table_separator(value: &str) -> bool {
     })
 }
 
-fn markdown_table_lines(rows: &[Vec<String>]) -> Vec<Line<'static>> {
+fn data_table_lines(rows: &[Vec<String>], markdown: bool) -> Vec<Line<'static>> {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![1; columns];
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index]
-                .max(UnicodeWidthStr::width(cell.as_str()))
-                .min(32);
+            let width = if markdown {
+                markdown_inline_spans(cell, Style::default())
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum()
+            } else {
+                UnicodeWidthStr::width(cell.as_str())
+            };
+            widths[index] = widths[index].max(width).min(32);
         }
     }
     let mut lines = Vec::new();
@@ -1400,15 +1590,21 @@ fn markdown_table_lines(rows: &[Vec<String>]) -> Vec<Line<'static>> {
         let mut spans = vec![Span::styled("│", Style::default().fg(MUTED))];
         for (column, width) in widths.iter().enumerate() {
             let cell = row.get(column).map(String::as_str).unwrap_or("");
-            let cell = truncate(cell, *width);
-            let padding = width.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
             let style = if row_index == 0 {
                 Style::default().fg(ACCENT).bold()
             } else {
                 Style::default()
             };
+            spans.push(Span::styled(" ", style));
+            let cell_spans = if markdown {
+                markdown_inline_spans(cell, style)
+            } else {
+                vec![Span::styled(cell.to_string(), style)]
+            };
+            let (cell_spans, used) = truncate_spans(cell_spans, *width);
+            spans.extend(cell_spans);
             spans.push(Span::styled(
-                format!(" {cell}{} ", " ".repeat(padding)),
+                format!("{} ", " ".repeat(width.saturating_sub(used))),
                 style,
             ));
             spans.push(Span::styled("│", Style::default().fg(MUTED)));
@@ -1427,6 +1623,29 @@ fn markdown_table_lines(rows: &[Vec<String>]) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+fn truncate_spans(spans: Vec<Span<'static>>, maximum: usize) -> (Vec<Span<'static>>, usize) {
+    let mut rendered = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut value = String::new();
+        for character in span.content.chars() {
+            let width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used + width > maximum {
+                break;
+            }
+            value.push(character);
+            used += width;
+        }
+        if !value.is_empty() {
+            rendered.push(Span::styled(value, span.style));
+        }
+        if used >= maximum {
+            break;
+        }
+    }
+    (rendered, used)
 }
 
 fn is_markdown_rule(value: &str) -> bool {
@@ -2607,6 +2826,11 @@ mod tests {
             preview_error: None,
             preview_scroll: 0,
             preview_max_scroll: 0,
+            preview_page_rows: 1,
+            preview_rendered: None,
+            query: String::new(),
+            preview_cache: std::collections::HashMap::new(),
+            preload_pending: std::collections::HashSet::new(),
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
@@ -2622,7 +2846,10 @@ mod tests {
         assert!(rendered.contains("Files  This machine:/work"));
         assert!(rendered.contains("README.md"));
         assert!(rendered.contains("File preview"));
-        assert!(rendered.contains("Enter close preview"));
+        assert!(rendered.contains("Enter close"));
+        assert!(app.pane_layout.machines.is_none());
+        assert!(app.pane_layout.agents.is_some());
+        assert!(app.pane_layout.recap.is_some());
 
         app.modal = Some(Modal::Help(HelpForm {
             offset: HELP_CONTENT_ROWS - 1,
@@ -2638,5 +2865,88 @@ mod tests {
         assert!(rendered.contains("History And Search"));
         assert!(rendered.contains("View And Configuration"));
         assert!(rendered.contains("Home/End jump"));
+    }
+
+    #[test]
+    fn structured_previews_parse_and_highlight_common_text_formats() {
+        let json = file_preview_text(&crate::model::FilePreview {
+            path: "/tmp/data.json".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 20,
+            content: r#"{"name":"muxloom","count":2}"#.into(),
+            truncated: false,
+        });
+        let json_text = rendered_text(&json);
+        assert!(json_text.contains("\"name\""));
+        assert!(json_text.contains("\"muxloom\""));
+        assert!(json.height() > 3, "JSON should be pretty printed");
+
+        let jsonl = file_preview_text(&crate::model::FilePreview {
+            path: "/tmp/events.jsonl".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 30,
+            content: "{\"id\":1}\n{\"id\":2}".into(),
+            truncated: false,
+        });
+        let jsonl_text = rendered_text(&jsonl);
+        assert!(jsonl_text.contains("record 1"));
+        assert!(jsonl_text.contains("record 2"));
+
+        let csv = file_preview_text(&crate::model::FilePreview {
+            path: "/tmp/data.csv".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 30,
+            content: "name,count\nmuxloom,2".into(),
+            truncated: false,
+        });
+        let csv_text = rendered_text(&csv);
+        assert!(csv_text.contains("name"));
+        assert!(csv_text.contains("muxloom"));
+        assert!(csv.lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.content.contains("name") && span.style.add_modifier.contains(Modifier::BOLD)
+        })));
+
+        let rust = file_preview_text(&crate::model::FilePreview {
+            path: "/tmp/main.rs".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 12,
+            content: "fn main() {}".into(),
+            truncated: false,
+        });
+        assert!(rust.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("fn") && span.style.fg.is_some())
+        }));
+    }
+
+    #[test]
+    fn markdown_table_renders_inline_bold_spans() {
+        let lines = markdown_lines("| name | status |\n| --- | --- |\n| muxloom | **ready** |");
+        assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.content.contains("ready") && span.style.add_modifier.contains(Modifier::BOLD)
+        })));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("**")))
+        );
+    }
+
+    fn rendered_text(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

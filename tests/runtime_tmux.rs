@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -143,6 +145,47 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&remain.stdout).trim(), "on");
+}
+
+#[test]
+fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
+    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux is not installed; skipping integration check");
+        return;
+    }
+    let config = Config {
+        companion_command: "definitely-missing-muxloomd".into(),
+        ..Config::default()
+    };
+    let runtime = Runtime::new(&config);
+    let target = Target::local();
+    let request = LaunchRequest {
+        target: target.clone(),
+        kind: AgentKind::Codex,
+        path: std::env::temp_dir().display().to_string(),
+        label: "tmux fallback".into(),
+        resume_id: None,
+    };
+    let command = CommandConfig {
+        command: "sh".into(),
+        args: vec!["-c".into(), "printf fallback-ready; sleep 2".into()],
+        ..CommandConfig::default()
+    };
+
+    let session_id = runtime.launch(&request, &command, &[]).unwrap();
+    let _guard = SessionGuard {
+        runtime: &runtime,
+        target: &target,
+        session_id: session_id.clone(),
+    };
+    assert!(session_id.starts_with("muxloom-"));
+    assert!(
+        Command::new("tmux")
+            .args(["has-session", "-t", &session_id])
+            .status()
+            .is_ok_and(|status| status.success())
+    );
 }
 
 #[test]

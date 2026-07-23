@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    env, fs,
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
         Arc, Mutex, Weak,
@@ -12,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 
 use crate::{
     daemon_protocol::{
@@ -24,12 +27,16 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const COMPANION_RELEASE_ROOT: &str =
+    "https://github.com/MarsTechHAN/Muxloom/releases/latest/download";
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
     pub connect_timeout_secs: u64,
     pub command: String,
     pub reverse_tunnel: String,
+    pub bootstrap_binary: String,
+    pub download_environment: Vec<(String, String)>,
 }
 
 impl Default for BridgeOptions {
@@ -38,6 +45,8 @@ impl Default for BridgeOptions {
             connect_timeout_secs: 5,
             command: "muxloomd".into(),
             reverse_tunnel: String::new(),
+            bootstrap_binary: String::new(),
+            download_environment: Vec::new(),
         }
     }
 }
@@ -195,7 +204,10 @@ pub struct BridgeConnection {
 }
 
 impl BridgeConnection {
-    pub fn connect_ssh(alias: &str, options: &BridgeOptions) -> Result<Arc<Self>> {
+    pub fn connect_ssh(
+        alias: &str,
+        options: &BridgeOptions,
+    ) -> Result<(Arc<Self>, Option<String>)> {
         let mut command = Command::new("ssh");
         command.args([
             "-T",
@@ -220,28 +232,39 @@ impl BridgeConnection {
                 options.reverse_tunnel.trim(),
             ]);
         }
+        let bootstrap = remote_bootstrap_script(&options.command);
         command
             .arg(alias)
-            .arg(&options.command)
-            .arg("bridge")
+            .arg(format!("sh -c {}", shell_quote(&bootstrap)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to open muxloomd bridge to {alias}"))?;
-        let writer = child.stdin.take().context("ssh bridge has no stdin")?;
-        let reader = child.stdout.take().context("ssh bridge has no stdout")?;
-        if let Some(stderr) = child.stderr.take() {
-            let target = alias.to_string();
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    debug::log("bridge", format!("target={target} ssh: {line}"));
-                }
-            });
-        }
+        let mut writer = child.stdin.take().context("ssh bridge has no stdin")?;
+        let mut reader = BufReader::new(child.stdout.take().context("ssh bridge has no stdout")?);
+        let stderr_lines = child
+            .stderr
+            .take()
+            .map(|stderr| capture_bridge_stderr(stderr, alias));
+        let provision_notice = match negotiate_remote_companion(
+            alias,
+            options,
+            &mut child,
+            &mut reader,
+            &mut writer,
+            stderr_lines.as_ref(),
+        ) {
+            Ok(notice) => notice,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let connection = Self::from_parts(alias.to_string(), reader, writer, Some(child));
-        Self::handshake(connection, alias)
+        Ok((Self::handshake(connection, alias)?, provision_notice))
     }
 
     pub fn connect_local(configured_command: &str) -> Result<Arc<Self>> {
@@ -755,10 +778,395 @@ fn local_companion_command() -> String {
     executable_name
 }
 
+const BOOTSTRAP_MARKER: &str = "__MUXLOOM_BOOTSTRAP__";
+
+fn remote_bootstrap_script(configured_command: &str) -> String {
+    format!(
+        r#"configured={configured}
+case "$configured" in "~/"*) configured="$HOME/${{configured#~/}}" ;; esac
+install_root="${{XDG_DATA_HOME:-$HOME/.local/share}}/muxloom/bin"
+installed="$install_root/muxloomd"
+expected_protocol='{protocol_version}'
+candidate=
+if [ -x "$installed" ] && [ "$("$installed" protocol-version 2>/dev/null || true)" = "$expected_protocol" ]; then
+    candidate="$installed"
+elif command -v "$configured" >/dev/null 2>&1 && [ "$("$configured" protocol-version 2>/dev/null || true)" = "$expected_protocol" ]; then
+    candidate="$configured"
+elif [ -x "$configured" ] && [ "$("$configured" protocol-version 2>/dev/null || true)" = "$expected_protocol" ]; then
+    candidate="$configured"
+fi
+if [ -n "$candidate" ]; then
+    printf '{marker} READY\n'
+    exec "$candidate" bridge
+fi
+os=$(uname -s 2>/dev/null || printf unknown)
+arch=$(uname -m 2>/dev/null || printf unknown)
+printf '{marker} NEED %s %s\n' "$os" "$arch"
+IFS= read -r muxloom_size
+case "$muxloom_size" in ''|*[!0-9]*) printf 'invalid bootstrap size\n' >&2; exit 64 ;; esac
+mkdir -p "$install_root"
+temporary="$installed.tmp.$$"
+if head -c 0 </dev/null >/dev/null 2>&1; then
+    head -c "$muxloom_size" > "$temporary"
+else
+    dd bs=1 count="$muxloom_size" of="$temporary" 2>/dev/null
+fi
+chmod 700 "$temporary"
+mv -f "$temporary" "$installed"
+printf '{marker} INSTALLED\n'
+exec "$installed" bridge"#,
+        configured = shell_quote(configured_command),
+        protocol_version = PROTOCOL_VERSION,
+        marker = BOOTSTRAP_MARKER,
+    )
+}
+
+fn capture_bridge_stderr(
+    stderr: impl Read + Send + 'static,
+    target: &str,
+) -> Arc<Mutex<Vec<String>>> {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&lines);
+    let target = target.to_string();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            debug::log("bridge", format!("target={target} ssh: {line}"));
+            captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(line);
+        }
+    });
+    lines
+}
+
+fn negotiate_remote_companion(
+    alias: &str,
+    options: &BridgeOptions,
+    child: &mut Child,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
+) -> Result<Option<String>> {
+    let mut status = String::new();
+    if reader.read_line(&mut status)? == 0 {
+        let _ = child.wait();
+        let detail = stderr_lines
+            .map(|lines| {
+                lines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .join("; ")
+            })
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or_else(|| "remote bootstrap exited before reporting status".into());
+        bail!("failed to start muxloomd on {alias}: {detail}");
+    }
+    let fields: Vec<_> = status.split_whitespace().collect();
+    match fields.as_slice() {
+        [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
+        [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
+            let (asset, notice) = resolve_companion_asset(options, os, arch)?;
+            let mut file = fs::File::open(&asset)
+                .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
+            let size = file.metadata()?.len();
+            debug::log(
+                "bridge",
+                format!(
+                    "target={alias} deploying {} bytes from {} for {os}/{arch}",
+                    size,
+                    asset.display()
+                ),
+            );
+            writeln!(writer, "{size}")?;
+            std::io::copy(&mut file, writer)?;
+            writer.flush()?;
+            status.clear();
+            if reader.read_line(&mut status)? == 0
+                || status.trim() != format!("{BOOTSTRAP_MARKER} INSTALLED")
+            {
+                bail!(
+                    "muxloomd deployment on {alias} did not complete: {}",
+                    status.trim()
+                );
+            }
+            Ok(Some(notice))
+        }
+        _ => bail!(
+            "invalid muxloomd bootstrap response from {alias}: {}",
+            status.trim()
+        ),
+    }
+}
+
+fn resolve_companion_asset(
+    options: &BridgeOptions,
+    os: &str,
+    arch: &str,
+) -> Result<(PathBuf, String)> {
+    let triple = companion_target_triple(os, arch)?;
+    if !options.bootstrap_binary.trim().is_empty() {
+        let path = expand_local_tilde(options.bootstrap_binary.trim());
+        if path.is_file() {
+            debug::log(
+                "bridge",
+                format!(
+                    "using configured {triple} companion asset {}",
+                    path.display()
+                ),
+            );
+            return Ok((
+                path,
+                format!("deployed configured {triple} muxloomd companion"),
+            ));
+        }
+        debug::log(
+            "bridge",
+            format!(
+                "configured {triple} companion asset is missing: {}; trying packaged assets",
+                path.display()
+            ),
+        );
+    }
+    let executable = format!("muxloomd{}", executable_suffix(os));
+    let current = env::current_exe().context("failed to locate the muxloom executable")?;
+    let parent = current.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = vec![
+        parent.join("companions").join(&triple).join(&executable),
+        parent.join(format!("muxloomd-{triple}")),
+    ];
+    if current_target_triple().as_deref() == Some(triple.as_str()) {
+        candidates.insert(0, parent.join(&executable));
+    }
+    if let Some(workspace) = parent.parent().and_then(Path::parent) {
+        candidates.push(
+            workspace
+                .join("target")
+                .join(&triple)
+                .join("release")
+                .join(&executable),
+        );
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        debug::log(
+            "bridge",
+            format!("using bundled {triple} companion asset {}", path.display()),
+        );
+        return Ok((
+            path,
+            format!("deployed bundled {triple} muxloomd companion"),
+        ));
+    }
+    debug::log(
+        "bridge",
+        format!(
+            "no bundled {triple} companion asset; downloading the latest GitHub Release on the controller"
+        ),
+    );
+    let (path, downloaded) =
+        download_latest_companion(&triple, &executable, &options.download_environment)
+            .with_context(|| {
+                format!(
+                    "no bundled {triple} muxloomd asset and the controller could not fetch the latest GitHub Release"
+                )
+            })?;
+    let source = if downloaded {
+        "downloaded and checksum-verified from the latest GitHub Release"
+    } else {
+        "loaded from the checksum-verified controller cache"
+    };
+    Ok((path, format!("deployed {triple} muxloomd {source}")))
+}
+
+fn download_latest_companion(
+    triple: &str,
+    executable: &str,
+    environment: &[(String, String)],
+) -> Result<(PathBuf, bool)> {
+    let asset_name = format!(
+        "muxloomd-{triple}{}",
+        executable_suffix_for_name(executable)
+    );
+    let cache = companion_cache_root().join(triple);
+    fs::create_dir_all(&cache)
+        .with_context(|| format!("failed to create companion cache {}", cache.display()))?;
+    let destination = cache.join(executable);
+    let checksum_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}.sha256");
+    let expected = controller_fetch_text(&checksum_url, environment)
+        .context("failed to fetch companion checksum")?;
+    let expected = parse_sha256_checksum(&expected)?;
+    if destination.is_file() && sha256_file(&destination).is_ok_and(|actual| actual == expected) {
+        debug::log(
+            "bridge",
+            format!("using cached {triple} companion {}", destination.display()),
+        );
+        return Ok((destination, false));
+    }
+
+    let partial = cache.join(format!(".{executable}.partial-{}", std::process::id()));
+    let asset_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}");
+    let result = controller_download(&asset_url, &partial, environment).and_then(|_| {
+        let actual = sha256_file(&partial)?;
+        if actual != expected {
+            bail!("companion checksum mismatch: expected {expected}, got {actual}");
+        }
+        if destination.exists() {
+            fs::remove_file(&destination).with_context(|| {
+                format!("failed to replace stale cache {}", destination.display())
+            })?;
+        }
+        fs::rename(&partial, &destination).with_context(|| {
+            format!(
+                "failed to finalize companion download {}",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
+    }
+    debug::log(
+        "bridge",
+        format!(
+            "downloaded latest {triple} companion from GitHub to {}",
+            destination.display()
+        ),
+    );
+    Ok((destination, true))
+}
+
+fn executable_suffix_for_name(executable: &str) -> &'static str {
+    if executable.ends_with(".exe") {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+fn companion_cache_root() -> PathBuf {
+    if let Some(path) = env::var_os("MUXLOOM_CACHE_DIR") {
+        return PathBuf::from(path).join("companions");
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("muxloom/companions");
+    }
+    if let Some(path) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(path).join("Muxloom/cache/companions");
+    }
+    if let Some(path) = env::var_os("HOME") {
+        return PathBuf::from(path).join(".cache/muxloom/companions");
+    }
+    env::temp_dir().join("muxloom-cache/companions")
+}
+
+fn controller_fetch_text(url: &str, environment: &[(String, String)]) -> Result<String> {
+    let output = controller_curl(environment)
+        .args(["-fsSL", "--retry", "3", url])
+        .output()
+        .with_context(|| format!("failed to run curl for {url}"))?;
+    if !output.status.success() {
+        bail!(
+            "curl failed for {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("companion checksum response was not UTF-8")
+}
+
+fn controller_download(
+    url: &str,
+    destination: &Path,
+    environment: &[(String, String)],
+) -> Result<()> {
+    let output = controller_curl(environment)
+        .args(["-fsSL", "--retry", "3", "--output"])
+        .arg(destination)
+        .arg(url)
+        .output()
+        .with_context(|| format!("failed to run curl for {url}"))?;
+    if !output.status.success() {
+        bail!(
+            "curl failed for {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn controller_curl(environment: &[(String, String)]) -> Command {
+    let mut command = Command::new("curl");
+    command.envs(environment.iter().map(|(name, value)| (name, value)));
+    command
+}
+
+fn parse_sha256_checksum(value: &str) -> Result<String> {
+    let checksum = value
+        .split_whitespace()
+        .next()
+        .context("companion checksum file was empty")?;
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("companion checksum file did not contain a SHA-256 digest");
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for checksum", path.display()))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn companion_target_triple(os: &str, arch: &str) -> Result<String> {
+    match (
+        os.to_ascii_lowercase().as_str(),
+        arch.to_ascii_lowercase().as_str(),
+    ) {
+        ("linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-musl".into()),
+        ("linux", "aarch64" | "arm64") => Ok("aarch64-unknown-linux-musl".into()),
+        ("darwin", "arm64" | "aarch64") => Ok("aarch64-apple-darwin".into()),
+        ("darwin", "x86_64" | "amd64") => Ok("x86_64-apple-darwin".into()),
+        _ => bail!("unsupported muxloomd target platform {os}/{arch}"),
+    }
+}
+
+fn current_target_triple() -> Option<String> {
+    let os = match env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    companion_target_triple(os, env::consts::ARCH).ok()
+}
+
+fn executable_suffix(os: &str) -> &'static str {
+    if os.eq_ignore_ascii_case("windows") {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+fn expand_local_tilde(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(value)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[derive(Clone, Default)]
 pub struct BridgePool {
     connections: Arc<Mutex<HashMap<String, Arc<BridgeConnection>>>>,
     target_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    notices: Arc<Mutex<HashMap<String, String>>>,
     options: Arc<HashMap<String, BridgeOptions>>,
     default_options: BridgeOptions,
 }
@@ -778,6 +1186,7 @@ impl BridgePool {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             target_locks: Arc::new(Mutex::new(HashMap::new())),
+            notices: Arc::new(Mutex::new(HashMap::new())),
             options: Arc::new(options),
             default_options,
         }
@@ -908,14 +1317,18 @@ impl BridgePool {
         target: &Target,
         remote_path: String,
         destination: &std::path::Path,
+        mut progress: impl FnMut(u64),
     ) -> Result<()> {
         let connection = self.connection_for_target(target)?;
         let mut stream = connection.open_file(remote_path, 0, None, false)?;
         let mut file = std::fs::File::create(destination)
             .with_context(|| format!("failed to create {}", destination.display()))?;
+        let mut transferred = 0u64;
         while !stream.is_closed() {
             if let Some(bytes) = stream.read_timeout(REQUEST_TIMEOUT)? {
                 file.write_all(&bytes)?;
+                transferred = transferred.saturating_add(bytes.len() as u64);
+                progress(transferred);
             }
         }
         file.flush()?;
@@ -974,14 +1387,20 @@ impl BridgePool {
             connections.remove(target_id);
         }
         let options = self.options.get(target_id).unwrap_or(&self.default_options);
-        let connection = match alias {
+        let (connection, notice) = match alias {
             Some(alias) => BridgeConnection::connect_ssh(alias, options)?,
-            None => BridgeConnection::connect_local(&options.command)?,
+            None => (BridgeConnection::connect_local(&options.command)?, None),
         };
         self.connections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(target_id.into(), Arc::clone(&connection));
+        if let Some(notice) = notice {
+            self.notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target_id.into(), notice);
+        }
         Ok(connection)
     }
 
@@ -1012,6 +1431,13 @@ impl BridgePool {
             .values()
             .filter(|connection| connection.is_alive())
             .count()
+    }
+
+    pub fn take_notice(&self, target_id: &str) -> Option<String> {
+        self.notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(target_id)
     }
 
     pub fn is_connected(&self, target_id: &str) -> bool {
@@ -1081,5 +1507,51 @@ mod tests {
         assert_ne!(left.stdout, right.stdout);
         server_thread.join().unwrap();
         connection.state.shutdown();
+    }
+
+    #[test]
+    fn bootstrap_maps_remote_platforms_and_accepts_an_explicit_asset() {
+        assert_eq!(
+            companion_target_triple("Linux", "x86_64").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            companion_target_triple("Darwin", "arm64").unwrap(),
+            "aarch64-apple-darwin"
+        );
+        let asset = env::temp_dir().join(format!("muxloomd-bootstrap-{}", std::process::id()));
+        fs::write(&asset, b"companion").unwrap();
+        let options = BridgeOptions {
+            bootstrap_binary: asset.display().to_string(),
+            ..BridgeOptions::default()
+        };
+        assert_eq!(
+            resolve_companion_asset(&options, "Linux", "x86_64")
+                .unwrap()
+                .0,
+            asset
+        );
+        fs::remove_file(asset).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_script_updates_missing_or_stale_companions_in_place() {
+        let script = remote_bootstrap_script("~/.local/bin/muxloomd");
+        assert!(script.contains(BOOTSTRAP_MARKER));
+        assert!(script.contains("uname -s"));
+        assert!(script.contains("head -c \"$muxloom_size\""));
+        assert!(script.contains("mv -f \"$temporary\" \"$installed\""));
+        assert!(script.contains("exec \"$installed\" bridge"));
+    }
+
+    #[test]
+    fn github_companion_checksums_are_strictly_validated() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_sha256_checksum(&format!("{digest}  muxloomd-linux\n")).unwrap(),
+            digest
+        );
+        assert!(parse_sha256_checksum("not-a-checksum").is_err());
+        assert!(parse_sha256_checksum("").is_err());
     }
 }

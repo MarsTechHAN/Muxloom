@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use anyhow::{Result, bail};
 use muxloom::{
     daemon::{DaemonPaths, bridge, request_status, serve},
-    daemon_protocol::DaemonResponse,
+    daemon_protocol::{DaemonResponse, PROTOCOL_VERSION},
 };
 
 fn main() -> ExitCode {
@@ -34,6 +34,10 @@ fn run() -> Result<()> {
         }
         Some("--version" | "-V" | "version") => {
             println!("muxloomd {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("protocol-version") => {
+            println!("{PROTOCOL_VERSION}");
             Ok(())
         }
         Some("--help" | "-h" | "help") | None => {

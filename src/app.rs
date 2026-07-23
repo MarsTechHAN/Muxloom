@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{layout::Rect, widgets::ListState};
+use ratatui::{layout::Rect, text::Text, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -96,6 +96,11 @@ pub struct FileManagerForm {
     pub preview_error: Option<String>,
     pub preview_scroll: u16,
     pub preview_max_scroll: u16,
+    pub preview_page_rows: u16,
+    pub preview_rendered: Option<Text<'static>>,
+    pub query: String,
+    pub preview_cache: HashMap<String, FilePreview>,
+    pub preload_pending: HashSet<String>,
     pub entry_rows: Vec<(usize, Rect)>,
     pub list_area: Option<Rect>,
     pub preview_area: Option<Rect>,
@@ -153,7 +158,7 @@ pub struct SearchForm {
     pub edited_at: Instant,
 }
 
-pub const SETTING_LABELS: [&str; 19] = [
+pub const SETTING_LABELS: [&str; 20] = [
     "Refresh interval (ms)",
     "SSH timeout (sec)",
     "History limit",
@@ -162,6 +167,7 @@ pub const SETTING_LABELS: [&str; 19] = [
     "Environment (A=x B=y)",
     "Tunnel RPORT:LHOST:LPORT",
     "Companion command",
+    "Companion binary (local)",
     "Codex command",
     "Codex args",
     "Codex install command",
@@ -175,10 +181,11 @@ pub const SETTING_LABELS: [&str; 19] = [
     "Attention patterns",
 ];
 
-pub const HOST_SETTING_LABELS: [&str; 14] = [
+pub const HOST_SETTING_LABELS: [&str; 15] = [
     "Environment (A=x B=y)",
     "Tunnel RPORT:LHOST:LPORT",
     "Companion command",
+    "Companion binary (local)",
     "Codex command",
     "Codex args",
     "Codex install command",
@@ -432,6 +439,15 @@ impl App {
         if let Some(modal) = self.modal.take() {
             return self.handle_modal(key, modal);
         }
+        if self.file_manager.is_some() {
+            if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.open_file_manager();
+            } else {
+                self.focus = Focus::Agents;
+                self.handle_file_key(key);
+            }
+            return Action::Continue;
+        }
         if let Some(direction) = self.focus_direction_for_key(key) {
             self.move_focus(direction);
             return Action::Continue;
@@ -501,10 +517,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-
-        if self.file_manager.is_some() && self.focus == Focus::Agents && self.handle_file_key(key) {
-            return Action::Continue;
         }
 
         match key.code {
@@ -581,38 +593,75 @@ impl App {
     }
 
     fn handle_file_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers != KeyModifiers::NONE {
-            return false;
-        }
         let Some(mut form) = self.file_manager.take() else {
             return false;
         };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            self.file_manager = Some(form);
+            return true;
+        }
+
+        if form.preview_path.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => {
+                    Self::clear_file_preview(&mut form);
+                    self.status_message = "File preview closed; terminal restored".into();
+                }
+                KeyCode::Up | KeyCode::Left | KeyCode::PageUp | KeyCode::Char('k') => {
+                    Self::page_file_preview(&mut form, false);
+                }
+                KeyCode::Down
+                | KeyCode::Right
+                | KeyCode::PageDown
+                | KeyCode::Char('j')
+                | KeyCode::Char(' ') => Self::page_file_preview(&mut form, true),
+                KeyCode::Home | KeyCode::Char('g') => form.preview_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => form.preview_scroll = form.preview_max_scroll,
+                KeyCode::Char('c') => {
+                    if let Some(entry) = form.entries.get(form.selected) {
+                        self.clipboard_request = Some(entry.path.clone());
+                        self.status_message = format!("Copied path: {}", entry.path);
+                    }
+                }
+                KeyCode::Char('d') => self.download_selected_file(&form),
+                _ => {}
+            }
+            self.file_manager = Some(form);
+            return true;
+        }
+
         match key.code {
             KeyCode::Esc => {
-                if form.preview_path.is_some() {
-                    Self::clear_file_preview(&mut form);
-                    self.file_manager = Some(form);
-                    self.status_message = "File preview closed; terminal restored".into();
-                } else {
+                if form.query.is_empty() {
                     self.status_message = "File browser closed".into();
+                } else {
+                    form.query.clear();
+                    self.file_manager = Some(form);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 Self::move_file_selection(&mut form, -1);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 Self::move_file_selection(&mut form, 1);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::Home if !form.entries.is_empty() => {
                 form.selected = 0;
                 Self::clear_file_preview(&mut form);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::End if !form.entries.is_empty() => {
                 form.selected = form.entries.len() - 1;
                 Self::clear_file_preview(&mut form);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::Left => {
@@ -630,14 +679,15 @@ impl App {
             }
             KeyCode::Right | KeyCode::Enter => self.open_file_entry(form),
             KeyCode::PageUp => {
-                form.preview_scroll = form.preview_scroll.saturating_sub(8);
+                let page = form.preview_page_rows.max(1) as isize;
+                Self::move_file_selection(&mut form, -page);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::PageDown => {
-                form.preview_scroll = form
-                    .preview_scroll
-                    .saturating_add(8)
-                    .min(form.preview_max_scroll);
+                let page = form.preview_page_rows.max(1) as isize;
+                Self::move_file_selection(&mut form, page);
+                self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::Char('d') => {
@@ -652,9 +702,20 @@ impl App {
                 self.file_manager = Some(form);
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.request_file_listing(form),
+            KeyCode::Backspace => {
+                form.query.pop();
+                Self::select_file_query_match(&mut form);
+                self.queue_file_preloads(&mut form);
+                self.file_manager = Some(form);
+            }
+            KeyCode::Char(character) => {
+                form.query.push(character);
+                Self::select_file_query_match(&mut form);
+                self.queue_file_preloads(&mut form);
+                self.file_manager = Some(form);
+            }
             _ => {
                 self.file_manager = Some(form);
-                return false;
             }
         }
         true
@@ -808,6 +869,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if in_list {
+            self.queue_file_preloads(&mut form);
         }
         self.file_manager = Some(form);
         true
@@ -1455,12 +1519,25 @@ impl App {
                     }
                 }
             }
-            Event::Launched { target_id, result } => {
+            Event::Launched {
+                target_id,
+                notice,
+                result,
+            } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 match result {
                     Ok(session_id) => {
+                        let legacy_tmux = session_id.starts_with("muxloom-");
                         self.selected_session_id = Some(session_id);
-                        self.status_message = format!("Agent launched on {target_id}");
+                        self.status_message = if legacy_tmux {
+                            format!(
+                                "Agent launched on {target_id} using legacy tmux fallback (muxloomd unavailable)"
+                            )
+                        } else if let Some(notice) = notice {
+                            format!("Agent launched on {target_id} with muxloomd; {notice}")
+                        } else {
+                            format!("Agent launched on {target_id} with muxloomd")
+                        };
                         self.refresh_target(&target_id);
                     }
                     Err(error) => {
@@ -1648,10 +1725,11 @@ impl App {
                 requested_path,
                 result,
             } => {
-                if let Some(form) = self.file_manager.as_mut()
-                    && form.target.id == target_id
-                    && form.path == requested_path
-                {
+                if let Some(mut form) = self.file_manager.take() {
+                    if form.target.id != target_id || form.path != requested_path {
+                        self.file_manager = Some(form);
+                        return;
+                    }
                     form.loading = false;
                     match result {
                         Ok(FileListing { path, entries }) => {
@@ -1660,7 +1738,7 @@ impl App {
                                 .as_ref()
                                 .is_none_or(|path| entries.iter().any(|entry| &entry.path == path));
                             if !preview_still_exists {
-                                Self::clear_file_preview(form);
+                                Self::clear_file_preview(&mut form);
                             }
                             form.directory_cache.insert(path.clone(), entries.clone());
                             form.path = path;
@@ -1670,6 +1748,8 @@ impl App {
                         }
                         Err(error) => form.error = Some(short_error(&error)),
                     }
+                    self.queue_file_preloads(&mut form);
+                    self.file_manager = Some(form);
                 }
             }
             Event::FilePreviewed {
@@ -1685,7 +1765,9 @@ impl App {
                     form.preview_loading = false;
                     match result {
                         Ok(preview) => {
+                            form.preview_cache.insert(path.clone(), preview.clone());
                             form.preview = Some(preview);
+                            form.preview_rendered = None;
                             form.preview_error = None;
                             form.preview_scroll = 0;
                         }
@@ -1695,6 +1777,63 @@ impl App {
                         }
                     }
                 }
+            }
+            Event::DirectoryPreloaded {
+                target_id,
+                path,
+                result,
+            } => {
+                if let Some(form) = self.file_manager.as_mut()
+                    && form.target.id == target_id
+                {
+                    form.preload_pending.remove(&path);
+                    if let Ok(listing) = result {
+                        form.directory_cache.insert(listing.path, listing.entries);
+                    }
+                }
+            }
+            Event::PreviewPreloaded {
+                target_id,
+                path,
+                result,
+            } => {
+                if let Some(form) = self.file_manager.as_mut()
+                    && form.target.id == target_id
+                {
+                    form.preload_pending.remove(&path);
+                    if let Ok(preview) = result {
+                        form.preview_cache.insert(path, preview);
+                    }
+                }
+            }
+            Event::FileDownloadProgress {
+                remote_path,
+                transferred,
+                total_size,
+                bytes_per_second,
+            } => {
+                let name = remote_path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(remote_path.as_str());
+                let percent = transferred
+                    .saturating_mul(100)
+                    .checked_div(total_size)
+                    .unwrap_or(0);
+                let progress = if total_size > 0 {
+                    format!(
+                        "{}%  {}/{}",
+                        percent,
+                        format_transfer_bytes(transferred),
+                        format_transfer_bytes(total_size)
+                    )
+                } else {
+                    format_transfer_bytes(transferred)
+                };
+                self.status_message = format!(
+                    "Downloading {name}  {progress}  {}/s",
+                    format_transfer_bytes(bytes_per_second as u64)
+                );
             }
             Event::FileDownloaded { result } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
@@ -2401,6 +2540,7 @@ impl App {
                 self.config.environment.clone(),
                 self.config.reverse_tunnel.clone(),
                 self.config.companion_command.clone(),
+                self.config.companion_binary.clone(),
                 self.config.agents.codex.command.clone(),
                 format_shell_list(&self.config.agents.codex.args),
                 self.config.agents.codex.install.clone(),
@@ -2461,6 +2601,11 @@ impl App {
                     .get(&target_id)
                     .and_then(|host| host.companion_command.clone())
                     .unwrap_or_else(|| self.config.companion_command.clone()),
+                self.config
+                    .hosts
+                    .get(&target_id)
+                    .and_then(|host| host.companion_binary.clone())
+                    .unwrap_or_else(|| self.config.companion_binary.clone()),
                 codex.command,
                 format_shell_list(&codex.args),
                 codex.install,
@@ -2532,6 +2677,11 @@ impl App {
             preview_error: None,
             preview_scroll: 0,
             preview_max_scroll: 0,
+            preview_page_rows: 1,
+            preview_rendered: None,
+            query: String::new(),
+            preview_cache: HashMap::new(),
+            preload_pending: HashSet::new(),
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
@@ -2561,6 +2711,8 @@ impl App {
         form.preview_error = None;
         form.preview_scroll = 0;
         form.preview_max_scroll = 0;
+        form.preview_page_rows = 1;
+        form.preview_rendered = None;
         form.preview_area = None;
     }
 
@@ -2595,6 +2747,78 @@ impl App {
         Self::clear_file_preview(form);
     }
 
+    fn select_file_query_match(form: &mut FileManagerForm) {
+        if let Some((index, _)) = form
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                folder_match_rank(&entry.name, &form.query).map(|rank| (index, rank))
+            })
+            .min_by_key(|(_, rank)| *rank)
+        {
+            form.selected = index;
+        }
+    }
+
+    fn page_file_preview(form: &mut FileManagerForm, forward: bool) {
+        let step = form.preview_page_rows.max(1);
+        if form.preview_max_scroll == 0 {
+            form.preview_scroll = 0;
+        } else if forward {
+            form.preview_scroll = if form.preview_scroll >= form.preview_max_scroll {
+                0
+            } else {
+                form.preview_scroll
+                    .saturating_add(step)
+                    .min(form.preview_max_scroll)
+            };
+        } else {
+            form.preview_scroll = if form.preview_scroll == 0 {
+                form.preview_max_scroll
+            } else {
+                form.preview_scroll.saturating_sub(step)
+            };
+        }
+    }
+
+    fn queue_file_preloads(&self, form: &mut FileManagerForm) {
+        const PREVIEW_LIMIT: u64 = 256 * 1024;
+        if form.entries.is_empty() {
+            return;
+        }
+        let start = form.selected.saturating_sub(2);
+        let end = (form.selected + 3).min(form.entries.len());
+        for (index, entry) in form.entries[start..end].iter().enumerate() {
+            if start + index == form.selected || form.preload_pending.contains(&entry.path) {
+                continue;
+            }
+            let request = match entry.kind {
+                FileEntryKind::Directory if !form.directory_cache.contains_key(&entry.path) => {
+                    Some(Request::PreloadDirectory {
+                        target: form.target.clone(),
+                        path: entry.path.clone(),
+                    })
+                }
+                FileEntryKind::File
+                    if entry.size <= PREVIEW_LIMIT
+                        && !form.preview_cache.contains_key(&entry.path) =>
+                {
+                    Some(Request::PreloadPreview {
+                        target: form.target.clone(),
+                        path: entry.path.clone(),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(request) = request
+                && self.worker.requests.send(request).is_ok()
+            {
+                form.preload_pending.insert(entry.path.clone());
+            }
+        }
+    }
+
     fn open_file_entry(&mut self, mut form: FileManagerForm) {
         let entry = form.entries.get(form.selected).cloned();
         let Some(entry) = entry else {
@@ -2614,15 +2838,21 @@ impl App {
         } else {
             Self::clear_file_preview(&mut form);
             form.preview_path = Some(entry.path.clone());
-            form.preview_requested_path = Some(entry.path.clone());
-            form.preview_loading = true;
-            let request = Request::PreviewFile {
-                target: form.target.clone(),
-                path: entry.path,
-            };
-            if self.worker.requests.send(request).is_err() {
+            if let Some(preview) = form.preview_cache.get(&entry.path).cloned() {
+                form.preview = Some(preview);
                 form.preview_loading = false;
-                form.preview_error = Some("Preview worker is unavailable".into());
+                self.status_message = "Opened preloaded preview".into();
+            } else {
+                form.preview_requested_path = Some(entry.path.clone());
+                form.preview_loading = true;
+                let request = Request::PreviewFile {
+                    target: form.target.clone(),
+                    path: entry.path,
+                };
+                if self.worker.requests.send(request).is_err() {
+                    form.preview_loading = false;
+                    form.preview_error = Some("Preview worker is unavailable".into());
+                }
             }
             self.file_manager = Some(form);
         }
@@ -2640,6 +2870,7 @@ impl App {
             target: form.target.clone(),
             remote_path: entry.path.clone(),
             local_directory: default_download_directory(),
+            total_size: entry.size,
         };
         if self.worker.requests.send(request).is_ok() {
             self.busy_operations += 1;
@@ -3039,44 +3270,45 @@ impl App {
                     config.environment = form.values[5].clone();
                     config.reverse_tunnel = form.values[6].clone();
                     config.companion_command = form.values[7].clone();
-                    config.agents.codex.command = form.values[8].clone();
+                    config.companion_binary = form.values[8].clone();
+                    config.agents.codex.command = form.values[9].clone();
                     config.agents.codex.args =
-                        parse_shell_list(&form.values[9], SETTING_LABELS[9])?;
-                    config.agents.codex.install = form.values[10].clone();
+                        parse_shell_list(&form.values[10], SETTING_LABELS[10])?;
+                    config.agents.codex.install = form.values[11].clone();
                     config.agents.codex.sync_files =
-                        parse_shell_list(&form.values[11], SETTING_LABELS[11])?;
-                    config.agents.claude.command = form.values[12].clone();
+                        parse_shell_list(&form.values[12], SETTING_LABELS[12])?;
+                    config.agents.claude.command = form.values[13].clone();
                     config.agents.claude.args =
-                        parse_shell_list(&form.values[13], SETTING_LABELS[13])?;
-                    config.agents.claude.install = form.values[14].clone();
+                        parse_shell_list(&form.values[14], SETTING_LABELS[14])?;
+                    config.agents.claude.install = form.values[15].clone();
                     config.agents.claude.sync_files =
-                        parse_shell_list(&form.values[15], SETTING_LABELS[15])?;
-                    config.agents.terminal.command = form.values[16].clone();
+                        parse_shell_list(&form.values[16], SETTING_LABELS[16])?;
+                    config.agents.terminal.command = form.values[17].clone();
                     config.agents.terminal.args =
-                        parse_shell_list(&form.values[17], SETTING_LABELS[17])?;
-                    config.attention_patterns =
                         parse_shell_list(&form.values[18], SETTING_LABELS[18])?;
+                    config.attention_patterns =
+                        parse_shell_list(&form.values[19], SETTING_LABELS[19])?;
                 }
                 SettingsScope::Host(target_id) => {
                     let codex = CommandConfig {
-                        command: form.values[3].clone(),
-                        args: parse_shell_list(&form.values[4], HOST_SETTING_LABELS[4])?,
-                        install: form.values[5].clone(),
-                        sync_files: parse_shell_list(&form.values[6], HOST_SETTING_LABELS[6])?,
+                        command: form.values[4].clone(),
+                        args: parse_shell_list(&form.values[5], HOST_SETTING_LABELS[5])?,
+                        install: form.values[6].clone(),
+                        sync_files: parse_shell_list(&form.values[7], HOST_SETTING_LABELS[7])?,
                     };
                     let claude = CommandConfig {
-                        command: form.values[7].clone(),
-                        args: parse_shell_list(&form.values[8], HOST_SETTING_LABELS[8])?,
-                        install: form.values[9].clone(),
-                        sync_files: parse_shell_list(&form.values[10], HOST_SETTING_LABELS[10])?,
+                        command: form.values[8].clone(),
+                        args: parse_shell_list(&form.values[9], HOST_SETTING_LABELS[9])?,
+                        install: form.values[10].clone(),
+                        sync_files: parse_shell_list(&form.values[11], HOST_SETTING_LABELS[11])?,
                     };
                     let terminal = CommandConfig {
-                        command: form.values[11].clone(),
-                        args: parse_shell_list(&form.values[12], HOST_SETTING_LABELS[12])?,
+                        command: form.values[12].clone(),
+                        args: parse_shell_list(&form.values[13], HOST_SETTING_LABELS[13])?,
                         ..CommandConfig::default()
                     };
                     let attention_patterns =
-                        parse_shell_list(&form.values[13], HOST_SETTING_LABELS[13])?;
+                        parse_shell_list(&form.values[14], HOST_SETTING_LABELS[14])?;
                     config.hosts.insert(
                         target_id.clone(),
                         HostConfig {
@@ -3086,6 +3318,7 @@ impl App {
                             environment: Some(form.values[0].clone()),
                             reverse_tunnel: Some(form.values[1].clone()),
                             companion_command: Some(form.values[2].clone()),
+                            companion_binary: Some(form.values[3].clone()),
                             attention_patterns: Some(attention_patterns),
                         },
                     );
@@ -4164,6 +4397,21 @@ fn folder_match_rank(name: &str, query: &str) -> Option<(u8, usize, usize)> {
     Some((2, first.unwrap_or(0), gaps))
 }
 
+fn format_transfer_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn parse_setting<T>(value: &str, label: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -4645,7 +4893,7 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        form.values[16] = "/bin/zsh".into();
+        form.values[17] = "/bin/zsh".into();
         app.apply_settings(form);
 
         assert_eq!(app.config.refresh_interval_ms, 1500);
@@ -4903,6 +5151,33 @@ mod tests {
                 }],
             }),
         });
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(
+            request_rx.recv().unwrap(),
+            Request::DownloadFile { total_size: 42, .. }
+        ));
+        app.handle_worker_event(Event::FileDownloadProgress {
+            remote_path: "/work/project/README.md".into(),
+            transferred: 21,
+            total_size: 42,
+            bytes_per_second: 2048.0,
+        });
+        assert!(app.status_message.contains("50%"));
+        assert!(app.status_message.contains("2.0 KiB/s"));
+        app.handle_worker_event(Event::FileDownloaded {
+            result: Ok(PathBuf::from("/tmp/README.md")),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.as_str()),
+            Some("n")
+        );
+        assert!(app.modal.is_none());
+        assert!(request_rx.try_recv().is_err());
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert!(app.modal.is_none());
+        assert!(request_rx.try_recv().is_err());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             request_rx.recv().unwrap(),
@@ -4912,6 +5187,23 @@ mod tests {
         assert_eq!(
             app.take_clipboard_request().as_deref(),
             Some("/work/project/README.md")
+        );
+        {
+            let form = app.file_manager.as_mut().unwrap();
+            form.preview_max_scroll = 20;
+            form.preview_page_rows = 8;
+        }
+        for expected in [8, 16, 20, 0] {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(
+                app.file_manager.as_ref().map(|form| form.preview_scroll),
+                Some(expected)
+            );
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.preview_scroll),
+            Some(20)
         );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
@@ -4971,6 +5263,94 @@ mod tests {
             Request::UploadFiles { ref remote_directory, .. } if remote_directory == "/work/project"
         ));
         let _ = std::fs::remove_file(dropped);
+    }
+
+    #[test]
+    fn file_manager_preloads_neighbor_directories_and_previews() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.open_file_manager();
+        assert!(matches!(
+            request_rx.recv().unwrap(),
+            Request::ListFiles { .. }
+        ));
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: ".".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![
+                    FileEntry {
+                        name: "alpha.txt".into(),
+                        path: "/work/alpha.txt".into(),
+                        kind: FileEntryKind::File,
+                        size: 5,
+                    },
+                    FileEntry {
+                        name: "beta.rs".into(),
+                        path: "/work/beta.rs".into(),
+                        kind: FileEntryKind::File,
+                        size: 12,
+                    },
+                    FileEntry {
+                        name: "src".into(),
+                        path: "/work/src".into(),
+                        kind: FileEntryKind::Directory,
+                        size: 0,
+                    },
+                ],
+            }),
+        });
+        let pending: Vec<_> = request_rx.try_iter().collect();
+        assert!(pending.iter().any(|request| matches!(
+            request,
+            Request::PreloadPreview { path, .. } if path == "/work/beta.rs"
+        )));
+        assert!(pending.iter().any(|request| matches!(
+            request,
+            Request::PreloadDirectory { path, .. } if path == "/work/src"
+        )));
+        app.handle_worker_event(Event::PreviewPreloaded {
+            target_id: "local".into(),
+            path: "/work/beta.rs".into(),
+            result: Ok(FilePreview {
+                path: "/work/beta.rs".into(),
+                mime: "text/plain".into(),
+                kind: crate::model::FilePreviewKind::Text,
+                size: 12,
+                content: "fn beta() {}".into(),
+                truncated: false,
+            }),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.file_manager.as_ref().is_some_and(|form| {
+            form.preview_path.as_deref() == Some("/work/beta.rs")
+                && form
+                    .preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.content == "fn beta() {}")
+                && !form.preview_loading
+        }));
+        assert!(
+            !request_rx
+                .try_iter()
+                .any(|request| matches!(request, Request::PreviewFile { .. }))
+        );
     }
 
     #[test]
@@ -5054,9 +5434,10 @@ mod tests {
         form.values[0] = "HTTP_PROXY=http://proxy:8080".into();
         form.values[1] = "18118:127.0.0.1:8080".into();
         form.values[2] = "~/.local/bin/muxloomd".into();
-        form.values[3] = "/opt/codex".into();
-        form.values[4] = "--full-auto".into();
-        form.values[13] = "'gpu approval'".into();
+        form.values[3] = "~/Downloads/muxloomd-linux".into();
+        form.values[4] = "/opt/codex".into();
+        form.values[5] = "--full-auto".into();
+        form.values[14] = "'gpu approval'".into();
         app.apply_settings(form);
 
         let reloaded = Config::load(&config_path).unwrap();
@@ -5070,6 +5451,10 @@ mod tests {
         );
         assert_eq!(reloaded.attention_patterns_for("gpu"), ["gpu approval"]);
         assert_eq!(reloaded.reverse_tunnel_for("gpu"), "18118:127.0.0.1:8080");
+        assert_eq!(
+            reloaded.companion_binary_for("gpu"),
+            "~/Downloads/muxloomd-linux"
+        );
         assert_eq!(
             reloaded.environment_for("gpu").unwrap(),
             [("HTTP_PROXY".into(), "http://proxy:8080".into())]

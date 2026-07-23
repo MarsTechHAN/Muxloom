@@ -47,7 +47,7 @@ jobs:
         run: cargo test --locked --all-targets
 
   build:
-    name: Build ${{ matrix.label }}
+    name: Compile ${{ matrix.label }}
     needs: check
     strategy:
       fail-fast: false
@@ -57,22 +57,18 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             executable: muxloom
-            archive: tar.gz
           - label: macOS Apple Silicon
             os: macos-latest
             target: aarch64-apple-darwin
             executable: muxloom
-            archive: tar.gz
           - label: macOS Intel
             os: macos-15-intel
             target: x86_64-apple-darwin
             executable: muxloom
-            archive: tar.gz
           - label: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: muxloom.exe
-            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -95,7 +91,40 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Set package name
+      - name: Stage raw binaries
+        shell: bash
+        run: |
+          raw="raw/${{ matrix.target }}"
+          mkdir -p "$raw"
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$raw/"
+          if [[ "${{ matrix.target }}" != *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/muxloomd" "$raw/"
+          fi
+
+      - name: Upload raw binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: raw-${{ matrix.target }}
+          path: raw
+          if-no-files-found: error
+          compression-level: 0
+
+  package:
+    name: Assemble controller and companion bundles
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Download raw binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: raw-*
+          path: raw
+          merge-multiple: true
+
+      - name: Assemble all platform archives
         shell: bash
         run: |
           ref_name="${GITHUB_REF_NAME//\//-}"
@@ -104,53 +133,65 @@ jobs:
           else
             version="${ref_name}-${GITHUB_SHA:0:7}"
           fi
-          echo "PACKAGE_NAME=muxloom-${version}-${{ matrix.target }}" >> "$GITHUB_ENV"
+          mkdir -p dist
+          package_target() {
+            target="$1"
+            executable="$2"
+            archive="$3"
+            package="muxloom-${version}-${target}"
+            root="dist/$package"
+            mkdir -p "$root"
+            cp "raw/$target/$executable" "$root/"
+            if [[ -f "raw/$target/muxloomd" ]]; then
+              cp "raw/$target/muxloomd" "$root/"
+            fi
+            for companion_target in \
+              x86_64-unknown-linux-musl \
+              aarch64-apple-darwin \
+              x86_64-apple-darwin; do
+              mkdir -p "$root/companions/$companion_target"
+              cp "raw/$companion_target/muxloomd" \
+                "$root/companions/$companion_target/muxloomd"
+            done
+            cp README.md LICENSE "$root/"
+            if [[ "$archive" == "zip" ]]; then
+              (cd dist && zip -qr "$package.zip" "$package")
+              (cd dist && sha256sum "$package.zip" > "$package.zip.sha256")
+            else
+              tar -C dist -czf "dist/$package.tar.gz" "$package"
+              (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+            fi
+          }
+          package_target x86_64-unknown-linux-musl muxloom tar.gz
+          package_target aarch64-apple-darwin muxloom tar.gz
+          package_target x86_64-apple-darwin muxloom tar.gz
+          package_target x86_64-pc-windows-msvc muxloom.exe zip
+          for companion_target in \
+            x86_64-unknown-linux-musl \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin; do
+            asset="muxloomd-$companion_target"
+            cp "raw/$companion_target/muxloomd" "dist/$asset"
+            (cd dist && sha256sum "$asset" > "$asset.sha256")
+          done
 
-      - name: Package Unix archive
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          package_dir="dist/$PACKAGE_NAME"
-          mkdir -p "$package_dir"
-          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$package_dir/"
-          cp "target/${{ matrix.target }}/release/muxloomd" "$package_dir/"
-          cp README.md LICENSE "$package_dir/"
-          tar -C dist -czf "dist/$PACKAGE_NAME.tar.gz" "$PACKAGE_NAME"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$PACKAGE_NAME.tar.gz" > "$PACKAGE_NAME.tar.gz.sha256")
-          else
-            (cd dist && shasum -a 256 "$PACKAGE_NAME.tar.gz" > "$PACKAGE_NAME.tar.gz.sha256")
-          fi
-
-      - name: Package Windows archive
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $packageDir = Join-Path "dist" $env:PACKAGE_NAME
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" $packageDir
-          Copy-Item README.md, LICENSE $packageDir
-          $archive = "dist/$env:PACKAGE_NAME.zip"
-          Compress-Archive -Path $packageDir -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          "$hash  $env:PACKAGE_NAME.zip" | Set-Content -Encoding utf8 "$archive.sha256"
-
-      - name: Upload build artifact
+      - name: Upload release packages
         uses: actions/upload-artifact@v7
         with:
-          name: muxloom-${{ matrix.target }}
+          name: muxloom-packages
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.zip
             dist/*.zip.sha256
+            dist/muxloomd-*
           if-no-files-found: error
           compression-level: 0
 
   release:
     name: Publish GitHub Release
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: build
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -163,7 +204,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: muxloom-*
+          pattern: muxloom-packages
           path: dist
           merge-multiple: true
 

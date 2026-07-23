@@ -21,6 +21,7 @@ pub struct Config {
     pub environment: String,
     pub reverse_tunnel: String,
     pub companion_command: String,
+    pub companion_binary: String,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
 }
@@ -44,6 +45,7 @@ impl Default for Config {
             environment: String::new(),
             reverse_tunnel: String::new(),
             companion_command: "muxloomd".into(),
+            companion_binary: String::new(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
         }
@@ -106,6 +108,7 @@ pub struct HostConfig {
     pub environment: Option<String>,
     pub reverse_tunnel: Option<String>,
     pub companion_command: Option<String>,
+    pub companion_binary: Option<String>,
     pub attention_patterns: Option<Vec<String>>,
 }
 
@@ -190,6 +193,13 @@ impl Config {
             .get(host)
             .and_then(|config| config.companion_command.as_deref())
             .unwrap_or(&self.companion_command)
+    }
+
+    pub fn companion_binary_for(&self, host: &str) -> &str {
+        self.hosts
+            .get(host)
+            .and_then(|config| config.companion_binary.as_deref())
+            .unwrap_or(&self.companion_binary)
     }
 
     pub fn ssh_config_path(&self) -> PathBuf {
@@ -367,6 +377,7 @@ ssh_config = "~/.ssh/config"
 environment = ""
 reverse_tunnel = ""
 companion_command = "muxloomd"
+companion_binary = ""
 
 [agents.codex]
 command = "codex"
@@ -392,6 +403,7 @@ sync_files = []
 # environment = 'HTTP_PROXY=http://proxy:8118 HTTPS_PROXY=http://proxy:8118 NO_PROXY="localhost,.internal"'
 # reverse_tunnel = "18118:127.0.0.1:8118"
 # companion_command = "~/.local/bin/muxloomd"
+# companion_binary = "~/Downloads/muxloomd-x86_64-unknown-linux-musl"
 # attention_patterns = ["approve", "do you want to proceed"]
 
 # [hosts.gpu-box.claude]
@@ -419,6 +431,7 @@ mod tests {
                 environment: None,
                 reverse_tunnel: None,
                 companion_command: None,
+                companion_binary: None,
                 attention_patterns: None,
             },
         );
