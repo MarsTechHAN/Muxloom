@@ -2102,7 +2102,14 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
 }
 
 fn attention_tail(screen: &str) -> String {
-    let lines: Vec<_> = screen.lines().collect();
+    let mut lines: Vec<_> = screen.lines().collect();
+    // Drop trailing blank rows first. A full-height TUI (e.g. Claude Code in an
+    // 86-row pane with a short transcript) draws its status/spinner line well
+    // above the empty bottom of the grid; without this the last 24 raw lines are
+    // all blank and a working/waiting agent is misread as idle.
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
     lines[lines.len().saturating_sub(24)..].join("\n")
 }
 
@@ -2901,6 +2908,22 @@ mod tests {
         );
         assert_eq!(attention_reason(AgentKind::Codex, &stale_prompt, &[]), None);
         assert!(attention_reason(AgentKind::Codex, "working...", &[]).is_none());
+    }
+
+    #[test]
+    fn working_status_is_detected_above_a_blank_screen_bottom() {
+        // A tall pane whose transcript is short leaves the bottom rows empty, so
+        // the status/spinner line sits well above the last raw lines. It must
+        // still be classified as working rather than idle.
+        let mut claude =
+            String::from("✻ Nucleating… (esc to interrupt · 27m 56s · ↓ 24.0k tokens)\n");
+        claude.push_str(&"\n".repeat(40));
+        assert!(agent_is_working(AgentKind::Claude, &claude));
+
+        let mut codex =
+            String::from("• Working (7s • esc to interrupt) · 1 background terminal running\n");
+        codex.push_str(&"   \n".repeat(40));
+        assert!(agent_is_working(AgentKind::Codex, &codex));
     }
 
     #[test]
