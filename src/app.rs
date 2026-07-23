@@ -160,7 +160,7 @@ pub const HELP_CONTENT_ROWS: usize = 50;
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
 /// constant regardless of how frequently the UI redraws.
-const ANIMATION_FRAME_MS: u128 = 90;
+const ANIMATION_FRAME_MS: u128 = 180;
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
