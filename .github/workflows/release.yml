@@ -17,6 +17,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_VERSION: "1.97.1"
+  FFMPEG_STATIC_RELEASE: "b6.1.1"
+  MUXLOOM_BUILD_ID: ${{ github.sha }}
 
 jobs:
   check:
@@ -57,18 +59,26 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             executable: muxloom
+            ffmpeg_platform: linux
+            ffmpeg_arch: x64
           - label: macOS Apple Silicon
             os: macos-latest
             target: aarch64-apple-darwin
             executable: muxloom
+            ffmpeg_platform: darwin
+            ffmpeg_arch: arm64
           - label: macOS Intel
             os: macos-15-intel
             target: x86_64-apple-darwin
             executable: muxloom
+            ffmpeg_platform: darwin
+            ffmpeg_arch: x64
           - label: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: muxloom.exe
+            ffmpeg_platform: win32
+            ffmpeg_arch: x64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -91,12 +101,29 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Fetch controller-side FFmpeg decoder
+        shell: bash
+        run: |
+          mkdir -p vendor
+          base="https://github.com/eugeneware/ffmpeg-static/releases/download/$FFMPEG_STATIC_RELEASE"
+          asset="ffmpeg-${{ matrix.ffmpeg_platform }}-${{ matrix.ffmpeg_arch }}"
+          executable="ffmpeg"
+          if [[ "${{ matrix.ffmpeg_platform }}" == "win32" ]]; then
+            executable="ffmpeg.exe"
+          fi
+          curl --fail --location --retry 3 "$base/$asset.gz" | gzip -d > "vendor/$executable"
+          curl --fail --location --retry 3 "$base/${{ matrix.ffmpeg_platform }}-${{ matrix.ffmpeg_arch }}.LICENSE" \
+            --output vendor/ffmpeg.LICENSE
+          chmod +x "vendor/$executable"
+          "vendor/$executable" -version | head -n 1
+
       - name: Stage raw binaries
         shell: bash
         run: |
           raw="raw/${{ matrix.target }}"
           mkdir -p "$raw"
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$raw/"
+          cp vendor/ffmpeg* "$raw/"
           if [[ "${{ matrix.target }}" != *windows* ]]; then
             cp "target/${{ matrix.target }}/release/muxloomd" "$raw/"
           fi
@@ -145,6 +172,7 @@ jobs:
             if [[ -f "raw/$target/muxloomd" ]]; then
               cp "raw/$target/muxloomd" "$root/"
             fi
+            cp raw/$target/ffmpeg* "$root/"
             for companion_target in \
               x86_64-unknown-linux-musl \
               aarch64-apple-darwin \

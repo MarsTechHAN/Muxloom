@@ -19,11 +19,13 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_VERSION: "1.97.1"
+  MUXLOOM_BUILD_ID: ${{ github.sha }}
 
 jobs:
   format:
     name: Rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -39,6 +41,7 @@ jobs:
 
   regression:
     name: ${{ matrix.label }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -82,4 +85,5 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run regression suite
-        run: cargo test --locked --all-targets -- --test-threads=1
+        timeout-minutes: 12
+        run: cargo test --locked --all-targets -- --test-threads=1 --nocapture
