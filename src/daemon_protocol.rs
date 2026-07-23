@@ -215,6 +215,7 @@ pub enum DaemonRequest {
     },
     Ping,
     Status,
+    PrepareHandover,
     ProbeExecutables {
         executables: Vec<String>,
     },
@@ -285,6 +286,8 @@ pub enum DaemonResponse {
         uptime_ms: u64,
         clients: usize,
     },
+    HandoverReady,
+    HandoverDeferred,
     Executables {
         available: Vec<String>,
     },

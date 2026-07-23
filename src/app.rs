@@ -136,6 +136,10 @@ pub enum Modal {
         launch: LaunchForm,
         resume_id: Option<String>,
     },
+    LegacyFallback {
+        target_id: String,
+        detail: String,
+    },
     Help(HelpForm),
     Settings(SettingsForm),
     Search(SearchForm),
@@ -1648,6 +1652,16 @@ impl App {
                         let legacy_tmux = session_id.starts_with("muxloom-");
                         self.selected_session_id = Some(session_id);
                         self.status_message = if legacy_tmux {
+                            let detail = notice.unwrap_or_else(|| {
+                                "muxloomd was unavailable; compatibility mode was selected".into()
+                            });
+                            self.notifications.push(format!(
+                                "Muxloom warning: {target_id} is using legacy tmux fallback"
+                            ));
+                            self.modal = Some(Modal::LegacyFallback {
+                                target_id: target_id.clone(),
+                                detail: short_error(&detail),
+                            });
                             format!(
                                 "Agent launched on {target_id} using legacy tmux fallback (muxloomd unavailable)"
                             )
@@ -3491,6 +3505,10 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Enter => self.install_and_launch(launch, resume_id),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.modal = Some(Modal::ConfirmInstall { launch, resume_id }),
+            },
+            Modal::LegacyFallback { target_id, detail } => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {}
+                _ => self.modal = Some(Modal::LegacyFallback { target_id, detail }),
             },
             Modal::Launch(mut form) => match key.code {
                 KeyCode::Esc => {}
@@ -5446,7 +5464,42 @@ mod tests {
             Some(Modal::ConfirmKill { archive: false, .. })
         ));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(request_rx.recv().unwrap(), Request::Kill { .. }));
+        assert!(matches!(receive_request(&request_rx), Request::Kill { .. }));
+    }
+
+    #[test]
+    fn legacy_tmux_fallback_requires_visible_acknowledgement() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.handle_worker_event(Event::Launched {
+            target_id: "remote".into(),
+            notice: Some("muxloomd bootstrap failed".into()),
+            result: Ok("muxloom-codex-legacy".into()),
+        });
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::LegacyFallback {
+                ref target_id,
+                ref detail,
+            }) if target_id == "remote" && detail.contains("bootstrap failed")
+        ));
+        assert!(app.status_message.contains("legacy tmux fallback"));
+        assert!(
+            app.notifications
+                .iter()
+                .any(|notification| notification.contains("legacy tmux fallback"))
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
     }
 
     #[test]

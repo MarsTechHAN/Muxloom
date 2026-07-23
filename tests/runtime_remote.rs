@@ -14,7 +14,6 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
     let command = std::env::var("MUXLOOM_REMOTE_COMPANION_COMMAND")
         .unwrap_or_else(|_| "definitely-missing-muxloomd".into());
     let companion_binary = std::env::var("MUXLOOM_REMOTE_COMPANION_ASSET").ok();
-    let expects_deployment = companion_binary.is_some();
     let mut hosts = BTreeMap::new();
     hosts.insert(
         alias.clone(),
@@ -50,15 +49,16 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
     };
 
     let session_id = runtime.launch(&request, &agent, &[]).unwrap();
-    assert!(session_id.starts_with("muxloomd-"));
-    assert_eq!(runtime.bridge_pool().connected_targets(), 1);
     let notice = runtime.take_bridge_notice(&alias);
-    if expects_deployment {
+    assert!(
+        session_id.starts_with("muxloomd-"),
+        "native companion was not used: session={session_id} notice={notice:?}"
+    );
+    assert_eq!(runtime.bridge_pool().connected_targets(), 1);
+    if let Some(notice) = notice {
         assert!(
-            notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("deployed configured")),
-            "provision notice: {notice:?}"
+            notice.contains("deployed configured"),
+            "unexpected provision notice: {notice}"
         );
     }
     let mut history = String::new();
@@ -70,6 +70,14 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(history.contains(&marker), "remote history: {history:?}");
+    if let Ok(path) = std::env::var("MUXLOOM_REMOTE_TEST_PATH") {
+        let listing = runtime.list_files(&target, &path).unwrap();
+        assert!(!listing.path.is_empty());
+        assert!(
+            !listing.entries.is_empty(),
+            "remote file listing was empty for {path}"
+        );
+    }
     let mut sessions = Vec::new();
     let mut working_seen = false;
     for _ in 0..40 {

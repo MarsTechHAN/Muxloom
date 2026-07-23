@@ -372,13 +372,20 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(request.target.id.clone(), Instant::now());
-            return self
+            let legacy_session = self
                 .launch_legacy_tmux(request, command, environment, now)
                 .with_context(|| {
                     format!(
                         "muxloomd launch failed ({daemon_error:#}); legacy tmux fallback also failed"
                     )
-                });
+                })?;
+            self.bridges.record_notice(
+                &request.target.id,
+                format!(
+                    "WARNING: muxloomd was unavailable, so this session uses legacy tmux; {daemon_error:#}"
+                ),
+            );
+            return Ok(legacy_session);
         }
         debug::log(
             "runtime",

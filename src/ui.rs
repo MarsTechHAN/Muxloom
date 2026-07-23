@@ -1125,6 +1125,31 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                 area,
             );
         }
+        Modal::LegacyFallback { target_id, detail } => {
+            let area = centered_rect(72, 11, outer);
+            frame.render_widget(Clear, area);
+            let text = vec![
+                Line::raw(""),
+                Line::styled(
+                    format!("{target_id} is running this session through legacy tmux."),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Line::raw(""),
+                Line::raw(
+                    "The agent is running, but native history, files, and reconnect behavior may differ.",
+                ),
+                Line::styled(detail.clone(), Style::default().fg(MUTED)),
+                Line::raw(""),
+                Line::styled("Enter/Esc acknowledge", Style::default().fg(MUTED)),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" Legacy tmux compatibility fallback ", true)),
+                area,
+            );
+        }
         Modal::Help(form) => draw_help_modal(frame, form, outer),
         Modal::Settings(form) => draw_settings_modal(frame, form, outer),
         Modal::Search(form) => draw_search_modal(frame, form, outer),

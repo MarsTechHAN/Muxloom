@@ -787,6 +787,8 @@ case "$configured" in "~/"*) configured="$HOME/${{configured#~/}}" ;; esac
 install_root="${{XDG_DATA_HOME:-$HOME/.local/share}}/muxloom/bin"
 installed="$install_root/muxloomd"
 expected_protocol='{protocol_version}'
+os=$(uname -s 2>/dev/null || printf unknown)
+arch=$(uname -m 2>/dev/null || printf unknown)
 candidate=
 if [ -x "$installed" ] && [ "$("$installed" protocol-version 2>/dev/null || true)" = "$expected_protocol" ]; then
     candidate="$installed"
@@ -796,13 +798,20 @@ elif [ -x "$configured" ] && [ "$("$configured" protocol-version 2>/dev/null || 
     candidate="$configured"
 fi
 if [ -n "$candidate" ]; then
-    printf '{marker} READY\n'
+    fingerprint=$("$candidate" binary-sha256 2>/dev/null || true)
+    case "$fingerprint" in ''|*[!0-9a-fA-F]*) fingerprint=legacy ;; esac
+    printf '{marker} HAVE %s %s %s\n' "$os" "$arch" "$fingerprint"
+else
+    printf '{marker} NEED %s %s\n' "$os" "$arch"
+fi
+IFS= read -r muxloom_action
+if [ "$muxloom_action" = USE ] && [ -n "$candidate" ]; then
     exec "$candidate" bridge
 fi
-os=$(uname -s 2>/dev/null || printf unknown)
-arch=$(uname -m 2>/dev/null || printf unknown)
-printf '{marker} NEED %s %s\n' "$os" "$arch"
-IFS= read -r muxloom_size
+case "$muxloom_action" in
+    'INSTALL '*) muxloom_size=${{muxloom_action#INSTALL }} ;;
+    *) printf 'invalid bootstrap action\n' >&2; exit 64 ;;
+esac
 case "$muxloom_size" in ''|*[!0-9]*) printf 'invalid bootstrap size\n' >&2; exit 64 ;; esac
 mkdir -p "$install_root"
 temporary="$installed.tmp.$$"
@@ -865,38 +874,81 @@ fn negotiate_remote_companion(
     let fields: Vec<_> = status.split_whitespace().collect();
     match fields.as_slice() {
         [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
+        [marker, "HAVE", os, arch, fingerprint] if *marker == BOOTSTRAP_MARKER => {
+            let (asset, notice) = match resolve_companion_asset(options, os, arch) {
+                Ok(asset) => asset,
+                Err(error) => {
+                    debug::log(
+                        "bridge",
+                        format!(
+                            "target={alias} companion update unavailable; continuing compatible remote binary: {error:#}"
+                        ),
+                    );
+                    writeln!(writer, "USE")?;
+                    writer.flush()?;
+                    return Ok(Some(format!(
+                        "companion update unavailable; continuing compatible remote generation ({error:#})"
+                    )));
+                }
+            };
+            let expected = sha256_file(&asset)?;
+            if fingerprint.eq_ignore_ascii_case(&expected) {
+                debug::log(
+                    "bridge",
+                    format!("target={alias} remote companion fingerprint is current"),
+                );
+                writeln!(writer, "USE")?;
+                writer.flush()?;
+                Ok(None)
+            } else {
+                deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer)
+            }
+        }
         [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
             let (asset, notice) = resolve_companion_asset(options, os, arch)?;
-            let mut file = fs::File::open(&asset)
-                .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
-            let size = file.metadata()?.len();
-            debug::log(
-                "bridge",
-                format!(
-                    "target={alias} deploying {} bytes from {} for {os}/{arch}",
-                    size,
-                    asset.display()
-                ),
-            );
-            writeln!(writer, "{size}")?;
-            std::io::copy(&mut file, writer)?;
-            writer.flush()?;
-            status.clear();
-            if reader.read_line(&mut status)? == 0
-                || status.trim() != format!("{BOOTSTRAP_MARKER} INSTALLED")
-            {
-                bail!(
-                    "muxloomd deployment on {alias} did not complete: {}",
-                    status.trim()
-                );
-            }
-            Ok(Some(notice))
+            deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer)
         }
         _ => bail!(
             "invalid muxloomd bootstrap response from {alias}: {}",
             status.trim()
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deploy_remote_companion(
+    alias: &str,
+    asset: &Path,
+    notice: &str,
+    os: &str,
+    arch: &str,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> Result<Option<String>> {
+    let mut file = fs::File::open(asset)
+        .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
+    let size = file.metadata()?.len();
+    debug::log(
+        "bridge",
+        format!(
+            "target={alias} deploying {} bytes from {} for {os}/{arch}",
+            size,
+            asset.display()
+        ),
+    );
+    writeln!(writer, "INSTALL {size}")?;
+    std::io::copy(&mut file, writer)?;
+    writer.flush()?;
+    let mut status = String::new();
+    if reader.read_line(&mut status)? == 0
+        || status.trim() != format!("{BOOTSTRAP_MARKER} INSTALLED")
+    {
+        bail!(
+            "muxloomd deployment on {alias} did not complete: {}",
+            status.trim()
+        );
+    }
+    Ok(Some(notice.into()))
 }
 
 fn resolve_companion_asset(
@@ -1440,6 +1492,13 @@ impl BridgePool {
             .remove(target_id)
     }
 
+    pub fn record_notice(&self, target_id: &str, notice: impl Into<String>) {
+        self.notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(target_id.into(), notice.into());
+    }
+
     pub fn is_connected(&self, target_id: &str) -> bool {
         self.connections
             .lock()
@@ -1539,6 +1598,9 @@ mod tests {
         let script = remote_bootstrap_script("~/.local/bin/muxloomd");
         assert!(script.contains(BOOTSTRAP_MARKER));
         assert!(script.contains("uname -s"));
+        assert!(script.contains("binary-sha256"));
+        assert!(script.contains("HAVE %s %s %s"));
+        assert!(script.contains("INSTALL "));
         assert!(script.contains("head -c \"$muxloom_size\""));
         assert!(script.contains("mv -f \"$temporary\" \"$installed\""));
         assert!(script.contains("exec \"$installed\" bridge"));

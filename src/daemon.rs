@@ -46,6 +46,7 @@ mod platform {
         pub socket: PathBuf,
         pub pid: PathBuf,
         pub log: PathBuf,
+        pub generation: PathBuf,
         pub history: PathBuf,
         pub sessions: PathBuf,
     }
@@ -69,6 +70,7 @@ mod platform {
                 socket: root.join("muxloomd.sock"),
                 pid: root.join("muxloomd.pid"),
                 log: root.join("muxloomd.log"),
+                generation: root.join("muxloomd.generation"),
                 history: root.join("history"),
                 sessions: root.join("sessions"),
                 root,
@@ -90,6 +92,9 @@ mod platform {
     struct DaemonState {
         started: Instant,
         clients: AtomicUsize,
+        client_gate: Mutex<()>,
+        draining: AtomicBool,
+        shutdown: AtomicBool,
         next_subscriber: AtomicU64,
         sessions: Mutex<HashMap<String, Arc<ManagedSession>>>,
         paths: DaemonPaths,
@@ -195,6 +200,9 @@ mod platform {
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
+                client_gate: Mutex::new(()),
+                draining: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
                 next_subscriber: AtomicU64::new(1),
                 sessions: Mutex::new(HashMap::new()),
                 paths,
@@ -219,14 +227,17 @@ mod platform {
             .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
         fs::write(&paths.pid, format!("{}\n", std::process::id()))?;
+        fs::write(&paths.generation, format!("{}\n", current_generation()))?;
         let _guard = SocketGuard {
             socket: paths.socket.clone(),
             pid: paths.pid.clone(),
         };
         let state = Arc::new(DaemonState::new(paths.clone()));
-        for connection in listener.incoming() {
-            match connection {
-                Ok(stream) => {
+        listener.set_nonblocking(true)?;
+        while !state.shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
                     let state = Arc::clone(&state);
                     thread::spawn(move || {
                         if let Err(error) = serve_client(stream, state) {
@@ -235,6 +246,9 @@ mod platform {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 Err(error) => return Err(error).context("muxloomd accept failed"),
             }
         }
@@ -262,7 +276,16 @@ mod platform {
     }
 
     fn serve_client(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-        state.clients.fetch_add(1, Ordering::Relaxed);
+        {
+            let _registration = state
+                .client_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.draining.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            state.clients.fetch_add(1, Ordering::Relaxed);
+        }
         let _client_guard = ClientGuard(Arc::clone(&state));
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let flow = Arc::new(StreamFlow::default());
@@ -609,6 +632,7 @@ mod platform {
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
+                            "handover-drain-v1".into(),
                         ],
                     },
                 )
@@ -637,6 +661,22 @@ mod platform {
                     clients: state.clients.load(Ordering::Relaxed),
                 },
             ),
+            DaemonRequest::PrepareHandover => {
+                let ready = prepare_handover(state);
+                write_response(
+                    writer,
+                    request_id,
+                    if ready {
+                        &DaemonResponse::HandoverReady
+                    } else {
+                        &DaemonResponse::HandoverDeferred
+                    },
+                )?;
+                if ready {
+                    state.shutdown.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
             DaemonRequest::ProbeExecutables { executables } => {
                 let available = executables
                     .into_iter()
@@ -670,6 +710,13 @@ mod platform {
                 columns,
                 rows,
             } => {
+                let _launch_guard = state
+                    .client_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.draining.load(Ordering::Acquire) {
+                    bail!("muxloomd is draining for a generation handover");
+                }
                 let session = launch_session(
                     state,
                     session_id,
@@ -791,6 +838,29 @@ mod platform {
                 )
             }
         }
+    }
+
+    fn prepare_handover(state: &DaemonState) -> bool {
+        let _registration = state
+            .client_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.draining.load(Ordering::Acquire) || state.clients.load(Ordering::Acquire) != 1 {
+            return false;
+        }
+        let no_live_sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .all(|session| {
+                let snapshot = session.snapshot();
+                snapshot.dead || snapshot.archived
+            });
+        if no_live_sessions {
+            state.draining.store(true, Ordering::Release);
+        }
+        no_live_sessions
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1416,8 +1486,24 @@ mod platform {
     }
 
     pub fn connect_or_start(paths: &DaemonPaths) -> Result<UnixStream> {
-        if let Ok(stream) = UnixStream::connect(&paths.socket) {
-            return Ok(stream);
+        if let Ok(mut stream) = UnixStream::connect(&paths.socket) {
+            if running_generation_is_current(paths) {
+                return Ok(stream);
+            }
+            match prepare_atomic_handover(&mut stream)? {
+                Some(false) => return Ok(stream),
+                Some(true) => {
+                    drop(stream);
+                    wait_for_daemon_stop(paths)?;
+                }
+                None => {
+                    if !daemon_is_idle_for_handover(&mut stream).unwrap_or(false) {
+                        return Ok(stream);
+                    }
+                    drop(stream);
+                    stop_idle_daemon(paths)?;
+                }
+            }
         }
         if daemon_process_alive(paths) {
             bail!("muxloomd is running but its socket is not accessible");
@@ -1473,6 +1559,126 @@ mod platform {
         };
         let result = unsafe { libc::kill(pid, 0) };
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    fn current_generation() -> String {
+        format!(
+            "{}:protocol-{}:{}",
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            option_env!("MUXLOOM_BUILD_ID").unwrap_or("local")
+        )
+    }
+
+    fn running_generation_is_current(paths: &DaemonPaths) -> bool {
+        fs::read_to_string(&paths.generation)
+            .is_ok_and(|generation| generation.trim() == current_generation())
+    }
+
+    fn prepare_atomic_handover(stream: &mut UnixStream) -> Result<Option<bool>> {
+        const REQUEST_ID: u64 = u64::MAX - 3;
+        Frame::json(
+            FrameKind::Request,
+            0,
+            REQUEST_ID,
+            &DaemonRequest::PrepareHandover,
+        )?
+        .write_to(stream)?;
+        loop {
+            let frame =
+                Frame::read_from(stream)?.context("daemon closed during handover request")?;
+            if frame.kind != FrameKind::Response || frame.request_id != REQUEST_ID {
+                continue;
+            }
+            return Ok(match frame.decode_json::<DaemonResponse>()? {
+                DaemonResponse::HandoverReady => Some(true),
+                DaemonResponse::HandoverDeferred => Some(false),
+                DaemonResponse::Error { .. } => None,
+                response => bail!("unexpected handover response: {response:?}"),
+            });
+        }
+    }
+
+    fn daemon_is_idle_for_handover(stream: &mut UnixStream) -> Result<bool> {
+        const STATUS_REQUEST: u64 = u64::MAX - 1;
+        const SESSIONS_REQUEST: u64 = u64::MAX - 2;
+        Frame::json(
+            FrameKind::Request,
+            0,
+            STATUS_REQUEST,
+            &DaemonRequest::Status,
+        )?
+        .write_to(stream)?;
+        Frame::json(
+            FrameKind::Request,
+            0,
+            SESSIONS_REQUEST,
+            &DaemonRequest::ListSessions,
+        )?
+        .write_to(stream)?;
+        let mut sole_client = None;
+        let mut no_live_sessions = None;
+        while sole_client.is_none() || no_live_sessions.is_none() {
+            let frame = Frame::read_from(stream)?.context("daemon closed during handover probe")?;
+            if frame.kind != FrameKind::Response {
+                continue;
+            }
+            match frame.request_id {
+                STATUS_REQUEST => match frame.decode_json::<DaemonResponse>()? {
+                    DaemonResponse::Status { clients, .. } => sole_client = Some(clients <= 1),
+                    DaemonResponse::Error { message } => bail!(message),
+                    response => bail!("unexpected handover status response: {response:?}"),
+                },
+                SESSIONS_REQUEST => match frame.decode_json::<DaemonResponse>()? {
+                    DaemonResponse::Sessions { sessions } => {
+                        no_live_sessions = Some(
+                            sessions
+                                .iter()
+                                .all(|session| session.dead || session.archived),
+                        )
+                    }
+                    DaemonResponse::Error { message } => bail!(message),
+                    response => bail!("unexpected handover sessions response: {response:?}"),
+                },
+                _ => {}
+            }
+        }
+        Ok(sole_client == Some(true) && no_live_sessions == Some(true))
+    }
+
+    fn stop_idle_daemon(paths: &DaemonPaths) -> Result<()> {
+        let pid = fs::read_to_string(&paths.pid)
+            .context("stale muxloomd generation has no pid file")?
+            .trim()
+            .parse::<i32>()
+            .context("stale muxloomd pid is invalid")?;
+        let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if result != 0 {
+            return Err(io::Error::last_os_error()).context("failed to stop idle muxloomd");
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while daemon_process_alive(paths) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if daemon_process_alive(paths) {
+            bail!("idle muxloomd did not stop during generation handover");
+        }
+        let _ = fs::remove_file(&paths.socket);
+        let _ = fs::remove_file(&paths.pid);
+        Ok(())
+    }
+
+    fn wait_for_daemon_stop(paths: &DaemonPaths) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while daemon_process_alive(paths) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if daemon_process_alive(paths) {
+            bail!("muxloomd did not stop after accepting generation handover");
+        }
+        let _ = fs::remove_file(&paths.socket);
+        let _ = fs::remove_file(&paths.pid);
+        Ok(())
     }
 
     fn open_log(path: &Path) -> Result<File> {
@@ -1558,6 +1764,84 @@ mod platform {
             assert_eq!(stdout, b"shell-output");
             assert_eq!(stderr, b"shell-error");
             assert_eq!(exit, Some(7));
+            drop(client);
+            handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn generation_handover_requires_an_idle_daemon() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let state = test_state("handover");
+            let server_state = Arc::clone(&state);
+            let handle = thread::spawn(move || serve_client(server, server_state));
+
+            assert!(daemon_is_idle_for_handover(&mut client).unwrap());
+            Frame::json(
+                FrameKind::Request,
+                0,
+                70,
+                &DaemonRequest::Launch {
+                    session_id: "muxloomd-terminal-handover".into(),
+                    kind: "terminal".into(),
+                    path: "/tmp".into(),
+                    label: "handover guard".into(),
+                    executable: "/bin/cat".into(),
+                    args: vec![],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 70 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    break;
+                }
+            }
+            assert!(!daemon_is_idle_for_handover(&mut client).unwrap());
+            assert!(!prepare_handover(&state));
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                71,
+                &DaemonRequest::Archive {
+                    session_id: "muxloomd-terminal-handover".into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 71 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            assert!(daemon_is_idle_for_handover(&mut client).unwrap());
+            assert!(prepare_handover(&state));
+
+            let (mut rejected, server) = UnixStream::pair().unwrap();
+            let draining_state = Arc::clone(&state);
+            let rejected_handle = thread::spawn(move || serve_client(server, draining_state));
+            let mut byte = [0_u8; 1];
+            assert_eq!(rejected.read(&mut byte).unwrap(), 0);
+            rejected_handle.join().unwrap().unwrap();
             drop(client);
             handle.join().unwrap().unwrap();
         }
