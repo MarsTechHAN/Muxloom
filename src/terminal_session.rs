@@ -361,7 +361,7 @@ impl TerminalSession {
     }
 }
 
-fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
+pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
     let (previous_height, previous_width) = parser.screen().size();
     if width < previous_width {
         // vt100 0.15 can leave the first half of a wide glyph in the new last

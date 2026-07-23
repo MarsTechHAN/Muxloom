@@ -35,6 +35,7 @@ mod platform {
         },
         recap::extract_recap,
         runtime::{agent_is_working, attention_reason},
+        terminal_session::resize_parser,
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -100,6 +101,7 @@ mod platform {
         writer: Mutex<Box<dyn Write + Send>>,
         child: Mutex<Box<dyn Child + Send + Sync>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
+        screen: Mutex<vt100::Parser>,
         recent_output: Mutex<Vec<u8>>,
         history_path: PathBuf,
         metadata_path: PathBuf,
@@ -878,6 +880,7 @@ mod platform {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             subscribers: Mutex::new(HashMap::new()),
+            screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             recent_output: Mutex::new(Vec::new()),
             history_path,
             metadata_path,
@@ -1116,6 +1119,12 @@ mod platform {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             snapshot.archived = self.archived.load(Ordering::Relaxed);
+            let visible_screen = self
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .screen()
+                .contents();
             let recent = self
                 .recent_output
                 .lock()
@@ -1123,9 +1132,10 @@ mod platform {
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
                 let output = String::from_utf8_lossy(&recent);
                 snapshot.recap = extract_recap(kind, &output);
-                snapshot.attention_reason = attention_reason(kind, &output, &[]);
+                snapshot.attention_reason = attention_reason(kind, &visible_screen, &[]);
                 snapshot.needs_attention = snapshot.attention_reason.is_some();
-                snapshot.working = !snapshot.needs_attention && agent_is_working(kind, &output);
+                snapshot.working =
+                    !snapshot.needs_attention && agent_is_working(kind, &visible_screen);
             }
             snapshot
         }
@@ -1141,6 +1151,14 @@ mod platform {
         fn resize(&self, columns: u16, rows: u16) -> Result<()> {
             self.columns.store(columns.max(20), Ordering::Relaxed);
             self.rows.store(rows.max(5), Ordering::Relaxed);
+            resize_parser(
+                &mut self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                rows.max(5),
+                columns.max(20),
+            );
             self.master
                 .lock()
                 .map_err(|_| anyhow!("session PTY is poisoned"))?
@@ -1181,6 +1199,10 @@ mod platform {
                 bytes.iter().filter(|&&byte| byte == b'\n').count(),
                 Ordering::Relaxed,
             );
+            self.screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .process(bytes);
             let mut recent = self
                 .recent_output
                 .lock()
@@ -1511,6 +1533,34 @@ mod platform {
             assert_eq!(exit, Some(7));
             drop(client);
             handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn visible_pty_screen_drives_agent_working_state() {
+            let state = test_state("visible-working");
+            let session = launch_session(
+                &state,
+                "muxloomd-codex-visible-working".into(),
+                "codex".into(),
+                "/tmp".into(),
+                "visible working state".into(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\033[2J\\033[H• Working (2s • esc to interrupt)'; sleep 1".into(),
+                ],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !session.snapshot().working && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(session.snapshot().working);
+            session.archive().unwrap();
         }
 
         #[test]

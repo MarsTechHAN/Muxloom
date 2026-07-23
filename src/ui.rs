@@ -1,4 +1,4 @@
-use std::{path::Path, sync::LazyLock};
+use std::{collections::HashMap, path::Path, sync::LazyLock};
 
 use ratatui::{
     Frame,
@@ -507,6 +507,23 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let sessions: Vec<_> = app.visible_sessions().into_iter().cloned().collect();
+    let mut working_by_group = HashMap::<String, (bool, bool)>::new();
+    for session in &sessions {
+        if session.dead || !session.working {
+            continue;
+        }
+        let group = if app.state.flatten {
+            format!("{}  {}", session.target_id, session.path)
+        } else {
+            session.path.clone()
+        };
+        let active = working_by_group.entry(group).or_default();
+        match session.kind {
+            AgentKind::Codex => active.0 = true,
+            AgentKind::Claude => active.1 = true,
+            AgentKind::Terminal => {}
+        }
+    }
     let archived_count = app.archived_count();
     let mut items = Vec::new();
     let mut row_ids = Vec::new();
@@ -529,12 +546,34 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             session.path.clone()
         };
         if group != previous_group {
-            items.push(ListItem::new(Line::styled(
-                truncate(&group, area.width.saturating_sub(4) as usize),
+            let active = working_by_group.get(&group).copied().unwrap_or_default();
+            let activity_width = usize::from(active.0) * 2 + usize::from(active.1) * 2;
+            let mut spans = vec![Span::styled(
+                truncate(
+                    &group,
+                    area.width
+                        .saturating_sub(4)
+                        .saturating_sub(activity_width as u16) as usize,
+                ),
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD),
-            )));
+            )];
+            if active.0 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    running_agent_effect(AgentKind::Codex, app.animation_frame),
+                    Style::default().fg(CODEX).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if active.1 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    running_agent_effect(AgentKind::Claude, app.animation_frame),
+                    Style::default().fg(CLAUDE).add_modifier(Modifier::BOLD),
+                ));
+            }
+            items.push(ListItem::new(Line::from(spans)));
             row_ids.push((None, 1));
             previous_group = group;
         }
@@ -2342,14 +2381,13 @@ fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
 }
 
 fn running_agent_effect(kind: AgentKind, frame: u64) -> &'static str {
-    const CODEX_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    const CODEX_FRAMES: [&str; 2] = ["•", "◦"];
     const CLAUDE_FRAMES: [&str; 4] = ["✻", "✽", "✶", "✳"];
-    let frames = match kind {
-        AgentKind::Codex => &CODEX_FRAMES,
-        AgentKind::Claude => &CLAUDE_FRAMES,
-        AgentKind::Terminal => return "▣",
-    };
-    frames[(frame / 3 % frames.len() as u64) as usize]
+    match kind {
+        AgentKind::Codex => CODEX_FRAMES[(frame / 18 % CODEX_FRAMES.len() as u64) as usize],
+        AgentKind::Claude => CLAUDE_FRAMES[(frame / 4 % CLAUDE_FRAMES.len() as u64) as usize],
+        AgentKind::Terminal => "▣",
+    }
 }
 
 fn segment(label: &'static str, selected: bool, color: Color) -> Span<'static> {
@@ -2539,8 +2577,81 @@ mod tests {
         }));
         assert_ne!(
             running_agent_effect(AgentKind::Codex, 0),
-            running_agent_effect(AgentKind::Codex, 5)
+            running_agent_effect(AgentKind::Codex, 20)
         );
+    }
+
+    #[test]
+    fn working_agent_animation_is_visible_in_machine_and_folder_panes() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        for (id, kind) in [("codex", AgentKind::Codex), ("claude", AgentKind::Claude)] {
+            app.sessions.push(AgentSession {
+                id: format!("muxloomd-{id}-working"),
+                target_id: "local".into(),
+                kind,
+                path: "/work/project".into(),
+                label: format!("{id} task"),
+                created_at: 1,
+                dead: false,
+                pid: Some(1),
+                working: true,
+                needs_attention: false,
+                attention_reason: None,
+                recap: None,
+            });
+        }
+
+        let backend = TestBackend::new(70, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_machines(frame, &mut app, frame.area()))
+            .unwrap();
+        let machines = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(machines.contains('•'));
+        assert!(machines.contains('✻'));
+
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        let folders = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(folders.contains("/work/project • ✻"));
+
+        app.animation_frame = 20;
+        terminal
+            .draw(|frame| draw_machines(frame, &mut app, frame.area()))
+            .unwrap();
+        let next_frame = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(next_frame.contains('◦'));
+        assert!(next_frame.contains('✽'));
     }
 
     #[test]
