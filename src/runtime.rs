@@ -1316,10 +1316,12 @@ END {
 
     pub fn list_directory(&self, target: &Target, path: &str) -> Result<DirectoryListing> {
         let path = if path.trim().is_empty() { "." } else { path };
-        match self.bridges.list_directory(target, path.into()) {
-            Ok(listing) => return Ok(listing),
-            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
-            Err(_) => {}
+        if !self.bridge_recently_failed(&target.id) {
+            match self.bridges.list_directory(target, path.into()) {
+                Ok(listing) => return Ok(listing),
+                Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                Err(_) => self.mark_bridge_failed(&target.id),
+            }
         }
         let script = format!(
             "cd {} && pwd -P && find -L . -mindepth 1 -maxdepth 1 -type d -print0",
@@ -1332,15 +1334,19 @@ END {
 
     pub fn list_files(&self, target: &Target, path: &str) -> Result<FileListing> {
         let path = if path.trim().is_empty() { "." } else { path };
-        match self.bridges.list_files(target, path.into()) {
-            Ok(listing) => return Ok(listing),
-            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
-            Err(_) => {}
+        if !self.bridge_recently_failed(&target.id) {
+            match self.bridges.list_files(target, path.into()) {
+                Ok(listing) => return Ok(listing),
+                Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                Err(_) => self.mark_bridge_failed(&target.id),
+            }
         }
         let collect = r#"for entry do
             if [ -L "$entry" ]; then kind=l; size=0;
             elif [ -d "$entry" ]; then kind=d; size=0;
-            elif [ -f "$entry" ]; then kind=f; size=$(wc -c < "$entry" | tr -d '[:space:]');
+            elif [ -f "$entry" ]; then
+                kind=f
+                size=$(stat -c %s -- "$entry" 2>/dev/null || stat -f %z "$entry" 2>/dev/null || wc -c < "$entry" | tr -d '[:space:]')
             else kind=o; size=0; fi
             name=${entry#./}
             printf '%s\0%s\0%s\0' "$kind" "$size" "$name"
@@ -1371,19 +1377,21 @@ END {
 
     pub fn preview_file(&self, target: &Target, path: &str) -> Result<FilePreview> {
         const LIMIT: u64 = 256 * 1024;
-        match self
-            .bridges
-            .preview_file(target, path.into(), LIMIT as usize)
-        {
-            Ok(preview) => return Ok(preview),
-            Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
-            Err(_) => {}
+        if !self.bridge_recently_failed(&target.id) {
+            match self
+                .bridges
+                .preview_file(target, path.into(), LIMIT as usize)
+            {
+                Ok(preview) => return Ok(preview),
+                Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                Err(_) => self.mark_bridge_failed(&target.id),
+            }
         }
         let quoted = shell_quote(path);
         let script = format!(
             r#"path={quoted}
             test -f "$path" || {{ printf 'not a regular file\n' >&2; exit 2; }}
-            size=$(wc -c < "$path" | tr -d '[:space:]')
+            size=$(stat -c %s -- "$path" 2>/dev/null || stat -f %z "$path" 2>/dev/null || wc -c < "$path" | tr -d '[:space:]')
             if command -v file >/dev/null 2>&1; then
                 mime=$(file -b --mime-type -- "$path" 2>/dev/null || printf application/octet-stream)
                 description=$(file -b -- "$path" 2>/dev/null || true)
@@ -1394,10 +1402,12 @@ END {
             lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
             case "$lower" in
                 *.md|*.markdown|*.mdown|*.mkd) kind=markdown ;;
+                *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.ico|*.tif|*.tiff|*.pnm|*.pbm|*.pgm|*.ppm|*.qoi) kind=image ;;
                 *.mp3|*.wav|*.flac|*.aac|*.m4a|*.ogg|*.opus) kind=audio ;;
                 *.mp4|*.m4v|*.mov|*.mkv|*.webm|*.avi|*.mpeg|*.mpg) kind=video ;;
                 *) case "$mime" in
                     text/*|application/json|application/xml|application/javascript|application/x-sh|application/toml) kind=text ;;
+                    image/*) kind=image ;;
                     audio/*) kind=audio ;;
                     video/*) kind=video ;;
                     *) kind=binary ;;
@@ -1770,6 +1780,13 @@ END {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(target_id)
             .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30))
+    }
+
+    fn mark_bridge_failed(&self, target_id: &str) {
+        self.bridge_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(target_id.to_string(), Instant::now());
     }
 
     fn ensure_reverse_tunnel(&self, target: &Target) -> Result<()> {
@@ -2205,6 +2222,7 @@ fn parse_file_preview(output: &[u8]) -> Result<FilePreview> {
     let kind = match fields.next().map(String::from_utf8_lossy).as_deref() {
         Some("text") => FilePreviewKind::Text,
         Some("markdown") => FilePreviewKind::Markdown,
+        Some("image") => FilePreviewKind::Image,
         Some("audio") => FilePreviewKind::Audio,
         Some("video") => FilePreviewKind::Video,
         Some("binary") => FilePreviewKind::Binary,

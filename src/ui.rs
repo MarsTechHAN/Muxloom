@@ -17,8 +17,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal,
-        PaneLayout, PathPickerForm, ResumeForm, SearchForm, SettingsForm, SettingsScope,
+        App, FileManagerForm, FileManagerOrigin, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
+        LaunchForm, Modal, PaneLayout, PathPickerForm, ResumeForm, SearchForm, SettingsForm,
+        SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
@@ -215,7 +216,11 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, portrait: bool
 }
 
 fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneLayout {
-    if app.file_manager.is_some() {
+    if app
+        .file_manager
+        .as_ref()
+        .is_some_and(|form| form.origin == FileManagerOrigin::TerminalPane)
+    {
         let maximum = area.width.saturating_sub(24).max(12);
         let file_width = app.state.file_width.clamp(12, maximum);
         let split = Layout::default()
@@ -1241,11 +1246,11 @@ fn draw_file_browser(
     };
 
     let footer = if form.preview_path.is_some() {
-        "Enter close  Arrows/PgUp/PgDn page  g/G first/last"
+        "Double-click/Enter close  Scroll or arrows page  Right-click parent"
     } else if form.loading {
-        "← parent  → previous child  loading in background"
+        "Click select  Double-click open  Right-click parent  loading"
     } else {
-        "↑↓ select  ← parent  Enter open  c copy  d download"
+        "Click select  Double-click open  Right-click parent  c copy  d download"
     };
     frame.render_widget(
         Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
@@ -1272,6 +1277,44 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .as_mut()
         .expect("preview requires file manager");
     form.preview_area = Some(area);
+    let visual_media = form.preview.as_ref().is_some_and(|preview| {
+        matches!(
+            preview.kind,
+            FilePreviewKind::Image | FilePreviewKind::Video
+        )
+    });
+    if visual_media {
+        form.preview_scroll = 0;
+        form.preview_max_scroll = 0;
+        form.preview_page_rows = inner.height.max(1);
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        if let Some(preview) = &form.preview {
+            frame.render_widget(Paragraph::new(file_preview_metadata(preview)), rows[0]);
+        }
+        if let Some(media) = &form.media_frame {
+            draw_media_frame(frame, media, rows[1]);
+        } else if let Some(error) = &form.media_error {
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .style(Style::default().fg(Color::Red))
+                    .wrap(Wrap { trim: false }),
+                rows[1],
+            );
+        } else {
+            let message = if form.media_loading {
+                "Streaming encoded media and decoding on this machine..."
+            } else {
+                "Waiting for the media decoder..."
+            };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(MUTED))
+                    .alignment(Alignment::Center),
+                rows[1],
+            );
+        }
+        return;
+    }
     if form.preview_rendered.is_none() {
         form.preview_rendered = form.preview.as_ref().map(file_preview_text);
     }
@@ -1311,17 +1354,7 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
 }
 
 fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{}  ", preview.kind),
-            Style::default().fg(ACCENT).bold(),
-        ),
-        Span::styled(preview.mime.clone(), Style::default().fg(MUTED)),
-        Span::styled(
-            format!("  {}", format_bytes(preview.size)),
-            Style::default().fg(MUTED),
-        ),
-    ])];
+    let mut lines = vec![file_preview_metadata(preview)];
     if preview.truncated {
         lines.push(Line::styled(
             "Preview truncated at 256 KiB",
@@ -1332,12 +1365,16 @@ fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
     match preview.kind {
         FilePreviewKind::Markdown => lines.extend(markdown_lines(&preview.content)),
         FilePreviewKind::Text => lines.extend(text_preview_lines(preview)),
+        FilePreviewKind::Image => lines.push(Line::styled(
+            "Image decoding has not started.",
+            Style::default().fg(MUTED),
+        )),
         FilePreviewKind::Audio => lines.push(Line::styled(
-            "Encoded audio stream is ready for controller-side playback.",
+            "Audio playback is not implemented yet.",
             Style::default().fg(MUTED),
         )),
         FilePreviewKind::Video => lines.push(Line::styled(
-            "Encoded video stream is ready for controller-side playback.",
+            "Video decoding has not started.",
             Style::default().fg(MUTED),
         )),
         FilePreviewKind::Binary => lines.push(Line::styled(
@@ -1346,6 +1383,73 @@ fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
         )),
     }
     Text::from(lines)
+}
+
+fn file_preview_metadata(preview: &crate::model::FilePreview) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{}  ", preview.kind),
+            Style::default().fg(ACCENT).bold(),
+        ),
+        Span::styled(preview.mime.clone(), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("  {}", format_bytes(preview.size)),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn draw_media_frame(frame: &mut Frame<'_>, media: &crate::media::MediaFrame, area: Rect) {
+    let text = media_frame_text(media);
+    let height = text.height().min(area.height as usize) as u16;
+    let top = area.y + area.height.saturating_sub(height) / 2;
+    frame.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center),
+        Rect::new(area.x, top, area.width, height),
+    );
+}
+
+fn media_frame_text(media: &crate::media::MediaFrame) -> Text<'static> {
+    const BACKGROUND: [u8; 3] = [18, 20, 24];
+    if media.width == 0
+        || media.height == 0
+        || media.rgba.len() != media.width as usize * media.height as usize * 4
+    {
+        return Text::default();
+    }
+    let mut lines = Vec::with_capacity(media.height.div_ceil(2) as usize);
+    for top_y in (0..media.height).step_by(2) {
+        let mut spans = Vec::with_capacity(media.width as usize);
+        for x in 0..media.width {
+            let top = composited_media_color(media, x, top_y, BACKGROUND);
+            let bottom = if top_y + 1 < media.height {
+                composited_media_color(media, x, top_y + 1, BACKGROUND)
+            } else {
+                Color::Rgb(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2])
+            };
+            spans.push(Span::styled("▄", Style::default().fg(bottom).bg(top)));
+        }
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
+}
+
+fn composited_media_color(
+    media: &crate::media::MediaFrame,
+    x: u16,
+    y: u16,
+    background: [u8; 3],
+) -> Color {
+    let offset = (y as usize * media.width as usize + x as usize) * 4;
+    let alpha = media.rgba[offset + 3] as u16;
+    let blend = |foreground: u8, background: u8| {
+        ((foreground as u16 * alpha + background as u16 * (255 - alpha) + 127) / 255) as u8
+    };
+    Color::Rgb(
+        blend(media.rgba[offset], background[0]),
+        blend(media.rgba[offset + 1], background[1]),
+        blend(media.rgba[offset + 2], background[2]),
+    )
 }
 
 fn text_preview_lines(preview: &crate::model::FilePreview) -> Vec<Line<'static>> {
@@ -2910,6 +3014,7 @@ mod tests {
 
         app.modal = None;
         app.file_manager = Some(FileManagerForm {
+            origin: FileManagerOrigin::TerminalPane,
             target: Target::local(),
             path: "/work".into(),
             entries: vec![crate::model::FileEntry {
@@ -2945,6 +3050,10 @@ mod tests {
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
+            media_playback: None,
+            media_frame: None,
+            media_loading: false,
+            media_error: None,
         });
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal
@@ -2959,6 +3068,13 @@ mod tests {
         assert!(rendered.contains("File preview"));
         assert!(rendered.contains("Enter close"));
         assert!(app.pane_layout.machines.is_none());
+        assert!(app.pane_layout.agents.is_some());
+        assert!(app.pane_layout.recap.is_some());
+
+        let form = app.file_manager.as_mut().unwrap();
+        form.origin = FileManagerOrigin::AgentPane;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.pane_layout.machines.is_some());
         assert!(app.pane_layout.agents.is_some());
         assert!(app.pane_layout.recap.is_some());
 
@@ -3046,6 +3162,21 @@ mod tests {
                 .iter()
                 .any(|line| line.spans.iter().any(|span| span.content.contains("**")))
         );
+    }
+
+    #[test]
+    fn media_frame_uses_half_blocks_for_two_pixel_rows() {
+        let text = media_frame_text(&crate::media::MediaFrame {
+            width: 1,
+            height: 2,
+            rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
+            sequence: 0,
+        });
+        assert_eq!(text.height(), 1);
+        let span = &text.lines[0].spans[0];
+        assert_eq!(span.content, "▄");
+        assert_eq!(span.style.bg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(span.style.fg, Some(Color::Rgb(0, 0, 255)));
     }
 
     fn rendered_text(text: &Text<'_>) -> String {

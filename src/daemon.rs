@@ -970,7 +970,7 @@ mod platform {
         let path = canonical_directory(path)?;
         let mut directories = fs::read_dir(&path)?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.metadata().is_ok_and(|metadata| metadata.is_dir()))
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         directories.sort_by_key(|value| value.to_lowercase());
@@ -986,7 +986,6 @@ mod platform {
         for entry in fs::read_dir(&path)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
-            let metadata = entry.metadata().ok();
             let kind = if file_type.is_symlink() {
                 FileEntryKind::Symlink
             } else if file_type.is_dir() {
@@ -1000,9 +999,11 @@ mod platform {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().to_string_lossy().into_owned(),
                 kind,
-                size: metadata
-                    .filter(|metadata| metadata.is_file())
-                    .map_or(0, |metadata| metadata.len()),
+                size: if file_type.is_file() {
+                    entry.metadata().map_or(0, |metadata| metadata.len())
+                } else {
+                    0
+                },
             });
         }
         entries.sort_by(|left, right| {
@@ -1048,6 +1049,15 @@ mod platform {
         let lower = path.to_lowercase();
         let kind = if matches_extension(&lower, &["md", "markdown", "mdown", "mkd"]) {
             FilePreviewKind::Markdown
+        } else if matches_extension(
+            &lower,
+            &[
+                "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "pnm", "pbm",
+                "pgm", "ppm", "qoi",
+            ],
+        ) || looks_like_image(&bytes)
+        {
+            FilePreviewKind::Image
         } else if matches_extension(&lower, &["mp3", "wav", "flac", "aac", "m4a", "ogg", "opus"]) {
             FilePreviewKind::Audio
         } else if matches_extension(
@@ -1063,6 +1073,7 @@ mod platform {
         let mime = match kind {
             FilePreviewKind::Text => "text/plain",
             FilePreviewKind::Markdown => "text/markdown",
+            FilePreviewKind::Image => "image/*",
             FilePreviewKind::Audio => "audio/*",
             FilePreviewKind::Video => "video/*",
             FilePreviewKind::Binary => "application/octet-stream",
@@ -1104,6 +1115,22 @@ mod platform {
             .filter(|&&byte| byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t' | 0x0c))
             .count();
         controls.saturating_mul(100) < bytes.len()
+    }
+
+    fn looks_like_image(bytes: &[u8]) -> bool {
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+            || bytes.starts_with(b"\xff\xd8\xff")
+            || bytes.starts_with(b"GIF87a")
+            || bytes.starts_with(b"GIF89a")
+            || bytes.starts_with(b"BM")
+            || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+            || bytes.starts_with(b"II*\0")
+            || bytes.starts_with(b"MM\0*")
+            || bytes.starts_with(b"qoif")
+            || matches!(
+                bytes.get(..2),
+                Some(b"P1") | Some(b"P2") | Some(b"P3") | Some(b"P4") | Some(b"P5") | Some(b"P6")
+            )
     }
 
     fn is_executable(path: &Path) -> bool {
@@ -1702,6 +1729,37 @@ mod platform {
             assert!(saw_compressed);
             assert_eq!(downloaded, source_bytes);
 
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::FILE_BASE + 2,
+                33,
+                &OpenStream::Media {
+                    path: source.to_string_lossy().into_owned(),
+                    offset: 128,
+                    length: Some(4096),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            let mut media = Vec::new();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                match frame.kind {
+                    FrameKind::Data if frame.stream_id == stream::FILE_BASE + 2 => {
+                        assert_eq!(frame.flags, 0, "encoded media must not be recompressed");
+                        let payload = frame.decoded_payload().unwrap();
+                        media.extend_from_slice(&payload);
+                        Frame::window_update(frame.stream_id, payload.len() as u32)
+                            .write_to(&mut client)
+                            .unwrap();
+                    }
+                    FrameKind::CloseStream if frame.stream_id == stream::FILE_BASE + 2 => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(media, source_bytes[128..128 + 4096]);
+
             let destination = root.join("uploaded.txt");
             let upload = vec![b'u'; 128 * 1024];
             Frame::json(
@@ -1744,6 +1802,19 @@ mod platform {
                 }
             }
             assert_eq!(fs::read(destination).unwrap(), upload);
+
+            let extensionless_image = root.join("image-data");
+            fs::write(
+                &extensionless_image,
+                b"\x89PNG\r\n\x1a\nnot-a-complete-image",
+            )
+            .unwrap();
+            assert_eq!(
+                native_preview_file(extensionless_image.to_str().unwrap(), 1024)
+                    .unwrap()
+                    .kind,
+                FilePreviewKind::Image
+            );
             drop(client);
             handle.join().unwrap().unwrap();
         }

@@ -245,6 +245,7 @@ pub struct FileListing {
 pub enum FilePreviewKind {
     Text,
     Markdown,
+    Image,
     Audio,
     Video,
     Binary,
@@ -255,6 +256,7 @@ impl fmt::Display for FilePreviewKind {
         f.write_str(match self {
             Self::Text => "text",
             Self::Markdown => "markdown",
+            Self::Image => "image",
             Self::Audio => "audio",
             Self::Video => "video",
             Self::Binary => "binary",

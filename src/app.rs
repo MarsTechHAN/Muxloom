@@ -12,10 +12,11 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     config::{CommandConfig, Config, HostConfig, State},
     debug,
+    media::{MediaFrame, MediaPlayback, MediaUpdate},
     model::{
         AgentKind, AgentSession, ConnectionState, DirectoryListing, FileEntry, FileEntryKind,
-        FileListing, FilePreview, HistoryPage, LOCAL_TARGET_ID, LaunchRequest, ResumeCandidate,
-        SearchResult, Target, TargetStatus,
+        FileListing, FilePreview, FilePreviewKind, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
+        ResumeCandidate, SearchResult, Target, TargetStatus,
     },
     recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason},
@@ -29,6 +30,12 @@ pub enum Focus {
     Machines,
     Agents,
     Recap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileManagerOrigin {
+    AgentPane,
+    TerminalPane,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +86,9 @@ pub struct ResumeForm {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileManagerForm {
+    pub origin: FileManagerOrigin,
     pub target: Target,
     pub path: String,
     pub entries: Vec<FileEntry>,
@@ -104,6 +112,16 @@ pub struct FileManagerForm {
     pub entry_rows: Vec<(usize, Rect)>,
     pub list_area: Option<Rect>,
     pub preview_area: Option<Rect>,
+    pub media_playback: Option<MediaPlayback>,
+    pub media_frame: Option<MediaFrame>,
+    pub media_loading: bool,
+    pub media_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FileClick {
+    key: String,
+    at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +345,7 @@ pub struct App {
     clipboard_request: Option<String>,
     pending_install_launch: Option<(LaunchForm, Option<String>)>,
     pending_archived_resume: Option<ArchivedResume>,
+    last_file_click: Option<FileClick>,
 }
 
 impl App {
@@ -404,6 +423,7 @@ impl App {
             clipboard_request: None,
             pending_install_launch: None,
             pending_archived_resume: None,
+            last_file_click: None,
         }
     }
 
@@ -415,6 +435,7 @@ impl App {
     pub fn on_tick(&mut self) {
         self.animation_frame = self.animation_frame.wrapping_add(1);
         self.drain_worker();
+        self.poll_media();
         self.poll_terminal();
         self.maybe_auto_submit_search();
         if !self.has_terminal_for_selected()
@@ -448,6 +469,10 @@ impl App {
             }
             return Action::Continue;
         }
+        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_file_manager();
+            return Action::Continue;
+        }
         if let Some(direction) = self.focus_direction_for_key(key) {
             self.move_focus(direction);
             return Action::Continue;
@@ -464,10 +489,6 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.refresh_enabled();
-                    return Action::Continue;
-                }
-                KeyCode::Char('f') => {
-                    self.open_file_manager();
                     return Action::Continue;
                 }
                 KeyCode::Char('h') => {
@@ -596,6 +617,7 @@ impl App {
         let Some(mut form) = self.file_manager.take() else {
             return false;
         };
+        self.last_file_click = None;
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
@@ -654,12 +676,14 @@ impl App {
             }
             KeyCode::Home if !form.entries.is_empty() => {
                 form.selected = 0;
+                form.return_path = None;
                 Self::clear_file_preview(&mut form);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::End if !form.entries.is_empty() => {
                 form.selected = form.entries.len() - 1;
+                form.return_path = None;
                 Self::clear_file_preview(&mut form);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
@@ -672,10 +696,6 @@ impl App {
                 } else {
                     self.navigate_file_form(form, parent, Some(child));
                 }
-            }
-            KeyCode::Right if form.loading && form.return_path.is_some() => {
-                let path = form.return_path.clone().expect("checked return path");
-                self.navigate_file_form(form, path, None);
             }
             KeyCode::Right | KeyCode::Enter => self.open_file_entry(form),
             KeyCode::PageUp => {
@@ -846,6 +866,17 @@ impl App {
         }
         let mut form = self.file_manager.take().expect("file form disappeared");
         self.focus = Focus::Agents;
+        if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+            self.last_file_click = None;
+            let child = form.path.clone();
+            let parent = parent_path(&child);
+            if parent == child {
+                self.file_manager = Some(form);
+            } else {
+                self.navigate_file_form(form, parent, Some(child));
+            }
+            return true;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp if in_preview => {
                 form.preview_scroll = form.preview_scroll.saturating_sub(3);
@@ -864,8 +895,33 @@ impl App {
                     .iter()
                     .find(|(_, area)| inside(*area, mouse.column, mouse.row))
                 {
-                    form.selected = *index;
-                    Self::clear_file_preview(&mut form);
+                    let index = *index;
+                    let Some(path) = form.entries.get(index).map(|entry| entry.path.clone()) else {
+                        self.file_manager = Some(form);
+                        return true;
+                    };
+                    let key = format!("entry:{path}");
+                    let double_click = self.is_file_double_click(&key);
+                    if form.selected != index {
+                        Self::clear_file_preview(&mut form);
+                    }
+                    form.selected = index;
+                    form.return_path = None;
+                    if double_click {
+                        self.last_file_click = None;
+                        self.open_file_entry(form);
+                        return true;
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_preview => {
+                if let Some(path) = form.preview_path.clone() {
+                    let key = format!("preview:{path}");
+                    if self.is_file_double_click(&key) {
+                        self.last_file_click = None;
+                        Self::clear_file_preview(&mut form);
+                        self.status_message = "File preview closed; terminal restored".into();
+                    }
                 }
             }
             _ => {}
@@ -877,12 +933,26 @@ impl App {
         true
     }
 
+    fn is_file_double_click(&mut self, key: &str) -> bool {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
+        let now = Instant::now();
+        let double_click = self.last_file_click.as_ref().is_some_and(|click| {
+            click.key == key && now.saturating_duration_since(click.at) <= DOUBLE_CLICK_WINDOW
+        });
+        self.last_file_click = Some(FileClick {
+            key: key.into(),
+            at: now,
+        });
+        double_click
+    }
+
     pub fn handle_paste(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
-        if let Some(form) = self.file_manager.as_ref().cloned() {
+        if let Some(form) = self.file_manager.take() {
             self.upload_dropped_files(&form, &text);
+            self.file_manager = Some(form);
             return;
         }
         if let Some(modal) = self.modal.as_mut() {
@@ -1775,12 +1845,24 @@ impl App {
             } => {
                 if let Some(mut form) = self.file_manager.take() {
                     if form.target.id != target_id || form.path != requested_path {
+                        debug::log(
+                            "files",
+                            format!(
+                                "ignored stale listing target={target_id} requested={requested_path} current_target={} current_path={}",
+                                form.target.id, form.path
+                            ),
+                        );
                         self.file_manager = Some(form);
                         return;
                     }
                     form.loading = false;
                     match result {
                         Ok(FileListing { path, entries }) => {
+                            let selected_path = form.return_path.clone().or_else(|| {
+                                form.entries
+                                    .get(form.selected)
+                                    .map(|entry| entry.path.clone())
+                            });
                             let preview_still_exists = form
                                 .preview_path
                                 .as_ref()
@@ -1791,8 +1873,24 @@ impl App {
                             form.directory_cache.insert(path.clone(), entries.clone());
                             form.path = path;
                             form.entries = entries;
-                            form.selected = 0;
+                            form.selected = selected_path
+                                .as_ref()
+                                .and_then(|selected_path| {
+                                    form.entries
+                                        .iter()
+                                        .position(|entry| &entry.path == selected_path)
+                                })
+                                .unwrap_or(0);
                             form.error = None;
+                            debug::log(
+                                "files",
+                                format!(
+                                    "list completed target={target_id} path={} entries={} selected={}",
+                                    form.path,
+                                    form.entries.len(),
+                                    form.selected
+                                ),
+                            );
                         }
                         Err(error) => form.error = Some(short_error(&error)),
                     }
@@ -1805,6 +1903,7 @@ impl App {
                 path,
                 result,
             } => {
+                let mut media_request = None;
                 if let Some(form) = self.file_manager.as_mut()
                     && form.target.id == target_id
                     && form.preview_path.as_deref() == Some(path.as_str())
@@ -1813,6 +1912,13 @@ impl App {
                     form.preview_loading = false;
                     match result {
                         Ok(preview) => {
+                            if matches!(
+                                preview.kind,
+                                FilePreviewKind::Image | FilePreviewKind::Video
+                            ) {
+                                media_request =
+                                    Some((form.target.clone(), path.clone(), preview.kind));
+                            }
                             form.preview_cache.insert(path.clone(), preview.clone());
                             form.preview = Some(preview);
                             form.preview_rendered = None;
@@ -1822,6 +1928,30 @@ impl App {
                         Err(error) => {
                             form.preview = None;
                             form.preview_error = Some(short_error(&error));
+                        }
+                    }
+                }
+                if let Some((target, path, kind)) = media_request {
+                    self.request_media_preview(target, path, kind);
+                }
+            }
+            Event::MediaOpened {
+                target_id,
+                path,
+                result,
+            } => {
+                if let Some(form) = self.file_manager.as_mut()
+                    && form.target.id == target_id
+                    && form.preview_path.as_deref() == Some(path.as_str())
+                {
+                    match result {
+                        Ok(playback) => {
+                            form.media_playback = Some(playback);
+                            form.media_error = None;
+                        }
+                        Err(error) => {
+                            form.media_loading = false;
+                            form.media_error = Some(short_error(&error));
                         }
                     }
                 }
@@ -2685,10 +2815,16 @@ impl App {
     }
 
     fn open_file_manager(&mut self) {
+        self.last_file_click = None;
         if self.file_manager.take().is_some() {
             self.status_message = "File browser closed".into();
             return;
         }
+        let origin = if self.focus == Focus::Recap {
+            FileManagerOrigin::TerminalPane
+        } else {
+            FileManagerOrigin::AgentPane
+        };
         let selected = self.selected_session().cloned();
         let target = selected
             .as_ref()
@@ -2710,6 +2846,7 @@ impl App {
         self.release_terminal_input("File manager opened");
         self.focus = Focus::Agents;
         self.request_file_listing(FileManagerForm {
+            origin,
             target,
             path,
             entries: Vec::new(),
@@ -2733,6 +2870,10 @@ impl App {
             entry_rows: Vec::new(),
             list_area: None,
             preview_area: None,
+            media_playback: None,
+            media_frame: None,
+            media_loading: false,
+            media_error: None,
         });
     }
 
@@ -2744,6 +2885,15 @@ impl App {
             target: form.target.clone(),
             path: form.path.clone(),
         };
+        debug::log(
+            "files",
+            format!(
+                "list requested target={} path={} cached_entries={}",
+                form.target.id,
+                form.path,
+                form.entries.len()
+            ),
+        );
         if self.worker.requests.send(request).is_err() {
             form.loading = false;
             form.error = Some("File browser worker is unavailable".into());
@@ -2762,6 +2912,88 @@ impl App {
         form.preview_page_rows = 1;
         form.preview_rendered = None;
         form.preview_area = None;
+        form.media_playback = None;
+        form.media_frame = None;
+        form.media_loading = false;
+        form.media_error = None;
+    }
+
+    fn request_media_preview(&mut self, target: Target, path: String, kind: FilePreviewKind) {
+        let area = self.pane_layout.recap;
+        let width = area
+            .map(|area| area.width.saturating_sub(2))
+            .unwrap_or(self.agent_viewport_width)
+            .clamp(1, 240);
+        let height = area
+            .map(|area| area.height.saturating_sub(4).saturating_mul(2))
+            .unwrap_or_else(|| self.agent_viewport_height.saturating_mul(2))
+            .clamp(2, 240);
+        let Some(form) = self.file_manager.as_mut() else {
+            return;
+        };
+        if form.target.id != target.id || form.preview_path.as_deref() != Some(path.as_str()) {
+            return;
+        }
+        form.media_playback = None;
+        form.media_frame = None;
+        form.media_error = None;
+        form.media_loading = true;
+        if self
+            .worker
+            .requests
+            .send(Request::OpenMedia {
+                target,
+                path,
+                kind,
+                width,
+                height,
+            })
+            .is_err()
+        {
+            form.media_loading = false;
+            form.media_error = Some("Media preview worker is unavailable".into());
+        }
+    }
+
+    fn poll_media(&mut self) {
+        let Some(form) = self.file_manager.as_mut() else {
+            return;
+        };
+        let mut close_playback = false;
+        while let Some(playback) = form.media_playback.as_ref() {
+            let update = playback.try_update();
+            match update {
+                Ok(MediaUpdate::Frame(frame)) => {
+                    form.media_frame = Some(frame);
+                    form.media_loading = false;
+                    form.media_error = None;
+                }
+                Ok(MediaUpdate::Finished) => {
+                    form.media_loading = false;
+                    close_playback = true;
+                    break;
+                }
+                Ok(MediaUpdate::Failed(error)) => {
+                    form.media_loading = false;
+                    form.media_error = Some(short_error(&error));
+                    close_playback = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if form.media_loading && form.media_frame.is_none() {
+                        form.media_error =
+                            Some("Media decoder stopped before the first frame".into());
+                    }
+                    form.media_loading = false;
+                    close_playback = true;
+                    break;
+                }
+            }
+        }
+        if close_playback {
+            form.media_playback = None;
+        }
     }
 
     fn navigate_file_form(
@@ -2780,8 +3012,16 @@ impl App {
             .get(&form.path)
             .cloned()
             .unwrap_or_default();
-        form.selected = 0;
         form.return_path = return_path;
+        form.selected = form
+            .return_path
+            .as_ref()
+            .and_then(|return_path| {
+                form.entries
+                    .iter()
+                    .position(|entry| &entry.path == return_path)
+            })
+            .unwrap_or(0);
         Self::clear_file_preview(&mut form);
         self.request_file_listing(form);
     }
@@ -2792,6 +3032,7 @@ impl App {
             return;
         }
         form.selected = shifted(form.selected, form.entries.len(), delta);
+        form.return_path = None;
         Self::clear_file_preview(form);
     }
 
@@ -2806,6 +3047,7 @@ impl App {
             .min_by_key(|(_, rank)| *rank)
         {
             form.selected = index;
+            form.return_path = None;
         }
     }
 
@@ -2832,22 +3074,20 @@ impl App {
 
     fn queue_file_preloads(&self, form: &mut FileManagerForm) {
         const PREVIEW_LIMIT: u64 = 256 * 1024;
+        const MAX_PENDING_PRELOADS: usize = 2;
         if form.entries.is_empty() {
             return;
         }
-        let start = form.selected.saturating_sub(2);
-        let end = (form.selected + 3).min(form.entries.len());
+        let start = form.selected.saturating_sub(1);
+        let end = (form.selected + 2).min(form.entries.len());
         for (index, entry) in form.entries[start..end].iter().enumerate() {
+            if form.preload_pending.len() >= MAX_PENDING_PRELOADS {
+                break;
+            }
             if start + index == form.selected || form.preload_pending.contains(&entry.path) {
                 continue;
             }
             let request = match entry.kind {
-                FileEntryKind::Directory if !form.directory_cache.contains_key(&entry.path) => {
-                    Some(Request::PreloadDirectory {
-                        target: form.target.clone(),
-                        path: entry.path.clone(),
-                    })
-                }
                 FileEntryKind::File
                     if entry.size <= PREVIEW_LIMIT
                         && !form.preview_cache.contains_key(&entry.path) =>
@@ -2886,7 +3126,14 @@ impl App {
         } else {
             Self::clear_file_preview(&mut form);
             form.preview_path = Some(entry.path.clone());
+            let mut media_kind = None;
             if let Some(preview) = form.preview_cache.get(&entry.path).cloned() {
+                if matches!(
+                    preview.kind,
+                    FilePreviewKind::Image | FilePreviewKind::Video
+                ) {
+                    media_kind = Some(preview.kind);
+                }
                 form.preview = Some(preview);
                 form.preview_loading = false;
                 self.status_message = "Opened preloaded preview".into();
@@ -2895,14 +3142,19 @@ impl App {
                 form.preview_loading = true;
                 let request = Request::PreviewFile {
                     target: form.target.clone(),
-                    path: entry.path,
+                    path: entry.path.clone(),
                 };
                 if self.worker.requests.send(request).is_err() {
                     form.preview_loading = false;
                     form.preview_error = Some("Preview worker is unavailable".into());
                 }
             }
+            let media_request =
+                media_kind.map(|kind| (form.target.clone(), entry.path.clone(), kind));
             self.file_manager = Some(form);
+            if let Some((target, path, kind)) = media_request {
+                self.request_media_preview(target, path, kind);
+            }
         }
     }
 
@@ -4350,6 +4602,10 @@ fn default_download_directory() -> PathBuf {
 }
 
 fn dropped_file_paths(value: &str) -> Vec<PathBuf> {
+    let whole_path = PathBuf::from(value.trim());
+    if whole_path.is_file() {
+        return vec![whole_path];
+    }
     let values = shell_words::split(value).unwrap_or_else(|_| {
         value
             .lines()
@@ -4483,6 +4739,12 @@ fn format_shell_list(values: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::{runtime::Runtime, worker::Worker};
+
+    fn receive_request(receiver: &std::sync::mpsc::Receiver<Request>) -> Request {
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected worker request within two seconds")
+    }
 
     #[test]
     fn shifted_wraps_and_pages_in_both_directions() {
@@ -5099,7 +5361,7 @@ mod tests {
         app.focus = Focus::Agents;
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match request_rx.recv().unwrap() {
+        match receive_request(&request_rx) {
             Request::ScanResumes { target, kind, path } => {
                 assert_eq!(target.id, "local");
                 assert_eq!(kind, AgentKind::Codex);
@@ -5120,7 +5382,7 @@ mod tests {
                 updated_at: "2026-07-22T12:00:00Z".into(),
             }]),
         });
-        match request_rx.recv().unwrap() {
+        match receive_request(&request_rx) {
             Request::Launch { request, .. } => {
                 assert_eq!(request.target.id, "local");
                 assert_eq!(request.kind, AgentKind::Codex);
@@ -5173,7 +5435,7 @@ mod tests {
         ));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::Archive { .. }
         ));
 
@@ -5221,8 +5483,12 @@ mod tests {
         });
         app.selected_session_id = Some("muxloom-codex-files".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.origin),
+            Some(FileManagerOrigin::AgentPane)
+        );
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::ListFiles { ref path, .. } if path == "/work/project"
         ));
         app.handle_worker_event(Event::FilesListed {
@@ -5240,7 +5506,7 @@ mod tests {
         });
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::DownloadFile { total_size: 42, .. }
         ));
         app.handle_worker_event(Event::FileDownloadProgress {
@@ -5267,7 +5533,7 @@ mod tests {
         assert!(request_rx.try_recv().is_err());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::PreviewFile { ref path, .. } if path == "/work/project/README.md"
         ));
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
@@ -5300,12 +5566,12 @@ mod tests {
         );
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::ListFiles { ref path, .. } if path == "/work"
         ));
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::ListFiles { ref path, .. } if path == "/work/project"
         ));
         assert!(app.file_manager.as_ref().is_some_and(|form| {
@@ -5325,7 +5591,7 @@ mod tests {
         );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::PreviewFile { ref path, .. } if path == "/work/project/README.md"
         ));
         app.handle_worker_event(Event::FilesListed {
@@ -5346,14 +5612,48 @@ mod tests {
         std::fs::write(&dropped, "upload").unwrap();
         app.handle_paste(dropped.display().to_string());
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::UploadFiles { ref remote_directory, .. } if remote_directory == "/work/project"
         ));
         let _ = std::fs::remove_file(dropped);
     }
 
     #[test]
-    fn file_manager_preloads_neighbor_directories_and_previews() {
+    fn attached_terminal_ctrl_f_opens_the_terminal_pane_file_browser() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.focus = Focus::Recap;
+        app.interactive = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.origin),
+            Some(FileManagerOrigin::TerminalPane)
+        );
+        assert!(!app.interactive);
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Request::ListFiles { path, .. } if path == "."
+        ));
+    }
+
+    #[test]
+    fn file_manager_preloads_only_neighbor_file_previews() {
         let config = Config::default();
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
@@ -5372,7 +5672,7 @@ mod tests {
         );
         app.open_file_manager();
         assert!(matches!(
-            request_rx.recv().unwrap(),
+            receive_request(&request_rx),
             Request::ListFiles { .. }
         ));
         app.handle_worker_event(Event::FilesListed {
@@ -5407,10 +5707,11 @@ mod tests {
             request,
             Request::PreloadPreview { path, .. } if path == "/work/beta.rs"
         )));
-        assert!(pending.iter().any(|request| matches!(
-            request,
-            Request::PreloadDirectory { path, .. } if path == "/work/src"
-        )));
+        assert!(
+            !pending
+                .iter()
+                .any(|request| matches!(request, Request::PreloadDirectory { .. }))
+        );
         app.handle_worker_event(Event::PreviewPreloaded {
             target_id: "local".into(),
             path: "/work/beta.rs".into(),
@@ -5438,6 +5739,178 @@ mod tests {
                 .try_iter()
                 .any(|request| matches!(request, Request::PreviewFile { .. }))
         );
+    }
+
+    #[test]
+    fn file_manager_mouse_double_clicks_entries_and_right_clicks_parent() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.open_file_manager();
+        let _ = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: ".".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![
+                    FileEntry {
+                        name: "README.md".into(),
+                        path: "/work/README.md".into(),
+                        kind: FileEntryKind::File,
+                        size: 300_000,
+                    },
+                    FileEntry {
+                        name: "src".into(),
+                        path: "/work/src".into(),
+                        kind: FileEntryKind::Directory,
+                        size: 0,
+                    },
+                ],
+            }),
+        });
+        {
+            let form = app.file_manager.as_mut().unwrap();
+            form.list_area = Some(Rect::new(0, 0, 20, 4));
+            form.entry_rows = vec![(0, Rect::new(0, 1, 20, 1)), (1, Rect::new(0, 2, 20, 1))];
+        }
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(click(1));
+        assert!(request_rx.try_recv().is_err(), "single click only selects");
+        app.handle_mouse(click(1));
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Request::PreviewFile { path, .. } if path == "/work/README.md"
+        ));
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: "/work/README.md".into(),
+            result: Ok(FilePreview {
+                path: "/work/README.md".into(),
+                mime: "text/markdown".into(),
+                kind: FilePreviewKind::Markdown,
+                size: 300_000,
+                content: "# Muxloom".into(),
+                truncated: true,
+            }),
+        });
+        app.handle_mouse(click(1));
+        app.handle_mouse(click(1));
+        assert!(
+            app.file_manager
+                .as_ref()
+                .is_some_and(|form| form.preview_path.is_none())
+        );
+
+        app.handle_mouse(click(2));
+        app.handle_mouse(click(2));
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Request::ListFiles { path, .. } if path == "/work/src"
+        ));
+        {
+            let form = app.file_manager.as_mut().unwrap();
+            form.list_area = Some(Rect::new(0, 0, 20, 4));
+        }
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Request::ListFiles { path, .. } if path == "/work"
+        ));
+    }
+
+    #[test]
+    fn changing_selection_while_parent_loads_does_not_reopen_the_previous_child() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.open_file_manager();
+        let _ = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let form = app.file_manager.as_mut().unwrap();
+        form.path = "/work".into();
+        form.entries = vec![
+            FileEntry {
+                name: "old".into(),
+                path: "/work/old".into(),
+                kind: FileEntryKind::Directory,
+                size: 0,
+            },
+            FileEntry {
+                name: "new".into(),
+                path: "/work/new".into(),
+                kind: FileEntryKind::Directory,
+                size: 0,
+            },
+        ];
+        form.selected = 0;
+        form.loading = true;
+        form.return_path = Some("/work/old".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![
+                    FileEntry {
+                        name: "old".into(),
+                        path: "/work/old".into(),
+                        kind: FileEntryKind::Directory,
+                        size: 0,
+                    },
+                    FileEntry {
+                        name: "new".into(),
+                        path: "/work/new".into(),
+                        kind: FileEntryKind::Directory,
+                        size: 0,
+                    },
+                ],
+            }),
+        });
+        assert_eq!(app.file_manager.as_ref().map(|form| form.selected), Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(
+            request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Request::ListFiles { path, .. } if path == "/work/new"
+        ));
     }
 
     #[test]

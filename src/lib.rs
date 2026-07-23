@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_protocol;
 pub mod debug;
+pub mod media;
 pub mod model;
 pub mod recap;
 pub mod runtime;

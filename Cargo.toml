@@ -12,6 +12,7 @@ readme = "README.md"
 anyhow = "1.0"
 crossterm = "0.28"
 csv = "1.4"
+image = { version = "=0.25.5", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.11"
 portable-pty = "0.8"

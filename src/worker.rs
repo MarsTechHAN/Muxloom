@@ -4,9 +4,11 @@ use crate::{
     bridge::BridgePool,
     config::CommandConfig,
     debug,
+    media::{MediaPlayback, MediaUpdate, decode_image_stream, decode_video_stream},
     model::{
-        AgentKind, AgentSession, DirectoryListing, FileListing, FilePreview, HistoryMatch,
-        HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind, SearchResult, Target,
+        AgentKind, AgentSession, DirectoryListing, FileListing, FilePreview, FilePreviewKind,
+        HistoryMatch, HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind,
+        SearchResult, Target,
     },
     runtime::Runtime,
 };
@@ -70,6 +72,13 @@ pub enum Request {
     PreviewFile {
         target: Target,
         path: String,
+    },
+    OpenMedia {
+        target: Target,
+        path: String,
+        kind: FilePreviewKind,
+        width: u16,
+        height: u16,
     },
     PreloadDirectory {
         target: Target,
@@ -146,6 +155,11 @@ pub enum Event {
         target_id: String,
         path: String,
         result: Result<FilePreview, String>,
+    },
+    MediaOpened {
+        target_id: String,
+        path: String,
+        result: Result<MediaPlayback, String>,
     },
     DirectoryPreloaded {
         target_id: String,
@@ -442,12 +456,61 @@ impl Worker {
                         let target_id = target.id.clone();
                         let result = runtime
                             .preview_file(&target, &path)
+                            .map(normalize_legacy_image_preview)
                             .map_err(|error| error.to_string());
                         let _ = events.send(Event::FilePreviewed {
                             target_id,
                             path,
                             result,
                         });
+                    }
+                    Request::OpenMedia {
+                        target,
+                        path,
+                        kind,
+                        width,
+                        height,
+                    } => {
+                        let target_id = target.id.clone();
+                        match runtime
+                            .bridge_pool()
+                            .open_media(&target, path.clone(), 0, None)
+                        {
+                            Ok(stream) => {
+                                let (updates, playback) = MediaPlayback::channel();
+                                if events
+                                    .send(Event::MediaOpened {
+                                        target_id,
+                                        path: path.clone(),
+                                        result: Ok(playback),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let result = match kind {
+                                    FilePreviewKind::Image => {
+                                        decode_image_stream(stream, width, height, &updates)
+                                    }
+                                    FilePreviewKind::Video => {
+                                        decode_video_stream(stream, width, height, &updates)
+                                    }
+                                    _ => {
+                                        Err(anyhow::anyhow!("{} is not a visual media type", kind))
+                                    }
+                                };
+                                if let Err(error) = result {
+                                    let _ = updates.send(MediaUpdate::Failed(error.to_string()));
+                                }
+                            }
+                            Err(error) => {
+                                let _ = events.send(Event::MediaOpened {
+                                    target_id,
+                                    path,
+                                    result: Err(error.to_string()),
+                                });
+                            }
+                        }
                     }
                     Request::PreloadDirectory { target, path } => {
                         let target_id = target.id.clone();
@@ -464,6 +527,7 @@ impl Worker {
                         let target_id = target.id.clone();
                         let result = runtime
                             .preview_file(&target, &path)
+                            .map(normalize_legacy_image_preview)
                             .map_err(|error| error.to_string());
                         let _ = events.send(Event::PreviewPreloaded {
                             target_id,
@@ -533,6 +597,43 @@ impl Worker {
             bridges,
         }
     }
+}
+
+fn normalize_legacy_image_preview(mut preview: FilePreview) -> FilePreview {
+    if preview.kind == FilePreviewKind::Binary
+        && (preview.mime.starts_with("image/") || image_extension(&preview.path))
+    {
+        preview.kind = FilePreviewKind::Image;
+        if !preview.mime.starts_with("image/") {
+            preview.mime = "image/*".into();
+        }
+    }
+    preview
+}
+
+fn image_extension(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "ico"
+                    | "tif"
+                    | "tiff"
+                    | "pnm"
+                    | "pbm"
+                    | "pgm"
+                    | "ppm"
+                    | "qoi"
+            )
+        })
 }
 
 fn best_name_match(session: &AgentSession, query: &str) -> Option<(usize, String)> {
@@ -692,5 +793,19 @@ mod tests {
             },
         ];
         assert!(best_history_match(&matches, "renderer").unwrap().0.recap);
+    }
+
+    #[test]
+    fn legacy_binary_image_previews_are_normalized_on_the_controller() {
+        let preview = normalize_legacy_image_preview(FilePreview {
+            path: "/tmp/frame.PNG".into(),
+            mime: "application/octet-stream".into(),
+            kind: FilePreviewKind::Binary,
+            size: 12,
+            content: String::new(),
+            truncated: false,
+        });
+        assert_eq!(preview.kind, FilePreviewKind::Image);
+        assert_eq!(preview.mime, "image/*");
     }
 }
