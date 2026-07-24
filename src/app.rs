@@ -125,6 +125,9 @@ pub struct FileManagerForm {
     pub preview_page_rows: u16,
     pub preview_rendered: Option<Text<'static>>,
     pub query: String,
+    pub search_request_id: Option<u64>,
+    pub searching: bool,
+    pub search_edited_at: Option<Instant>,
     pub preview_cache: HashMap<String, FilePreview>,
     pub preload_pending: HashSet<String>,
     pub entry_rows: Vec<(usize, Rect)>,
@@ -156,6 +159,11 @@ pub enum Modal {
     ConfirmInstall {
         launch: LaunchForm,
         resume_id: Option<String>,
+        initial_prompt: Option<String>,
+    },
+    ConfirmHistoryReference {
+        form: ResumeForm,
+        candidate: ResumeCandidate,
     },
     LegacyFallback {
         target_id: String,
@@ -177,12 +185,14 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 51;
+pub const HELP_CONTENT_ROWS: usize = 52;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
 /// constant regardless of how frequently the UI redraws.
 const ANIMATION_FRAME_MS: u128 = 180;
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -334,6 +344,9 @@ pub struct App {
     pub focus: Focus,
     pub selected_target: usize,
     pub selected_session_id: Option<String>,
+    /// Last highlighted session for each machine. Machine navigation restores
+    /// this before falling back to the first visible session.
+    selected_sessions_by_target: HashMap<String, String>,
     pub history: HistoryPage,
     pub history_message: String,
     pub history_loading: bool,
@@ -371,11 +384,13 @@ pub struct App {
     animation_epoch: Instant,
     worker: Worker,
     pending_scans: HashSet<String>,
+    pending_activity_refreshes: HashSet<String>,
     pending_capture: Option<(String, String, usize)>,
     history_cache: HashMap<String, Vec<HistoryPage>>,
     history_cache_dir: PathBuf,
     dragging: Option<DragDivider>,
     last_refresh: Instant,
+    last_activity_refresh: Instant,
     top_up_count: u8,
     last_top_up: Option<Instant>,
     notifications: Vec<String>,
@@ -385,9 +400,11 @@ pub struct App {
     pending_terminal_has_output: bool,
     pending_terminal_take_input: bool,
     clipboard_request: Option<String>,
-    pending_install_launch: Option<(LaunchForm, Option<String>)>,
+    pending_install_launch: Option<(LaunchForm, Option<String>, Option<String>)>,
     pending_archived_resume: Option<ArchivedResume>,
     last_file_click: Option<FileClick>,
+    last_machine_click: Option<FileClick>,
+    next_file_search_id: u64,
     update_slot: UpdateSlot,
     pub(crate) task_progress: Vec<(String, TaskKind, TaskProgress)>,
     /// A newer version staged (or available) by the background update check;
@@ -425,6 +442,7 @@ impl App {
             focus: Focus::Machines,
             selected_target: 0,
             selected_session_id: None,
+            selected_sessions_by_target: HashMap::new(),
             history: HistoryPage::default(),
             history_message: "Select an agent to load its terminal history.".into(),
             history_loading: false,
@@ -457,11 +475,13 @@ impl App {
             animation_epoch: Instant::now(),
             worker,
             pending_scans: HashSet::new(),
+            pending_activity_refreshes: HashSet::new(),
             pending_capture: None,
             history_cache: HashMap::new(),
             history_cache_dir,
             dragging: None,
             last_refresh: Instant::now(),
+            last_activity_refresh: Instant::now(),
             top_up_count: 0,
             last_top_up: None,
             notifications: Vec::new(),
@@ -474,6 +494,8 @@ impl App {
             pending_install_launch: None,
             pending_archived_resume: None,
             last_file_click: None,
+            last_machine_click: None,
+            next_file_search_id: 0,
             update_slot: Arc::new(Mutex::new(None)),
             task_progress: Vec::new(),
             staged_update: None,
@@ -519,6 +541,10 @@ impl App {
         self.poll_media();
         self.poll_terminal();
         self.maybe_auto_submit_search();
+        self.maybe_submit_file_search();
+        if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
+            self.refresh_daemon_activity();
+        }
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -543,6 +569,9 @@ impl App {
         if let Some(modal) = self.modal.take() {
             return self.handle_modal(key, modal);
         }
+        if self.handle_pane_number_shortcut(key) {
+            return Action::Continue;
+        }
         if self.file_manager.is_some() {
             // Ctrl+F toggles the browser closed regardless of which pane is focused.
             if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -558,7 +587,13 @@ impl App {
             // The browser is modal only while its own pane (the agents column) is
             // focused. When another pane holds focus, fall through so it can
             // handle the key normally.
-            if self.focus == Focus::Agents {
+            if self.focus == Focus::Agents
+                || (self.focus == Focus::Recap
+                    && self
+                        .file_manager
+                        .as_ref()
+                        .is_some_and(|form| form.preview_path.is_some()))
+            {
                 self.handle_file_key(key);
                 return Action::Continue;
             }
@@ -597,43 +632,9 @@ impl App {
                     self.open_search();
                     return Action::Continue;
                 }
-                KeyCode::Char('1') => {
-                    if !self.state.flatten {
-                        self.focus = Focus::Machines;
-                    }
-                    return Action::Continue;
-                }
-                KeyCode::Char('2') => {
-                    self.focus = Focus::Agents;
-                    return Action::Continue;
-                }
-                KeyCode::Char('3') => {
-                    self.focus = Focus::Recap;
-                    self.activate_terminal();
-                    return Action::Continue;
-                }
                 _ => {}
             }
         }
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            match key.code {
-                KeyCode::Char('1') if !self.state.flatten => {
-                    self.focus = Focus::Machines;
-                    return Action::Continue;
-                }
-                KeyCode::Char('2') => {
-                    self.focus = Focus::Agents;
-                    return Action::Continue;
-                }
-                KeyCode::Char('3') => {
-                    self.focus = Focus::Recap;
-                    self.activate_terminal();
-                    return Action::Continue;
-                }
-                _ => {}
-            }
-        }
-
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('?') => {
@@ -711,6 +712,41 @@ impl App {
         }
     }
 
+    fn handle_pane_number_shortcut(&mut self, key: KeyEvent) -> bool {
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('1') if !self.state.flatten => {
+                self.focus = Focus::Machines;
+                self.release_terminal_input("Machine pane focused");
+                true
+            }
+            KeyCode::Char('2') => {
+                self.focus = Focus::Agents;
+                self.release_terminal_input("Agent pane focused");
+                true
+            }
+            KeyCode::Char('3') => {
+                self.focus = Focus::Recap;
+                if self
+                    .file_manager
+                    .as_ref()
+                    .is_some_and(|form| form.preview_path.is_some())
+                {
+                    self.release_terminal_input("File preview focused");
+                } else {
+                    self.activate_terminal();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_file_key(&mut self, key: KeyEvent) -> bool {
         let Some(mut form) = self.file_manager.take() else {
             return false;
@@ -728,6 +764,7 @@ impl App {
             match key.code {
                 KeyCode::Enter | KeyCode::Esc => {
                     Self::clear_file_preview(&mut form);
+                    self.focus = Focus::Agents;
                     self.status_message = "File preview closed; terminal restored".into();
                 }
                 KeyCode::Up | KeyCode::Left | KeyCode::PageUp | KeyCode::Char('k') => {
@@ -759,15 +796,26 @@ impl App {
                     self.status_message = "File browser closed".into();
                 } else {
                     form.query.clear();
+                    Self::restore_file_directory_entries(&mut form);
                     self.file_manager = Some(form);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 Self::move_file_selection(&mut form, -1);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Char('k') if form.query.is_empty() => {
+                Self::move_file_selection(&mut form, -1);
+                self.queue_file_preloads(&mut form);
+                self.file_manager = Some(form);
+            }
+            KeyCode::Down => {
+                Self::move_file_selection(&mut form, 1);
+                self.queue_file_preloads(&mut form);
+                self.file_manager = Some(form);
+            }
+            KeyCode::Char('j') if form.query.is_empty() => {
                 Self::move_file_selection(&mut form, 1);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
@@ -795,6 +843,12 @@ impl App {
                     self.navigate_file_form(form, parent, Some(child));
                 }
             }
+            KeyCode::Right | KeyCode::Enter if form.query.starts_with('/') && form.searching => {
+                if form.search_request_id.is_none() {
+                    self.submit_file_search(&mut form);
+                }
+                self.file_manager = Some(form);
+            }
             KeyCode::Right | KeyCode::Enter => self.open_file_entry(form),
             KeyCode::PageUp => {
                 let page = form.preview_page_rows.max(1) as isize;
@@ -808,29 +862,28 @@ impl App {
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if form.query.is_empty() => {
                 self.download_selected_file(&form);
                 self.file_manager = Some(form);
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if form.query.is_empty() => {
                 if let Some(entry) = form.entries.get(form.selected) {
                     self.clipboard_request = Some(entry.path.clone());
                     self.status_message = format!("Copied path: {}", entry.path);
                 }
                 self.file_manager = Some(form);
             }
-            KeyCode::Char('r') | KeyCode::F(5) => self.request_file_listing(form),
+            KeyCode::Char('r') if form.query.is_empty() => self.request_file_listing(form),
+            KeyCode::F(5) => self.request_file_listing(form),
             KeyCode::Backspace => {
+                let was_recursive = form.query.starts_with('/');
                 form.query.pop();
-                Self::select_file_query_match(&mut form);
-                self.queue_file_preloads(&mut form);
-                self.file_manager = Some(form);
+                self.update_file_query(form, was_recursive);
             }
             KeyCode::Char(character) => {
+                let was_recursive = form.query.starts_with('/');
                 form.query.push(character);
-                Self::select_file_query_match(&mut form);
-                self.queue_file_preloads(&mut form);
-                self.file_manager = Some(form);
+                self.update_file_query(form, was_recursive);
             }
             _ => {
                 self.file_manager = Some(form);
@@ -840,7 +893,18 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && !self
+                .pane_layout
+                .machines
+                .is_some_and(|area| inside(area, mouse.column, mouse.row))
+        {
+            self.last_machine_click = None;
+        }
         if let Some(modal) = self.modal.as_mut() {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.last_machine_click = None;
+            }
             match modal {
                 Modal::Help(form) => match mouse.kind {
                     MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(3),
@@ -966,7 +1030,11 @@ impl App {
             return false;
         }
         let mut form = self.file_manager.take().expect("file form disappeared");
-        self.focus = Focus::Agents;
+        self.focus = if in_preview || preview_dragging {
+            Focus::Recap
+        } else {
+            Focus::Agents
+        };
         if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
             self.last_file_click = None;
             let child = form.path.clone();
@@ -1022,6 +1090,7 @@ impl App {
                     if self.is_file_double_click(&key) {
                         self.last_file_click = None;
                         Self::clear_file_preview(&mut form);
+                        self.focus = Focus::Agents;
                         self.status_message = "File preview closed; terminal restored".into();
                         closed = true;
                     }
@@ -1789,6 +1858,12 @@ impl App {
                     self.request_history();
                 }
             }
+            Event::ActivityRefreshed { target_id, result } => {
+                self.pending_activity_refreshes.remove(&target_id);
+                if let Ok(sessions) = result {
+                    self.apply_activity_refresh(&target_id, &sessions);
+                }
+            }
             Event::Captured {
                 target_id,
                 session_id,
@@ -1848,6 +1923,8 @@ impl App {
                 match result {
                     Ok(session_id) => {
                         let legacy_tmux = session_id.starts_with("muxloom-");
+                        self.selected_sessions_by_target
+                            .insert(target_id.clone(), session_id.clone());
                         self.selected_session_id = Some(session_id);
                         // Land on the new agent in the Agents pane rather than
                         // leaving focus on the machine/folder sidebar.
@@ -1889,11 +1966,12 @@ impl App {
                     Ok(message) => {
                         self.status_message = message;
                         self.refresh_target(&target_id);
-                        if let Some((launch, resume_id)) = self.pending_install_launch.take()
+                        if let Some((launch, resume_id, initial_prompt)) =
+                            self.pending_install_launch.take()
                             && launch.target.id == target_id
                             && launch.kind == kind
                         {
-                            self.submit_launch(launch, resume_id);
+                            self.submit_launch(launch, resume_id, initial_prompt);
                         }
                     }
                     Err(error) => {
@@ -2023,7 +2101,9 @@ impl App {
                         .expect("matched pending archived resume");
                     match result {
                         Ok(candidates) => {
-                            if let Some(candidate) = candidates.first() {
+                            if let Some(candidate) =
+                                candidates.iter().find(|candidate| candidate.kind == kind)
+                            {
                                 debug::log(
                                     "resume",
                                     format!(
@@ -2036,6 +2116,7 @@ impl App {
                                 self.confirm_or_submit_launch(
                                     pending.launch,
                                     Some(candidate.id.clone()),
+                                    None,
                                 );
                             } else {
                                 self.request_history();
@@ -2074,6 +2155,13 @@ impl App {
                     form.loading = false;
                     match result {
                         Ok(FileListing { path, entries }) => {
+                            form.directory_cache.insert(path.clone(), entries.clone());
+                            form.path = path;
+                            if form.query.starts_with('/') {
+                                form.error = None;
+                                self.file_manager = Some(form);
+                                return;
+                            }
                             let selected_path = form.return_path.clone().or_else(|| {
                                 form.entries
                                     .get(form.selected)
@@ -2085,9 +2173,10 @@ impl App {
                                 .is_none_or(|path| entries.iter().any(|entry| &entry.path == path));
                             if !preview_still_exists {
                                 Self::clear_file_preview(&mut form);
+                                if self.focus == Focus::Recap {
+                                    self.focus = Focus::Agents;
+                                }
                             }
-                            form.directory_cache.insert(path.clone(), entries.clone());
-                            form.path = path;
                             form.entries = entries;
                             form.selected = selected_path
                                 .as_ref()
@@ -2112,6 +2201,36 @@ impl App {
                     }
                     self.queue_file_preloads(&mut form);
                     self.file_manager = Some(form);
+                }
+            }
+            Event::FilesSearched {
+                target_id,
+                root,
+                pattern,
+                request_id,
+                result,
+            } => {
+                let active_matches = self.file_manager.as_ref().is_some_and(|form| {
+                    form.target.id == target_id
+                        && form.search_request_id == Some(request_id)
+                        && form.query.strip_prefix('/') == Some(pattern.as_str())
+                });
+                if active_matches {
+                    let form = self.file_manager.as_mut().expect("matched file manager");
+                    Self::apply_file_search_result(form, result);
+                } else if let Some(form) = self.stashed_file_managers.values_mut().find(|form| {
+                    form.target.id == target_id
+                        && form.search_request_id == Some(request_id)
+                        && form.query.strip_prefix('/') == Some(pattern.as_str())
+                }) {
+                    Self::apply_file_search_result(form, result);
+                } else {
+                    debug::log(
+                        "files",
+                        format!(
+                            "ignored stale search target={target_id} root={root} pattern={pattern} request={request_id}"
+                        ),
+                    );
                 }
             }
             Event::FilePreviewed {
@@ -2272,6 +2391,110 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
+    fn refresh_daemon_activity(&mut self) {
+        let targets: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|status| {
+                status.enabled
+                    && status.state == ConnectionState::Online
+                    && !self.pending_scans.contains(&status.target.id)
+                    && !self.pending_activity_refreshes.contains(&status.target.id)
+                    && self.sessions.iter().any(|session| {
+                        session.target_id == status.target.id
+                            && !session.dead
+                            && crate::runtime::is_daemon_session_id(&session.id)
+                    })
+            })
+            .map(|status| status.target.clone())
+            .collect();
+        for target in targets {
+            let target_id = target.id.clone();
+            if self
+                .worker
+                .requests
+                .send(Request::RefreshActivity { target })
+                .is_ok()
+            {
+                self.pending_activity_refreshes.insert(target_id);
+            }
+        }
+        self.last_activity_refresh = Instant::now();
+    }
+
+    fn apply_activity_refresh(&mut self, target_id: &str, refreshed: &[AgentSession]) {
+        let by_id: HashMap<_, _> = refreshed
+            .iter()
+            .map(|session| (session.id.as_str(), session))
+            .collect();
+        let mut exited = Vec::new();
+        let mut notifications = Vec::new();
+        let mut changed = 0usize;
+        for session in self
+            .sessions
+            .iter_mut()
+            .filter(|session| session.target_id == target_id)
+        {
+            let Some(latest) = by_id.get(session.id.as_str()) else {
+                continue;
+            };
+            let was_dead = session.dead;
+            let needed_attention = session.needs_attention;
+            let status_changed = session.dead != latest.dead
+                || session.pid != latest.pid
+                || session.working != latest.working
+                || session.needs_attention != latest.needs_attention
+                || session.attention_reason != latest.attention_reason;
+            session.dead = latest.dead;
+            session.pid = latest.pid;
+            session.working = latest.working;
+            session.needs_attention = latest.needs_attention;
+            session
+                .attention_reason
+                .clone_from(&latest.attention_reason);
+            if latest.recap.is_some() {
+                session.recap.clone_from(&latest.recap);
+            }
+            if status_changed {
+                changed += 1;
+            }
+            if !was_dead && session.dead {
+                exited.push(session.id.clone());
+            }
+            if !needed_attention && session.needs_attention {
+                notifications.push((
+                    session.id.clone(),
+                    session.display_label().to_string(),
+                    session
+                        .attention_reason
+                        .clone()
+                        .unwrap_or_else(|| "input required".into()),
+                ));
+            }
+        }
+        for session_id in exited {
+            self.history_cache
+                .remove(&history_cache_key(target_id, &session_id));
+            if self.selected_session_id.as_deref() == Some(session_id.as_str()) {
+                self.history = HistoryPage::default();
+            }
+        }
+        for (session_id, label, reason) in notifications {
+            self.notifications
+                .push(format!("{target_id} / {label} needs input ({reason})"));
+            debug::log(
+                "attention",
+                format!("new prompt target={target_id} session={session_id} reason={reason}"),
+            );
+        }
+        if changed > 0 {
+            debug::log(
+                "activity",
+                format!("refreshed target={target_id} changed_sessions={changed}"),
+            );
+        }
+    }
+
     fn refresh_target(&mut self, id: &str) {
         if self.pending_scans.contains(id) {
             return;
@@ -2378,6 +2601,10 @@ impl App {
             .targets
             .get(self.selected_target)
             .map(|status| status.target.id.clone());
+        if let Some(session) = self.selected_session() {
+            self.selected_sessions_by_target
+                .insert(session.target_id.clone(), session.id.clone());
+        }
         self.selected_target = index;
         let current = self
             .targets
@@ -2385,6 +2612,10 @@ impl App {
             .map(|status| status.target.id.clone());
         if previous != current {
             self.rebind_file_manager(previous.as_deref(), current.as_deref());
+            self.selected_session_id = current
+                .as_ref()
+                .and_then(|target_id| self.selected_sessions_by_target.get(target_id))
+                .cloned();
         }
     }
 
@@ -2448,7 +2679,15 @@ impl App {
         );
         self.focus = next;
         if next == Focus::Recap {
-            self.activate_terminal();
+            if self
+                .file_manager
+                .as_ref()
+                .is_some_and(|form| form.preview_path.is_some())
+            {
+                self.release_terminal_input("File preview focused");
+            } else {
+                self.activate_terminal();
+            }
         } else {
             self.release_terminal_input("Terminal remains attached; focus moved to a sidebar");
         }
@@ -2596,6 +2835,10 @@ impl App {
 
     fn select_session(&mut self, id: String) {
         if self.selected_session_id.as_deref() == Some(&id) {
+            if let Some(session) = self.selected_session() {
+                self.selected_sessions_by_target
+                    .insert(session.target_id.clone(), session.id.clone());
+            }
             return;
         }
         self.pending_archived_resume = None;
@@ -2605,6 +2848,10 @@ impl App {
         self.terminal_retry_at = None;
         self.terminal_failures = 0;
         self.selected_session_id = Some(id);
+        if let Some(session) = self.selected_session() {
+            self.selected_sessions_by_target
+                .insert(session.target_id.clone(), session.id.clone());
+        }
         self.history_offset = 0;
         self.history = HistoryPage::default();
         if self.selected_session().is_some_and(|session| session.dead) {
@@ -3180,6 +3427,9 @@ impl App {
             preview_page_rows: 1,
             preview_rendered: None,
             query: String::new(),
+            search_request_id: None,
+            searching: false,
+            search_edited_at: None,
             preview_cache: HashMap::new(),
             preload_pending: HashSet::new(),
             entry_rows: Vec::new(),
@@ -3217,6 +3467,106 @@ impl App {
             form.error = Some("File browser worker is unavailable".into());
         }
         self.file_manager = Some(form);
+    }
+
+    fn update_file_query(&mut self, mut form: FileManagerForm, was_recursive: bool) {
+        if form.query.starts_with('/') {
+            if form.query.len() == 1 {
+                Self::restore_file_directory_entries(&mut form);
+                self.file_manager = Some(form);
+                return;
+            }
+            form.search_request_id = None;
+            form.searching = true;
+            form.search_edited_at = Some(Instant::now());
+            form.error = None;
+            form.selected = 0;
+            Self::clear_file_preview(&mut form);
+        } else {
+            if was_recursive {
+                Self::restore_file_directory_entries(&mut form);
+            }
+            Self::select_file_query_match(&mut form);
+            self.queue_file_preloads(&mut form);
+        }
+        self.file_manager = Some(form);
+    }
+
+    fn maybe_submit_file_search(&mut self) {
+        let ready = self.file_manager.as_ref().is_some_and(|form| {
+            form.query.starts_with('/')
+                && form.query.len() > 1
+                && form.search_request_id.is_none()
+                && form
+                    .search_edited_at
+                    .is_some_and(|edited| edited.elapsed() >= FILE_SEARCH_DEBOUNCE)
+        });
+        if !ready {
+            return;
+        }
+        let mut form = self.file_manager.take().expect("matched file manager");
+        self.submit_file_search(&mut form);
+        self.file_manager = Some(form);
+    }
+
+    fn submit_file_search(&mut self, form: &mut FileManagerForm) {
+        let Some(pattern) = form
+            .query
+            .strip_prefix('/')
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.next_file_search_id = self.next_file_search_id.wrapping_add(1).max(1);
+        let request_id = self.next_file_search_id;
+        form.search_request_id = Some(request_id);
+        form.search_edited_at = None;
+        form.searching = true;
+        let request = Request::SearchFiles {
+            target: form.target.clone(),
+            root: form.path.clone(),
+            pattern,
+            request_id,
+        };
+        if self.worker.requests.send(request).is_err() {
+            form.search_request_id = None;
+            form.searching = false;
+            form.error = Some("File search worker is unavailable".into());
+        }
+    }
+
+    fn restore_file_directory_entries(form: &mut FileManagerForm) {
+        form.search_request_id = None;
+        form.searching = false;
+        form.search_edited_at = None;
+        form.error = None;
+        form.entries = form
+            .directory_cache
+            .get(&form.path)
+            .cloned()
+            .unwrap_or_default();
+        form.selected = form.selected.min(form.entries.len().saturating_sub(1));
+        Self::clear_file_preview(form);
+    }
+
+    fn apply_file_search_result(form: &mut FileManagerForm, result: Result<FileListing, String>) {
+        form.searching = false;
+        form.search_edited_at = None;
+        match result {
+            Ok(listing) => {
+                form.entries = listing.entries;
+                form.selected = 0;
+                form.return_path = None;
+                form.error = None;
+            }
+            Err(error) => {
+                form.entries.clear();
+                form.selected = 0;
+                form.error = Some(short_error(&error));
+            }
+        }
+        Self::clear_file_preview(form);
     }
 
     fn clear_file_preview(form: &mut FileManagerForm) {
@@ -3325,8 +3675,12 @@ impl App {
     ) {
         // Entering or leaving a directory resets the filter so the query does not
         // silently follow the user into a folder where it no longer matches.
+        let was_recursive = form.query.starts_with('/');
         form.query.clear();
-        if !form.entries.is_empty() {
+        form.search_request_id = None;
+        form.searching = false;
+        form.search_edited_at = None;
+        if !was_recursive && !form.entries.is_empty() {
             form.directory_cache
                 .insert(form.path.clone(), form.entries.clone());
         }
@@ -3445,6 +3799,7 @@ impl App {
             self.navigate_file_form(form, entry.path, None);
         } else if form.preview_path.as_deref() == Some(entry.path.as_str()) {
             Self::clear_file_preview(&mut form);
+            self.focus = Focus::Agents;
             self.status_message = "File preview closed; terminal restored".into();
             self.file_manager = Some(form);
         } else {
@@ -3475,6 +3830,7 @@ impl App {
             }
             let media_request =
                 media_kind.map(|kind| (form.target.clone(), entry.path.clone(), kind));
+            self.focus = Focus::Recap;
             self.file_manager = Some(form);
             if let Some((target, path, kind)) = media_request {
                 self.request_media_preview(target, path, kind);
@@ -3815,7 +4171,7 @@ impl App {
             Modal::Resume(mut form) => match key.code {
                 KeyCode::Esc | KeyCode::Left => self.modal = Some(Modal::Launch(form.launch)),
                 KeyCode::Enter if form.selected == 0 => {
-                    self.confirm_or_submit_launch(form.launch, None)
+                    self.confirm_or_submit_launch(form.launch, None, None)
                 }
                 KeyCode::Up | KeyCode::Char('k') if !form.loading => {
                     form.selected = shifted(form.selected, form.candidates.len() + 1, -1);
@@ -3826,12 +4182,20 @@ impl App {
                     self.modal = Some(Modal::Resume(form));
                 }
                 KeyCode::Enter if !form.loading => {
-                    let resume_id = form
+                    let candidate = form
                         .selected
                         .checked_sub(1)
                         .and_then(|index| form.candidates.get(index))
-                        .map(|candidate| candidate.id.clone());
-                    self.confirm_or_submit_launch(form.launch, resume_id);
+                        .cloned();
+                    match candidate {
+                        Some(candidate) if candidate.kind != form.launch.kind => {
+                            self.modal = Some(Modal::ConfirmHistoryReference { form, candidate });
+                        }
+                        Some(candidate) => {
+                            self.confirm_or_submit_launch(form.launch, Some(candidate.id), None)
+                        }
+                        None => self.confirm_or_submit_launch(form.launch, None, None),
+                    }
                 }
                 _ => self.modal = Some(Modal::Resume(form)),
             },
@@ -3851,10 +4215,32 @@ impl App {
                     })
                 }
             },
-            Modal::ConfirmInstall { launch, resume_id } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.install_and_launch(launch, resume_id),
+            Modal::ConfirmInstall {
+                launch,
+                resume_id,
+                initial_prompt,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.install_and_launch(launch, resume_id, initial_prompt)
+                }
                 KeyCode::Esc | KeyCode::Char('n') => {}
-                _ => self.modal = Some(Modal::ConfirmInstall { launch, resume_id }),
+                _ => {
+                    self.modal = Some(Modal::ConfirmInstall {
+                        launch,
+                        resume_id,
+                        initial_prompt,
+                    })
+                }
+            },
+            Modal::ConfirmHistoryReference { form, candidate } => match key.code {
+                KeyCode::Char('r') | KeyCode::Enter => {
+                    let prompt = history_reference_prompt(&form.launch, &candidate);
+                    self.confirm_or_submit_launch(form.launch, None, Some(prompt));
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.modal = Some(Modal::Resume(form));
+                }
+                _ => self.modal = Some(Modal::ConfirmHistoryReference { form, candidate }),
             },
             Modal::LegacyFallback { target_id, detail } => match key.code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {}
@@ -4098,6 +4484,7 @@ impl App {
         self.ensure_session_selection();
         self.worker = Worker::start(Runtime::new(&self.config));
         self.pending_scans.clear();
+        self.pending_activity_refreshes.clear();
         self.pending_capture = None;
         self.status_message = match &form.scope {
             SettingsScope::Global => {
@@ -4115,7 +4502,12 @@ impl App {
         self.refresh_enabled();
     }
 
-    fn submit_launch(&mut self, form: LaunchForm, resume_id: Option<String>) {
+    fn submit_launch(
+        &mut self,
+        form: LaunchForm,
+        resume_id: Option<String>,
+        initial_prompt: Option<String>,
+    ) {
         if form.path.trim().is_empty() {
             self.status_message = "Launch cancelled: working directory is required".into();
             return;
@@ -4136,6 +4528,7 @@ impl App {
             path: form.path,
             label: form.label,
             resume_id,
+            initial_prompt,
         };
         if self
             .worker
@@ -4152,7 +4545,12 @@ impl App {
         }
     }
 
-    fn confirm_or_submit_launch(&mut self, form: LaunchForm, resume_id: Option<String>) {
+    fn confirm_or_submit_launch(
+        &mut self,
+        form: LaunchForm,
+        resume_id: Option<String>,
+        initial_prompt: Option<String>,
+    ) {
         let available = self
             .targets
             .iter()
@@ -4163,16 +4561,22 @@ impl App {
                 AgentKind::Terminal => true,
             });
         if available || form.kind == AgentKind::Terminal {
-            self.submit_launch(form, resume_id);
+            self.submit_launch(form, resume_id, initial_prompt);
         } else {
             self.modal = Some(Modal::ConfirmInstall {
                 launch: form,
                 resume_id,
+                initial_prompt,
             });
         }
     }
 
-    fn install_and_launch(&mut self, launch: LaunchForm, resume_id: Option<String>) {
+    fn install_and_launch(
+        &mut self,
+        launch: LaunchForm,
+        resume_id: Option<String>,
+        initial_prompt: Option<String>,
+    ) {
         let command = self
             .config
             .command_for(&launch.target.id, launch.kind)
@@ -4188,7 +4592,7 @@ impl App {
             environment,
         };
         if self.worker.requests.send(request).is_ok() {
-            self.pending_install_launch = Some((launch.clone(), resume_id));
+            self.pending_install_launch = Some((launch.clone(), resume_id, initial_prompt));
             self.busy_operations += 1;
             self.status_message =
                 format!("Installing {} on {}...", launch.kind, launch.target.label);
@@ -4382,15 +4786,16 @@ impl App {
                 }
                 line = line.saturating_sub(*height);
             }
-            if let Some((target_index, item_line)) = hit {
+            if let Some((target_index, _item_line)) = hit {
                 self.set_selected_target(target_index);
                 self.ensure_session_selection();
-                if item_line == 0
-                    && column >= area.x.saturating_add(5)
-                    && column <= area.x.saturating_add(7)
-                {
+                let target_id = self.targets[target_index].target.id.clone();
+                if self.is_machine_double_click(&target_id) {
+                    self.last_machine_click = None;
                     self.toggle_target(target_index);
                 }
+            } else {
+                self.last_machine_click = None;
             }
             return;
         }
@@ -4432,6 +4837,19 @@ impl App {
             self.focus = Focus::Recap;
             self.activate_terminal();
         }
+    }
+
+    fn is_machine_double_click(&mut self, target_id: &str) -> bool {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
+        let now = Instant::now();
+        let double_click = self.last_machine_click.as_ref().is_some_and(|click| {
+            click.key == target_id && now.saturating_duration_since(click.at) <= DOUBLE_CLICK_WINDOW
+        });
+        self.last_machine_click = Some(FileClick {
+            key: target_id.into(),
+            at: now,
+        });
+        double_click
     }
 
     fn forward_terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -4488,6 +4906,12 @@ impl App {
             return false;
         };
         self.focus = Focus::Recap;
+        if !self.interactive
+            && self.history_offset == 0
+            && self.selected_session().is_some_and(|session| !session.dead)
+        {
+            self.activate_terminal();
+        }
         self.terminal_selection = Some(TerminalSelection {
             anchor: point,
             cursor: point,
@@ -4832,6 +5256,31 @@ fn single_line_paste(value: &str) -> String {
             character => Some(character),
         })
         .collect()
+}
+
+fn history_reference_prompt(launch: &LaunchForm, candidate: &ResumeCandidate) -> String {
+    let mut prompt = format!(
+        "Continue the work from a {} session in this directory. Its history cannot be resumed directly by {}, so use it as reference context.",
+        candidate.kind, launch.kind
+    );
+    if candidate.source_path.is_empty() {
+        prompt.push_str(&format!(" Source session ID: {}.", candidate.id));
+    } else {
+        prompt.push_str(&format!(
+            " Read the complete source transcript at: {}",
+            candidate.source_path
+        ));
+    }
+    if let Some(recap) = candidate.recap.as_deref() {
+        prompt.push_str(&format!(" Session recap: {recap}"));
+    }
+    if let Some(last) = candidate.last_message.as_deref() {
+        prompt.push_str(&format!(" Most recent user request: {last}"));
+    }
+    prompt.push_str(
+        " Preserve relevant decisions and completed work, verify the current workspace state, then continue the unfinished task.",
+    );
+    prompt
 }
 
 fn short_error(error: &str) -> String {
@@ -5287,6 +5736,121 @@ mod tests {
     }
 
     #[test]
+    fn background_activity_refresh_updates_every_agent_not_only_the_selected_one() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.selected_session_id = Some("muxloomd-codex-selected".into());
+        app.sessions = vec![
+            AgentSession {
+                id: "muxloomd-codex-selected".into(),
+                target_id: "local".into(),
+                kind: AgentKind::Codex,
+                path: "/work/a".into(),
+                label: "selected".into(),
+                created_at: 1,
+                dead: false,
+                pid: Some(10),
+                working: false,
+                needs_attention: false,
+                attention_reason: None,
+                recap: None,
+            },
+            AgentSession {
+                id: "muxloomd-claude-background".into(),
+                target_id: "local".into(),
+                kind: AgentKind::Claude,
+                path: "/work/b".into(),
+                label: "background".into(),
+                created_at: 2,
+                dead: false,
+                pid: Some(20),
+                working: true,
+                needs_attention: false,
+                attention_reason: None,
+                recap: None,
+            },
+        ];
+        app.pending_activity_refreshes.insert("local".into());
+
+        app.handle_worker_event(Event::ActivityRefreshed {
+            target_id: "local".into(),
+            result: Ok(vec![
+                AgentSession {
+                    working: true,
+                    ..app.sessions[0].clone()
+                },
+                AgentSession {
+                    working: false,
+                    needs_attention: true,
+                    attention_reason: Some("approval required".into()),
+                    recap: Some("waiting for approval".into()),
+                    ..app.sessions[1].clone()
+                },
+            ]),
+        });
+
+        assert!(app.pending_activity_refreshes.is_empty());
+        assert!(app.sessions[0].working);
+        assert!(!app.sessions[1].working);
+        assert!(app.sessions[1].needs_attention);
+        assert_eq!(
+            app.sessions[1].attention_reason.as_deref(),
+            Some("approval required")
+        );
+        assert_eq!(
+            app.sessions[1].recap.as_deref(),
+            Some("waiting for approval")
+        );
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn online_daemon_targets_schedule_lightweight_activity_refreshes() {
+        let config = Config::default();
+        let runtime = Runtime::new(&config);
+        let bridges = runtime.bridge_pool();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges,
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].state = ConnectionState::Online;
+        app.sessions.push(AgentSession {
+            id: "muxloomd-codex-refresh".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work".into(),
+            label: "refresh".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+
+        app.refresh_daemon_activity();
+
+        assert!(app.pending_activity_refreshes.contains("local"));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::RefreshActivity { target } if target.id == "local"
+        ));
+    }
+
+    #[test]
     fn grouped_launch_uses_selected_machine_not_old_session() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
@@ -5344,6 +5908,14 @@ mod tests {
         assert_eq!(app.visible_target_indices(), vec![0]);
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
         assert_eq!(app.focus, Focus::Agents);
+        app.focus = Focus::Recap;
+        app.interactive = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(
+            !app.interactive,
+            "sidebar focus must release terminal input"
+        );
         let _ = std::fs::remove_file(state_path);
     }
 
@@ -5838,6 +6410,8 @@ mod tests {
             path: "/work/project".into(),
             result: Ok(vec![ResumeCandidate {
                 id: "thread-id".into(),
+                kind: AgentKind::Codex,
+                source_path: "/home/test/.codex/sessions/thread.jsonl".into(),
                 recap: Some("Fix the renderer".into()),
                 first_message: None,
                 last_message: None,
@@ -6158,8 +6732,15 @@ mod tests {
             Some("x".into())
         );
 
+        // Pane shortcuts are handled before the browser's modal key capture.
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Recap);
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.clone()),
+            Some("x".into())
+        );
+
         // Focus another pane: the browser stays open but no longer swallows keys.
-        app.focus = Focus::Recap;
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(app.file_manager.is_some());
         assert_eq!(
@@ -6397,6 +6978,34 @@ mod tests {
             !request_rx
                 .try_iter()
                 .any(|request| matches!(request, Request::PreviewFile { .. }))
+        );
+    }
+
+    #[test]
+    fn file_preview_owns_terminal_pane_focus_without_activating_agent_input() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let mut form = blank_file_manager(Target::local(), None, "/work");
+        form.preview_path = Some("/work/README.md".into());
+        app.file_manager = Some(form);
+        app.focus = Focus::Agents;
+        app.interactive = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+
+        assert_eq!(app.focus, Focus::Recap);
+        assert!(!app.interactive);
+        assert!(
+            app.file_manager
+                .as_ref()
+                .is_some_and(|form| form.preview_path.is_some())
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Agents);
+        assert!(
+            app.file_manager
+                .as_ref()
+                .is_some_and(|form| form.preview_path.is_none())
         );
     }
 
@@ -6759,6 +7368,7 @@ mod tests {
             Some(Modal::ConfirmInstall {
                 ref launch,
                 resume_id: None,
+                ..
             }) if launch.kind == AgentKind::Codex && launch.target.id == "local"
         ));
     }
@@ -6840,6 +7450,9 @@ mod tests {
             preview_page_rows: 1,
             preview_rendered: None,
             query: String::new(),
+            search_request_id: None,
+            searching: false,
+            search_edited_at: None,
             preview_cache: HashMap::new(),
             preload_pending: HashSet::new(),
             entry_rows: Vec::new(),
@@ -6990,5 +7603,244 @@ mod tests {
         let restored = app.file_manager.as_ref().expect("browser restored");
         assert_eq!(restored.path, "/work/local");
         assert_eq!(restored.target.id, "local");
+    }
+
+    #[test]
+    fn machine_click_selects_and_double_click_toggles() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("remote")]);
+        app.pane_layout.machines = Some(Rect::new(0, 0, 30, 8));
+        app.machine_rows = vec![(0, 2), (1, 2)];
+        let click_remote = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(click_remote);
+        assert_eq!(app.selected_target, 1);
+        assert!(app.targets[1].enabled, "single click only selects");
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(click_remote);
+        assert!(
+            app.targets[1].enabled,
+            "an intervening click cancels the double-click gesture"
+        );
+        app.handle_mouse(click_remote);
+        assert!(!app.targets[1].enabled, "double click toggles the machine");
+    }
+
+    #[test]
+    fn switching_machines_restores_each_last_selected_session() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("remote")]);
+        app.state.show_archived = true;
+        let session = |id: &str, target_id: &str, created_at| AgentSession {
+            id: id.into(),
+            target_id: target_id.into(),
+            kind: AgentKind::Codex,
+            path: format!("/work/{id}"),
+            label: id.into(),
+            created_at,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        };
+        app.sessions = vec![
+            session("local-a", "local", 1),
+            session("local-b", "local", 2),
+            session("remote-a", "remote", 1),
+        ];
+        app.selected_session_id = Some("local-b".into());
+
+        app.set_selected_target(1);
+        app.ensure_session_selection();
+        assert_eq!(app.selected_session_id.as_deref(), Some("remote-a"));
+
+        app.set_selected_target(0);
+        app.ensure_session_selection();
+        assert_eq!(app.selected_session_id.as_deref(), Some("local-b"));
+    }
+
+    #[test]
+    fn cross_agent_history_requires_confirmation_then_launches_as_reference() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].probe.codex = true;
+        let launch = LaunchForm {
+            target: Target::local(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "handoff".into(),
+            field: LaunchField::Path,
+        };
+        let claude = ResumeCandidate {
+            id: "claude-thread".into(),
+            kind: AgentKind::Claude,
+            source_path: "/home/test/.claude/projects/claude-thread.jsonl".into(),
+            recap: Some("Finish the renderer".into()),
+            first_message: Some("Start the renderer".into()),
+            last_message: Some("Wire the final state".into()),
+            updated_at: "2026-07-24T08:00:00Z".into(),
+        };
+        app.modal = Some(Modal::Resume(ResumeForm {
+            launch,
+            candidates: vec![claude.clone()],
+            selected: 1,
+            loading: false,
+            error: None,
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmHistoryReference { ref candidate, .. })
+                if candidate.id == "claude-thread"
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Resume(ResumeForm { ref candidates, selected: 1, .. }))
+                if candidates == std::slice::from_ref(&claude)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match receive_request(&request_rx) {
+            Request::Launch { request, .. } => {
+                assert_eq!(request.kind, AgentKind::Codex);
+                assert!(request.resume_id.is_none());
+                let prompt = request.initial_prompt.expect("reference prompt");
+                assert!(prompt.contains("claude"));
+                assert!(prompt.contains("claude-thread.jsonl"));
+                assert!(prompt.contains("Wire the final state"));
+            }
+            request => panic!("expected reference launch, got {request:?}"),
+        }
+    }
+
+    #[test]
+    fn recursive_file_search_accepts_wildcards_and_ignores_stale_results() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let original = FileEntry {
+            name: "README.md".into(),
+            path: "/work/README.md".into(),
+            kind: FileEntryKind::File,
+            size: 10,
+        };
+        let mut form = blank_file_manager(Target::local(), None, "/work");
+        form.entries = vec![original.clone()];
+        form.directory_cache
+            .insert("/work".into(), vec![original.clone()]);
+        app.file_manager = Some(form);
+        app.focus = Focus::Agents;
+
+        for character in "/j**.rs".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.file_manager.as_mut().unwrap().search_edited_at =
+            Some(Instant::now() - FILE_SEARCH_DEBOUNCE);
+        app.maybe_submit_file_search();
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.as_str()),
+            Some("/j**.rs")
+        );
+
+        let mut latest = None;
+        while let Ok(request) = request_rx.try_recv() {
+            if let Request::SearchFiles {
+                pattern,
+                request_id,
+                ..
+            } = request
+            {
+                latest = Some((pattern, request_id));
+            }
+        }
+        let (pattern, request_id) = latest.expect("recursive search request");
+        assert_eq!(pattern, "j**.rs");
+        app.handle_worker_event(Event::FilesSearched {
+            target_id: "local".into(),
+            root: "/work".into(),
+            pattern: pattern.clone(),
+            request_id: request_id.saturating_sub(1),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![FileEntry {
+                    name: "stale.rs".into(),
+                    path: "/work/stale.rs".into(),
+                    kind: FileEntryKind::File,
+                    size: 1,
+                }],
+            }),
+        });
+        assert_eq!(
+            app.file_manager.as_ref().unwrap().entries,
+            std::slice::from_ref(&original)
+        );
+
+        let found = FileEntry {
+            name: "src/job.rs".into(),
+            path: "/work/src/job.rs".into(),
+            kind: FileEntryKind::File,
+            size: 20,
+        };
+        let second = FileEntry {
+            name: "tests/job.rs".into(),
+            path: "/work/tests/job.rs".into(),
+            kind: FileEntryKind::File,
+            size: 30,
+        };
+        app.handle_worker_event(Event::FilesSearched {
+            target_id: "local".into(),
+            root: "/work".into(),
+            pattern,
+            request_id,
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![found.clone(), second.clone()],
+            }),
+        });
+        assert_eq!(app.file_manager.as_ref().unwrap().entries, [found, second]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.file_manager.as_ref().unwrap().selected, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.file_manager.as_ref().unwrap().entries, [original]);
     }
 }

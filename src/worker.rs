@@ -25,6 +25,9 @@ pub struct ScanRequest {
 #[derive(Debug)]
 pub enum Request {
     Scan(ScanRequest),
+    RefreshActivity {
+        target: Target,
+    },
     Capture {
         target: Target,
         session_id: String,
@@ -69,6 +72,12 @@ pub enum Request {
         target: Target,
         path: String,
     },
+    SearchFiles {
+        target: Target,
+        root: String,
+        pattern: String,
+        request_id: u64,
+    },
     PreviewFile {
         target: Target,
         path: String,
@@ -112,6 +121,10 @@ pub enum Event {
         target_id: String,
         result: Result<(Probe, Vec<AgentSession>), String>,
     },
+    ActivityRefreshed {
+        target_id: String,
+        result: Result<Vec<AgentSession>, String>,
+    },
     Captured {
         target_id: String,
         session_id: String,
@@ -154,6 +167,13 @@ pub enum Event {
     FilesListed {
         target_id: String,
         requested_path: String,
+        result: Result<FileListing, String>,
+    },
+    FilesSearched {
+        target_id: String,
+        root: String,
+        pattern: String,
+        request_id: u64,
         result: Result<FileListing, String>,
     },
     FilePreviewed {
@@ -271,6 +291,19 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::Scanned { target_id, result });
+                    }
+                    Request::RefreshActivity { target } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .daemon_sessions(&target)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("activity refresh failed target={target_id}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::ActivityRefreshed { target_id, result });
                     }
                     Request::Capture {
                         target,
@@ -464,9 +497,45 @@ impl Worker {
                     }
                     Request::ScanResumes { target, kind, path } => {
                         let target_id = target.id.clone();
-                        let result = runtime
-                            .scan_resumes(&target, kind, &path)
+                        let codex = runtime
+                            .scan_resumes(&target, AgentKind::Codex, &path)
                             .map_err(|error| error.to_string());
+                        let claude = runtime
+                            .scan_resumes(&target, AgentKind::Claude, &path)
+                            .map_err(|error| error.to_string());
+                        let result = match (codex, claude) {
+                            (Ok(mut codex), Ok(claude)) => {
+                                codex.extend(claude);
+                                Ok(codex)
+                            }
+                            (Ok(candidates), Err(error)) => {
+                                debug::log(
+                                    "resume",
+                                    format!(
+                                        "Claude history scan failed target={target_id}: {error}"
+                                    ),
+                                );
+                                Ok(candidates)
+                            }
+                            (Err(error), Ok(candidates)) => {
+                                debug::log(
+                                    "resume",
+                                    format!(
+                                        "Codex history scan failed target={target_id}: {error}"
+                                    ),
+                                );
+                                Ok(candidates)
+                            }
+                            (Err(codex), Err(claude)) => Err(format!(
+                                "Codex history scan failed: {codex}; Claude history scan failed: {claude}"
+                            )),
+                        }
+                        .map(|mut candidates| {
+                            candidates
+                                .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                            candidates.truncate(100);
+                            candidates
+                        });
                         let _ = events.send(Event::ResumesScanned {
                             target_id,
                             kind,
@@ -483,6 +552,24 @@ impl Worker {
                         let _ = events.send(Event::FilesListed {
                             target_id,
                             requested_path,
+                            result,
+                        });
+                    }
+                    Request::SearchFiles {
+                        target,
+                        root,
+                        pattern,
+                        request_id,
+                    } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .search_files(&target, &root, &pattern)
+                            .map_err(|error| error.to_string());
+                        let _ = events.send(Event::FilesSearched {
+                            target_id,
+                            root,
+                            pattern,
+                            request_id,
                             result,
                         });
                     }

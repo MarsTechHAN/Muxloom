@@ -36,6 +36,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
         path: std::env::temp_dir().display().to_string(),
         label: "integration smoke".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -166,6 +167,7 @@ fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
         path: std::env::temp_dir().display().to_string(),
         label: "tmux fallback".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -200,6 +202,7 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
         path: std::env::temp_dir().display().to_string(),
         label: "pty smoke".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -249,6 +252,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
         path: std::env::temp_dir().display().to_string(),
         label: "ordinary terminal".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let session_id = runtime
         .launch(&request, config.agents.get(AgentKind::Terminal), &[])
@@ -282,6 +286,7 @@ fn exited_terminal_is_removed_instead_of_archived() {
         path: std::env::temp_dir().display().to_string(),
         label: "short terminal".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -321,6 +326,7 @@ fn live_agent_can_be_archived_before_permanent_removal() {
         path: std::env::temp_dir().display().to_string(),
         label: "archive lifecycle".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -366,6 +372,7 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
     std::fs::create_dir_all(&source_root).unwrap();
     std::fs::write(root.join("README.md"), "# Preview\n\n- item\n").unwrap();
     std::fs::write(root.join("script_without_extension"), "print('preview')\n").unwrap();
+    std::fs::write(root.join("src/job.rs"), "fn main() {}\n").unwrap();
     let upload = source_root.join("upload.txt");
     std::fs::write(&upload, "uploaded").unwrap();
 
@@ -381,6 +388,11 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
             .iter()
             .any(|entry| entry.name == "README.md")
     );
+    let searched = runtime
+        .search_files(&target, &root.display().to_string(), "j**.rs")
+        .unwrap();
+    assert_eq!(searched.entries.len(), 1);
+    assert_eq!(searched.entries[0].name, "src/job.rs");
     let preview = runtime
         .preview_file(&target, &root.join("README.md").display().to_string())
         .unwrap();
@@ -438,6 +450,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         path: std::env::temp_dir().display().to_string(),
         label: "history and resize".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let command = CommandConfig {
         command: "sh".into(),

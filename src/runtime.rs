@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -341,6 +341,18 @@ impl Runtime {
         Ok((probe, sessions))
     }
 
+    /// Refresh muxloomd-owned session metadata without running executable
+    /// probes or touching the legacy tmux compatibility path.
+    pub fn daemon_sessions(&self, target: &Target) -> Result<Vec<AgentSession>> {
+        let sessions = self
+            .bridges
+            .list_sessions(target)?
+            .into_iter()
+            .filter_map(|session| daemon_agent_session(&target.id, session))
+            .collect();
+        Ok(sessions)
+    }
+
     pub fn launch(
         &self,
         request: &LaunchRequest,
@@ -379,6 +391,12 @@ impl Runtime {
                 AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
                 AgentKind::Terminal => {}
             }
+        }
+        if request.resume_id.is_none()
+            && request.kind != AgentKind::Terminal
+            && let Some(prompt) = request.initial_prompt.as_ref()
+        {
+            args.push(prompt.clone());
         }
         let daemon_launch = self.bridges.launch(
             &request.target,
@@ -448,7 +466,12 @@ impl Runtime {
             } else {
                 interactive_shell_command(&format!(
                     "{exports} exec {}",
-                    command_line(command, request.kind, request.resume_id.as_deref())
+                    command_line(
+                        command,
+                        request.kind,
+                        request.resume_id.as_deref(),
+                        request.initial_prompt.as_deref(),
+                    )
                 ))
             };
         let label = request.label.replace(['\t', '\n', '\r'], " ");
@@ -1430,6 +1453,62 @@ END {
         parse_file_listing(&output.stdout)
     }
 
+    pub fn search_files(&self, target: &Target, root: &str, pattern: &str) -> Result<FileListing> {
+        const MAX_VISITED: usize = 100_000;
+        const MAX_RESULTS: usize = 2_000;
+
+        let root_listing = self.list_files(target, root)?;
+        let canonical_root = root_listing.path.clone();
+        let mut directories = VecDeque::<String>::new();
+        let mut listing = Some(root_listing);
+        let mut results = Vec::new();
+        let mut visited = 0usize;
+
+        loop {
+            let current = if let Some(listing) = listing.take() {
+                listing
+            } else if let Some(path) = directories.pop_front() {
+                match self.list_files(target, &path) {
+                    Ok(listing) => listing,
+                    Err(error) => {
+                        debug::log(
+                            "files",
+                            format!("recursive search skipped {path}: {error:#}"),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                break;
+            };
+
+            for mut entry in current.entries {
+                visited += 1;
+                if visited > MAX_VISITED || results.len() >= MAX_RESULTS {
+                    break;
+                }
+                match entry.kind {
+                    FileEntryKind::Directory => directories.push_back(entry.path),
+                    FileEntryKind::File | FileEntryKind::Symlink
+                        if filename_matches_pattern(&entry.name, pattern) =>
+                    {
+                        entry.name = relative_search_path(&canonical_root, &entry.path);
+                        results.push(entry);
+                    }
+                    _ => {}
+                }
+            }
+            if visited > MAX_VISITED || results.len() >= MAX_RESULTS {
+                break;
+            }
+        }
+        results.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(FileListing {
+            path: canonical_root,
+            entries: results,
+        })
+    }
+
     pub fn preview_file(&self, target: &Target, path: &str) -> Result<FilePreview> {
         const LIMIT: u64 = 256 * 1024;
         if !self.bridge_recently_failed(&target.id) {
@@ -1665,7 +1744,7 @@ END {
         } else {
             ""
         };
-        let collect = r#"query=$1; shift; for file do if grep -F -q -- "$query" "$file"; then printf '\036SESSION\n'; sed -n '1,60p' "$file"; tail -n 80 "$file"; fi; done"#;
+        let collect = r#"query=$1; shift; for file do if grep -F -q -- "$query" "$file"; then printf '\036SESSION\n%s\n' "$file"; sed -n '1,60p' "$file"; tail -n 80 "$file"; fi; done"#;
         let find_args = shell_join(&[
             "-type", "f", "-name", "*.jsonl", "-exec", "sh", "-c", collect, "sh", path, "{}", "+",
         ]);
@@ -2491,6 +2570,49 @@ fn remote_child_path(directory: &str, name: &str) -> String {
     }
 }
 
+fn relative_search_path(root: &str, path: &str) -> String {
+    if root == "/" {
+        path.trim_start_matches('/').to_string()
+    } else {
+        path.strip_prefix(root.trim_end_matches('/'))
+            .unwrap_or(path)
+            .trim_start_matches('/')
+            .to_string()
+    }
+}
+
+fn filename_matches_pattern(filename: &str, pattern: &str) -> bool {
+    let filename = filename.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    if !pattern.contains('*') {
+        return filename.contains(&pattern);
+    }
+
+    let text: Vec<_> = filename.chars().collect();
+    let mut previous = vec![false; text.len() + 1];
+    previous[0] = true;
+    let mut previous_was_star = false;
+    for token in pattern.chars() {
+        if token == '*' && previous_was_star {
+            continue;
+        }
+        let mut current = vec![false; text.len() + 1];
+        if token == '*' {
+            current[0] = previous[0];
+            for index in 1..=text.len() {
+                current[index] = previous[index] || current[index - 1];
+            }
+        } else {
+            for index in 1..=text.len() {
+                current[index] = previous[index - 1] && text[index - 1] == token;
+            }
+        }
+        previous = current;
+        previous_was_star = token == '*';
+    }
+    previous[text.len()]
+}
+
 fn unique_destination(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let original = directory.join(name);
     if !original.exists() {
@@ -2539,9 +2661,14 @@ fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<Res
         let Some(session) = chunk.strip_prefix("SESSION\n") else {
             continue;
         };
+        let (source_path, session) = match session.split_once('\n') {
+            Some((first, _)) if first.starts_with('{') => ("", session),
+            Some(parts) => parts,
+            None => ("", session),
+        };
         let candidate = match kind {
-            AgentKind::Codex => parse_codex_resume(session, &normalized_path, &titles),
-            AgentKind::Claude => parse_claude_resume(session, &normalized_path),
+            AgentKind::Codex => parse_codex_resume(session, &normalized_path, source_path, &titles),
+            AgentKind::Claude => parse_claude_resume(session, &normalized_path, source_path),
             AgentKind::Terminal => None,
         };
         if let Some(candidate) = candidate {
@@ -2564,6 +2691,7 @@ fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<Res
 fn parse_codex_resume(
     session: &str,
     path: &str,
+    source_path: &str,
     titles: &HashMap<String, String>,
 ) -> Option<ResumeCandidate> {
     let mut id = None;
@@ -2643,6 +2771,8 @@ fn parse_codex_resume(
         .filter(|title| !title.is_empty());
     Some(ResumeCandidate {
         id,
+        kind: AgentKind::Codex,
+        source_path: source_path.to_string(),
         recap,
         first_message: first_message.or(fallback_first),
         last_message: last_message.or(fallback_last),
@@ -2650,7 +2780,7 @@ fn parse_codex_resume(
     })
 }
 
-fn parse_claude_resume(session: &str, path: &str) -> Option<ResumeCandidate> {
+fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<ResumeCandidate> {
     let mut id = None;
     let mut cwd = None;
     let mut updated_at = String::new();
@@ -2697,6 +2827,8 @@ fn parse_claude_resume(session: &str, path: &str) -> Option<ResumeCandidate> {
     }
     Some(ResumeCandidate {
         id: id?,
+        kind: AgentKind::Claude,
+        source_path: source_path.to_string(),
         recap: summary.filter(|message| !message.is_empty()),
         first_message,
         last_message,
@@ -2737,7 +2869,12 @@ fn login_shell_command(command: &str) -> String {
     format!("\"${{SHELL:-/bin/sh}}\" -lc {}", shell_quote(command))
 }
 
-fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str>) -> String {
+fn command_line(
+    command: &CommandConfig,
+    kind: AgentKind,
+    resume_id: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
     let mut values = Vec::with_capacity(command.args.len() + 3);
     values.push(command.command.as_str());
     values.extend(command.args.iter().map(String::as_str));
@@ -2747,6 +2884,12 @@ fn command_line(command: &CommandConfig, kind: AgentKind, resume_id: Option<&str
             AgentKind::Claude => values.extend(["--resume", resume_id]),
             AgentKind::Terminal => {}
         }
+    }
+    if resume_id.is_none()
+        && kind != AgentKind::Terminal
+        && let Some(prompt) = initial_prompt
+    {
+        values.push(prompt);
     }
     shell_join(&values)
 }
@@ -3218,12 +3361,18 @@ mod tests {
             "\u{1e}INDEX\n",
             "{\"id\":\"codex-id\",\"thread_name\":\"Fix the renderer\",\"updated_at\":\"2026-07-20T10:00:00Z\"}\n",
             "\u{1e}SESSION\n",
+            "/home/test/.codex/sessions/rollout-codex-id.jsonl\n",
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T09:00:00Z\"}}\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"first codex prompt\"}}\n"
         );
         let candidates = parse_resume_candidates(AgentKind::Codex, "/work/project/", codex);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, "codex-id");
+        assert_eq!(candidates[0].kind, AgentKind::Codex);
+        assert_eq!(
+            candidates[0].source_path,
+            "/home/test/.codex/sessions/rollout-codex-id.jsonl"
+        );
         assert_eq!(candidates[0].recap.as_deref(), Some("Fix the renderer"));
         assert_eq!(
             candidates[0].first_message.as_deref(),
@@ -3236,10 +3385,12 @@ mod tests {
 
         let claude = concat!(
             "\u{1e}SESSION\n",
+            "/home/test/.claude/projects/claude-id.jsonl\n",
             "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T11:00:00Z\",\"message\":{\"content\":\"first claude prompt\"}}\n"
         );
         let candidates = parse_resume_candidates(AgentKind::Claude, "/work/project", claude);
         assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, AgentKind::Claude);
         assert_eq!(candidates[0].recap, None);
         assert_eq!(
             candidates[0].first_message.as_deref(),
@@ -3263,7 +3414,7 @@ mod tests {
             ..CommandConfig::default()
         };
         assert_eq!(
-            command_line(&command, AgentKind::Codex, Some("session id")),
+            command_line(&command, AgentKind::Codex, Some("session id"), None),
             "codex --full-auto resume 'session id'"
         );
         let command = CommandConfig {
@@ -3272,8 +3423,29 @@ mod tests {
             ..CommandConfig::default()
         };
         assert_eq!(
-            command_line(&command, AgentKind::Claude, Some("abc")),
+            command_line(&command, AgentKind::Claude, Some("abc"), None),
             "claude --resume abc"
+        );
+        assert_eq!(
+            command_line(
+                &command,
+                AgentKind::Claude,
+                None,
+                Some("Read /tmp/source history.jsonl")
+            ),
+            "claude 'Read /tmp/source history.jsonl'"
+        );
+    }
+
+    #[test]
+    fn filename_search_supports_substrings_and_star_globs() {
+        assert!(filename_matches_pattern("Main.RS", "main"));
+        assert!(filename_matches_pattern("main.rs", "*.rs"));
+        assert!(filename_matches_pattern("job.rs", "j**.rs"));
+        assert!(!filename_matches_pattern("job.md", "j**.rs"));
+        assert_eq!(
+            relative_search_path("/work/project", "/work/project/src/main.rs"),
+            "src/main.rs"
         );
     }
 }

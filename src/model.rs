@@ -239,6 +239,9 @@ pub struct LaunchRequest {
     pub path: String,
     pub label: String,
     pub resume_id: Option<String>,
+    /// Initial prompt for a fresh session. Used when another agent runtime's
+    /// history is referenced instead of passed as an incompatible resume id.
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +308,8 @@ pub struct FilePreview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeCandidate {
     pub id: String,
+    pub kind: AgentKind,
+    pub source_path: String,
     pub recap: Option<String>,
     pub first_message: Option<String>,
     pub last_message: Option<String>,

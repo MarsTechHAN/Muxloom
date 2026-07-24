@@ -36,6 +36,7 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         path: "/tmp".into(),
         label: "remote native companion smoke".into(),
         resume_id: None,
+        initial_prompt: None,
     };
     let agent = CommandConfig {
         command: "sh".into(),

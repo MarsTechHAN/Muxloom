@@ -102,10 +102,10 @@ muxloom update [--config PATH]
 ### 首次使用
 
 1. 启动 `muxloom`。本机默认启用，具体 SSH Alias 会显示在 Machines。
-2. 选择远端机器，按 `Space` 或点击 Checkbox 启用；未启用的机器不会探测。
+2. 单击选择远端机器，按 `Space` 或双击该机器启用；未启用的机器不会探测。
 3. 按 `n`，启动目标就是当前选中的机器。
 4. 选择 Codex、Claude 或 Terminal，选择工作目录，并可填写 Label。
-5. 直接选择 `New session`，或从当前 Runtime、当前精确目录的历史中 Resume。
+5. 选择 `New session`，或从当前精确目录下同时扫描出的 Codex/Claude 历史中 Resume/Reference。
 6. 按 `Enter` 或点击 Terminal 开始输入。
 7. 使用平台组合键加方向键，或点击 Back 返回导航。
 8. 按 `q` 退出 Dashboard；daemon 管理的会话继续运行。
@@ -114,8 +114,10 @@ muxloom update [--config PATH]
 `Right` 进入子目录，`Enter` 确认当前目录。Resume 页面也支持 `Left` 返回启动表单。
 
 Codex Resume 来源是 `~/.codex/sessions` 和 `~/.codex/session_index.jsonl`；Claude
-来源是 `~/.claude/projects`。候选项优先显示 Recap，没有 Recap 时显示第一条和最后一条
-用户消息。Terminal 始终新建。
+来源是 `~/.claude/projects`。每次都会扫描两者并用 Runtime 图标标记。相同 Runtime 原生
+Resume；交叉选择会先提示类型不匹配，确认 Reference 后新建目标 Agent，并在首条 Prompt 中
+给出源 History 文件。候选项优先显示 Recap，没有 Recap 时显示第一条和最后一条用户消息。
+Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 Agent。
 
 <a id="zh-interface"></a>
 
@@ -188,7 +190,8 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 attach 时回放保留的输出，退出并重新启动 controller 后 scrollback 仍会恢复。回滚时以及打开
 文件浏览器时都可以选择并复制内容。
 
-鼠标支持点击 Focus/选择、Checkbox、Archive、Back 和提醒 Banner。可以拖动所有布局分隔线；
+鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。Machine 单击只选择，双击才启用或
+禁用。可以拖动所有布局分隔线；
 直接拖选 Terminal 文本会在松开时复制，`Alt+拖拽` 则转发给启用 Mouse Reporting 的程序。
 
 <a id="zh-configuration"></a>
@@ -270,6 +273,7 @@ Pane（Pane-focus 快捷键或点击）即可在那里输入或操作，Files �
 | --- | --- |
 | `Up` / `Down`、`j` / `k` | 选择文件或目录 |
 | 直接输入 | 在当前目录 Match |
+| `/pattern` | 递归搜索当前目录下的文件名，支持 `*` 和 `**` 通配符 |
 | `Right`、`Enter`、双击 | 进入目录或展开/收起 Preview |
 | `Left`、右键 | 返回父目录 |
 | 方向键、`PageUp` / `PageDown` | 对打开内容翻页，末尾继续向后会折回 |
@@ -353,7 +357,8 @@ Debug Log 可能包含少量当前 Agent 可见文本，应按敏感信息处理
 
 ### 限制与安全
 
-- 暂未实现 Codex 与 Claude 之间的历史转换；
+- Codex 与 Claude 私有 History 格式不同；跨 Runtime Reference 会新建会话并在首条 Prompt
+  中引用源 History 文件，不会伪装成原生 Resume 或转换私有格式；
 - Windows 暂时只能作为远程 Controller；
 - Audio Playback、Video Seek 和音量控制暂未实现；
 - Resume 依赖 Codex/Claude 当前的本地元数据格式；

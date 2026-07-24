@@ -514,8 +514,12 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let list = List::new(items)
         .block(panel(title, app.focus == Focus::Machines))
-        .highlight_style(Style::default().bg(Color::Rgb(42, 48, 58)))
-        .highlight_symbol("> ");
+        .highlight_style(list_highlight_style(app.focus == Focus::Machines, false))
+        .highlight_symbol(if app.focus == Focus::Machines {
+            "> "
+        } else {
+            "  "
+        });
     frame.render_stateful_widget(list, area, &mut app.machine_list_state);
 }
 
@@ -701,12 +705,12 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let list = List::new(items)
         .block(panel(title, app.focus == Focus::Agents))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(42, 48, 58))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
+        .highlight_style(list_highlight_style(app.focus == Focus::Agents, true))
+        .highlight_symbol(if app.focus == Focus::Agents {
+            "> "
+        } else {
+            "  "
+        });
     frame.render_stateful_widget(list, area, &mut app.agent_list_state);
 }
 
@@ -1198,6 +1202,45 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                 area,
             );
         }
+        Modal::ConfirmHistoryReference { form, candidate } => {
+            let area = centered_rect(76, 12, outer);
+            frame.render_widget(Clear, area);
+            let (_, source_name, source_color) = agent_visual(candidate.kind);
+            let (_, target_name, target_color) = agent_visual(form.launch.kind);
+            let text = vec![
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled(source_name, Style::default().fg(source_color).bold()),
+                    Span::raw(" history does not match "),
+                    Span::styled(target_name, Style::default().fg(target_color).bold()),
+                    Span::raw(" resume format."),
+                ]),
+                Line::raw(""),
+                Line::raw("Direct resume is unavailable, but this history can be referenced."),
+                Line::raw(
+                    "Muxloom will start a new agent with the source history file in its prompt.",
+                ),
+                Line::styled(
+                    truncate(
+                        &candidate.source_path,
+                        area.width.saturating_sub(6) as usize,
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Enter/r reference history    Esc/n back",
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" History type not match ", true)),
+                area,
+            );
+        }
         Modal::LegacyFallback { target_id, detail } => {
             let area = centered_rect(72, 11, outer);
             frame.render_widget(Clear, area);
@@ -1265,7 +1308,7 @@ fn draw_file_browser(
 ) {
     let title = format!(
         " Files{}  {}:{}{} ",
-        if form.loading {
+        if form.loading || form.searching {
             " [loading]"
         } else if form.error.is_some() {
             " [error]"
@@ -1277,7 +1320,11 @@ fn draw_file_browser(
         if form.query.is_empty() {
             String::new()
         } else {
-            format!("  match: {}", form.query)
+            if form.query.starts_with('/') {
+                format!("  search: {}", &form.query[1..])
+            } else {
+                format!("  match: {}", form.query)
+            }
         }
     );
     let block = panel(&title, focused);
@@ -1294,7 +1341,7 @@ fn draw_file_browser(
     }
 
     let list_inner = list_area;
-    let items: Vec<_> = if form.loading && form.entries.is_empty() {
+    let items: Vec<_> = if (form.loading || form.searching) && form.entries.is_empty() {
         vec![ListItem::new(Line::styled(
             "Loading...",
             Style::default().fg(MUTED),
@@ -1308,7 +1355,11 @@ fn draw_file_browser(
         ))]
     } else if form.entries.is_empty() {
         vec![ListItem::new(Line::styled(
-            "Empty directory",
+            if form.query.starts_with('/') {
+                "No matching files"
+            } else {
+                "Empty directory"
+            },
             Style::default().fg(MUTED),
         ))]
     } else {
@@ -1343,8 +1394,8 @@ fn draw_file_browser(
         state.select(Some(form.selected.min(form.entries.len() - 1)));
     }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Rgb(42, 48, 58)))
-        .highlight_symbol("> ");
+        .highlight_style(list_highlight_style(focused, false))
+        .highlight_symbol(if focused { "> " } else { "  " });
     frame.render_stateful_widget(list, list_area, &mut state);
     form.entry_rows = if form.entries.is_empty() {
         Vec::new()
@@ -1371,10 +1422,12 @@ fn draw_file_browser(
 
     let footer = if form.preview_path.is_some() {
         "Double-click/Enter close  Scroll or arrows page  Right-click parent"
-    } else if form.loading {
+    } else if form.loading || form.searching {
         "Click select  Double-click open  Right-click parent  loading"
+    } else if form.query.starts_with('/') {
+        "Recursive filename search  * and ** wildcards  Esc clears"
     } else {
-        "Click select  Double-click open  Right-click parent  c copy  d download"
+        "Type / to search subfolders  Double-click open  c copy  d download"
     };
     frame.render_widget(
         Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
@@ -1393,7 +1446,7 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         " Preview  {} ",
         truncate(&path, area.width.saturating_sub(14) as usize)
     );
-    let block = panel(&title, true);
+    let block = panel(&title, app.focus == Focus::Recap);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let form = app
@@ -2106,7 +2159,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("Up twice at top", "Open the first agent waiting for input"),
         Line::raw(""),
         help_header("Machines"),
-        help_row("Space", "Enable or disable the selected machine"),
+        help_row(
+            "Space / double-click",
+            "Enable or disable; single-click selects",
+        ),
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
         Line::raw(""),
@@ -2122,6 +2178,7 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Open or close files on the selected agent machine",
         ),
         help_row("Arrows / Enter", "Select, move to parent, or open an entry"),
+        help_row("/pattern", "Search subfolder filenames with * or **"),
         help_row("d", "Download the selected file to Downloads"),
         help_row("c", "Copy the selected target path to the clipboard"),
         help_row("Drop local files", "Upload them into the visible directory"),
@@ -2311,13 +2368,13 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     let status = if form.loading {
-        "Scanning resumable sessions... Enter starts New immediately"
+        "Scanning Codex and Claude history... Enter starts New immediately"
     } else if let Some(error) = &form.error {
         error
     } else if form.candidates.is_empty() {
         "No matching history; press Enter for a new session"
     } else {
-        "Resume history for this exact working directory"
+        "Resume matching history or reference the other agent's history"
     };
     frame.render_widget(
         Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(
@@ -2367,8 +2424,14 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
         frame.render_widget(
             Paragraph::new(truncate(
                 &format!(
-                    "{} Resume  {}",
+                    "{} {} {}  {}",
                     if selected { ">" } else { " " },
+                    agent_visual(candidate.kind).0,
+                    if candidate.kind == form.launch.kind {
+                        "Resume"
+                    } else {
+                        "Reference"
+                    },
                     candidate.summary()
                 ),
                 inner.width as usize,
@@ -2689,6 +2752,18 @@ fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { ACCENT } else { Color::DarkGray }))
+}
+
+fn list_highlight_style(focused: bool, bold: bool) -> Style {
+    if !focused {
+        return Style::default();
+    }
+    let style = Style::default().bg(Color::Rgb(42, 48, 58));
+    if bold {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
 }
 
 fn runtime_capability(
@@ -3298,6 +3373,8 @@ mod tests {
             },
             candidates: vec![crate::model::ResumeCandidate {
                 id: "resume-id".into(),
+                kind: AgentKind::Claude,
+                source_path: "/home/test/.claude/projects/resume-id.jsonl".into(),
                 recap: None,
                 first_message: Some("first user message".into()),
                 last_message: Some("last user message".into()),
@@ -3352,6 +3429,9 @@ mod tests {
             preview_page_rows: 1,
             preview_rendered: None,
             query: String::new(),
+            search_request_id: None,
+            searching: false,
+            search_edited_at: None,
             preview_cache: std::collections::HashMap::new(),
             preload_pending: std::collections::HashSet::new(),
             entry_rows: Vec::new(),

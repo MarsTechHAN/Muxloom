@@ -85,14 +85,18 @@ config. Enabling a target authorizes periodic BatchMode probing; disabled
 targets are never touched.
 
 **Keys** — `Space` enable/disable · `Ctrl-r` refresh · `v` hide disabled hosts ·
-click a checkbox.
+single-click select · double-click enable/disable. Each machine remembers its
+last selected agent while you move between targets.
 
 ### 🚀 Start and resume agents
 
 `n` opens the New/Resume flow. Pick a runtime and a working directory with the
 fuzzy path picker, then start fresh or resume a history discovered in that exact
-folder. Resume candidates come from Codex (`~/.codex/sessions`) and Claude Code
-(`~/.claude/projects`), and expand to show a recap.
+folder. Every scan includes both Codex (`~/.codex/sessions`) and Claude Code
+(`~/.claude/projects`) histories, marks each candidate with its runtime icon,
+and expands to show a recap. A matching runtime resumes natively. Selecting the
+other runtime shows a type-mismatch confirmation and can start a fresh agent
+with the source history file referenced in its initial prompt.
 
 **Keys** — `n` open · type to fuzzy-match a folder · `Left`/`Right` navigate ·
 `Enter` confirm.
@@ -211,7 +215,7 @@ in the background by default; set `auto_update = false` to disable it.
 
 1. Start `muxloom`. The local target is enabled by default; SSH aliases appear
    in Machines.
-2. Select an SSH target and press `Space` (or click its checkbox) to enable it.
+2. Select an SSH target and press `Space`, or double-click it, to enable it.
 3. Press `n`, choose Codex / Claude / Terminal, a working directory, and an
    optional label.
 4. Choose **New session**, or resume a history discovered in that exact folder.
@@ -270,6 +274,7 @@ to the application while terminal input is active.
 | --- | --- |
 | `Up` / `Down`, `j` / `k` | Select an entry |
 | Type text | Match entries in the current directory |
+| `/pattern` | Search filenames recursively below the current directory; supports `*` and `**` |
 | `Right`, `Enter`, double-click | Enter a directory or toggle Preview |
 | `Left`, right-click | Go to the parent directory |
 | Arrows, `PageUp` / `PageDown` | Page an opened preview |
@@ -281,8 +286,9 @@ to the application while terminal input is active.
 | `r`, `F5` | Refresh the current directory |
 | `Esc` | Close Preview, then clear a query, then close Files |
 
-Clicking a pane focuses it; checkboxes, session rows, Archive, Back, and the
-attention banner are clickable. When the embedded program enables mouse
+Clicking a pane focuses it; machine and session rows, Archive, Back, and the
+attention banner are clickable. A machine row needs a double-click to toggle
+enabled state; a single click only selects it. When the embedded program enables mouse
 reporting, Muxloom forwards encoded mouse events unless the gesture is reserved
 for text selection.
 
@@ -458,8 +464,9 @@ muxloom --debug-log /tmp/muxloom-debug.log
 
 ## Limitations and security
 
-- Direct Codex-to-Claude history conversion is not implemented; their private
-  event formats are independent.
+- Codex and Claude private history formats differ. Cross-runtime Reference
+  starts a fresh session whose initial prompt points at the source history file;
+  it is not a native resume or a private-format conversion.
 - Windows controls remote targets but does not host local managed sessions.
 - Audio playback and interactive video seek/volume controls are not implemented.
 - Resume discovery depends on the current Codex and Claude Code metadata formats.
