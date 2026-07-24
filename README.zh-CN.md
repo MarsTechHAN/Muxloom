@@ -70,9 +70,9 @@ chmod +x muxloom muxloomd ffmpeg companions/*/muxloomd
 Windows 运行 `muxloom.exe` 管理 SSH 目标。每个压缩包和独立 companion 都带有
 `.sha256` 文件。
 
-源码构建需要 Rust 1.85 或更高版本；远程目标需要 `ssh`；Controller 补取 companion 或
-Agent Package 时需要 `curl`；视频预览需要 `PATH` 中的 `ffmpeg` 或
-`MUXLOOM_FFMPEG`。Release Bundle 已经包含 FFmpeg。
+源码构建需要 Rust 1.85 或更高版本；远程目标需要 `ssh`；视频预览需要 `PATH` 中的
+`ffmpeg` 或 `MUXLOOM_FFMPEG`。Controller 已内置 HTTPS 下载、SHA-256 校验和压缩包
+解压，补取 companion、Agent Package 和自更新都不依赖系统 `curl` 或 `tar`。
 
 ```bash
 git clone https://github.com/MarsTechHAN/Muxloom.git
@@ -89,10 +89,13 @@ cargo build --release
 ```text
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
+muxloom update [--config PATH]
 ```
 
 `--config` 指定 TOML；`--debug` 写入默认 Debug Log；`--debug-log PATH` 指定日志路径。
 `muxloom init` 不会覆盖已有配置。
+`muxloom update` 会校验 SHA-256 后原地更新 Release Bundle。启动时默认在后台自动检查并
+更新；配置 `auto_update = false` 可以关闭。
 
 <a id="zh-first-run"></a>
 

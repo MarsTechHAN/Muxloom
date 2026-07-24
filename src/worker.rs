@@ -8,7 +8,7 @@ use crate::{
     model::{
         AgentKind, AgentSession, DirectoryListing, FileListing, FilePreview, FilePreviewKind,
         HistoryMatch, HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind,
-        SearchResult, Target,
+        SearchResult, Target, TaskProgress,
     },
     runtime::Runtime,
 };
@@ -103,6 +103,11 @@ pub enum Request {
 
 #[derive(Debug)]
 pub enum Event {
+    TaskProgress {
+        target_id: String,
+        operation: TaskKind,
+        progress: TaskProgress,
+    },
     Scanned {
         target_id: String,
         result: Result<(Probe, Vec<AgentSession>), String>,
@@ -187,6 +192,12 @@ pub enum Event {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Connect,
+    Install,
+}
+
 pub struct Worker {
     pub requests: mpsc::Sender<Request>,
     pub events: mpsc::Receiver<Event>,
@@ -206,12 +217,21 @@ impl Worker {
                 thread::spawn(move || match request {
                     Request::Scan(request) => {
                         let target_id = request.target.id.clone();
+                        let progress_target = target_id.clone();
+                        let progress_events = events.clone();
                         let mut result = runtime
-                            .probe_and_discover(
+                            .probe_and_discover_with_progress(
                                 &request.target,
                                 &request.codex_command,
                                 &request.claude_command,
                                 &request.environment,
+                                move |progress| {
+                                    let _ = progress_events.send(Event::TaskProgress {
+                                        target_id: progress_target.clone(),
+                                        operation: TaskKind::Connect,
+                                        progress,
+                                    });
+                                },
                             )
                             .map_err(|error| error.to_string());
                         if let Ok((_, sessions)) = &mut result {
@@ -312,8 +332,22 @@ impl Worker {
                         environment,
                     } => {
                         let target_id = target.id.clone();
+                        let progress_target = target_id.clone();
+                        let progress_events = events.clone();
                         let result = runtime
-                            .install_runtime(&target, kind, &command, &environment)
+                            .install_runtime_with_progress(
+                                &target,
+                                kind,
+                                &command,
+                                &environment,
+                                move |progress| {
+                                    let _ = progress_events.send(Event::TaskProgress {
+                                        target_id: progress_target.clone(),
+                                        operation: TaskKind::Install,
+                                        progress,
+                                    });
+                                },
+                            )
                             .map_err(|error| error.to_string());
                         if let Err(error) = &result {
                             debug::log(

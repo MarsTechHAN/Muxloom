@@ -22,7 +22,7 @@ use crate::{
         OpenStream, PROTOCOL_VERSION, stream,
     },
     debug,
-    model::{DirectoryListing, FileListing, FilePreview, Target, Transport},
+    model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -208,6 +208,15 @@ impl BridgeConnection {
         alias: &str,
         options: &BridgeOptions,
     ) -> Result<(Arc<Self>, Option<String>)> {
+        Self::connect_ssh_with_progress(alias, options, |_| {})
+    }
+
+    pub fn connect_ssh_with_progress(
+        alias: &str,
+        options: &BridgeOptions,
+        mut progress: impl FnMut(TaskProgress),
+    ) -> Result<(Arc<Self>, Option<String>)> {
+        progress(TaskProgress::pending(format!("Connecting to {alias}")));
         let mut command = Command::new("ssh");
         command.args([
             "-T",
@@ -248,6 +257,7 @@ impl BridgeConnection {
             .stderr
             .take()
             .map(|stderr| capture_bridge_stderr(stderr, alias));
+        progress(TaskProgress::pending(format!("Checking {alias} companion")));
         let provision_notice = match negotiate_remote_companion(
             alias,
             options,
@@ -255,6 +265,7 @@ impl BridgeConnection {
             &mut reader,
             &mut writer,
             stderr_lines.as_ref(),
+            &mut progress,
         ) {
             Ok(notice) => notice,
             Err(error) => {
@@ -263,6 +274,7 @@ impl BridgeConnection {
                 return Err(error);
             }
         };
+        progress(TaskProgress::pending(format!("Starting {alias} companion")));
         let connection = Self::from_parts(alias.to_string(), reader, writer, Some(child));
         Ok((Self::handshake(connection, alias)?, provision_notice))
     }
@@ -856,6 +868,7 @@ fn negotiate_remote_companion(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
+    progress: &mut impl FnMut(TaskProgress),
 ) -> Result<Option<String>> {
     let mut status = String::new();
     if reader.read_line(&mut status)? == 0 {
@@ -875,7 +888,7 @@ fn negotiate_remote_companion(
     match fields.as_slice() {
         [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
         [marker, "HAVE", os, arch, fingerprint] if *marker == BOOTSTRAP_MARKER => {
-            let (asset, notice) = match resolve_companion_asset(options, os, arch) {
+            let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
                 Err(error) => {
                     debug::log(
@@ -901,12 +914,12 @@ fn negotiate_remote_companion(
                 writer.flush()?;
                 Ok(None)
             } else {
-                deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer)
+                deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer, progress)
             }
         }
         [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
-            let (asset, notice) = resolve_companion_asset(options, os, arch)?;
-            deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer)
+            let (asset, notice) = resolve_companion_asset(options, os, arch, progress)?;
+            deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer, progress)
         }
         _ => bail!(
             "invalid muxloomd bootstrap response from {alias}: {}",
@@ -924,6 +937,7 @@ fn deploy_remote_companion(
     arch: &str,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
+    progress: &mut impl FnMut(TaskProgress),
 ) -> Result<Option<String>> {
     let mut file = fs::File::open(asset)
         .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
@@ -937,7 +951,19 @@ fn deploy_remote_companion(
         ),
     );
     writeln!(writer, "INSTALL {size}")?;
-    std::io::copy(&mut file, writer)?;
+    let label = format!("Uploading {alias} companion");
+    progress(TaskProgress::bytes(&label, 0, Some(size)));
+    let mut transferred = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        transferred = transferred.saturating_add(read as u64);
+        progress(TaskProgress::bytes(&label, transferred, Some(size)));
+    }
     writer.flush()?;
     let mut status = String::new();
     if reader.read_line(&mut status)? == 0
@@ -955,6 +981,7 @@ fn resolve_companion_asset(
     options: &BridgeOptions,
     os: &str,
     arch: &str,
+    progress: &mut impl FnMut(TaskProgress),
 ) -> Result<(PathBuf, String)> {
     let triple = companion_target_triple(os, arch)?;
     if !options.bootstrap_binary.trim().is_empty() {
@@ -1016,8 +1043,13 @@ fn resolve_companion_asset(
         ),
     );
     let (path, downloaded) =
-        download_latest_companion(&triple, &executable, &options.download_environment)
-            .with_context(|| {
+        download_latest_companion(
+            &triple,
+            &executable,
+            &options.download_environment,
+            progress,
+        )
+        .with_context(|| {
                 format!(
                     "no bundled {triple} muxloomd asset and the controller could not fetch the latest GitHub Release"
                 )
@@ -1034,6 +1066,7 @@ fn download_latest_companion(
     triple: &str,
     executable: &str,
     environment: &[(String, String)],
+    progress: &mut impl FnMut(TaskProgress),
 ) -> Result<(PathBuf, bool)> {
     let asset_name = format!(
         "muxloomd-{triple}{}",
@@ -1044,6 +1077,9 @@ fn download_latest_companion(
         .with_context(|| format!("failed to create companion cache {}", cache.display()))?;
     let destination = cache.join(executable);
     let checksum_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}.sha256");
+    progress(TaskProgress::pending(format!(
+        "Checking {triple} companion release"
+    )));
     let expected = controller_fetch_text(&checksum_url, environment)
         .context("failed to fetch companion checksum")?;
     let expected = parse_sha256_checksum(&expected)?;
@@ -1057,7 +1093,11 @@ fn download_latest_companion(
 
     let partial = cache.join(format!(".{executable}.partial-{}", std::process::id()));
     let asset_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}");
-    let result = controller_download(&asset_url, &partial, environment).and_then(|_| {
+    let label = format!("Downloading {triple} companion");
+    let result = controller_download(&asset_url, &partial, environment, |completed, total| {
+        progress(TaskProgress::bytes(&label, completed, total));
+    })
+    .and_then(|_| {
         let actual = sha256_file(&partial)?;
         if actual != expected {
             bail!("companion checksum mismatch: expected {expected}, got {actual}");
@@ -1114,43 +1154,35 @@ fn companion_cache_root() -> PathBuf {
 }
 
 fn controller_fetch_text(url: &str, environment: &[(String, String)]) -> Result<String> {
-    let output = controller_curl(environment)
-        .args(["-fsSL", "--retry", "3", url])
-        .output()
-        .with_context(|| format!("failed to run curl for {url}"))?;
-    if !output.status.success() {
-        bail!(
-            "curl failed for {url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    #[cfg(feature = "controller")]
+    {
+        crate::http::fetch_text(url, environment)
     }
-    String::from_utf8(output.stdout).context("companion checksum response was not UTF-8")
+    #[cfg(not(feature = "controller"))]
+    {
+        let _ = (url, environment);
+        bail!("companion downloads require the controller feature")
+    }
 }
 
-fn controller_download(
+fn controller_download<F>(
     url: &str,
     destination: &Path,
     environment: &[(String, String)],
-) -> Result<()> {
-    let output = controller_curl(environment)
-        .args(["-fsSL", "--retry", "3", "--output"])
-        .arg(destination)
-        .arg(url)
-        .output()
-        .with_context(|| format!("failed to run curl for {url}"))?;
-    if !output.status.success() {
-        bail!(
-            "curl failed for {url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    #[cfg(feature = "controller")]
+    {
+        crate::http::download(url, destination, environment, on_progress)
     }
-    Ok(())
-}
-
-fn controller_curl(environment: &[(String, String)]) -> Command {
-    let mut command = Command::new("curl");
-    command.envs(environment.iter().map(|(name, value)| (name, value)));
-    command
+    #[cfg(not(feature = "controller"))]
+    {
+        let _ = (url, destination, environment, on_progress);
+        bail!("companion downloads require the controller feature")
+    }
 }
 
 fn parse_sha256_checksum(value: &str) -> Result<String> {
@@ -1270,7 +1302,16 @@ impl BridgePool {
         target: &Target,
         executables: Vec<String>,
     ) -> Result<Vec<String>> {
-        self.connection_for_target(target)?
+        self.probe_executables_with_progress(target, executables, |_| {})
+    }
+
+    pub fn probe_executables_with_progress(
+        &self,
+        target: &Target,
+        executables: Vec<String>,
+        progress: impl FnMut(TaskProgress),
+    ) -> Result<Vec<String>> {
+        self.connection_for_target_with_progress(target, progress)?
             .probe_executables(executables)
     }
 
@@ -1409,13 +1450,32 @@ impl BridgePool {
     }
 
     fn connection_for_target(&self, target: &Target) -> Result<Arc<BridgeConnection>> {
+        self.connection_for_target_with_progress(target, |_| {})
+    }
+
+    fn connection_for_target_with_progress(
+        &self,
+        target: &Target,
+        progress: impl FnMut(TaskProgress),
+    ) -> Result<Arc<BridgeConnection>> {
         match &target.transport {
-            Transport::Local => self.connection(&target.id, None),
-            Transport::Ssh { alias } => self.connection(&target.id, Some(alias)),
+            Transport::Local => self.connection_with_progress(&target.id, None, progress),
+            Transport::Ssh { alias } => {
+                self.connection_with_progress(&target.id, Some(alias), progress)
+            }
         }
     }
 
     fn connection(&self, target_id: &str, alias: Option<&str>) -> Result<Arc<BridgeConnection>> {
+        self.connection_with_progress(target_id, alias, |_| {})
+    }
+
+    fn connection_with_progress(
+        &self,
+        target_id: &str,
+        alias: Option<&str>,
+        mut progress: impl FnMut(TaskProgress),
+    ) -> Result<Arc<BridgeConnection>> {
         let target_lock = self
             .target_locks
             .lock()
@@ -1440,8 +1500,13 @@ impl BridgePool {
         }
         let options = self.options.get(target_id).unwrap_or(&self.default_options);
         let (connection, notice) = match alias {
-            Some(alias) => BridgeConnection::connect_ssh(alias, options)?,
-            None => (BridgeConnection::connect_local(&options.command)?, None),
+            Some(alias) => {
+                BridgeConnection::connect_ssh_with_progress(alias, options, &mut progress)?
+            }
+            None => {
+                progress(TaskProgress::pending("Starting local companion"));
+                (BridgeConnection::connect_local(&options.command)?, None)
+            }
         };
         self.connections
             .lock()
@@ -1585,7 +1650,7 @@ mod tests {
             ..BridgeOptions::default()
         };
         assert_eq!(
-            resolve_companion_asset(&options, "Linux", "x86_64")
+            resolve_companion_asset(&options, "Linux", "x86_64", &mut |_| {})
                 .unwrap()
                 .0,
             asset
@@ -1615,5 +1680,42 @@ mod tests {
         );
         assert!(parse_sha256_checksum("not-a-checksum").is_err());
         assert!(parse_sha256_checksum("").is_err());
+    }
+
+    #[test]
+    fn companion_deployment_reports_uploaded_bytes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset = env::temp_dir().join(format!(
+            "muxloomd-progress-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        let contents = vec![7u8; 128 * 1024 + 3];
+        fs::write(&asset, &contents).unwrap();
+        let mut reader = std::io::Cursor::new(format!("{BOOTSTRAP_MARKER} INSTALLED\n"));
+        let mut writer = Vec::new();
+        let mut updates = Vec::new();
+        let notice = deploy_remote_companion(
+            "gpu",
+            &asset,
+            "deployed test companion",
+            "Linux",
+            "x86_64",
+            &mut reader,
+            &mut writer,
+            &mut |progress| updates.push(progress),
+        )
+        .unwrap();
+        fs::remove_file(asset).unwrap();
+
+        assert_eq!(notice.as_deref(), Some("deployed test companion"));
+        assert!(writer.starts_with(format!("INSTALL {}\n", contents.len()).as_bytes()));
+        assert!(writer.ends_with(&contents));
+        assert_eq!(updates.first().unwrap().completed, 0);
+        assert_eq!(updates.last().unwrap().completed, contents.len() as u64);
+        assert_eq!(updates.last().unwrap().total, Some(contents.len() as u64));
     }
 }

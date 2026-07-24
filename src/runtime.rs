@@ -24,7 +24,7 @@ use crate::{
     model::{
         AgentKind, AgentSession, DirectoryListing, FileEntry, FileEntryKind, FileListing,
         FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
-        Probe, ResumeCandidate, Target, Transport,
+        Probe, ResumeCandidate, Target, TaskProgress, Transport,
     },
     recap::extract_recap,
 };
@@ -53,6 +53,19 @@ struct TargetPlatform {
 }
 
 impl TargetPlatform {
+    fn local() -> Self {
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            "windows" => "windows_nt",
+            other => other,
+        };
+        Self {
+            os: os.into(),
+            arch: normalize_arch(std::env::consts::ARCH).into(),
+            musl: cfg!(target_env = "musl"),
+        }
+    }
+
     fn matches_local(&self) -> bool {
         let local_os = match std::env::consts::OS {
             "macos" => "darwin",
@@ -179,11 +192,29 @@ impl Runtime {
         claude_command: &str,
         environment: &[(String, String)],
     ) -> Result<(Probe, Vec<AgentSession>)> {
+        self.probe_and_discover_with_progress(
+            target,
+            codex_command,
+            claude_command,
+            environment,
+            |_| {},
+        )
+    }
+
+    pub fn probe_and_discover_with_progress(
+        &self,
+        target: &Target,
+        codex_command: &str,
+        claude_command: &str,
+        environment: &[(String, String)],
+        progress: impl FnMut(TaskProgress),
+    ) -> Result<(Probe, Vec<AgentSession>)> {
         debug::log("runtime", format!("probe start target={}", target.id));
-        if let Ok(available) = self
-            .bridges
-            .probe_executables(target, vec![codex_command.into(), claude_command.into()])
-        {
+        if let Ok(available) = self.bridges.probe_executables_with_progress(
+            target,
+            vec![codex_command.into(), claude_command.into()],
+            progress,
+        ) {
             let mut sessions = self
                 .bridges
                 .list_sessions(target)?
@@ -531,15 +562,26 @@ impl Runtime {
         command: &CommandConfig,
         environment: &[(String, String)],
     ) -> Result<String> {
+        self.install_runtime_with_progress(target, kind, command, environment, |_| {})
+    }
+
+    pub fn install_runtime_with_progress(
+        &self,
+        target: &Target,
+        kind: AgentKind,
+        command: &CommandConfig,
+        environment: &[(String, String)],
+        mut progress: impl FnMut(TaskProgress),
+    ) -> Result<String> {
         if kind == AgentKind::Terminal {
             bail!("ordinary terminals do not require a runtime install");
         }
+        progress(TaskProgress::pending(format!("Preparing {kind} install")));
         let executable_name = kind.as_str();
         let exports = environment_exports(environment);
-        let platform = if matches!(target.transport, Transport::Ssh { .. }) {
-            Some(self.target_platform(target)?)
-        } else {
-            None
+        let platform = match &target.transport {
+            Transport::Ssh { .. } => self.target_platform(target)?,
+            Transport::Local => TargetPlatform::local(),
         };
         let mut installed_source = None;
         let mut controller_download_error = None;
@@ -547,10 +589,11 @@ impl Runtime {
         if matches!(target.transport, Transport::Ssh { .. })
             && !command.command.contains('/')
             && command.command == executable_name
-            && platform.as_ref().is_some_and(TargetPlatform::matches_local)
+            && platform.matches_local()
             && let Some(local_binary) = find_local_native_executable(&command.command)
             && local_runtime_can_copy(kind, &local_binary)
         {
+            progress(TaskProgress::pending(format!("Uploading {kind} runtime")));
             match self.upload_runtime_binary(target, &local_binary, executable_name) {
                 Ok(()) => installed_source = Some("compatible controller binary".to_string()),
                 Err(error) => debug::log(
@@ -567,16 +610,21 @@ impl Runtime {
             && matches!(target.transport, Transport::Ssh { .. })
             && !command.command.contains('/')
             && command.command == executable_name
-            && let Some(platform) = &platform
         {
-            match self.download_and_upload_runtime(target, kind, platform, environment) {
+            match self.download_and_install_runtime(
+                target,
+                kind,
+                &platform,
+                environment,
+                &mut progress,
+            ) {
                 Ok(source) => installed_source = Some(source),
                 Err(error) => {
                     controller_download_error = Some(error.to_string());
                     debug::log(
                         "install",
                         format!(
-                            "controller-side download failed target={} kind={kind}: {error:#}; trying configured target installer",
+                            "built-in package install failed target={} kind={kind}: {error:#}; trying configured target installer",
                             target.id
                         ),
                     );
@@ -586,19 +634,25 @@ impl Runtime {
 
         if installed_source.is_none() {
             if command.install.trim().is_empty() {
+                if let Some(controller_error) = controller_download_error {
+                    bail!(
+                        "{} is unavailable on {}; built-in package install failed: {controller_error}",
+                        command.command,
+                        target.id
+                    );
+                }
                 bail!(
                     "{} is unavailable and no install command is configured for {}",
                     command.command,
                     target.id
                 );
             }
+            progress(TaskProgress::pending(format!("Running {kind} installer")));
             let script = login_shell_command(&format!("{exports} {}", command.install));
             let output = self.run_shell(target, &script, false)?;
             if let Err(error) = ensure_success(&output, &format!("install {kind}")) {
                 if let Some(controller_error) = controller_download_error {
-                    bail!(
-                        "{error}; controller-side offline install also failed: {controller_error}"
-                    );
+                    bail!("{error}; built-in package install also failed: {controller_error}");
                 }
                 return Err(error);
             }
@@ -606,6 +660,9 @@ impl Runtime {
         }
 
         let synced = if matches!(target.transport, Transport::Ssh { .. }) {
+            progress(TaskProgress::pending(format!(
+                "Syncing {kind} configuration"
+            )));
             self.sync_local_config_files(target, &command.sync_files)?
         } else {
             0
@@ -614,6 +671,7 @@ impl Runtime {
             "{exports} command -v {} >/dev/null 2>&1",
             shell_quote(&command.command)
         ));
+        progress(TaskProgress::pending(format!("Verifying {kind} install")));
         let output = self.run_shell(target, &verify, false)?;
         ensure_success(&output, &format!("verify {kind} install"))?;
         let source = installed_source.unwrap_or_else(|| "runtime installer".into());
@@ -639,17 +697,19 @@ impl Runtime {
         })
     }
 
-    fn download_and_upload_runtime(
+    fn download_and_install_runtime(
         &self,
         target: &Target,
         kind: AgentKind,
         platform: &TargetPlatform,
         environment: &[(String, String)],
+        progress: &mut impl FnMut(TaskProgress),
     ) -> Result<String> {
         let controller_environment = self.controller_download_environment(target, environment);
         match kind {
             AgentKind::Claude => {
                 let platform_name = platform.claude_name()?;
+                progress(TaskProgress::pending("Resolving Claude release"));
                 let version = validate_release_name(
                     self.controller_fetch_text(
                         &format!("{CLAUDE_RELEASES}/latest"),
@@ -675,19 +735,34 @@ impl Runtime {
                     .join(&version)
                     .join(&platform_name)
                     .join("claude");
+                let download_label = format!("Downloading Claude {version}");
                 self.controller_download_verified(
                     &format!("{CLAUDE_RELEASES}/{version}/{platform_name}/claude"),
                     &cache,
                     checksum,
                     &controller_environment,
+                    &download_label,
+                    progress,
                 )?;
-                self.upload_runtime_binary(target, &cache, "claude")?;
+                match &target.transport {
+                    Transport::Local => {
+                        progress(TaskProgress::pending(format!(
+                            "Installing Claude {version}"
+                        )));
+                        install_local_runtime_binary(&cache, "claude")?;
+                    }
+                    Transport::Ssh { .. } => {
+                        progress(TaskProgress::pending(format!("Uploading Claude {version}")));
+                        self.upload_runtime_binary(target, &cache, "claude")?;
+                    }
+                }
                 Ok(format!(
                     "controller-downloaded Claude {version} ({platform_name})"
                 ))
             }
             AgentKind::Codex => {
                 let platform_name = platform.codex_name()?;
+                progress(TaskProgress::pending("Resolving Codex release"));
                 let effective =
                     self.controller_effective_url(CODEX_LATEST, &controller_environment)?;
                 let version = effective
@@ -710,13 +785,27 @@ impl Runtime {
                     .join(&version)
                     .join(&platform_name)
                     .join(&asset);
+                let download_label = format!("Downloading Codex {version}");
                 self.controller_download_verified(
                     &format!("{release_root}/{asset}"),
                     &cache,
                     &checksum,
                     &controller_environment,
+                    &download_label,
+                    progress,
                 )?;
-                self.upload_codex_archive(target, &cache, &version)?;
+                match &target.transport {
+                    Transport::Local => {
+                        progress(TaskProgress::pending(format!("Installing Codex {version}")));
+                        install_local_codex_archive(&cache, &version)?;
+                    }
+                    Transport::Ssh { .. } => {
+                        progress(TaskProgress::pending(format!("Extracting Codex {version}")));
+                        let executable = extract_cached_codex_archive(&cache)?;
+                        progress(TaskProgress::pending(format!("Uploading Codex {version}")));
+                        self.upload_runtime_binary(target, &executable, "codex")?;
+                    }
+                }
                 Ok(format!(
                     "controller-downloaded Codex {version} ({platform_name})"
                 ))
@@ -730,6 +819,9 @@ impl Runtime {
         target: &Target,
         environment: &[(String, String)],
     ) -> Vec<(String, String)> {
+        if matches!(target.transport, Transport::Local) {
+            return environment.to_vec();
+        }
         let tunnel = self
             .host_reverse_tunnels
             .get(&target.id)
@@ -769,12 +861,16 @@ impl Runtime {
     }
 
     fn controller_fetch_text(&self, url: &str, environment: &[(String, String)]) -> Result<String> {
-        let output = controller_curl(environment)
-            .args(["-fsSL", "--retry", "3", url])
-            .output()
-            .with_context(|| format!("failed to download {url} on the controller"))?;
-        ensure_success(&output, "controller download")?;
-        String::from_utf8(output.stdout).context("controller download was not UTF-8")
+        #[cfg(feature = "controller")]
+        {
+            crate::http::fetch_text(url, environment)
+                .with_context(|| format!("failed to download {url} on the controller"))
+        }
+        #[cfg(not(feature = "controller"))]
+        {
+            let _ = (url, environment);
+            bail!("agent downloads require the controller feature")
+        }
     }
 
     fn controller_effective_url(
@@ -782,21 +878,16 @@ impl Runtime {
         url: &str,
         environment: &[(String, String)],
     ) -> Result<String> {
-        let output = controller_curl(environment)
-            .args([
-                "-fsSL",
-                "--retry",
-                "3",
-                "-o",
-                null_device(),
-                "-w",
-                "%{url_effective}",
-                url,
-            ])
-            .output()
-            .with_context(|| format!("failed to resolve {url} on the controller"))?;
-        ensure_success(&output, "resolve controller download URL")?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        #[cfg(feature = "controller")]
+        {
+            crate::http::effective_url(url, environment)
+                .with_context(|| format!("failed to resolve {url} on the controller"))
+        }
+        #[cfg(not(feature = "controller"))]
+        {
+            let _ = (url, environment);
+            bail!("agent downloads require the controller feature")
+        }
     }
 
     fn controller_download_verified(
@@ -805,6 +896,8 @@ impl Runtime {
         destination: &Path,
         expected_sha256: &str,
         environment: &[(String, String)],
+        progress_label: &str,
+        progress: &mut impl FnMut(TaskProgress),
     ) -> Result<()> {
         if destination.is_file()
             && sha256_file(destination).is_ok_and(|digest| digest == expected_sha256)
@@ -819,15 +912,13 @@ impl Runtime {
         let download_id = DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
         let partial =
             destination.with_extension(format!("partial-{}-{download_id}", std::process::id()));
-        let output = controller_curl(environment)
-            .args(["-fsSL", "--retry", "3", "--output"])
-            .arg(&partial)
-            .arg(url)
-            .output()
-            .with_context(|| format!("failed to download {url} on the controller"))?;
-        if !output.status.success() {
+        let result = controller_download(url, &partial, environment, |completed, total| {
+            progress(TaskProgress::bytes(progress_label, completed, total));
+        })
+        .with_context(|| format!("failed to download {url} on the controller"));
+        if let Err(error) = result {
             let _ = fs::remove_file(&partial);
-            ensure_success(&output, "controller runtime download")?;
+            return Err(error);
         }
         let actual = sha256_file(&partial)?;
         if actual != expected_sha256 {
@@ -846,49 +937,6 @@ impl Runtime {
             )
         })?;
         Ok(())
-    }
-
-    fn upload_codex_archive(
-        &self,
-        target: &Target,
-        local_archive: &Path,
-        version: &str,
-    ) -> Result<()> {
-        let Transport::Ssh { alias } = &target.transport else {
-            bail!("Codex package upload requires an SSH target");
-        };
-        let remote_home = self.remote_home(target)?;
-        let install_cache = format!("{remote_home}/.cache/muxloom/install");
-        let remote_archive = format!("{install_cache}/codex-package.tar.gz");
-        let releases = format!("{remote_home}/.local/share/muxloom/codex/releases");
-        let release_dir = format!("{releases}/{version}");
-        let staging = format!("{release_dir}.partial-{}", std::process::id());
-        let bin_dir = format!("{remote_home}/.local/bin");
-        let prepare = format!(
-            "mkdir -p {} {} {}",
-            shell_quote(&install_cache),
-            shell_quote(&releases),
-            shell_quote(&bin_dir)
-        );
-        let output = self.run_shell(target, &prepare, false)?;
-        ensure_success(&output, "prepare remote Codex package install")?;
-        self.scp_to(alias, local_archive, &remote_archive)?;
-        let activate = format!(
-            "rm -rf {staging}; mkdir -p {staging}; \
-             tar -xzf {archive} -C {staging} && \
-             test -f {staging}/bin/codex && \
-             chmod 755 {staging}/bin/codex && \
-             if [ -f {staging}/codex-path/rg ]; then chmod 755 {staging}/codex-path/rg; fi && \
-             if [ -f {staging}/codex-resources/bwrap ]; then chmod 755 {staging}/codex-resources/bwrap; fi && \
-             rm -rf {release}; mv {staging} {release} && \
-             ln -sfn {release}/bin/codex {bin}/codex && rm -f {archive}",
-            staging = shell_quote(&staging),
-            archive = shell_quote(&remote_archive),
-            release = shell_quote(&release_dir),
-            bin = shell_quote(&bin_dir),
-        );
-        let output = self.run_shell(target, &activate, false)?;
-        ensure_success(&output, "activate controller-downloaded Codex package")
     }
 
     fn upload_runtime_binary(
@@ -1902,20 +1950,194 @@ fn controller_download_cache() -> PathBuf {
         .join(".cache/muxloom/downloads")
 }
 
-fn controller_curl(environment: &[(String, String)]) -> Command {
-    let mut command = Command::new("curl");
-    command
-        .args([
-            "--connect-timeout",
-            "10",
-            "--speed-limit",
-            "1024",
-            "--speed-time",
-            "60",
-        ])
-        .stdin(Stdio::null())
-        .envs(environment.iter().cloned());
-    command
+#[cfg(feature = "controller")]
+fn local_install_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is unavailable while installing the local agent runtime")
+}
+
+#[cfg(feature = "controller")]
+fn extract_cached_codex_archive(archive: &Path) -> Result<PathBuf> {
+    let parent = archive
+        .parent()
+        .context("Codex package cache path has no parent")?;
+    let extracted = parent.join("extracted");
+    let executable = extracted.join("bin/codex");
+    if executable.is_file() {
+        return Ok(executable);
+    }
+    let staging = parent.join(format!(".extracted.partial-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<PathBuf> {
+        let file =
+            File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut package = tar::Archive::new(decoder);
+        package
+            .unpack(&staging)
+            .with_context(|| format!("failed to unpack {}", archive.display()))?;
+        let staged_executable = staging.join("bin/codex");
+        if !staged_executable.is_file() {
+            bail!("Codex package did not contain bin/codex");
+        }
+        set_executable(&staged_executable)?;
+        if extracted.exists() {
+            fs::remove_dir_all(&extracted)?;
+        }
+        fs::rename(&staging, &extracted)?;
+        Ok(executable)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+#[cfg(not(feature = "controller"))]
+fn extract_cached_codex_archive(_archive: &Path) -> Result<PathBuf> {
+    bail!("Codex package extraction requires the controller feature")
+}
+
+#[cfg(feature = "controller")]
+fn install_local_runtime_binary(source: &Path, executable: &str) -> Result<()> {
+    install_local_runtime_binary_at(source, executable, &local_install_home()?)
+}
+
+#[cfg(not(feature = "controller"))]
+fn install_local_runtime_binary(_source: &Path, _executable: &str) -> Result<()> {
+    bail!("local agent installation requires the controller feature")
+}
+
+#[cfg(feature = "controller")]
+fn install_local_runtime_binary_at(source: &Path, executable: &str, home: &Path) -> Result<()> {
+    let bin_dir = home.join(".local/bin");
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+    let destination = bin_dir.join(executable);
+    let staging = bin_dir.join(format!(".{executable}.partial-{}", std::process::id()));
+    let _ = fs::remove_file(&staging);
+    fs::copy(source, &staging).with_context(|| {
+        format!(
+            "failed to stage {} as {}",
+            source.display(),
+            staging.display()
+        )
+    })?;
+    set_executable(&staging)?;
+    fs::rename(&staging, &destination)
+        .with_context(|| format!("failed to activate local runtime {}", destination.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "controller")]
+fn install_local_codex_archive(archive: &Path, version: &str) -> Result<()> {
+    install_local_codex_archive_at(archive, version, &local_install_home()?)
+}
+
+#[cfg(not(feature = "controller"))]
+fn install_local_codex_archive(_archive: &Path, _version: &str) -> Result<()> {
+    bail!("local Codex installation requires the controller feature")
+}
+
+#[cfg(feature = "controller")]
+fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) -> Result<()> {
+    let releases = home.join(".local/share/muxloom/codex/releases");
+    let release = releases.join(version);
+    let staging = releases.join(format!(".{version}.partial-{}", std::process::id()));
+    let bin_dir = home.join(".local/bin");
+    fs::create_dir_all(&releases)?;
+    fs::create_dir_all(&bin_dir)?;
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+
+    let result = (|| -> Result<()> {
+        let file =
+            File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut package = tar::Archive::new(decoder);
+        package
+            .unpack(&staging)
+            .with_context(|| format!("failed to unpack {}", archive.display()))?;
+        let executable = staging.join("bin/codex");
+        if !executable.is_file() {
+            bail!("Codex package did not contain bin/codex");
+        }
+        set_executable(&executable)?;
+        if release.exists() {
+            fs::remove_dir_all(&release).with_context(|| {
+                format!(
+                    "failed to replace local Codex release {}",
+                    release.display()
+                )
+            })?;
+        }
+        fs::rename(&staging, &release).with_context(|| {
+            format!(
+                "failed to activate local Codex release {}",
+                release.display()
+            )
+        })?;
+        activate_local_codex_link(&release.join("bin/codex"), &bin_dir.join("codex"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+#[cfg(all(feature = "controller", unix))]
+fn activate_local_codex_link(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let staging = destination.with_extension(format!("partial-{}", std::process::id()));
+    let _ = fs::remove_file(&staging);
+    symlink(source, &staging)
+        .with_context(|| format!("failed to stage local Codex link from {}", source.display()))?;
+    fs::rename(&staging, destination)
+        .with_context(|| format!("failed to activate {}", destination.display()))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "controller", not(unix)))]
+fn activate_local_codex_link(_source: &Path, _destination: &Path) -> Result<()> {
+    bail!("local Codex package installation is unsupported on this platform")
+}
+
+#[cfg(feature = "controller")]
+fn set_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn controller_download<F>(
+    url: &str,
+    destination: &Path,
+    environment: &[(String, String)],
+    on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    #[cfg(feature = "controller")]
+    {
+        crate::http::download(url, destination, environment, on_progress)
+    }
+    #[cfg(not(feature = "controller"))]
+    {
+        let _ = (url, destination, environment, on_progress);
+        bail!("agent downloads require the controller feature")
+    }
 }
 
 fn parse_reverse_tunnel(value: &str) -> Option<(u16, &str, u16)> {
@@ -1925,10 +2147,6 @@ fn parse_reverse_tunnel(value: &str) -> Option<(u16, &str, u16)> {
     let local_port = fields.next()?.parse().ok()?;
     (fields.next().is_none() && remote_port > 0 && local_port > 0 && !local_host.is_empty())
         .then_some((remote_port, local_host, local_port))
-}
-
-fn null_device() -> &'static str {
-    if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
 fn validate_release_name(value: &str) -> Result<String> {
@@ -2583,6 +2801,7 @@ fn find_codex_resource(binary: &Path, name: &str) -> Option<PathBuf> {
     for ancestor in binary.parent()?.ancestors().take(7) {
         for relative in [
             PathBuf::from("codex-resources").join(name),
+            PathBuf::from("codex-path").join(name),
             PathBuf::from("path").join(name),
         ] {
             let candidate = ancestor.join(relative);
@@ -2793,6 +3012,59 @@ mod tests {
             checksum_for_asset(manifest, "codex-package.tar.gz").as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn installs_downloaded_agent_packages_without_system_tools() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-local-install-{}-{nonce}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        fs::create_dir_all(&root).unwrap();
+
+        let claude = root.join("claude");
+        fs::write(&claude, b"claude-binary").unwrap();
+        install_local_runtime_binary_at(&claude, "claude", &home).unwrap();
+        assert_eq!(
+            fs::read(home.join(".local/bin/claude")).unwrap(),
+            b"claude-binary"
+        );
+
+        let archive = root.join("codex.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut package = tar::Builder::new(encoder);
+        let payload = b"codex-binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        package
+            .append_data(&mut header, "bin/codex", &payload[..])
+            .unwrap();
+        package.into_inner().unwrap().finish().unwrap();
+
+        let extracted = extract_cached_codex_archive(&archive).unwrap();
+        assert_eq!(fs::read(extracted).unwrap(), b"codex-binary");
+        install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap();
+        assert_eq!(
+            fs::read(home.join(".local/bin/codex")).unwrap(),
+            b"codex-binary"
+        );
+        assert!(
+            home.join(".local/share/muxloom/codex/releases/1.2.3/bin/codex")
+                .is_file()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

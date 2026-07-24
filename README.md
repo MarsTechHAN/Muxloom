@@ -172,9 +172,10 @@ bundle does not provide a local `muxloomd`.
 
 ### Build from source
 
-Requires Rust 1.85+, `ssh` for remote targets, `curl` when the controller must
-fetch a companion or agent package, and `ffmpeg` on `PATH` (or `MUXLOOM_FFMPEG`)
-for video preview.
+Requires Rust 1.85+, `ssh` for remote targets, and `ffmpeg` on `PATH` (or
+`MUXLOOM_FFMPEG`) for video preview. HTTPS downloads, checksum verification,
+and archive extraction are built into the controller; no system `curl` or
+`tar` is required for companion, agent-package, or self-update downloads.
 
 ```bash
 git clone https://github.com/MarsTechHAN/Muxloom.git
@@ -189,6 +190,7 @@ cargo build --release
 ```text
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
+muxloom update [--config PATH]
 ```
 
 | Option | Purpose |
@@ -198,6 +200,10 @@ muxloom init [--config PATH]
 | `--config PATH` | Use a custom TOML configuration |
 | `--debug` | Write detailed logs to the default state directory |
 | `--debug-log PATH` | Write detailed logs to an explicit file |
+
+`muxloom update` checks the latest GitHub Release, verifies its SHA-256, and
+updates an installed release bundle in place. Startup auto-update does the same
+in the background by default; set `auto_update = false` to disable it.
 
 `muxloom init` refuses to overwrite an existing configuration.
 
@@ -310,17 +316,18 @@ reverse_tunnel = ""
 # Target command and optional controller-side companion asset.
 companion_command = "muxloomd"
 companion_binary = ""
+auto_update = true
 
 [agents.codex]
 command = "codex"
 args = []
-install = "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+install = ""
 sync_files = ["~/.codex/config.toml", "~/.codex/auth.json"]
 
 [agents.claude]
 command = "claude"
 args = []
-install = "curl -fsSL https://claude.ai/install.sh | bash"
+install = ""
 sync_files = ["~/.claude/settings.json"]
 
 # Empty means the target user's SHELL, then /bin/sh.

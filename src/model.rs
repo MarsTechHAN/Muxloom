@@ -69,6 +69,34 @@ pub enum ConnectionState {
     Offline,
 }
 
+/// Progress for controller-side connection, provisioning, and installation
+/// work. A missing total represents a stage whose duration is not measurable;
+/// byte transfers report their exact size when the server provides one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskProgress {
+    pub label: String,
+    pub completed: u64,
+    pub total: Option<u64>,
+}
+
+impl TaskProgress {
+    pub fn pending(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            completed: 0,
+            total: None,
+        }
+    }
+
+    pub fn bytes(label: impl Into<String>, completed: u64, total: Option<u64>) -> Self {
+        Self {
+            label: label.into(),
+            completed,
+            total,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub id: String,

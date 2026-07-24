@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -16,13 +17,13 @@ use crate::{
     model::{
         AgentKind, AgentSession, ConnectionState, DirectoryListing, FileEntry, FileEntryKind,
         FileListing, FilePreview, FilePreviewKind, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
-        ResumeCandidate, SearchResult, Target, TargetStatus,
+        ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
     recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason},
     ssh_config,
     terminal_session::TerminalSession,
-    worker::{Event, Request, ScanRequest, Worker},
+    worker::{Event, Request, ScanRequest, TaskKind, Worker},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,20 @@ struct ArchivedResume {
     source_session_id: String,
     launch: LaunchForm,
 }
+
+/// Result of the background self-update check, handed to the UI thread. Kept in
+/// `app` (rather than `update`, which is controller-only) so this module builds
+/// for the lean `muxloomd` companion too.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateNote {
+    /// Footer message to show, if any.
+    pub message: Option<String>,
+    /// The newer version that is now staged / available, if any.
+    pub staged_version: Option<String>,
+}
+
+/// A slot the startup update thread writes once; the UI drains it on the next tick.
+pub type UpdateSlot = Arc<Mutex<Option<UpdateNote>>>;
 
 #[derive(Debug, Clone)]
 pub struct PathPickerForm {
@@ -373,6 +388,11 @@ pub struct App {
     pending_install_launch: Option<(LaunchForm, Option<String>)>,
     pending_archived_resume: Option<ArchivedResume>,
     last_file_click: Option<FileClick>,
+    update_slot: UpdateSlot,
+    pub(crate) task_progress: Vec<(String, TaskKind, TaskProgress)>,
+    /// A newer version staged (or available) by the background update check;
+    /// shown in the header. `None` until the check reports something newer.
+    pub staged_update: Option<String>,
 }
 
 impl App {
@@ -454,12 +474,38 @@ impl App {
             pending_install_launch: None,
             pending_archived_resume: None,
             last_file_click: None,
+            update_slot: Arc::new(Mutex::new(None)),
+            task_progress: Vec::new(),
+            staged_update: None,
         }
     }
 
     pub fn start(&mut self) {
         self.ensure_target_visible();
         self.refresh_enabled();
+    }
+
+    /// A handle the startup update thread writes its result into.
+    pub fn update_slot(&self) -> UpdateSlot {
+        Arc::clone(&self.update_slot)
+    }
+
+    /// Pull a startup update result (if the background thread posted one) into
+    /// the footer message and the header's staged-version indicator.
+    fn drain_update_slot(&mut self) {
+        let note = self
+            .update_slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(note) = note {
+            if let Some(message) = note.message {
+                self.status_message = message;
+            }
+            if note.staged_version.is_some() {
+                self.staged_update = note.staged_version;
+            }
+        }
     }
 
     pub fn on_tick(&mut self) {
@@ -469,6 +515,7 @@ impl App {
         self.animation_frame =
             (self.animation_epoch.elapsed().as_millis() / ANIMATION_FRAME_MS) as u64;
         self.drain_worker();
+        self.drain_update_slot();
         self.poll_media();
         self.poll_terminal();
         self.maybe_auto_submit_search();
@@ -1626,9 +1673,38 @@ impl App {
         }
     }
 
+    pub fn visible_task_progress(&self) -> Option<(&str, &TaskProgress)> {
+        self.task_progress
+            .last()
+            .map(|(target_id, _, progress)| (target_id.as_str(), progress))
+    }
+
+    fn set_task_progress(
+        &mut self,
+        target_id: String,
+        operation: TaskKind,
+        progress: TaskProgress,
+    ) {
+        self.clear_task_progress(&target_id, operation);
+        self.task_progress.push((target_id, operation, progress));
+    }
+
+    fn clear_task_progress(&mut self, target_id: &str, operation: TaskKind) {
+        self.task_progress
+            .retain(|(active_target, active_operation, _)| {
+                active_target != target_id || *active_operation != operation
+            });
+    }
+
     fn handle_worker_event(&mut self, event: Event) {
         match event {
+            Event::TaskProgress {
+                target_id,
+                operation,
+                progress,
+            } => self.set_task_progress(target_id, operation, progress),
             Event::Scanned { target_id, result } => {
+                self.clear_task_progress(&target_id, TaskKind::Connect);
                 self.pending_scans.remove(&target_id);
                 let previous_attention: HashSet<_> = self
                     .sessions
@@ -1807,6 +1883,7 @@ impl App {
                 kind,
                 result,
             } => {
+                self.clear_task_progress(&target_id, TaskKind::Install);
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 match result {
                     Ok(message) => {
@@ -6792,6 +6869,53 @@ mod tests {
             app.selected_session_id.as_deref(),
             Some("muxloomd-codex-1-2-0")
         );
+    }
+
+    #[test]
+    fn task_progress_survives_other_targets_and_operations_finishing() {
+        let mut app = ux_test_app(vec![Target::ssh("gpu-a"), Target::ssh("gpu-b")]);
+        app.handle_worker_event(Event::TaskProgress {
+            target_id: "gpu-a".into(),
+            operation: TaskKind::Connect,
+            progress: TaskProgress::pending("Connecting to gpu-a"),
+        });
+        app.handle_worker_event(Event::TaskProgress {
+            target_id: "gpu-a".into(),
+            operation: TaskKind::Install,
+            progress: TaskProgress::bytes("Downloading Claude", 40, Some(100)),
+        });
+        app.handle_worker_event(Event::TaskProgress {
+            target_id: "gpu-b".into(),
+            operation: TaskKind::Connect,
+            progress: TaskProgress::pending("Connecting to gpu-b"),
+        });
+
+        app.handle_worker_event(Event::Scanned {
+            target_id: "gpu-b".into(),
+            result: Err("offline".into()),
+        });
+        assert_eq!(
+            app.visible_task_progress()
+                .map(|(target, progress)| (target, progress.label.as_str())),
+            Some(("gpu-a", "Downloading Claude"))
+        );
+
+        app.handle_worker_event(Event::Installed {
+            target_id: "gpu-a".into(),
+            kind: AgentKind::Claude,
+            result: Err("failed".into()),
+        });
+        assert_eq!(
+            app.visible_task_progress()
+                .map(|(target, progress)| (target, progress.label.as_str())),
+            Some(("gpu-a", "Connecting to gpu-a"))
+        );
+
+        app.handle_worker_event(Event::Scanned {
+            target_id: "gpu-a".into(),
+            result: Err("offline".into()),
+        });
+        assert!(app.visible_task_progress().is_none());
     }
 
     #[test]

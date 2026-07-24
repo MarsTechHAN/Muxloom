@@ -65,6 +65,11 @@ fn real_main() -> Result<()> {
             println!("muxloom {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Command::Update => {
+            let config = Config::load(&options.config_path)?;
+            let environment = config.environment_for(muxloom::model::LOCAL_TARGET_ID)?;
+            muxloom::update::run_cli(&environment)
+        }
         Command::Init => {
             if !options.config_explicit
                 && migrate_legacy_file(&legacy_config_path(), &options.config_path)?
@@ -90,6 +95,39 @@ fn real_main() -> Result<()> {
     }
 }
 
+/// Check GitHub for a newer release in the background and, on a real install,
+/// stage it. The result is posted into `slot` for the UI to surface; failures
+/// (offline, rate-limited, etc.) stay silent.
+fn spawn_update_check(slot: muxloom::app::UpdateSlot, environment: Vec<(String, String)>) {
+    std::thread::spawn(move || {
+        let Ok(result) = muxloom::update::check_and_maybe_apply(true, &environment) else {
+            return;
+        };
+        let note = if result.applied {
+            muxloom::app::UpdateNote {
+                message: Some(format!(
+                    "muxloom {} downloaded — restart to apply",
+                    result.latest
+                )),
+                staged_version: Some(result.latest),
+            }
+        } else if result.update_available {
+            muxloom::app::UpdateNote {
+                message: Some(format!(
+                    "muxloom {} available — run `muxloom update`",
+                    result.latest
+                )),
+                staged_version: Some(result.latest),
+            }
+        } else {
+            return;
+        };
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(note);
+        }
+    });
+}
+
 fn run(config_path: PathBuf) -> Result<()> {
     let config = Config::load(&config_path)?;
     let state_path = default_state_path();
@@ -103,11 +141,19 @@ fn run(config_path: PathBuf) -> Result<()> {
             .map(Target::ssh),
     );
 
+    let auto_update = config.auto_update;
+    let update_environment = config
+        .environment_for(muxloom::model::LOCAL_TARGET_ID)
+        .unwrap_or_default();
+
     let runtime = Runtime::new(&config);
     let worker = Worker::start(runtime.clone());
     let mut app = App::new(config, config_path, state, state_path, targets, worker);
     if let Some(path) = debug::path() {
         app.status_message = format!("Debug log: {}", path.display());
+    }
+    if auto_update {
+        spawn_update_check(app.update_slot(), update_environment);
     }
     app.start();
 
@@ -427,6 +473,7 @@ fn init_config(path: &Path) -> Result<()> {
 enum Command {
     Run,
     Init,
+    Update,
     Help,
     Version,
 }
@@ -447,6 +494,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
     while index < args.len() {
         match args[index].as_str() {
             "init" => command = Command::Init,
+            "update" => command = Command::Update,
             "--help" | "-h" => command = Command::Help,
             "--version" | "-V" => command = Command::Version,
             "--debug" => debug_log = Some(default_debug_log_path()),
@@ -479,7 +527,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
 
 fn print_help() {
     println!(
-        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n",
+        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the latest release, if newer\n",
         env!("CARGO_PKG_VERSION")
     );
 }

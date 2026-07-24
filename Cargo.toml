@@ -12,9 +12,11 @@ readme = "README.md"
 anyhow = "1.0"
 crossterm = "0.28"
 csv = "1.4"
+flate2 = { version = "1.1.9", optional = true }
 image = { version = "=0.25.5", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.11"
+minreq = { version = "3.0.0", default-features = false, features = ["https-rustls", "proxy"], optional = true }
 portable-pty = "0.8"
 ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
@@ -23,6 +25,15 @@ sha2 = "0.10"
 shell-words = "1.1"
 signal-hook = "0.3"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+tar = { version = "0.4.46", optional = true }
 toml = "0.8"
 unicode-width = "0.2"
 vt100 = "0.15"
+
+[features]
+# The `controller` feature carries everything only the `muxloom` dashboard
+# needs to talk to the network (in-process HTTPS via rustls: companion/agent
+# downloads and self-update). The `muxloomd` companion is built with
+# `--no-default-features` so it never links the TLS stack it does not use.
+default = ["controller"]
+controller = ["dep:minreq", "dep:flate2", "dep:tar"]

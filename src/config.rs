@@ -22,6 +22,10 @@ pub struct Config {
     pub reverse_tunnel: String,
     pub companion_command: String,
     pub companion_binary: String,
+    /// Check GitHub for a newer release on startup and install it in the
+    /// background so the next launch is up to date. `muxloom update` always
+    /// works regardless of this setting.
+    pub auto_update: bool,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
 }
@@ -46,6 +50,7 @@ impl Default for Config {
             reverse_tunnel: String::new(),
             companion_command: "muxloomd".into(),
             companion_binary: String::new(),
+            auto_update: true,
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
         }
@@ -66,13 +71,13 @@ impl Default for AgentCommands {
             codex: CommandConfig {
                 command: "codex".into(),
                 args: Vec::new(),
-                install: "curl -fsSL https://chatgpt.com/codex/install.sh | sh".into(),
+                install: String::new(),
                 sync_files: vec!["~/.codex/config.toml".into(), "~/.codex/auth.json".into()],
             },
             claude: CommandConfig {
                 command: "claude".into(),
                 args: Vec::new(),
-                install: "curl -fsSL https://claude.ai/install.sh | bash".into(),
+                install: String::new(),
                 sync_files: vec!["~/.claude/settings.json".into()],
             },
             terminal: CommandConfig::default(),
@@ -384,17 +389,19 @@ environment = ""
 reverse_tunnel = ""
 companion_command = "muxloomd"
 companion_binary = ""
+# Check GitHub for a newer release on startup and install it in the background.
+auto_update = true
 
 [agents.codex]
 command = "codex"
 args = []
-install = "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+install = ""
 sync_files = ["~/.codex/config.toml", "~/.codex/auth.json"]
 
 [agents.claude]
 command = "claude"
 args = []
-install = "curl -fsSL https://claude.ai/install.sh | bash"
+install = ""
 sync_files = ["~/.claude/settings.json"]
 
 # Empty command means the user's SHELL (or /bin/sh).
@@ -420,6 +427,14 @@ sync_files = []
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_agent_installers_do_not_require_system_download_tools() {
+        let config = Config::default();
+        assert!(config.agents.codex.install.is_empty());
+        assert!(config.agents.claude.install.is_empty());
+        assert!(!EXAMPLE_CONFIG.contains("curl"));
+    }
 
     #[test]
     fn host_command_overrides_default() {

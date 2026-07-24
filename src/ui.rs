@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use syntect::{
     easy::HighlightLines,
@@ -122,7 +122,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .get(app.selected_target)
         .map(|target| target.target.label.as_str())
         .unwrap_or("none");
-    let first = Line::from(vec![
+    let mut first_spans = vec![
         Span::styled(
             " MUXLOOM ",
             Style::default()
@@ -132,10 +132,25 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw("  "),
+        Span::styled(
             "persistent multi-machine agent sessions",
             Style::default().fg(Color::Gray),
         ),
-    ]);
+    ];
+    if let Some(version) = &app.staged_update {
+        first_spans.push(Span::raw("  "));
+        first_spans.push(Span::styled(
+            format!("↑ v{version} ready — restart"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let first = Line::from(first_spans);
     let second = Line::from(vec![
         Span::styled(
             format!(" {online}/{enabled} machines online"),
@@ -1039,6 +1054,51 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         ""
     };
+    if let Some((target_id, progress)) = app.visible_task_progress() {
+        let gauge_width = area.width.min(52);
+        let areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(gauge_width)])
+            .split(area);
+        let status_width = areas[0].width.saturating_sub(1) as usize;
+        frame.render_widget(
+            Paragraph::new(format!(
+                " {}{busy}",
+                truncate(&app.status_message, status_width)
+            ))
+            .style(Style::default().fg(Color::Gray)),
+            areas[0],
+        );
+        let ratio = progress
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| progress.completed as f64 / total as f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let percent = progress
+            .total
+            .filter(|total| *total > 0)
+            .map(|_| format!(" {:.0}%", ratio * 100.0))
+            .unwrap_or_default();
+        let label = truncate(
+            &format!("{target_id}: {}{percent}", progress.label),
+            gauge_width.saturating_sub(2) as usize,
+        );
+        frame.render_widget(
+            Gauge::default()
+                .ratio(ratio)
+                .label(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                .use_unicode(true),
+            areas[1],
+        );
+        return;
+    }
     let help = if app.interactive {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
@@ -2780,9 +2840,9 @@ mod tests {
     use crate::{
         app::App,
         config::{Config, State},
-        model::{AgentKind, AgentSession, Target},
+        model::{AgentKind, AgentSession, Target, TaskProgress},
         runtime::Runtime,
-        worker::Worker,
+        worker::{TaskKind, Worker},
     };
 
     #[test]
@@ -3342,6 +3402,37 @@ mod tests {
         assert!(rendered.contains("History And Search"));
         assert!(rendered.contains("View And Configuration"));
         assert!(rendered.contains("Home/End jump"));
+    }
+
+    #[test]
+    fn footer_renders_controller_task_progress_at_bottom_right() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::ssh("gpu-box")],
+            worker,
+        );
+        app.task_progress.push((
+            "gpu-box".into(),
+            TaskKind::Install,
+            TaskProgress::bytes("Downloading Claude", 1, Some(2)),
+        ));
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("gpu-box: Downloading Claude 50%"));
+        assert!(rendered.contains('█'));
     }
 
     #[test]

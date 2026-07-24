@@ -45,6 +45,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Check lean companion build
+        run: cargo clippy --locked --no-default-features --bin muxloomd -- -D warnings
+
       - name: Run tests
         run: cargo test --locked --all-targets
 
@@ -98,8 +101,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
 
-      - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build release controller
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin muxloom
+
+      - name: Build lean companion
+        if: ${{ !contains(matrix.target, 'windows') }}
+        run: cargo build --locked --release --target ${{ matrix.target }} --no-default-features --bin muxloomd
 
       - name: Fetch controller-side FFmpeg decoder
         shell: bash

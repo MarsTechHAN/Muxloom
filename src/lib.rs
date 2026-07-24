@@ -4,6 +4,8 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_protocol;
 pub mod debug;
+#[cfg(feature = "controller")]
+pub mod http;
 pub mod media;
 pub mod model;
 pub mod recap;
@@ -11,4 +13,6 @@ pub mod runtime;
 pub mod ssh_config;
 pub mod terminal_session;
 pub mod ui;
+#[cfg(feature = "controller")]
+pub mod update;
 pub mod worker;
