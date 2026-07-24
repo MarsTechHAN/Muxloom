@@ -13,7 +13,7 @@ mod platform {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{
-            Arc, Condvar, Mutex,
+            Arc, Condvar, Mutex, OnceLock,
             atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
@@ -39,6 +39,7 @@ mod platform {
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+    static METADATA_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -97,7 +98,17 @@ mod platform {
         shutdown: AtomicBool,
         next_subscriber: AtomicU64,
         sessions: Mutex<HashMap<String, Arc<ManagedSession>>>,
+        persisted_sessions: Mutex<HashMap<String, Arc<PersistedSession>>>,
         paths: DaemonPaths,
+    }
+
+    struct PersistedSession {
+        metadata: Mutex<DaemonSession>,
+        history_path: PathBuf,
+        metadata_path: PathBuf,
+        line_count: OnceLock<usize>,
+        columns: u16,
+        rows: u16,
     }
 
     struct ManagedSession {
@@ -197,6 +208,7 @@ mod platform {
 
     impl DaemonState {
         fn new(paths: DaemonPaths) -> Self {
+            let persisted_sessions = load_persisted_sessions(&paths);
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
@@ -205,9 +217,72 @@ mod platform {
                 shutdown: AtomicBool::new(false),
                 next_subscriber: AtomicU64::new(1),
                 sessions: Mutex::new(HashMap::new()),
+                persisted_sessions: Mutex::new(persisted_sessions),
                 paths,
             }
         }
+    }
+
+    fn load_persisted_sessions(paths: &DaemonPaths) -> HashMap<String, Arc<PersistedSession>> {
+        let mut sessions = HashMap::new();
+        let entries = match fs::read_dir(&paths.sessions) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "muxloomd could not read persisted sessions {}: {error}",
+                    paths.sessions.display()
+                );
+                return sessions;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json")
+                || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                continue;
+            }
+            let loaded = (|| -> Result<(String, Arc<PersistedSession>)> {
+                let mut metadata: DaemonSession = serde_json::from_slice(&fs::read(&path)?)?;
+                validate_session_id(&metadata.id)?;
+                if path.file_stem().and_then(|value| value.to_str()) != Some(metadata.id.as_str()) {
+                    bail!(
+                        "metadata filename does not match session id {}",
+                        metadata.id
+                    );
+                }
+                if !metadata.dead && !metadata.archived {
+                    bail!("metadata still describes a live PTY");
+                }
+                metadata.dead = true;
+                metadata.pid = None;
+                metadata.working = false;
+                metadata.needs_attention = false;
+                metadata.attention_reason = None;
+                let id = metadata.id.clone();
+                Ok((
+                    id.clone(),
+                    Arc::new(PersistedSession {
+                        metadata: Mutex::new(metadata),
+                        history_path: paths.history.join(format!("{id}.ansi")),
+                        metadata_path: path.clone(),
+                        line_count: OnceLock::new(),
+                        columns: 80,
+                        rows: 24,
+                    }),
+                ))
+            })();
+            match loaded {
+                Ok((id, session)) => {
+                    sessions.insert(id, session);
+                }
+                Err(error) => eprintln!(
+                    "muxloomd ignored persisted session {}: {error:#}",
+                    path.display()
+                ),
+            }
+        }
+        sessions
     }
 
     pub fn serve(paths: &DaemonPaths) -> Result<()> {
@@ -689,13 +764,21 @@ mod platform {
                 )
             }
             DaemonRequest::ListSessions => {
-                let sessions = state
+                let mut sessions: Vec<_> = state
                     .sessions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .values()
                     .map(|session| session.snapshot())
                     .collect();
+                sessions.extend(
+                    state
+                        .persisted_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .values()
+                        .map(|session| session.snapshot()),
+                );
                 write_response(writer, request_id, &DaemonResponse::Sessions { sessions })
             }
             DaemonRequest::Launch {
@@ -751,17 +834,37 @@ mod platform {
                 offset_from_bottom,
                 lines,
             } => {
-                let session = daemon_session(state, &session_id)?;
-                let (history, total_lines, actual_offset) =
-                    session.read_history(offset_from_bottom, lines)?;
+                let (history, total_lines, actual_offset, columns, rows) =
+                    if let Ok(session) = daemon_session(state, &session_id) {
+                        let (history, total_lines, actual_offset) =
+                            session.read_history(offset_from_bottom, lines)?;
+                        (
+                            history,
+                            total_lines,
+                            actual_offset,
+                            session.columns.load(Ordering::Relaxed),
+                            session.rows.load(Ordering::Relaxed),
+                        )
+                    } else {
+                        let session = persisted_session(state, &session_id)?;
+                        let (history, total_lines, actual_offset) =
+                            session.read_history(offset_from_bottom, lines)?;
+                        (
+                            history,
+                            total_lines,
+                            actual_offset,
+                            session.columns,
+                            session.rows,
+                        )
+                    };
                 write_chunks(writer, stream::HISTORY, request_id, &history)?;
                 write_response(
                     writer,
                     request_id,
                     &DaemonResponse::HistoryComplete {
                         total_lines,
-                        columns: session.columns.load(Ordering::Relaxed),
-                        rows: session.rows.load(Ordering::Relaxed),
+                        columns,
+                        rows,
                         offset_from_bottom: actual_offset,
                     },
                 )
@@ -771,8 +874,12 @@ mod platform {
                 query,
                 max_matches,
             } => {
-                let matches = daemon_session(state, &session_id)?
-                    .search_history(&query, max_matches.clamp(1, 50))?;
+                let matches = if let Ok(session) = daemon_session(state, &session_id) {
+                    session.search_history(&query, max_matches.clamp(1, 50))?
+                } else {
+                    persisted_session(state, &session_id)?
+                        .search_history(&query, max_matches.clamp(1, 50))?
+                };
                 write_response(
                     writer,
                     request_id,
@@ -801,19 +908,33 @@ mod platform {
                 },
             ),
             DaemonRequest::Archive { session_id } => {
-                daemon_session(state, &session_id)?.archive()?;
+                if let Ok(session) = daemon_session(state, &session_id) {
+                    session.archive()?;
+                } else {
+                    persisted_session(state, &session_id)?.archive()?;
+                }
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::Delete { session_id } => {
-                let session = state
+                let live = state
                     .sessions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&session_id)
-                    .with_context(|| format!("unknown daemon session {session_id}"))?;
-                session.archive()?;
-                let _ = fs::remove_file(&session.history_path);
-                let _ = fs::remove_file(&session.metadata_path);
+                    .remove(&session_id);
+                if let Some(session) = live {
+                    session.archive()?;
+                    let _ = fs::remove_file(&session.history_path);
+                    let _ = fs::remove_file(&session.metadata_path);
+                } else {
+                    let session = state
+                        .persisted_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&session_id)
+                        .with_context(|| format!("unknown daemon session {session_id}"))?;
+                    let _ = fs::remove_file(&session.history_path);
+                    let _ = fs::remove_file(&session.metadata_path);
+                }
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::RunShell {
@@ -929,6 +1050,11 @@ mod platform {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(&session_id)
+            || state
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&session_id)
         {
             bail!("daemon session already exists: {session_id}");
         }
@@ -1075,6 +1201,16 @@ mod platform {
     fn daemon_session(state: &DaemonState, session_id: &str) -> Result<Arc<ManagedSession>> {
         state
             .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .cloned()
+            .with_context(|| format!("unknown daemon session {session_id}"))
+    }
+
+    fn persisted_session(state: &DaemonState, session_id: &str) -> Result<Arc<PersistedSession>> {
+        state
+            .persisted_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id)
@@ -1281,6 +1417,63 @@ mod platform {
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
     }
 
+    impl PersistedSession {
+        fn snapshot(&self) -> DaemonSession {
+            self.metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn archive(&self) -> Result<()> {
+            let metadata = {
+                let mut metadata = self
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                metadata.archived = true;
+                metadata.dead = true;
+                metadata.pid = None;
+                metadata.working = false;
+                metadata.needs_attention = false;
+                metadata.attention_reason = None;
+                metadata.clone()
+            };
+            persist_session_metadata(&self.metadata_path, &metadata)
+        }
+
+        fn line_count(&self) -> Result<usize> {
+            if let Some(count) = self.line_count.get() {
+                return Ok(*count);
+            }
+            let count = count_history_lines(&self.history_path)?;
+            let _ = self.line_count.set(count);
+            Ok(count)
+        }
+
+        fn read_history(
+            &self,
+            offset_from_bottom: usize,
+            lines: usize,
+        ) -> Result<(Vec<u8>, usize, usize)> {
+            read_history_file(
+                &self.history_path,
+                self.line_count()?,
+                self.rows,
+                offset_from_bottom,
+                lines,
+            )
+        }
+
+        fn search_history(
+            &self,
+            query: &str,
+            max_matches: usize,
+        ) -> Result<Vec<DaemonHistoryMatch>> {
+            search_history_file(&self.history_path, query, max_matches)
+        }
+    }
+
     impl ManagedSession {
         fn snapshot(&self) -> DaemonSession {
             let mut snapshot = self
@@ -1302,20 +1495,23 @@ mod platform {
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
                 let output = String::from_utf8_lossy(&recent);
                 snapshot.recap = extract_recap(kind, &output);
-                snapshot.attention_reason = attention_reason(kind, &visible_screen, &[]);
-                snapshot.needs_attention = snapshot.attention_reason.is_some();
-                snapshot.working =
-                    !snapshot.needs_attention && agent_is_working(kind, &visible_screen);
+                if snapshot.dead || snapshot.archived {
+                    snapshot.pid = None;
+                    snapshot.working = false;
+                    snapshot.needs_attention = false;
+                    snapshot.attention_reason = None;
+                } else {
+                    snapshot.attention_reason = attention_reason(kind, &visible_screen, &[]);
+                    snapshot.needs_attention = snapshot.attention_reason.is_some();
+                    snapshot.working =
+                        !snapshot.needs_attention && agent_is_working(kind, &visible_screen);
+                }
             }
             snapshot
         }
 
         fn persist_metadata(&self) -> Result<()> {
-            fs::write(
-                &self.metadata_path,
-                serde_json::to_vec_pretty(&self.snapshot())?,
-            )?;
-            Ok(())
+            persist_session_metadata(&self.metadata_path, &self.snapshot())
         }
 
         fn resize(&self, columns: u16, rows: u16) -> Result<()> {
@@ -1429,30 +1625,13 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
         ) -> Result<(Vec<u8>, usize, usize)> {
-            let total_lines = self.line_count.load(Ordering::Relaxed);
-            let scrollback =
-                total_lines.saturating_sub(usize::from(self.rows.load(Ordering::Relaxed)));
-            let actual_offset = offset_from_bottom.min(scrollback);
-            let end = total_lines.saturating_sub(actual_offset);
-            let start = end.saturating_sub(lines.max(1));
-            let file = File::open(&self.history_path).with_context(|| {
-                format!("failed to open history {}", self.history_path.display())
-            })?;
-            let mut reader = BufReader::new(file);
-            let mut output = Vec::new();
-            let mut buffer = Vec::new();
-            let mut line = 0usize;
-            while line < end {
-                buffer.clear();
-                if reader.read_until(b'\n', &mut buffer)? == 0 {
-                    break;
-                }
-                if line >= start {
-                    output.extend_from_slice(&buffer);
-                }
-                line += 1;
-            }
-            Ok((output, total_lines, actual_offset))
+            read_history_file(
+                &self.history_path,
+                self.line_count.load(Ordering::Relaxed),
+                self.rows.load(Ordering::Relaxed),
+                offset_from_bottom,
+                lines,
+            )
         }
 
         fn search_history(
@@ -1460,48 +1639,116 @@ mod platform {
             query: &str,
             max_matches: usize,
         ) -> Result<Vec<DaemonHistoryMatch>> {
-            let query = query.trim().to_lowercase();
-            if query.is_empty() {
-                return Ok(Vec::new());
-            }
-            let file = File::open(&self.history_path)?;
-            let mut reader = BufReader::new(file);
-            let mut buffer = Vec::new();
-            let mut line_number = 0usize;
-            let mut matches = Vec::new();
-            loop {
-                buffer.clear();
-                if reader.read_until(b'\n', &mut buffer)? == 0 {
-                    break;
-                }
-                line_number += 1;
-                let text = String::from_utf8_lossy(&buffer);
-                if !text.to_lowercase().contains(&query) {
-                    continue;
-                }
-                let text = text
-                    .trim()
-                    .chars()
-                    .filter(|character| !character.is_control())
-                    .take(500)
-                    .collect::<String>();
-                if text.is_empty() {
-                    continue;
-                }
-                let lower = text.to_lowercase();
-                matches.push(DaemonHistoryMatch {
-                    recap: lower.contains("※ recap:")
-                        || lower.contains("※ recap：")
-                        || lower.starts_with("recap:"),
-                    line_number,
-                    text,
-                });
-                if matches.len() > max_matches {
-                    matches.remove(0);
-                }
-            }
-            Ok(matches)
+            search_history_file(&self.history_path, query, max_matches)
         }
+    }
+
+    fn persist_session_metadata(path: &Path, metadata: &DaemonSession) -> Result<()> {
+        let nonce = METADATA_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+        let result = (|| -> Result<()> {
+            fs::write(&temporary, serde_json::to_vec_pretty(metadata)?)?;
+            fs::rename(&temporary, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn count_history_lines(path: &Path) -> Result<usize> {
+        let mut file = File::open(path)
+            .with_context(|| format!("failed to open history {}", path.display()))?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut lines = 0usize;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            lines =
+                lines.saturating_add(buffer[..read].iter().filter(|&&byte| byte == b'\n').count());
+        }
+        Ok(lines)
+    }
+
+    fn read_history_file(
+        path: &Path,
+        total_lines: usize,
+        rows: u16,
+        offset_from_bottom: usize,
+        lines: usize,
+    ) -> Result<(Vec<u8>, usize, usize)> {
+        let scrollback = total_lines.saturating_sub(usize::from(rows));
+        let actual_offset = offset_from_bottom.min(scrollback);
+        let end = total_lines.saturating_sub(actual_offset);
+        let start = end.saturating_sub(lines.max(1));
+        let file = File::open(path)
+            .with_context(|| format!("failed to open history {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut output = Vec::new();
+        let mut buffer = Vec::new();
+        let mut line = 0usize;
+        while line < end {
+            buffer.clear();
+            if reader.read_until(b'\n', &mut buffer)? == 0 {
+                break;
+            }
+            if line >= start {
+                output.extend_from_slice(&buffer);
+            }
+            line += 1;
+        }
+        Ok((output, total_lines, actual_offset))
+    }
+
+    fn search_history_file(
+        path: &Path,
+        query: &str,
+        max_matches: usize,
+    ) -> Result<Vec<DaemonHistoryMatch>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut buffer = Vec::new();
+        let mut line_number = 0usize;
+        let mut matches = Vec::new();
+        loop {
+            buffer.clear();
+            if reader.read_until(b'\n', &mut buffer)? == 0 {
+                break;
+            }
+            line_number += 1;
+            let text = String::from_utf8_lossy(&buffer);
+            if !text.to_lowercase().contains(&query) {
+                continue;
+            }
+            let text = text
+                .trim()
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(500)
+                .collect::<String>();
+            if text.is_empty() {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            matches.push(DaemonHistoryMatch {
+                recap: lower.contains("※ recap:")
+                    || lower.contains("※ recap：")
+                    || lower.starts_with("recap:"),
+                line_number,
+                text,
+            });
+            if matches.len() > max_matches {
+                matches.remove(0);
+            }
+        }
+        Ok(matches)
     }
 
     fn write_chunks(
@@ -1985,6 +2232,65 @@ mod platform {
             }
             assert!(session.snapshot().working);
             session.archive().unwrap();
+            let archived = session.snapshot();
+            assert!(archived.archived && archived.dead);
+            assert!(!archived.working);
+            assert!(!archived.needs_attention);
+        }
+
+        #[test]
+        fn archived_sessions_reload_with_searchable_history_after_restart() {
+            let initial = test_state("persisted-archive");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-claude-persisted-archive";
+            persist_session_metadata(
+                &paths.sessions.join(format!("{session_id}.json")),
+                &DaemonSession {
+                    id: session_id.into(),
+                    kind: "claude".into(),
+                    path: "/tmp/project".into(),
+                    label: "persisted archive".into(),
+                    created_at: 42,
+                    pid: None,
+                    dead: true,
+                    archived: true,
+                    recap: Some("completed the persistent work".into()),
+                    working: false,
+                    needs_attention: false,
+                    attention_reason: None,
+                },
+            )
+            .unwrap();
+            fs::write(
+                paths.history.join(format!("{session_id}.ansi")),
+                b"first line\npersistent result\nlast line\n",
+            )
+            .unwrap();
+
+            for _ in 0..2 {
+                let restarted = DaemonState::new(paths.clone());
+                assert!(restarted.sessions.lock().unwrap().is_empty());
+                let persisted = persisted_session(&restarted, session_id).unwrap();
+                let snapshot = persisted.snapshot();
+                assert!(snapshot.archived && snapshot.dead);
+                assert_eq!(
+                    snapshot.recap.as_deref(),
+                    Some("completed the persistent work")
+                );
+                let (history, total_lines, offset) = persisted.read_history(0, 10).unwrap();
+                assert_eq!(total_lines, 3);
+                assert_eq!(offset, 0);
+                assert_eq!(
+                    String::from_utf8_lossy(&history),
+                    "first line\npersistent result\nlast line\n"
+                );
+                let matches = persisted.search_history("PERSISTENT", 10).unwrap();
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].line_number, 2);
+            }
+
+            fs::remove_dir_all(paths.root).unwrap();
         }
 
         #[test]
