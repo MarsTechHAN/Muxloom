@@ -271,6 +271,10 @@ pub struct State {
     pub portrait_terminal_percent: u16,
     pub portrait_machine_percent: u16,
     pub show_archived: bool,
+    /// Last working directory used to launch an agent, per machine (target id).
+    pub last_launch_dirs: BTreeMap<String, String>,
+    /// Custom display names for agents, keyed by session id.
+    pub session_labels: BTreeMap<String, String>,
 }
 
 impl Default for State {
@@ -285,6 +289,8 @@ impl Default for State {
             portrait_terminal_percent: 65,
             portrait_machine_percent: 45,
             show_archived: false,
+            last_launch_dirs: BTreeMap::new(),
+            session_labels: BTreeMap::new(),
         }
     }
 }

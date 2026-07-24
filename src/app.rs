@@ -90,6 +90,9 @@ pub struct ResumeForm {
 pub struct FileManagerForm {
     pub origin: FileManagerOrigin,
     pub target: Target,
+    /// Agent this browser was opened for, if any; used to remember the last
+    /// browsed directory per agent.
+    pub session_id: Option<String>,
     pub path: String,
     pub entries: Vec<FileEntry>,
     pub selected: usize,
@@ -148,6 +151,10 @@ pub enum Modal {
     Search(SearchForm),
     PathPicker(PathPickerForm),
     Resume(ResumeForm),
+    RenameAgent {
+        session_id: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,7 +162,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 50;
+pub const HELP_CONTENT_ROWS: usize = 51;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -319,6 +326,13 @@ pub struct App {
     pub interactive: bool,
     pub modal: Option<Modal>,
     pub file_manager: Option<FileManagerForm>,
+    /// File browsers stashed while another machine is selected, keyed by target
+    /// id. The active machine's browser lives in `file_manager`; switching
+    /// machines parks it here and restores the destination machine's browser.
+    stashed_file_managers: HashMap<String, FileManagerForm>,
+    /// Last directory browsed in the file view, keyed by session id, so
+    /// reopening the browser for an agent returns to where you left off.
+    file_dirs: HashMap<String, String>,
     pub status_message: String,
     pub busy_operations: usize,
     pub pane_layout: PaneLayout,
@@ -398,6 +412,8 @@ impl App {
             interactive: false,
             modal: None,
             file_manager: None,
+            stashed_file_managers: HashMap::new(),
+            file_dirs: HashMap::new(),
             status_message: "Space enables a machine; n starts an agent".into(),
             busy_operations: 0,
             pane_layout: PaneLayout::default(),
@@ -607,6 +623,10 @@ impl App {
             }
             KeyCode::Char('x') if self.focus == Focus::Agents => {
                 self.open_kill_confirmation();
+                Action::Continue
+            }
+            KeyCode::Char('e') if self.focus == Focus::Agents => {
+                self.open_rename_agent();
                 Action::Continue
             }
             KeyCode::Enter if matches!(self.focus, Focus::Agents | Focus::Recap) => {
@@ -1666,6 +1686,7 @@ impl App {
                             self.sessions
                                 .retain(|session| session.target_id != target_id);
                             self.sessions.extend(sessions);
+                            self.apply_session_labels();
                         }
                         Err(error) => {
                             target.consecutive_failures =
@@ -1752,6 +1773,9 @@ impl App {
                     Ok(session_id) => {
                         let legacy_tmux = session_id.starts_with("muxloom-");
                         self.selected_session_id = Some(session_id);
+                        // Land on the new agent in the Agents pane rather than
+                        // leaving focus on the machine/folder sidebar.
+                        self.focus = Focus::Agents;
                         self.status_message = if legacy_tmux {
                             let detail = notice.unwrap_or_else(|| {
                                 "muxloomd was unavailable; compatibility mode was selected".into()
@@ -2264,7 +2288,55 @@ impl App {
     fn ensure_target_visible(&mut self) {
         let visible = self.visible_target_indices();
         if !visible.contains(&self.selected_target) {
-            self.selected_target = visible.first().copied().unwrap_or(0);
+            let fallback = visible.first().copied().unwrap_or(0);
+            self.set_selected_target(fallback);
+        }
+    }
+
+    /// Select a machine by index, rebinding the file browser so it follows the
+    /// active machine: the previous machine's browser is parked and the
+    /// destination machine's browser (if any) is restored.
+    fn set_selected_target(&mut self, index: usize) {
+        let previous = self
+            .targets
+            .get(self.selected_target)
+            .map(|status| status.target.id.clone());
+        self.selected_target = index;
+        let current = self
+            .targets
+            .get(index)
+            .map(|status| status.target.id.clone());
+        if previous != current {
+            self.rebind_file_manager(previous.as_deref(), current.as_deref());
+        }
+    }
+
+    /// Park the active file browser under the machine it belongs to and restore
+    /// the destination machine's parked browser, so the file view is per-machine.
+    fn rebind_file_manager(&mut self, previous: Option<&str>, current: Option<&str>) {
+        if let Some(form) = self.file_manager.take() {
+            self.remember_file_dir(&form);
+            // Only machine-scoped (agent-pane) browsers survive a switch; a
+            // browser opened from an attached terminal is tied to that session.
+            if form.origin == FileManagerOrigin::AgentPane
+                && let Some(previous) = previous
+            {
+                self.stashed_file_managers
+                    .insert(previous.to_string(), form);
+            }
+        }
+        if let Some(current) = current
+            && let Some(form) = self.stashed_file_managers.remove(current)
+        {
+            self.file_manager = Some(form);
+        }
+    }
+
+    /// Remember where a browser was last pointed for its agent, so reopening it
+    /// returns to that directory.
+    fn remember_file_dir(&mut self, form: &FileManagerForm) {
+        if let Some(session_id) = &form.session_id {
+            self.file_dirs.insert(session_id.clone(), form.path.clone());
         }
     }
 
@@ -2364,7 +2436,7 @@ impl App {
                     .iter()
                     .position(|index| *index == self.selected_target)
                     .unwrap_or(0);
-                self.selected_target = visible[shifted(current, visible.len(), delta)];
+                self.set_selected_target(visible[shifted(current, visible.len(), delta)]);
                 self.release_terminal_input("Machine selected");
                 self.history_offset = 0;
                 self.ensure_session_selection();
@@ -2437,7 +2509,7 @@ impl App {
             .iter()
             .position(|target| target.target.id == target_id)
         {
-            self.selected_target = index;
+            self.set_selected_target(index);
         }
         self.select_session(session_id);
         self.focus = Focus::Recap;
@@ -2777,16 +2849,24 @@ impl App {
             .selected_session()
             .filter(|session| session.target_id == target.id)
             .map(|session| session.path.clone());
-        let path = if let Some(path) = selected_path {
-            path
-        } else if target.id == LOCAL_TARGET_ID {
-            env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .display()
-                .to_string()
-        } else {
-            ".".into()
-        };
+        // Default to the directory this machine was last launched in, then the
+        // highlighted agent's folder, then the local cwd (or "." for remotes).
+        let path = self
+            .state
+            .last_launch_dirs
+            .get(&target.id)
+            .cloned()
+            .or(selected_path)
+            .unwrap_or_else(|| {
+                if target.id == LOCAL_TARGET_ID {
+                    env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .display()
+                        .to_string()
+                } else {
+                    ".".into()
+                }
+            });
         self.modal = Some(Modal::Launch(LaunchForm {
             target,
             kind: AgentKind::Codex,
@@ -2964,7 +3044,8 @@ impl App {
 
     fn open_file_manager(&mut self) {
         self.last_file_click = None;
-        if self.file_manager.take().is_some() {
+        if let Some(form) = self.file_manager.take() {
+            self.remember_file_dir(&form);
             self.status_message = "File browser closed".into();
             return;
         }
@@ -2987,15 +3068,24 @@ impl App {
             self.status_message = "No machine is available for file browsing".into();
             return;
         };
-        let path = selected
-            .filter(|session| session.target_id == target.id)
-            .map(|session| session.path)
+        let session_id = selected.as_ref().map(|session| session.id.clone());
+        // Start where this agent's browser was last pointed, else the agent's
+        // own working directory, else the machine root.
+        let path = session_id
+            .as_ref()
+            .and_then(|id| self.file_dirs.get(id).cloned())
+            .or_else(|| {
+                selected
+                    .filter(|session| session.target_id == target.id)
+                    .map(|session| session.path)
+            })
             .unwrap_or_else(|| ".".into());
         self.release_terminal_input("File manager opened");
         self.focus = Focus::Agents;
         self.request_file_listing(FileManagerForm {
             origin,
             target,
+            session_id,
             path,
             entries: Vec::new(),
             selected: 0,
@@ -3418,7 +3508,7 @@ impl App {
             self.status_message = "Search result session is no longer available".into();
             return;
         }
-        self.selected_target = target_index;
+        self.set_selected_target(target_index);
         if result.dead && !self.state.show_archived {
             self.state.show_archived = true;
             self.persist_state();
@@ -3440,6 +3530,46 @@ impl App {
             label: session.display_label().into(),
             archive: !session.dead && session.kind != AgentKind::Terminal,
         });
+    }
+
+    fn open_rename_agent(&mut self) {
+        let Some(session) = self.selected_session() else {
+            self.status_message = "Select an agent to rename".into();
+            return;
+        };
+        self.modal = Some(Modal::RenameAgent {
+            session_id: session.id.clone(),
+            value: session.label.clone(),
+        });
+    }
+
+    fn submit_rename_agent(&mut self, session_id: String, value: String) {
+        let name = value.trim().to_string();
+        if name.is_empty() {
+            self.state.session_labels.remove(&session_id);
+        } else {
+            self.state
+                .session_labels
+                .insert(session_id.clone(), name.clone());
+        }
+        self.persist_state();
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.label = name.clone();
+        }
+        self.status_message = if name.is_empty() {
+            "Agent name cleared".into()
+        } else {
+            format!("Agent renamed to '{name}'")
+        };
+    }
+
+    /// Overlay custom agent names (keyed by session id) onto the live sessions.
+    fn apply_session_labels(&mut self) {
+        for session in &mut self.sessions {
+            if let Some(custom) = self.state.session_labels.get(&session.id) {
+                session.label = custom.clone();
+            }
+        }
     }
 
     fn handle_modal(&mut self, key: KeyEvent, modal: Modal) -> Action {
@@ -3702,6 +3832,30 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Launch(form)),
             },
+            Modal::RenameAgent {
+                session_id,
+                mut value,
+            } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.submit_rename_agent(session_id, value),
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.modal = Some(Modal::RenameAgent { session_id, value });
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    value.clear();
+                    self.modal = Some(Modal::RenameAgent { session_id, value });
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    value.push(character);
+                    self.modal = Some(Modal::RenameAgent { session_id, value });
+                }
+                _ => self.modal = Some(Modal::RenameAgent { session_id, value }),
+            },
         }
         Action::Continue
     }
@@ -3894,6 +4048,11 @@ impl App {
             .config
             .environment_for(&form.target.id)
             .unwrap_or_default();
+        // Remember this directory as the machine's default for the next launch.
+        self.state
+            .last_launch_dirs
+            .insert(form.target.id.clone(), form.path.clone());
+        self.persist_state();
         let request = LaunchRequest {
             target: form.target,
             kind: form.kind,
@@ -4147,7 +4306,7 @@ impl App {
                 line = line.saturating_sub(*height);
             }
             if let Some((target_index, item_line)) = hit {
-                self.selected_target = target_index;
+                self.set_selected_target(target_index);
                 self.ensure_session_selection();
                 if item_line == 0
                     && column >= area.x.saturating_add(5)
@@ -6559,5 +6718,153 @@ mod tests {
             single_line_paste("first\nsecond\tthird"),
             "first second third"
         );
+    }
+
+    fn ux_test_app(targets: Vec<Target>) -> App {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        for target in &targets {
+            state.enabled_hosts.insert(target.id.clone());
+        }
+        App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            std::env::temp_dir().join(format!("muxloom-ux-test-{}.json", std::process::id())),
+            targets,
+            worker,
+        )
+    }
+
+    fn blank_file_manager(
+        target: Target,
+        session_id: Option<String>,
+        path: &str,
+    ) -> FileManagerForm {
+        FileManagerForm {
+            origin: FileManagerOrigin::AgentPane,
+            target,
+            session_id,
+            path: path.into(),
+            entries: Vec::new(),
+            selected: 0,
+            loading: false,
+            error: None,
+            directory_cache: HashMap::new(),
+            return_path: None,
+            preview_path: None,
+            preview: None,
+            preview_requested_path: None,
+            preview_loading: false,
+            preview_error: None,
+            preview_scroll: 0,
+            preview_max_scroll: 0,
+            preview_page_rows: 1,
+            preview_rendered: None,
+            query: String::new(),
+            preview_cache: HashMap::new(),
+            preload_pending: HashSet::new(),
+            entry_rows: Vec::new(),
+            list_area: None,
+            preview_area: None,
+            preview_text_area: None,
+            preview_visible: Vec::new(),
+            preview_selection: None,
+            media_playback: None,
+            media_frame: None,
+            media_loading: false,
+            media_error: None,
+        }
+    }
+
+    #[test]
+    fn launching_focuses_the_agents_pane() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.focus = Focus::Machines;
+        app.handle_worker_event(Event::Launched {
+            target_id: "local".into(),
+            notice: None,
+            result: Ok("muxloomd-codex-1-2-0".into()),
+        });
+        assert_eq!(app.focus, Focus::Agents);
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some("muxloomd-codex-1-2-0")
+        );
+    }
+
+    #[test]
+    fn new_agent_defaults_to_the_machines_last_launch_dir() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.state
+            .last_launch_dirs
+            .insert("local".into(), "/work/remembered".into());
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(form.path, "/work/remembered");
+    }
+
+    #[test]
+    fn renaming_an_agent_sets_applies_and_clears_its_display_name() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions.push(AgentSession {
+            id: "s1".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: String::new(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.submit_rename_agent("s1".into(), "  My Bot  ".into());
+        assert_eq!(
+            app.state.session_labels.get("s1").map(String::as_str),
+            Some("My Bot")
+        );
+        assert_eq!(app.sessions[0].label, "My Bot");
+
+        // A blank name removes the override and reverts to the folder name.
+        app.submit_rename_agent("s1".into(), "   ".into());
+        assert!(!app.state.session_labels.contains_key("s1"));
+        assert_eq!(app.sessions[0].display_label(), "project");
+
+        // Overrides re-apply when a refresh rebuilds the session list.
+        app.state
+            .session_labels
+            .insert("s1".into(), "Persisted".into());
+        app.sessions[0].label = String::new();
+        app.apply_session_labels();
+        assert_eq!(app.sessions[0].label, "Persisted");
+    }
+
+    #[test]
+    fn file_browser_parks_and_restores_per_machine() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("remote")]);
+        app.file_manager = Some(blank_file_manager(
+            Target::local(),
+            Some("s1".into()),
+            "/work/local",
+        ));
+        // Switching to another machine parks the local browser.
+        app.set_selected_target(1);
+        assert!(app.file_manager.is_none());
+        // The agent's last browsed directory was remembered while parked.
+        assert_eq!(
+            app.file_dirs.get("s1").map(String::as_str),
+            Some("/work/local")
+        );
+        // Switching back restores the browser where it was.
+        app.set_selected_target(0);
+        let restored = app.file_manager.as_ref().expect("browser restored");
+        assert_eq!(restored.path, "/work/local");
+        assert_eq!(restored.target.id, "local");
     }
 }

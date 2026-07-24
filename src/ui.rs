@@ -1168,6 +1168,32 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
         Modal::Search(form) => draw_search_modal(frame, form, outer),
         Modal::PathPicker(form) => draw_path_picker(frame, form, outer),
         Modal::Resume(form) => draw_resume_modal(frame, form, outer),
+        Modal::RenameAgent { value, .. } => {
+            let area = centered_rect(54, 8, outer);
+            frame.render_widget(Clear, area);
+            let text = vec![
+                Line::raw(""),
+                Line::styled(
+                    "Display name (blank restores the folder name)",
+                    Style::default().fg(MUTED),
+                ),
+                Line::from(vec![
+                    Span::raw(value.clone()),
+                    Span::styled("█", Style::default().fg(ACCENT)),
+                ]),
+                Line::raw(""),
+                Line::styled(
+                    "Enter save    Ctrl-u clear    Esc cancel",
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .block(panel(" Rename agent ", true)),
+                area,
+            );
+        }
     }
 }
 
@@ -2016,6 +2042,7 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Archive live agents; permanently remove archived agents",
         ),
         help_row("a", "Expand or collapse Archived sessions"),
+        help_row("e", "Rename the selected agent's display name"),
         help_row("Up twice at top", "Open the first agent waiting for input"),
         Line::raw(""),
         help_header("Machines"),
@@ -3235,6 +3262,7 @@ mod tests {
         app.file_manager = Some(FileManagerForm {
             origin: FileManagerOrigin::TerminalPane,
             target: Target::local(),
+            session_id: None,
             path: "/work".into(),
             entries: vec![crate::model::FileEntry {
                 name: "README.md".into(),
