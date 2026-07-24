@@ -863,6 +863,52 @@ mod platform {
         no_live_sessions
     }
 
+    /// Resolve a program name to an absolute path using `path_env`.
+    ///
+    /// The agent binary must come from the *launch* environment (PATH), never
+    /// from the working directory being opened. portable-pty resolves a
+    /// *relative* command against the spawn cwd before PATH, and accepts any
+    /// existing filesystem entry — including a directory or non-executable file
+    /// — as the target, so a `claude` entry inside the working directory would
+    /// otherwise shadow the real CLI. Resolving to an absolute path here forces
+    /// the intended binary regardless of the working directory contents.
+    ///
+    /// Returns:
+    /// - the name unchanged if it already contains a path separator (an explicit
+    ///   absolute/relative path the caller asked for), or
+    /// - the absolute path of the first executable match on `path_env`, or
+    /// - `None` for a bare name that is not found on PATH — the caller must then
+    ///   refuse to launch rather than let portable-pty fall back to the cwd.
+    fn resolve_executable_on_path(
+        executable: &str,
+        path_env: Option<&std::ffi::OsStr>,
+    ) -> Option<std::ffi::OsString> {
+        if executable.contains('/') {
+            return Some(executable.into());
+        }
+        let path_env = path_env?;
+        for dir in std::env::split_paths(path_env) {
+            // An empty PATH entry means "current directory"; skipping it is what
+            // keeps the working directory from shadowing the real executable.
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join(executable);
+            if is_executable_file(&candidate) {
+                return Some(candidate.into_os_string());
+            }
+        }
+        None
+    }
+
+    /// True if `path` resolves (following symlinks) to a regular file with at
+    /// least one execute bit set.
+    fn is_executable_file(path: &Path) -> bool {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_session(
         state: &DaemonState,
@@ -894,27 +940,54 @@ mod platform {
         } else {
             executable
         };
+        // Work out the PATH the child will run with. portable-pty resolves a
+        // *relative* program name (a bare `claude`) against the spawn cwd
+        // *before* consulting PATH, and treats any existing entry there — even a
+        // directory or a non-executable file — as a match. So a `claude` entry
+        // inside the working directory would shadow the real CLI on PATH.
+        // Resolve to an absolute path up front so the launch always uses the
+        // intended binary regardless of what the working directory contains.
+        let path_overridden = environment.iter().any(|(name, _)| name == "PATH");
+        let prepended_path = if path_overridden {
+            None
+        } else if let (Some(home), Some(path)) =
+            (std::env::var_os("HOME"), std::env::var_os("PATH"))
+        {
+            let mut paths = vec![PathBuf::from(home).join(".local/bin")];
+            paths.extend(std::env::split_paths(&path));
+            std::env::join_paths(paths).ok()
+        } else {
+            None
+        };
+        let child_path = if path_overridden {
+            environment
+                .iter()
+                .find(|(name, _)| name == "PATH")
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        } else {
+            prepended_path.clone()
+        };
+        let program =
+            resolve_executable_on_path(&executable, child_path.as_deref()).with_context(|| {
+                format!(
+                    "cannot launch '{executable}': not found on PATH; \
+                     refusing to fall back to a same-named entry inside {path}"
+                )
+            })?;
         let pair = native_pty_system().openpty(PtySize {
             rows: rows.max(5),
             cols: columns.max(20),
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut command = CommandBuilder::new(executable);
+        let mut command = CommandBuilder::new(&program);
         command.args(args);
         command.cwd(path.clone());
-        let path_overridden = environment.iter().any(|(name, _)| name == "PATH");
         for (name, value) in environment {
             command.env(name, value);
         }
-        if !path_overridden
-            && let (Some(home), Some(path)) = (std::env::var_os("HOME"), std::env::var_os("PATH"))
-        {
-            let mut paths = vec![PathBuf::from(home).join(".local/bin")];
-            paths.extend(std::env::split_paths(&path));
-            if let Ok(path) = std::env::join_paths(paths) {
-                command.env("PATH", path);
-            }
+        if let Some(prepended_path) = prepended_path {
+            command.env("PATH", prepended_path);
         }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -1703,6 +1776,46 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn resolve_executable_prefers_path_over_a_cwd_named_entry() {
+            // Simulate `~/Works`, which contains a `claude` *directory* that
+            // portable-pty would otherwise exec (and abort on) instead of the
+            // real CLI. Resolving against PATH must ignore the cwd entirely.
+            let root = test_state("resolve-exe").paths.root.clone();
+            let bin = root.join("bin");
+            let cwd = root.join("cwd");
+            fs::create_dir_all(&bin).unwrap();
+            fs::create_dir_all(cwd.join("claude")).unwrap(); // a `claude` directory in cwd
+            let real = bin.join("claude");
+            fs::write(&real, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let path_env = std::ffi::OsString::from(bin.to_str().unwrap());
+            let resolved = resolve_executable_on_path("claude", Some(path_env.as_os_str()));
+            assert_eq!(resolved, Some(real.into_os_string()));
+        }
+
+        #[test]
+        fn resolve_executable_honours_explicit_paths_and_refuses_unresolved_names() {
+            // An explicit path is honoured verbatim.
+            assert_eq!(
+                resolve_executable_on_path("/usr/bin/env", None),
+                Some(std::ffi::OsString::from("/usr/bin/env"))
+            );
+            // A non-executable match on PATH is skipped; with nothing else to
+            // find, resolution returns None so the caller refuses to launch
+            // instead of falling back to a binary in the working directory.
+            let root = test_state("resolve-missing").paths.root.clone();
+            fs::write(root.join("claude"), b"data").unwrap(); // exists but not +x
+            let path_env = std::ffi::OsString::from(root.to_str().unwrap());
+            assert_eq!(
+                resolve_executable_on_path("claude", Some(path_env.as_os_str())),
+                None
+            );
+            // A bare name with no PATH to search is likewise refused.
+            assert_eq!(resolve_executable_on_path("claude", None), None);
+        }
 
         fn test_state(name: &str) -> Arc<DaemonState> {
             let root = std::env::temp_dir().join(format!(
