@@ -12,8 +12,9 @@
 //!   and
 //! - [`download`] to stream a file to disk with byte-level progress.
 //!
-//! Every request honors the standard `*_PROXY` environment variables carried in
-//! the `environment` pairs the controller already threads through for downloads.
+//! Every request honors the standard `*_PROXY` and `NO_PROXY` variables. Values
+//! explicitly carried in `environment` override the controller process's own
+//! environment, matching the behavior of the former curl subprocess.
 
 use std::{
     fs::File,
@@ -45,9 +46,76 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+fn environment_value(environment: &[(String, String)], keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| {
+            environment
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        })
+        .or_else(|| keys.iter().find_map(|key| std::env::var(key).ok()))
+}
+
+fn url_host_and_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, remainder) = url.split_once("://")?;
+    let authority = remainder.split('/').next()?.rsplit('@').next()?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    if let Some(authority) = authority.strip_prefix('[') {
+        let end = authority.find(']')?;
+        let host = authority[..end].to_ascii_lowercase();
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host, port));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse().ok().map(|port| (host, port)))
+        .unwrap_or((authority, default_port));
+    Some((host.trim_end_matches('.').to_ascii_lowercase(), port))
+}
+
+fn no_proxy_matches(url: &str, no_proxy: &str) -> bool {
+    let Some((host, port)) = url_host_and_port(url) else {
+        return false;
+    };
+    no_proxy.split(',').any(|entry| {
+        let entry = entry.trim();
+        if entry == "*" {
+            return true;
+        }
+        if entry.is_empty() || entry.contains('/') {
+            return false;
+        }
+        let entry = entry.trim_start_matches("*.");
+        let (pattern, required_port) = entry
+            .rsplit_once(':')
+            .and_then(|(pattern, port)| port.parse::<u16>().ok().map(|port| (pattern, Some(port))))
+            .unwrap_or((entry, None));
+        if required_port.is_some_and(|required| required != port) {
+            return false;
+        }
+        let pattern = pattern
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        !pattern.is_empty()
+            && (host == pattern
+                || host
+                    .strip_suffix(&pattern)
+                    .is_some_and(|prefix| prefix.ends_with('.')))
+    })
+}
+
 /// Build a proxy from the first usable `*_PROXY` variable, if any. Unparsable or
 /// non-HTTP proxies are ignored so the request falls back to a direct connection.
-fn proxy_for(environment: &[(String, String)]) -> Option<minreq::Proxy> {
+fn proxy_for(url: &str, environment: &[(String, String)]) -> Option<minreq::Proxy> {
     const KEYS: [&str; 6] = [
         "HTTPS_PROXY",
         "https_proxy",
@@ -56,17 +124,16 @@ fn proxy_for(environment: &[(String, String)]) -> Option<minreq::Proxy> {
         "HTTP_PROXY",
         "http_proxy",
     ];
-    for key in KEYS {
-        if let Some((_, value)) = environment.iter().find(|(name, _)| name == key) {
-            let value = value.trim();
-            if !value.is_empty()
-                && let Ok(proxy) = minreq::Proxy::new(value)
-            {
-                return Some(proxy);
-            }
-        }
+    if environment_value(environment, &["NO_PROXY", "no_proxy"])
+        .is_some_and(|value| no_proxy_matches(url, &value))
+    {
+        return None;
     }
-    None
+    let value = environment_value(environment, &KEYS)?;
+    let value = value.trim();
+    (!value.is_empty())
+        .then(|| minreq::Proxy::new(value).ok())
+        .flatten()
 }
 
 fn request(url: &str, environment: &[(String, String)]) -> minreq::Request {
@@ -74,7 +141,7 @@ fn request(url: &str, environment: &[(String, String)]) -> minreq::Request {
         .with_header("User-Agent", USER_AGENT)
         .with_header("Accept", "*/*")
         .with_timeout(REQUEST_TIMEOUT_SECS);
-    if let Some(proxy) = proxy_for(environment) {
+    if let Some(proxy) = proxy_for(url, environment) {
         request = request.with_proxy(proxy);
     }
     request
@@ -232,6 +299,34 @@ fn download_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_bypass_matches_hosts_subdomains_and_ports() {
+        assert!(no_proxy_matches(
+            "https://api.example.com/releases",
+            ".example.com,localhost"
+        ));
+        assert!(no_proxy_matches(
+            "https://example.com/releases",
+            "example.com"
+        ));
+        assert!(no_proxy_matches("http://localhost:8118/", "localhost:8118"));
+        assert!(!no_proxy_matches(
+            "http://localhost:8080/",
+            "localhost:8118"
+        ));
+        assert!(!no_proxy_matches("https://notexample.com/", "example.com"));
+        assert!(no_proxy_matches("https://anything.invalid/", "*"));
+    }
+
+    #[test]
+    fn explicit_download_environment_takes_precedence() {
+        let environment = vec![("HTTPS_PROXY".into(), "http://configured:8118".into())];
+        assert_eq!(
+            environment_value(&environment, &["HTTPS_PROXY", "https_proxy"]).as_deref(),
+            Some("http://configured:8118")
+        );
+    }
 
     // Network smoke test; run explicitly: cargo test --lib http -- --ignored --nocapture
     #[test]

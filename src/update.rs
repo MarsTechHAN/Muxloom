@@ -17,6 +17,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
@@ -28,8 +29,9 @@ use crate::http;
 const REPO_LATEST: &str = "https://github.com/MarsTechHAN/Muxloom/releases/latest";
 const DOWNLOAD_BASE: &str = "https://github.com/MarsTechHAN/Muxloom/releases/download";
 const RELEASES_PAGE: &str = "https://github.com/MarsTechHAN/Muxloom/releases";
+static UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The compiled-in package version, e.g. `"0.4.2"`.
+/// The compiled-in package version, e.g. `"0.4.3"`.
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -206,8 +208,8 @@ where
     let base = format!("{DOWNLOAD_BASE}/v{version}");
 
     // Stage inside the bundle dir so the final renames stay on one filesystem.
-    let workdir = bundle.join(".muxloom-update");
-    let _ = fs::remove_dir_all(&workdir);
+    let nonce = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let workdir = bundle.join(format!(".muxloom-update-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&workdir).with_context(|| format!("create {}", workdir.display()))?;
 
     let result = (|| -> Result<()> {
@@ -251,23 +253,32 @@ fn extract_tar_gz(archive: &Path, into: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace the bundle's known files (executables + the `companions/` tree) with
-/// the freshly extracted versions. Docs (README/LICENSE) are left untouched.
+/// Replace known bundle files atomically one at a time, with the controller as
+/// the final commit point. A failure before that leaves the old controller with
+/// newer compatible companions rather than a new controller with missing
+/// support files. Docs (README/LICENSE) and stale extra companions are retained.
 fn apply_over(src: &Path, dst: &Path) -> Result<()> {
     let suffix = env::consts::EXE_SUFFIX;
-    for base in ["muxloom", "muxloomd", "ffmpeg"] {
+    let controller = src.join(format!("muxloom{suffix}"));
+    let companion = src.join(format!("muxloomd{suffix}"));
+    if !controller.is_file() || !companion.is_file() {
+        bail!("release bundle is missing muxloom or muxloomd");
+    }
+
+    let companions_src = src.join("companions");
+    if companions_src.is_dir() {
+        overlay_tree(&companions_src, &dst.join("companions")).context("replace companions")?;
+    }
+    for base in ["muxloomd", "ffmpeg"] {
         let name = format!("{base}{suffix}");
         let from = src.join(&name);
         if from.is_file() {
             replace_file(&from, &dst.join(&name)).with_context(|| format!("replace {name}"))?;
         }
     }
-    let companions_src = src.join("companions");
-    if companions_src.is_dir() {
-        let companions_dst = dst.join("companions");
-        let _ = fs::remove_dir_all(&companions_dst);
-        move_tree(&companions_src, &companions_dst).context("replace companions")?;
-    }
+    let controller_name = format!("muxloom{suffix}");
+    replace_file(&controller, &dst.join(&controller_name))
+        .with_context(|| format!("replace {controller_name}"))?;
     Ok(())
 }
 
@@ -275,33 +286,33 @@ fn replace_file(from: &Path, to: &Path) -> Result<()> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
-    if fs::rename(from, to).is_err() {
-        fs::copy(from, to)?;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(to) {
+        if let Ok(metadata) = fs::metadata(from) {
             let mut permissions = metadata.permissions();
             permissions.set_mode(permissions.mode() | 0o755);
-            let _ = fs::set_permissions(to, permissions);
+            fs::set_permissions(from, permissions)?;
         }
     }
+    fs::rename(from, to).with_context(|| {
+        format!(
+            "atomic rename from {} to {} failed",
+            from.display(),
+            to.display()
+        )
+    })?;
     Ok(())
 }
 
-fn move_tree(from: &Path, to: &Path) -> Result<()> {
-    if fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    // Cross-filesystem fallback: recursive copy.
+fn overlay_tree(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let child_from = entry.path();
         let child_to = to.join(entry.file_name());
         if child_from.is_dir() {
-            move_tree(&child_from, &child_to)?;
+            overlay_tree(&child_from, &child_to)?;
         } else {
             replace_file(&child_from, &child_to)?;
         }
@@ -357,5 +368,58 @@ mod tests {
             release_archive_name("0.4.3", "aarch64-apple-darwin"),
             "muxloom-v0.4.3-aarch64-apple-darwin.tar.gz"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_overlay_replaces_core_files_and_preserves_extra_companions() {
+        let nonce = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "muxloom-update-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let src = root.join("new");
+        let dst = root.join("installed");
+        let suffix = env::consts::EXE_SUFFIX;
+        fs::create_dir_all(src.join("companions/test-target")).unwrap();
+        fs::create_dir_all(dst.join("companions/old-target")).unwrap();
+        for (base, contents) in [
+            ("muxloom", b"new-controller".as_slice()),
+            ("muxloomd", b"new-companion".as_slice()),
+            ("ffmpeg", b"new-ffmpeg".as_slice()),
+        ] {
+            fs::write(src.join(format!("{base}{suffix}")), contents).unwrap();
+            fs::write(dst.join(format!("{base}{suffix}")), b"old").unwrap();
+        }
+        fs::write(
+            src.join(format!("companions/test-target/muxloomd{suffix}")),
+            b"new-target",
+        )
+        .unwrap();
+        fs::write(
+            dst.join(format!("companions/old-target/muxloomd{suffix}")),
+            b"old-target",
+        )
+        .unwrap();
+
+        apply_over(&src, &dst).unwrap();
+
+        assert_eq!(
+            fs::read(dst.join(format!("muxloom{suffix}"))).unwrap(),
+            b"new-controller"
+        );
+        assert_eq!(
+            fs::read(dst.join(format!("muxloomd{suffix}"))).unwrap(),
+            b"new-companion"
+        );
+        assert!(
+            dst.join(format!("companions/test-target/muxloomd{suffix}"))
+                .is_file()
+        );
+        assert!(
+            dst.join(format!("companions/old-target/muxloomd{suffix}"))
+                .is_file()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
