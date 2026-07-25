@@ -2120,7 +2120,7 @@ fn install_local_codex_archive(_archive: &Path, _version: &str) -> Result<()> {
     bail!("local Codex installation requires the controller feature")
 }
 
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", unix))]
 fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) -> Result<()> {
     let releases = home.join(".local/share/muxloom/codex/releases");
     let release = releases.join(version);
@@ -2167,6 +2167,11 @@ fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) ->
     result
 }
 
+#[cfg(all(feature = "controller", not(unix)))]
+fn install_local_codex_archive_at(_archive: &Path, _version: &str, _home: &Path) -> Result<()> {
+    bail!("local Codex package installation is unsupported on this platform")
+}
+
 #[cfg(all(feature = "controller", unix))]
 fn activate_local_codex_link(source: &Path, destination: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
@@ -2178,11 +2183,6 @@ fn activate_local_codex_link(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(&staging, destination)
         .with_context(|| format!("failed to activate {}", destination.display()))?;
     Ok(())
-}
-
-#[cfg(all(feature = "controller", not(unix)))]
-fn activate_local_codex_link(_source: &Path, _destination: &Path) -> Result<()> {
-    bail!("local Codex package installation is unsupported on this platform")
 }
 
 #[cfg(feature = "controller")]
@@ -3197,15 +3197,28 @@ mod tests {
 
         let extracted = extract_cached_codex_archive(&archive).unwrap();
         assert_eq!(fs::read(extracted).unwrap(), b"codex-binary");
-        install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap();
-        assert_eq!(
-            fs::read(home.join(".local/bin/codex")).unwrap(),
-            b"codex-binary"
-        );
-        assert!(
-            home.join(".local/share/muxloom/codex/releases/1.2.3/bin/codex")
-                .is_file()
-        );
+        #[cfg(unix)]
+        {
+            install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap();
+            assert_eq!(
+                fs::read(home.join(".local/bin/codex")).unwrap(),
+                b"codex-binary"
+            );
+            assert!(
+                home.join(".local/share/muxloom/codex/releases/1.2.3/bin/codex")
+                    .is_file()
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let error = install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap_err();
+            assert!(error.to_string().contains("unsupported on this platform"));
+            assert!(
+                !home
+                    .join(".local/share/muxloom/codex/releases/1.2.3")
+                    .exists()
+            );
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
