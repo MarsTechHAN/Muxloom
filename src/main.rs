@@ -158,6 +158,7 @@ fn run(config_path: PathBuf) -> Result<()> {
     app.start();
 
     let shutdown = install_shutdown_handlers()?;
+    spawn_terminal_hangup_watchdog(Arc::clone(&shutdown));
     let mut restore_guard = TerminalRestoreGuard::new();
     let mut terminal = enter_terminal()?;
     debug::log("app", format!("terminal entered; {}", debug::tty_state()));
@@ -216,6 +217,61 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
         }
     }
 }
+
+/// Watch the controlling terminal and force the dashboard to exit if it hangs
+/// up, then never return.
+///
+/// crossterm 0.28's `event::poll`/`event::read` spin forever on `read()==EOF`
+/// once the terminal closes (their inner loop only breaks on `WouldBlock` or a
+/// parsed event, never on end-of-file). That pins a CPU core *and* strands the
+/// main thread in native code where it can no longer observe the shutdown flag,
+/// so SIGTERM/SIGHUP are silently ignored. An independent watchdog is the only
+/// reliable escape: it blocks in its own `poll` — regardless of where the main
+/// thread is stuck — and terminates the process the moment the tty reports
+/// hangup.
+///
+/// Only polling here (never reading) keeps input bytes intact for crossterm.
+#[cfg(unix)]
+fn spawn_terminal_hangup_watchdog(shutdown: Arc<AtomicBool>) {
+    // Only meaningful when stdin is the tty crossterm actually reads from.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return;
+    }
+    std::thread::spawn(move || {
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut poll_fd = libc::pollfd {
+                // macOS only reports POLLHUP when POLLIN is also requested.
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Wake at least once a second to re-check the shutdown flag; a real
+            // hangup wakes the poll immediately with POLLHUP latched.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 1000) };
+            if ready <= 0 {
+                // Timeout (idle terminal) or EINTR — nothing to do, loop again.
+                continue;
+            }
+            if poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                debug::log(
+                    "app",
+                    "watchdog: controlling terminal hung up; exiting dashboard",
+                );
+                restore_terminal_best_effort();
+                std::process::exit(0);
+            }
+            // Readable with pending input (no hangup): the main thread is
+            // draining it. Back off briefly so we don't spin while it does.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_terminal_hangup_watchdog(_shutdown: Arc<AtomicBool>) {}
 
 fn log_navigation_key(key: KeyEvent) {
     if !debug::enabled() {
