@@ -1,16 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,6 +27,14 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Bytes the outbound frame queue may hold before producers wait. Large enough
+/// that an upload keeps several 64 KiB chunks in flight, small enough that a
+/// stalled link cannot buffer a whole file in memory.
+const WRITE_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+/// How long a producer waits for queue room before reporting the link as
+/// backed up. Keystrokes and resizes come from the render loop, so they must
+/// fail loudly instead of blocking the UI forever.
+const WRITE_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPANION_RELEASE_ROOT: &str =
     "https://github.com/MarsTechHAN/Muxloom/releases/latest/download";
 
@@ -78,13 +86,129 @@ pub struct BridgeHistory {
 
 struct ConnectionState {
     target: String,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<FrameWriter>,
     child: Mutex<Option<Child>>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
     streams: Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>,
     next_request: AtomicU64,
     next_stream: AtomicU64,
     alive: AtomicBool,
+}
+
+/// Outbound side of one bridge connection. Frames are queued here and written
+/// by a dedicated thread, so a slow or stalled link never blocks the caller —
+/// keystrokes, resizes, and stream teardown are all issued from the render
+/// loop, where a blocking `write` would freeze the whole dashboard.
+#[derive(Debug, Default)]
+struct FrameWriter {
+    queue: Mutex<FrameQueue>,
+    /// Signals the writer thread that frames are waiting.
+    pending: Condvar,
+    /// Signals producers that the queue has room again.
+    drained: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct FrameQueue {
+    frames: VecDeque<Frame>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl FrameWriter {
+    /// Queue one frame. Returns once it is accepted for writing, not once it
+    /// reaches the peer.
+    fn send(&self, frame: Frame) -> Result<()> {
+        let size = frame.payload.len() + crate::daemon_protocol::HEADER_LEN;
+        let deadline = Instant::now() + WRITE_QUEUE_TIMEOUT;
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A single oversized frame is always admitted once the queue is empty,
+        // so an upload chunk larger than the limit cannot deadlock.
+        while !queue.closed && queue.bytes > 0 && queue.bytes + size > WRITE_QUEUE_LIMIT {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("muxloomd bridge write queue is full");
+            }
+            let (next, _) = self
+                .drained
+                .wait_timeout(queue, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue = next;
+        }
+        if queue.closed {
+            bail!("muxloomd bridge writer has stopped");
+        }
+        queue.bytes += size;
+        queue.frames.push_back(frame);
+        self.pending.notify_one();
+        Ok(())
+    }
+
+    /// Stop accepting frames and wake everyone waiting on the queue.
+    fn close(&self) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
+        self.pending.notify_all();
+        self.drained.notify_all();
+    }
+
+    fn next_frame(&self) -> Option<Frame> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(frame) = queue.frames.pop_front() {
+                return Some(frame);
+            }
+            if queue.closed {
+                return None;
+            }
+            queue = self
+                .pending
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self, size: usize) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.bytes = queue.bytes.saturating_sub(size);
+        self.drained.notify_all();
+    }
+}
+
+fn spawn_writer(
+    writer: Arc<FrameWriter>,
+    state: Weak<ConnectionState>,
+    mut sink: impl Write + Send + 'static,
+) {
+    thread::spawn(move || {
+        while let Some(frame) = writer.next_frame() {
+            let size = frame.payload.len() + crate::daemon_protocol::HEADER_LEN;
+            let result = frame.write_to(&mut sink);
+            writer.release(size);
+            if let Err(error) = result {
+                writer.close();
+                if let Some(state) = state.upgrade() {
+                    debug::log(
+                        "bridge",
+                        format!("target={} writer stopped: {error}", state.target),
+                    );
+                    state.fail_all(error.to_string());
+                }
+                return;
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -133,13 +257,9 @@ impl BridgeStream {
         if self.is_closed() {
             bail!("daemon terminal stream is closed");
         }
-        Frame::data(self.stream_id, 0, bytes, compress).write_to(
-            &mut *self
-                .state
-                .writer
-                .lock()
-                .map_err(|_| anyhow!("bridge writer is poisoned"))?,
-        )
+        self.state
+            .writer
+            .send(Frame::data(self.stream_id, 0, bytes, compress))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -155,9 +275,7 @@ impl Drop for BridgeStream {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.stream_id);
         let frame = Frame::new(FrameKind::CloseStream, self.stream_id, 0, vec![]);
-        if let Ok(mut writer) = self.state.writer.lock() {
-            let _ = frame.write_to(&mut *writer);
-        }
+        let _ = self.state.writer.send(frame);
     }
 }
 
@@ -187,6 +305,7 @@ impl ConnectionState {
 
     fn shutdown(&self) {
         self.fail_all("bridge connection closed");
+        self.writer.close();
         if let Some(mut child) = self
             .child
             .lock()
@@ -339,9 +458,10 @@ impl BridgeConnection {
         writer: impl Write + Send + 'static,
         child: Option<Child>,
     ) -> Arc<Self> {
+        let frames = Arc::new(FrameWriter::default());
         let state = Arc::new(ConnectionState {
             target,
-            writer: Mutex::new(Box::new(writer)),
+            writer: Arc::clone(&frames),
             child: Mutex::new(child),
             pending: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -349,6 +469,7 @@ impl BridgeConnection {
             next_stream: AtomicU64::new(u64::from(stream::PTY_BASE)),
             alive: AtomicBool::new(true),
         });
+        spawn_writer(frames, Arc::downgrade(&state), writer);
         spawn_reader(Arc::clone(&state), reader);
         spawn_heartbeat(Arc::downgrade(&state));
         Arc::new(Self { state })
@@ -374,7 +495,7 @@ impl BridgeConnection {
                 },
             );
         let frame = Frame::json(FrameKind::Request, 0, request_id, &request)?;
-        if let Err(error) = self.write_frame(&frame) {
+        if let Err(error) = self.write_frame(frame) {
             self.state
                 .pending
                 .lock()
@@ -400,14 +521,8 @@ impl BridgeConnection {
         }
     }
 
-    fn write_frame(&self, frame: &Frame) -> Result<()> {
-        frame.write_to(
-            &mut *self
-                .state
-                .writer
-                .lock()
-                .map_err(|_| anyhow!("bridge writer is poisoned"))?,
-        )
+    fn write_frame(&self, frame: Frame) -> Result<()> {
+        self.state.writer.send(frame)
     }
 
     pub fn run_shell(&self, script: &str, environment: &[(String, String)]) -> Result<Output> {
@@ -565,6 +680,24 @@ impl BridgeConnection {
         })
     }
 
+    /// Resize without waiting for the acknowledgement. Attached terminals are
+    /// resized from the render loop, so waiting a round trip there would stall
+    /// every pane whenever the layout changes on a slow link. The daemon
+    /// ignores nothing: only our own reply handling is skipped.
+    fn resize_detached(&self, session_id: String, columns: u16, rows: u16) -> Result<()> {
+        let request_id = self.state.next_request.fetch_add(1, Ordering::Relaxed);
+        self.write_frame(Frame::json(
+            FrameKind::Request,
+            0,
+            request_id,
+            &DaemonRequest::Resize {
+                session_id,
+                columns,
+                rows,
+            },
+        )?)
+    }
+
     fn expect_ack(&self, request: DaemonRequest) -> Result<()> {
         match self.request(request)?.response {
             DaemonResponse::Ack => Ok(()),
@@ -612,7 +745,7 @@ impl BridgeConnection {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(stream_id, sender);
         let frame = Frame::json(FrameKind::OpenStream, stream_id, 0, &open)?;
-        if let Err(error) = self.write_frame(&frame) {
+        if let Err(error) = self.write_frame(frame) {
             self.state
                 .streams
                 .lock()
@@ -694,12 +827,9 @@ fn spawn_reader(state: Arc<ConnectionState>, mut reader: impl Read + Send + 'sta
                             let _ = stream.send(StreamEvent::Data(payload));
                         }
                         if frame.request_id == 0 && consumed > 0 {
-                            Frame::window_update(frame.stream_id, consumed).write_to(
-                                &mut *state
-                                    .writer
-                                    .lock()
-                                    .map_err(|_| anyhow!("bridge writer is poisoned"))?,
-                            )?;
+                            state
+                                .writer
+                                .send(Frame::window_update(frame.stream_id, consumed))?;
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
@@ -757,12 +887,7 @@ fn spawn_heartbeat(state: Weak<ConnectionState>) {
                 return;
             }
             let heartbeat = Frame::new(FrameKind::Heartbeat, 0, 0, vec![]);
-            let result = state
-                .writer
-                .lock()
-                .map_err(|_| anyhow!("bridge writer is poisoned"))
-                .and_then(|mut writer| heartbeat.write_to(&mut *writer));
-            if let Err(error) = result {
+            if let Err(error) = state.writer.send(heartbeat) {
                 state.fail_all(error.to_string());
                 return;
             }
@@ -1394,6 +1519,23 @@ impl BridgePool {
             .resize(session_id, columns, rows)
     }
 
+    /// Resize over the bridge this target already has, without waiting for the
+    /// acknowledgement and without ever opening a connection. A target with no
+    /// live bridge has no attached terminal to resize, and re-attaching sends
+    /// the current size anyway, so that case is a no-op rather than a stall.
+    pub fn resize_detached(
+        &self,
+        target: &Target,
+        session_id: String,
+        columns: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let Some(connection) = self.live_connection(&target.id) else {
+            return Ok(());
+        };
+        connection.resize_detached(session_id, columns, rows)
+    }
+
     pub fn open_pty(
         &self,
         target: &Target,
@@ -1565,11 +1707,20 @@ impl BridgePool {
     }
 
     pub fn is_connected(&self, target_id: &str) -> bool {
+        self.live_connection(target_id).is_some()
+    }
+
+    /// The target's established bridge, if it has one. Unlike
+    /// [`Self::connection_for_target`] this never connects and never waits on
+    /// the per-target connect lock, so callers on the render loop stay
+    /// responsive while another thread is dialling.
+    fn live_connection(&self, target_id: &str) -> Option<Arc<BridgeConnection>> {
         self.connections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(target_id)
-            .is_some_and(|connection| connection.is_alive())
+            .filter(|connection| connection.is_alive())
+            .map(Arc::clone)
     }
 }
 
@@ -1630,6 +1781,58 @@ mod tests {
         });
         assert_ne!(left.stdout, right.stdout);
         server_thread.join().unwrap();
+        connection.state.shutdown();
+    }
+
+    /// The render loop writes keystrokes and resizes itself, so a peer that has
+    /// stopped reading must never stall the caller — the writer thread absorbs
+    /// the backlog up to the queue budget.
+    #[cfg(unix)]
+    #[test]
+    fn writes_do_not_block_the_caller_when_the_peer_stops_reading() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let reader = client.try_clone().unwrap();
+        let connection = BridgeConnection::from_parts("test".into(), reader, client, None);
+        // Nothing ever reads `server`, so the socket buffer fills within a few
+        // frames; a synchronous write would wedge here.
+        let payload = vec![7u8; 64 * 1024];
+        let started = Instant::now();
+        for _ in 0..16 {
+            connection
+                .write_frame(Frame::data(stream::PTY_BASE, 0, &payload, false))
+                .unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        connection.state.shutdown();
+        drop(server);
+    }
+
+    /// Resizes are issued from the render loop on every layout change, so they
+    /// are fire-and-forget: the frame goes out but no reply is awaited.
+    #[cfg(unix)]
+    #[test]
+    fn detached_resize_sends_a_frame_without_awaiting_a_reply() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = client.try_clone().unwrap();
+        let connection = BridgeConnection::from_parts("test".into(), reader, client, None);
+        connection
+            .resize_detached("muxloom-demo".into(), 120, 40)
+            .unwrap();
+        let frame = Frame::read_from(&mut server).unwrap().unwrap();
+        assert_eq!(frame.kind, FrameKind::Request);
+        match frame.decode_json::<DaemonRequest>().unwrap() {
+            DaemonRequest::Resize {
+                session_id,
+                columns,
+                rows,
+            } => {
+                assert_eq!(session_id, "muxloom-demo");
+                assert_eq!((columns, rows), (120, 40));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        // No pending entry was registered, so nothing is waiting on a response.
+        assert!(connection.state.pending.lock().unwrap().is_empty());
         connection.state.shutdown();
     }
 

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -59,6 +59,17 @@ pub struct LaunchForm {
 struct ArchivedResume {
     source_session_id: String,
     launch: LaunchForm,
+}
+
+/// An attach running on a background thread. Attaching dials the daemon bridge
+/// (or spawns ssh/tmux), which takes seconds on a poor link, so the render loop
+/// hands the work off and picks the result up on a later tick.
+struct PendingAttach {
+    session_id: String,
+    /// Whether the terminal should take keyboard input once it is live. A second
+    /// activation request while the attach is in flight upgrades this.
+    take_input: bool,
+    outcome: mpsc::Receiver<Result<TerminalSession, String>>,
 }
 
 /// Result of the background self-update check, handed to the UI thread. Kept in
@@ -408,6 +419,7 @@ pub struct App {
     pub terminal_session_id: Option<String>,
     pub pending_terminal: Option<TerminalSession>,
     pub pending_terminal_session_id: Option<String>,
+    pending_attach: Option<PendingAttach>,
     pub terminal_selection: Option<TerminalSelection>,
     pub animation_frame: u64,
     animation_epoch: Instant,
@@ -501,6 +513,7 @@ impl App {
             terminal_session_id: None,
             pending_terminal: None,
             pending_terminal_session_id: None,
+            pending_attach: None,
             terminal_selection: None,
             animation_frame: 0,
             animation_epoch: Instant::now(),
@@ -572,6 +585,7 @@ impl App {
         self.drain_worker();
         self.drain_update_slot();
         self.poll_media();
+        self.poll_attach();
         self.poll_terminal();
         self.maybe_auto_submit_search();
         self.maybe_submit_file_search();
@@ -1534,6 +1548,18 @@ impl App {
             }
             return;
         }
+        if let Some(pending) = self.pending_attach.as_mut()
+            && pending.session_id == session.id
+        {
+            pending.take_input |= take_input;
+            self.history_offset = 0;
+            if take_input {
+                self.focus = Focus::Recap;
+                self.status_message =
+                    "Terminal is connecting; input will activate with its first frame".into();
+            }
+            return;
+        }
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
@@ -1546,47 +1572,91 @@ impl App {
                 target.id, session.id, self.agent_viewport_width, self.agent_viewport_height
             ),
         );
-        let terminal = if crate::runtime::is_daemon_session_id(&session.id) {
-            TerminalSession::attach_daemon(
-                self.worker.bridges.clone(),
-                &target,
-                &session.id,
-                self.agent_viewport_width,
-                self.agent_viewport_height,
-            )
+        // Attaching dials the bridge (or spawns ssh), which stalls for seconds on
+        // a slow link. Run it on its own thread so the UI keeps redrawing and
+        // stays responsive while the connection comes up.
+        let (sender, outcome) = mpsc::channel();
+        let bridges = self.worker.bridges.clone();
+        let session_id = session.id.clone();
+        let width = self.agent_viewport_width;
+        let height = self.agent_viewport_height;
+        let spawned = std::thread::Builder::new()
+            .name("muxloom-attach".into())
+            .spawn(move || {
+                let terminal = if crate::runtime::is_daemon_session_id(&session_id) {
+                    TerminalSession::attach_daemon(bridges, &target, &session_id, width, height)
+                } else {
+                    TerminalSession::attach(&target, &session_id, width, height)
+                };
+                let result = terminal.map_err(|error| {
+                    debug::log(
+                        "app",
+                        format!(
+                            "attach failed target={} session={session_id}: {error:#}",
+                            target.id
+                        ),
+                    );
+                    short_error(&error.to_string())
+                });
+                let _ = sender.send(result);
+            });
+        if let Err(error) = spawned {
+            self.status_message = format!("Attach failed: {}", short_error(&error.to_string()));
+            self.defer_terminal_retry();
+            return;
+        }
+        self.pending_attach = Some(PendingAttach {
+            session_id: session.id,
+            take_input,
+            outcome,
+        });
+        self.history_offset = 0;
+        if take_input {
+            self.focus = Focus::Recap;
+            self.status_message =
+                "Terminal is connecting; input activates with its first frame".into();
         } else {
-            TerminalSession::attach(
-                &target,
-                &session.id,
-                self.agent_viewport_width,
-                self.agent_viewport_height,
-            )
+            self.status_message = "Switching terminal in background".into();
+        }
+    }
+
+    /// Installs a background attach once it finishes. Results for a session the
+    /// user has already navigated away from are dropped, which closes the
+    /// half-built terminal instead of letting it replace the live one.
+    fn poll_attach(&mut self) {
+        let Some(pending) = self.pending_attach.as_ref() else {
+            return;
         };
-        match terminal {
+        let outcome = match pending.outcome.try_recv() {
+            Ok(outcome) => outcome,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("attach thread stopped".into()),
+        };
+        let Some(pending) = self.pending_attach.take() else {
+            return;
+        };
+        if self.selected_session_id.as_deref() != Some(pending.session_id.as_str()) {
+            debug::log(
+                "app",
+                format!(
+                    "discarding attach for deselected session={}",
+                    pending.session_id
+                ),
+            );
+            return;
+        }
+        match outcome {
             Ok(terminal) => {
                 self.pending_terminal = Some(terminal);
-                self.pending_terminal_session_id = Some(session.id);
+                self.pending_terminal_session_id = Some(pending.session_id);
                 self.pending_terminal_started_at = Some(Instant::now());
                 self.pending_terminal_has_output = false;
-                self.pending_terminal_take_input = take_input;
-                self.history_offset = 0;
-                if take_input {
-                    self.focus = Focus::Recap;
-                    self.status_message =
-                        "Terminal is connecting; input activates with its first frame".into();
-                } else {
-                    self.status_message = "Switching terminal in background".into();
-                }
+                self.pending_terminal_take_input = pending.take_input;
+                // The layout may have changed while the attach was dialing.
+                self.sync_terminal_size();
             }
             Err(error) => {
-                debug::log(
-                    "app",
-                    format!(
-                        "attach failed target={} session={}: {error:#}",
-                        target.id, session.id
-                    ),
-                );
-                self.status_message = format!("Attach failed: {}", short_error(&error.to_string()));
+                self.status_message = format!("Attach failed: {error}");
                 self.defer_terminal_retry();
             }
         }
@@ -1611,13 +1681,21 @@ impl App {
         self.pending_terminal_started_at = None;
         self.pending_terminal_has_output = false;
         self.pending_terminal_take_input = false;
+        // Dropping the receiver abandons any in-flight attach; its result is
+        // discarded when the thread finishes.
+        self.pending_attach = None;
     }
 
     fn has_terminal_for_selected(&self) -> bool {
         let selected = self.selected_session_id.as_deref();
         selected.is_some()
             && (self.terminal_session_id.as_deref() == selected
-                || self.pending_terminal_session_id.as_deref() == selected)
+                || self.pending_terminal_session_id.as_deref() == selected
+                || self
+                    .pending_attach
+                    .as_ref()
+                    .map(|pending| pending.session_id.as_str())
+                    == selected)
     }
 
     /// True when a live emulator is attached for the currently selected session,
@@ -1683,7 +1761,7 @@ impl App {
             self.terminal = None;
             self.terminal_session_id = None;
             self.interactive = false;
-            if closed_selected && self.pending_terminal.is_none() {
+            if closed_selected && self.pending_terminal.is_none() && self.pending_attach.is_none() {
                 self.handle_selected_terminal_closed();
             }
         }
@@ -4067,11 +4145,7 @@ impl App {
     /// Build the initial prompt that references a backed-up conversation from
     /// (possibly) another machine. Embeds a transcript excerpt — the source file
     /// is not on this machine — and warns the agent it did not run here.
-    fn cross_machine_reference_prompt(
-        &self,
-        launch: &LaunchForm,
-        hit: &CrossMachineHit,
-    ) -> String {
+    fn cross_machine_reference_prompt(&self, launch: &LaunchForm, hit: &CrossMachineHit) -> String {
         // Compare machines, not raw aliases: hit.target_id is a stable machine
         // key, so canonicalise the launch target's alias the same way before
         // deciding whether the referenced conversation ran on a different box.
@@ -4093,7 +4167,10 @@ impl App {
             ));
         }
         if !hit.title.trim().is_empty() {
-            prompt.push_str(&format!("\n\nReferenced conversation: {}", hit.title.trim()));
+            prompt.push_str(&format!(
+                "\n\nReferenced conversation: {}",
+                hit.title.trim()
+            ));
         }
         let transcript = backup_session_transcript(&hit.target_id, &hit.session_id, 24_000);
         if !transcript.is_empty() {
@@ -4101,7 +4178,9 @@ impl App {
             prompt.push_str(&transcript);
             prompt.push_str("\n--- end of referenced transcript ---");
         }
-        prompt.push_str("\n\nUse the above as reference, then continue the task in the current workspace.");
+        prompt.push_str(
+            "\n\nUse the above as reference, then continue the task in the current workspace.",
+        );
         prompt
     }
 

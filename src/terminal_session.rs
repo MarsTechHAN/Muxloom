@@ -284,9 +284,15 @@ impl TerminalSession {
             return Ok(());
         }
         if let Some(daemon) = &self.daemon {
-            daemon
-                .bridges
-                .resize(&daemon.target, daemon.session_id.clone(), width, height)?;
+            // Fire and forget: the controller resizes from the render loop, so
+            // waiting for the daemon's acknowledgement would stall every pane
+            // for a full round trip whenever the layout changes.
+            daemon.bridges.resize_detached(
+                &daemon.target,
+                daemon.session_id.clone(),
+                width,
+                height,
+            )?;
         } else if let Some(master) = &self.master {
             master
                 .resize(PtySize {
