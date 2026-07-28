@@ -28,6 +28,8 @@ pub struct Config {
     pub auto_update: bool,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
+    /// Local backup of every session's conversation history (see [`BackupConfig`]).
+    pub backup: BackupConfig,
 }
 
 impl Default for Config {
@@ -53,6 +55,37 @@ impl Default for Config {
             auto_update: true,
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
+            backup: BackupConfig::default(),
+        }
+    }
+}
+
+/// Settings for the local history backup that mirrors every session (running and
+/// archived) from all machines into `<state>/backup/` as zstd blobs + a JSON
+/// index. Local only — nothing leaves the machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Master switch for the periodic backup.
+    pub enabled: bool,
+    /// Seconds between backup passes. Captures are append-only, so each pass
+    /// only ships the delta.
+    pub interval_secs: u64,
+    /// Also mirror the raw terminal `.ansi` capture (faithful replay). The
+    /// structured transcript is always backed up regardless.
+    pub include_ansi: bool,
+    /// Per-session cap on the compressed capture blob; older frames are dropped
+    /// past this. 0 disables the cap.
+    pub ansi_max_bytes: u64,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            include_ansi: true,
+            ansi_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -391,6 +424,16 @@ companion_command = "muxloomd"
 companion_binary = ""
 # Check GitHub for a newer release on startup and install it in the background.
 auto_update = true
+
+# Local backup of every session's conversation history (running + archived)
+# from all machines into ~/.local/state/muxloom/backup/ as compressed blobs.
+# Local only; nothing leaves the machine.
+[backup]
+enabled = true
+interval_secs = 300
+include_ansi = true
+# Per-session cap on the compressed terminal capture (0 = unlimited).
+ansi_max_bytes = 67108864
 
 [agents.codex]
 command = "codex"

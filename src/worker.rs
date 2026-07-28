@@ -108,6 +108,12 @@ pub enum Request {
         local_paths: Vec<PathBuf>,
         remote_directory: String,
     },
+    /// Mirror the given targets' session history into the local backup store.
+    BackupSync {
+        targets: Vec<Target>,
+        include_ansi: bool,
+        ansi_max_bytes: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -209,6 +215,10 @@ pub enum Event {
         target_id: String,
         remote_directory: String,
         result: Result<usize, String>,
+    },
+    /// One backup pass finished; the payload is a human-readable summary.
+    BackupSynced {
+        result: Result<String, String>,
     },
 }
 
@@ -707,6 +717,31 @@ impl Worker {
                             remote_directory,
                             result,
                         });
+                    }
+                    Request::BackupSync {
+                        targets,
+                        include_ansi,
+                        ansi_max_bytes,
+                    } => {
+                        #[cfg(feature = "controller")]
+                        {
+                            let result = crate::backup::run_sync(
+                                &runtime,
+                                &targets,
+                                include_ansi,
+                                ansi_max_bytes,
+                            )
+                            .map(|summary| summary.to_string())
+                            .map_err(|error| error.to_string());
+                            if let Err(error) = &result {
+                                debug::log("worker", format!("backup sync failed: {error}"));
+                            }
+                            let _ = events.send(Event::BackupSynced { result });
+                        }
+                        #[cfg(not(feature = "controller"))]
+                        {
+                            let _ = (targets, include_ansi, ansi_max_bytes);
+                        }
                     }
                 });
             }

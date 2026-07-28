@@ -99,6 +99,35 @@ pub struct ResumeForm {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// Cross-machine reference panel: search across every machine's backed-up
+    /// history and reference one that is not on this machine. Collapsed until
+    /// the user types a query.
+    pub query: String,
+    pub history_hits: Vec<CrossMachineHit>,
+    pub history_selected: usize,
+    pub searched_query: String,
+    pub search_edited_at: Option<Instant>,
+}
+
+impl ResumeForm {
+    /// True once the user has typed a search query — the cross-machine panel is
+    /// expanded and its list takes navigation.
+    pub fn history_active(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+}
+
+/// A backed-up conversation surfaced by the cross-machine reference search.
+/// Plain fields only (no backup-crate types) so the modal compiles without the
+/// controller feature.
+#[derive(Debug, Clone)]
+pub struct CrossMachineHit {
+    pub target_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub title: String,
+    pub snippet: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug)]
@@ -391,6 +420,8 @@ pub struct App {
     dragging: Option<DragDivider>,
     last_refresh: Instant,
     last_activity_refresh: Instant,
+    last_backup_sync: Option<Instant>,
+    backup_in_flight: bool,
     top_up_count: u8,
     last_top_up: Option<Instant>,
     notifications: Vec<String>,
@@ -482,6 +513,8 @@ impl App {
             dragging: None,
             last_refresh: Instant::now(),
             last_activity_refresh: Instant::now(),
+            last_backup_sync: None,
+            backup_in_flight: false,
             top_up_count: 0,
             last_top_up: None,
             notifications: Vec::new(),
@@ -542,9 +575,11 @@ impl App {
         self.poll_terminal();
         self.maybe_auto_submit_search();
         self.maybe_submit_file_search();
+        self.maybe_search_resume_history();
         if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
             self.refresh_daemon_activity();
         }
+        self.maybe_backup_sync();
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -2407,7 +2442,54 @@ impl App {
                     }
                 }
             }
+            Event::BackupSynced { result } => {
+                self.backup_in_flight = false;
+                match result {
+                    Ok(summary) => debug::log("backup", summary),
+                    Err(error) => {
+                        debug::log("backup", format!("sync failed: {error}"));
+                    }
+                }
+            }
         }
+    }
+
+    /// Enqueue a backup pass over the enabled targets when one is due and none
+    /// is already running. The very first pass fires as soon as targets exist.
+    fn maybe_backup_sync(&mut self) {
+        if !self.config.backup.enabled || self.backup_in_flight {
+            return;
+        }
+        let interval = Duration::from_secs(self.config.backup.interval_secs.max(10));
+        let due = self
+            .last_backup_sync
+            .map(|at| at.elapsed() >= interval)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.dispatch_backup_sync();
+    }
+
+    /// Send a backup pass to the worker now (used by the timer and the manual
+    /// command). No-op when nothing is enabled yet.
+    fn dispatch_backup_sync(&mut self) {
+        let targets: Vec<Target> = self
+            .targets
+            .iter()
+            .filter(|status| status.enabled)
+            .map(|status| status.target.clone())
+            .collect();
+        if targets.is_empty() {
+            return; // nothing enabled yet; retry next tick without arming the timer
+        }
+        self.last_backup_sync = Some(Instant::now());
+        self.backup_in_flight = true;
+        let _ = self.worker.requests.send(Request::BackupSync {
+            targets,
+            include_ansi: self.config.backup.include_ansi,
+            ansi_max_bytes: self.config.backup.ansi_max_bytes,
+        });
     }
 
     fn refresh_enabled(&mut self) {
@@ -3274,6 +3356,11 @@ impl App {
             selected: 0,
             loading: false,
             error: None,
+            query: String::new(),
+            history_hits: Vec::new(),
+            history_selected: 0,
+            searched_query: String::new(),
+            search_edited_at: None,
         };
         if form.launch.kind != AgentKind::Terminal {
             form.loading = true;
@@ -3956,6 +4043,64 @@ impl App {
         }
     }
 
+    /// Debounced cross-machine history search feeding the resume modal's panel.
+    /// Runs against the local backup, so it is synchronous and needs no worker.
+    fn maybe_search_resume_history(&mut self) {
+        let ready = matches!(self.modal.as_ref(), Some(Modal::Resume(form))
+            if form.history_active()
+                && form.searched_query != form.query.trim()
+                && form
+                    .search_edited_at
+                    .is_some_and(|at| at.elapsed() >= Duration::from_millis(250)));
+        if !ready {
+            return;
+        }
+        let Some(Modal::Resume(form)) = self.modal.as_mut() else {
+            return;
+        };
+        let query = form.query.trim().to_string();
+        form.searched_query = query.clone();
+        form.history_hits = backup_search_hits(&query, 50);
+        form.history_selected = 0;
+    }
+
+    /// Build the initial prompt that references a backed-up conversation from
+    /// (possibly) another machine. Embeds a transcript excerpt — the source file
+    /// is not on this machine — and warns the agent it did not run here.
+    fn cross_machine_reference_prompt(
+        &self,
+        launch: &LaunchForm,
+        hit: &CrossMachineHit,
+    ) -> String {
+        let same_machine = hit.target_id == launch.target.id;
+        let mut prompt = String::new();
+        if same_machine {
+            prompt.push_str(&format!(
+                "Reference a previous {} conversation from this machine as context for the work below.",
+                hit.kind
+            ));
+        } else {
+            prompt.push_str(&format!(
+                "IMPORTANT: the conversation referenced below ran on a DIFFERENT machine ({}), \
+                 not the machine you are running on now ({}). Its files, paths, and environment \
+                 may not exist here — treat it purely as reference context, verify anything before \
+                 relying on it, and do not assume the referenced workspace is present.",
+                hit.target_id, launch.target.id
+            ));
+        }
+        if !hit.title.trim().is_empty() {
+            prompt.push_str(&format!("\n\nReferenced conversation: {}", hit.title.trim()));
+        }
+        let transcript = backup_session_transcript(&hit.target_id, &hit.session_id, 24_000);
+        if !transcript.is_empty() {
+            prompt.push_str("\n\n--- referenced transcript (excerpt) ---\n");
+            prompt.push_str(&transcript);
+            prompt.push_str("\n--- end of referenced transcript ---");
+        }
+        prompt.push_str("\n\nUse the above as reference, then continue the task in the current workspace.");
+        prompt
+    }
+
     fn open_search_result(&mut self, result: SearchResult) {
         let Some(target_index) = self
             .targets
@@ -4200,18 +4345,53 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::PathPicker(form)),
             },
+            // Typing a query expands the cross-machine reference panel and its
+            // list takes navigation; otherwise the same-machine candidate list
+            // behaves as before. Arrow keys navigate (j/k route into the search
+            // box so they can be typed).
             Modal::Resume(mut form) => match key.code {
-                KeyCode::Esc | KeyCode::Left => self.modal = Some(Modal::Launch(form.launch)),
+                KeyCode::Esc => {
+                    if form.history_active() {
+                        form.query.clear();
+                        form.searched_query.clear();
+                        form.history_hits.clear();
+                        form.history_selected = 0;
+                        self.modal = Some(Modal::Resume(form));
+                    } else {
+                        self.modal = Some(Modal::Launch(form.launch));
+                    }
+                }
+                KeyCode::Left if !form.history_active() => {
+                    self.modal = Some(Modal::Launch(form.launch))
+                }
+                KeyCode::Backspace => {
+                    form.query.pop();
+                    form.search_edited_at = Some(Instant::now());
+                    self.modal = Some(Modal::Resume(form));
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                    if form.history_active() {
+                        if !form.history_hits.is_empty() {
+                            form.history_selected =
+                                shifted(form.history_selected, form.history_hits.len(), delta);
+                        }
+                    } else if !form.loading {
+                        form.selected = shifted(form.selected, form.candidates.len() + 1, delta);
+                    }
+                    self.modal = Some(Modal::Resume(form));
+                }
+                KeyCode::Enter if form.history_active() => {
+                    match form.history_hits.get(form.history_selected).cloned() {
+                        Some(hit) => {
+                            let prompt = self.cross_machine_reference_prompt(&form.launch, &hit);
+                            self.confirm_or_submit_launch(form.launch, None, Some(prompt));
+                        }
+                        None => self.modal = Some(Modal::Resume(form)),
+                    }
+                }
                 KeyCode::Enter if form.selected == 0 => {
                     self.confirm_or_submit_launch(form.launch, None, None)
-                }
-                KeyCode::Up | KeyCode::Char('k') if !form.loading => {
-                    form.selected = shifted(form.selected, form.candidates.len() + 1, -1);
-                    self.modal = Some(Modal::Resume(form));
-                }
-                KeyCode::Down | KeyCode::Char('j') if !form.loading => {
-                    form.selected = shifted(form.selected, form.candidates.len() + 1, 1);
-                    self.modal = Some(Modal::Resume(form));
                 }
                 KeyCode::Enter if !form.loading => {
                     let candidate = form
@@ -4228,6 +4408,11 @@ impl App {
                         }
                         None => self.confirm_or_submit_launch(form.launch, None, None),
                     }
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.query.push(character);
+                    form.search_edited_at = Some(Instant::now());
+                    self.modal = Some(Modal::Resume(form));
                 }
                 _ => self.modal = Some(Modal::Resume(form)),
             },
@@ -5288,6 +5473,79 @@ fn single_line_paste(value: &str) -> String {
             character => Some(character),
         })
         .collect()
+}
+
+/// Search the local backup for conversations matching `query`, de-duplicated to
+/// one entry per session (best-ranked hit). Empty without the controller build.
+#[cfg(feature = "controller")]
+fn backup_search_hits(query: &str, limit: usize) -> Vec<CrossMachineHit> {
+    let store = crate::backup::BackupStore::new(crate::backup::BackupStore::default_root());
+    let hits = match crate::backup::search(&store, query, limit.saturating_mul(4)) {
+        Ok(hits) => hits,
+        Err(error) => {
+            debug::log("backup", format!("history search failed: {error:#}"));
+            return Vec::new();
+        }
+    };
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for hit in hits {
+        if !seen.insert((hit.target_id.clone(), hit.session_id.clone())) {
+            continue;
+        }
+        out.push(CrossMachineHit {
+            target_id: hit.target_id,
+            session_id: hit.session_id,
+            kind: hit.kind,
+            title: hit.title,
+            snippet: hit.snippet,
+            created_at: hit.created_at,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "controller"))]
+fn backup_search_hits(_query: &str, _limit: usize) -> Vec<CrossMachineHit> {
+    Vec::new()
+}
+
+/// Render a backed-up session's transcript as `role: text` lines, keeping at
+/// most the last `max_chars` (most recent context). Empty without controller.
+#[cfg(feature = "controller")]
+fn backup_session_transcript(target_id: &str, session_id: &str, max_chars: usize) -> String {
+    let store = crate::backup::BackupStore::new(crate::backup::BackupStore::default_root());
+    let raw = store
+        .read_blob(target_id, session_id, crate::backup::MESSAGES_BLOB)
+        .unwrap_or_default();
+    let mut out = String::new();
+    for line in String::from_utf8_lossy(&raw).lines() {
+        if let Ok(message) = serde_json::from_str::<crate::backup::ExtractedMessage>(line) {
+            let text = message.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            out.push_str(&message.role);
+            out.push_str(": ");
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+    let chars: Vec<char> = out.chars().collect();
+    if chars.len() > max_chars {
+        let tail: String = chars[chars.len() - max_chars..].iter().collect();
+        format!("…{tail}")
+    } else {
+        out
+    }
+}
+
+#[cfg(not(feature = "controller"))]
+fn backup_session_transcript(_target_id: &str, _session_id: &str, _max_chars: usize) -> String {
+    String::new()
 }
 
 fn history_reference_prompt(launch: &LaunchForm, candidate: &ResumeCandidate) -> String {
@@ -7393,6 +7651,11 @@ mod tests {
             selected: 0,
             loading: false,
             error: None,
+            query: String::new(),
+            history_hits: Vec::new(),
+            history_selected: 0,
+            searched_query: String::new(),
+            search_edited_at: None,
         }));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
@@ -7742,6 +8005,11 @@ mod tests {
             selected: 1,
             loading: false,
             error: None,
+            query: String::new(),
+            history_hits: Vec::new(),
+            history_selected: 0,
+            searched_query: String::new(),
+            search_edited_at: None,
         }));
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

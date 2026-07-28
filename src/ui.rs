@@ -2350,6 +2350,22 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+    // Second-to-last row hosts the cross-machine search box; the list above it
+    // shows candidates (collapsed) or backed-up conversations (expanded).
+    let search_y = footer_y.saturating_sub(1);
+    draw_resume_history_panel(frame, form, inner, search_y);
+    if form.history_active() {
+        frame.render_widget(
+            Paragraph::new(
+                "Up/Down select   Enter reference (cross-machine)   Backspace edit   Esc back",
+            )
+            .style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+        return;
+    }
+
     let new_selected = form.selected == 0;
     frame.render_widget(
         Paragraph::new(if new_selected {
@@ -2391,7 +2407,7 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     let selected_candidate = form.selected.saturating_sub(1);
     let start = selected_candidate.saturating_sub(available.saturating_sub(4));
     let mut y = inner.y + 2;
-    let last_y = inner.y + inner.height.saturating_sub(1);
+    let last_y = search_y;
     for (index, candidate) in form.candidates.iter().enumerate().skip(start) {
         let selected = form.selected == index + 1;
         let details: Vec<(&str, &str)> = if selected {
@@ -2464,15 +2480,91 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new("Up/Down select   Enter launch   Left/Esc edit runtime/path")
+        Paragraph::new("Up/Down select   Enter launch   type to search other machines   Left/Esc back")
             .style(Style::default().fg(MUTED)),
-        Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        ),
+        Rect::new(inner.x, footer_y, inner.width, 1),
     );
+}
+
+/// The cross-machine reference panel shown at the bottom of the resume modal.
+/// Collapsed to a one-line prompt until the user types a query, then it expands
+/// to a searchable list of backed-up conversations from every machine.
+fn draw_resume_history_panel(frame: &mut Frame<'_>, form: &ResumeForm, inner: Rect, search_y: u16) {
+    let query_line = if form.query.is_empty() {
+        " Type to search & reference history on any machine".to_string()
+    } else {
+        format!(" Search all machines: {}", form.query)
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(&query_line, inner.width as usize)).style(
+            Style::default().fg(if form.query.is_empty() { MUTED } else { ACCENT }),
+        ),
+        Rect::new(inner.x, search_y, inner.width, 1),
+    );
+    if !form.history_active() {
+        return;
+    }
+    // Draw the expanded hit list over the candidate area (from the top).
+    let body_top = inner.y + 2;
+    let mut y = body_top;
+    let status = if form.history_hits.is_empty() {
+        if form.searched_query == form.query.trim() {
+            "No matching history on any machine"
+        } else {
+            "Searching backed-up history..."
+        }
+    } else {
+        "Enter references the selected conversation (transcript is injected as context)"
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+    );
+    let rows = search_y.saturating_sub(body_top) as usize;
+    let start = form
+        .history_selected
+        .saturating_sub(rows.saturating_sub(2).max(1));
+    for (index, hit) in form.history_hits.iter().enumerate().skip(start) {
+        if y >= search_y {
+            break;
+        }
+        let selected = index == form.history_selected;
+        let glyph = hit.kind.parse::<AgentKind>().map(|k| agent_visual(k).0).unwrap_or("•");
+        let title = if hit.title.trim().is_empty() {
+            hit.snippet.as_str()
+        } else {
+            hit.title.as_str()
+        };
+        let background = if selected {
+            Color::Rgb(42, 48, 58)
+        } else {
+            Color::Reset
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(
+                &format!(
+                    "{} {glyph} [{}]  {title}",
+                    if selected { ">" } else { " " },
+                    hit.target_id
+                ),
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(Color::White).bg(background)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+        if selected && y < search_y {
+            frame.render_widget(
+                Paragraph::new(truncate(
+                    &format!("    {}", hit.snippet),
+                    inner.width as usize,
+                ))
+                .style(Style::default().fg(Color::Gray).bg(background)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
 }
 
 fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) {
@@ -3383,6 +3475,11 @@ mod tests {
             selected: 0,
             loading: false,
             error: None,
+            query: String::new(),
+            history_hits: Vec::new(),
+            history_selected: 0,
+            searched_query: String::new(),
+            search_edited_at: None,
         }));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal

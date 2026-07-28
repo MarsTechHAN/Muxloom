@@ -1,4 +1,6 @@
 pub mod app;
+#[cfg(feature = "controller")]
+pub mod backup;
 pub mod bridge;
 pub mod config;
 pub mod daemon;
