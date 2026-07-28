@@ -7,7 +7,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{layout::Rect, text::Text, widgets::ListState};
+use ratatui::{layout::Rect, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -171,7 +171,10 @@ pub struct FileManagerForm {
     /// preview now on screen. A later listing with a different stamp means the
     /// file changed and the preview needs re-fetching.
     pub preview_stamp: Option<(u64, u64)>,
-    pub preview_rendered: Option<Text<'static>>,
+    /// Styled rows for the preview on screen. Rebuilt only when the content
+    /// changes, and kept out of the per-frame path so paging a large file never
+    /// re-renders it.
+    pub preview_rendered: Option<crate::ui::PreviewRender>,
     pub query: String,
     pub search_request_id: Option<u64>,
     pub searching: bool,
@@ -248,6 +251,10 @@ const FILE_MONITOR_INTERVAL: Duration = Duration::from_millis(1500);
 /// How long to wait for a monitor listing before assuming it was lost and
 /// polling again. Keeps a dropped reply from wedging the monitor for good.
 const FILE_MONITOR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Largest file the monitor re-reads on its own. A preview always shows the
+/// whole file, so following a bigger one would mean hauling it across the link
+/// every time it changes; those wait for an explicit refresh.
+const AUTO_REFRESH_LIMIT: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -864,6 +871,14 @@ impl App {
                     }
                 }
                 KeyCode::Char('d') => self.download_selected_file(&form),
+                // Large files are not watched automatically, so the reader keeps
+                // an explicit way to pull the current bytes.
+                KeyCode::Char('r') | KeyCode::F(5) => {
+                    if let Some(path) = form.preview_path.clone() {
+                        self.request_preview_refresh(&mut form, path);
+                        self.status_message = "Re-reading the open file".into();
+                    }
+                }
                 _ => {}
             }
             self.file_manager = Some(form);
@@ -2438,7 +2453,7 @@ impl App {
                                 media_request =
                                     Some((form.target.clone(), path.clone(), preview.kind));
                             }
-                            form.preview_cache.insert(path.clone(), preview.clone());
+                            Self::cache_preview(form, &path, &preview);
                             // A refresh that read back the same bytes must not
                             // throw away the highlighted text; re-rendering it is
                             // the expensive part of showing a preview.
@@ -2510,7 +2525,7 @@ impl App {
                 {
                     form.preload_pending.remove(&path);
                     if let Ok(preview) = result {
-                        form.preview_cache.insert(path, preview);
+                        Self::cache_preview(form, &path, &preview);
                     }
                 }
             }
@@ -3798,6 +3813,12 @@ impl App {
             return;
         }
         form.preview_stamp = Some(stamp);
+        // Watching a large file means pulling all of it across the link on every
+        // change, which costs far more than the update is worth. Those refresh
+        // on demand instead, with r or F5.
+        if entry.size > AUTO_REFRESH_LIMIT {
+            return;
+        }
         self.request_preview_refresh(form, path);
     }
 
@@ -4101,7 +4122,21 @@ impl App {
             form.preview_max_scroll > 0 && form.preview_scroll >= form.preview_max_scroll;
     }
 
+    /// Keep a preview for reopening only while it is small. Opening a file
+    /// still reads it whole; caching megabytes per neighbour would grow the
+    /// browser's footprint without saving a visible amount of work.
+    fn cache_preview(form: &mut FileManagerForm, path: &str, preview: &FilePreview) {
+        const CACHE_LIMIT: usize = 256 * 1024;
+        if preview.content.len() > CACHE_LIMIT {
+            form.preview_cache.remove(path);
+            return;
+        }
+        form.preview_cache.insert(path.to_string(), preview.clone());
+    }
+
     fn queue_file_preloads(&self, form: &mut FileManagerForm) {
+        // Neighbours are read ahead only when they are small: a preload is a
+        // guess, and guessing wrong on a large file costs the link dearly.
         const PREVIEW_LIMIT: u64 = 256 * 1024;
         const MAX_PENDING_PRELOADS: usize = 2;
         if form.entries.is_empty() {
@@ -7621,6 +7656,42 @@ mod tests {
                 .map(|preview| preview.content.as_str()),
             Some("first\n")
         );
+    }
+
+    /// A preview shows the whole file, so watching a big one would drag it
+    /// across the link on every change. Those wait for the reader to ask.
+    #[test]
+    fn large_previews_refresh_on_demand_instead_of_on_every_change() {
+        let (mut app, request_rx, entry) =
+            preview_monitor_app(AUTO_REFRESH_LIMIT + 1, 1_700_000_000);
+        app.focus = Focus::Agents;
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![FileEntry {
+                    size: AUTO_REFRESH_LIMIT + 4_096,
+                    mtime: 1_700_000_050,
+                    ..entry.clone()
+                }],
+            }),
+        });
+        assert!(
+            !request_rx
+                .try_iter()
+                .any(|request| matches!(request, Request::PreviewFile { .. })),
+            "the monitor leaves large files alone"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(request_rx.try_iter().any(
+            |request| matches!(request, Request::PreviewFile { path, .. } if path == entry.path)
+        ));
+        // Asking for a fresh copy must not close the file or reset the reader.
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert_eq!(form.preview_path.as_deref(), Some(entry.path.as_str()));
+        assert_eq!(form.preview_scroll, 4);
     }
 
     #[test]

@@ -142,10 +142,18 @@ CSV/TSV tables, images (truecolor half-blocks), and video (encoded bytes
 streamed to controller-side FFmpeg). Media stays encoded across SSH; the target
 never sends expanded RGB frames.
 
+Previews are never cut short. Bodies too large for one response are completed
+over the chunked file stream, and only the rows on screen are turned into styled
+text, so paging a multi-megabyte log costs the same per frame as a small file.
+Delimited data gets numbered rows and columns, and its header stays pinned above
+the viewport while you page.
+
 An open preview is watched: edits on the target appear within a couple of
 seconds without reopening the file, and a preview parked on its last line
 follows the file as it grows. The watch only carries directory metadata, so the
 file itself is re-read only when its size or modification time actually moves.
+Files over 4 MiB are not re-read on their own — press `r` or `F5` to pull the
+current bytes.
 
 **Keys** — `Ctrl-f` open/close · type to match · `Enter`/`Right` open · `Left`
 up · `d` download · `c` copy path · drag preview text to copy · drag local files
@@ -288,7 +296,7 @@ to the application while terminal input is active.
 | Drag over preview text | Copy the selected preview text on release |
 | `d` | Download the selected file to `~/Downloads` |
 | Drag local files in | Upload them to the browsed directory |
-| `r`, `F5` | Refresh the current directory |
+| `r`, `F5` | Re-read the open preview, or refresh the current directory |
 | `Esc` | Close Preview, then clear a query, then close Files |
 
 Clicking a pane focuses it; machine and session rows, Archive, Back, and the

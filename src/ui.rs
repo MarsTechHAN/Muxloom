@@ -1492,29 +1492,46 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
         return;
     }
-    if form.preview_rendered.is_none() {
-        form.preview_rendered = form.preview.as_ref().map(file_preview_text);
-    }
-    let preview = if let Some(error) = &form.preview_error {
-        Text::from(Line::styled(error.clone(), Style::default().fg(Color::Red)))
+    // Transient states borrow nothing from the cache; the rendered preview is
+    // moved out and put back so no frame ever clones a multi-megabyte body.
+    let mut transient = true;
+    let mut render = if let Some(error) = &form.preview_error {
+        PreviewRender::notice(error.clone(), Color::Red)
     } else if form.preview_loading {
-        Text::from(Line::styled(
-            "Loading preview...",
-            Style::default().fg(MUTED),
-        ))
-    } else if let Some(preview) = &form.preview_rendered {
-        preview.clone()
+        PreviewRender::notice("Loading preview...".to_string(), MUTED)
+    } else if let Some(render) = form.preview_rendered.take() {
+        transient = false;
+        render
+    } else if let Some(preview) = &form.preview {
+        transient = false;
+        file_preview_render(preview)
     } else {
-        Text::from(Line::styled(
-            "No preview output",
-            Style::default().fg(MUTED),
-        ))
+        PreviewRender::notice("No preview output".to_string(), MUTED)
     };
-    let total_rows = wrapped_text_height(&preview, inner.width);
-    form.preview_max_scroll = total_rows
-        .saturating_sub(inner.height as usize)
+    // Measuring is O(lines) but only runs when the body or the pane width
+    // changed, so scrolling a large file stays O(visible rows).
+    render.measure(inner.width);
+    let pinned_rows = render
+        .pinned_height()
+        .min(inner.height.saturating_sub(1) as usize) as u16;
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + pinned_rows,
+        inner.width,
+        inner.height.saturating_sub(pinned_rows),
+    );
+    if pinned_rows > 0 {
+        let header = render.pinned_window(pinned_rows as usize);
+        frame.render_widget(
+            Paragraph::new(Text::from(header)),
+            Rect::new(inner.x, inner.y, inner.width, pinned_rows),
+        );
+    }
+    form.preview_max_scroll = render
+        .height()
+        .saturating_sub(body_area.height as usize)
         .min(u16::MAX as usize) as u16;
-    form.preview_page_rows = inner.height.max(1);
+    form.preview_page_rows = body_area.height.max(1);
     // A reader parked at the end of the file stays there as it grows: the
     // monitor swaps in longer content and the view follows to the new tail.
     form.preview_scroll = if form.preview_follow_tail {
@@ -1527,15 +1544,10 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // lines in JSON/JSONL session dumps and, once scrolled, leaves stray glyphs
     // on otherwise-empty rows. Emitting exactly the visible rows keeps scroll
     // bounds accurate and drops control characters that would shift columns.
-    let window = preview_window(
-        &preview,
-        inner.width,
-        form.preview_scroll as usize,
-        inner.height as usize,
-    );
+    let window = render.window(form.preview_scroll as usize, body_area.height as usize);
     // Remember the plain text of the visible rows so a mouse selection over the
     // preview can be copied, mirroring terminal selection.
-    form.preview_text_area = Some(inner);
+    form.preview_text_area = Some(body_area);
     form.preview_visible = window
         .iter()
         .map(|line| {
@@ -1546,8 +1558,11 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect();
     let selection = form.preview_selection;
-    frame.render_widget(Paragraph::new(Text::from(window)), inner);
-    highlight_terminal_selection(frame, inner, selection);
+    frame.render_widget(Paragraph::new(Text::from(window)), body_area);
+    highlight_terminal_selection(frame, body_area, selection);
+    if !transient {
+        form.preview_rendered = Some(render);
+    }
 }
 
 /// Rows a single logical line occupies when hard-wrapped to `width` display
@@ -1571,14 +1586,6 @@ fn wrapped_row_count(line: &Line<'_>, width: usize) -> usize {
         }
     }
     rows
-}
-
-fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
-    let width = width.max(1) as usize;
-    text.lines
-        .iter()
-        .map(|line| wrapped_row_count(line, width))
-        .sum()
 }
 
 /// Hard-wrap one logical line into visual rows no wider than `width`, splitting
@@ -1618,7 +1625,7 @@ fn split_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
 /// The visual rows visible in a `height`-row viewport that starts at wrapped
 /// row `start`. Only lines overlapping the window are materialised, so large
 /// files stay off the allocation-heavy part of the render path.
-fn preview_window(text: &Text<'_>, width: u16, start: usize, height: usize) -> Vec<Line<'static>> {
+fn window_lines(lines: &[Line<'_>], width: u16, start: usize, height: usize) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
     }
@@ -1626,7 +1633,7 @@ fn preview_window(text: &Text<'_>, width: u16, start: usize, height: usize) -> V
     let end = start.saturating_add(height);
     let mut out: Vec<Line<'static>> = Vec::with_capacity(height);
     let mut row = 0usize;
-    for line in &text.lines {
+    for line in lines {
         if out.len() >= height {
             break;
         }
@@ -1646,36 +1653,325 @@ fn preview_window(text: &Text<'_>, width: u16, start: usize, height: usize) -> V
     out
 }
 
-fn file_preview_text(preview: &crate::model::FilePreview) -> Text<'static> {
-    let mut lines = vec![file_preview_metadata(preview)];
+/// Cut a line at `width` display columns, dropping zero-width and control
+/// characters the way `split_line` does. Used where wrapping would break column
+/// alignment, so the row always occupies exactly one visual row.
+fn clip_line(line: &Line<'_>, width: usize) -> Line<'static> {
+    let spans = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.to_string(), line.style.patch(span.style)))
+        .collect();
+    Line::from(truncate_spans(spans, width.max(1)).0)
+}
+
+/// Rows a plain string occupies when hard-wrapped to `width` columns. Mirrors
+/// `wrapped_row_count` without allocating a `Line` for the measurement.
+fn wrapped_str_rows(value: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for character in value.chars() {
+        let advance = UnicodeWidthChar::width(character).unwrap_or(0);
+        if advance == 0 {
+            continue;
+        }
+        if column > 0 && column + advance > width {
+            rows += 1;
+            column = 0;
+        }
+        column += advance;
+    }
+    rows
+}
+
+/// Bodies larger than this are rendered as plain rows instead of being
+/// highlighted or reformatted. Running syntect (or a JSON round-trip) over
+/// megabytes costs far more than the colour is worth, and the plain body is
+/// materialised lazily so the whole file still stays readable.
+const RICH_RENDER_LIMIT: usize = 512 * 1024;
+
+/// A preview split into rows pinned above the viewport — the file summary and,
+/// for delimited data, the column ruler and header — and a scrolling body.
+#[derive(Debug, Default)]
+pub struct PreviewRender {
+    pinned: Vec<Line<'static>>,
+    body: PreviewBody,
+    layout: PreviewLayout,
+}
+
+/// The scrolling part of a preview. Small bodies are turned into styled lines
+/// once, where highlighting pays for itself; large text and delimited data keep
+/// their source and become `Line`s only for the rows actually on screen, so a
+/// multi-megabyte file costs the same per frame as a small one.
+#[derive(Debug)]
+enum PreviewBody {
+    Lines(Vec<Line<'static>>),
+    Plain(PlainBody),
+    Table(TableBody),
+}
+
+impl Default for PreviewBody {
+    fn default() -> Self {
+        Self::Lines(Vec::new())
+    }
+}
+
+#[derive(Debug)]
+struct PlainBody {
+    content: String,
+    /// Byte range of every logical line in `content`, newline excluded.
+    lines: Vec<(usize, usize)>,
+    style: Style,
+}
+
+#[derive(Debug)]
+struct TableBody {
+    rows: Vec<Vec<String>>,
+    widths: Vec<usize>,
+    /// Display width of the row-number gutter.
+    gutter: usize,
+    /// First row of `rows` that carries data: 1 when the file has a header,
+    /// because that header is pinned rather than scrolled.
+    first_data_row: usize,
+}
+
+/// Cumulative wrapped-row offsets for one body at one pane width. Rebuilt only
+/// when either changes, so scroll bounds and windowing stay O(visible rows).
+#[derive(Debug, Default)]
+struct PreviewLayout {
+    width: u16,
+    /// `starts[i]` is the first visual row of body line `i`; the final entry is
+    /// the total row count. Empty while the body is rendered one row per line.
+    starts: Vec<u32>,
+    total: usize,
+}
+
+impl PreviewRender {
+    fn notice(message: String, color: Color) -> Self {
+        Self {
+            pinned: Vec::new(),
+            body: PreviewBody::Lines(vec![Line::styled(message, Style::default().fg(color))]),
+            layout: PreviewLayout::default(),
+        }
+    }
+
+    fn lines(pinned: Vec<Line<'static>>, lines: Vec<Line<'static>>) -> Self {
+        Self {
+            pinned,
+            body: PreviewBody::Lines(lines),
+            layout: PreviewLayout::default(),
+        }
+    }
+
+    /// Table rows are clipped to the pane instead of wrapped: a wrapped table
+    /// loses the column alignment that makes it worth drawing, and one row per
+    /// record keeps the scroll math exact without materialising any line.
+    fn wraps(&self) -> bool {
+        !matches!(self.body, PreviewBody::Table(_))
+    }
+
+    fn measure(&mut self, width: u16) {
+        let width = width.max(1);
+        if !self.wraps() {
+            self.layout.width = width;
+            self.layout.starts = Vec::new();
+            self.layout.total = self.body.len();
+            return;
+        }
+        if self.layout.width == width && self.layout.starts.len() == self.body.len() + 1 {
+            return;
+        }
+        self.layout.width = width;
+        self.layout.starts.clear();
+        self.layout.starts.reserve(self.body.len() + 1);
+        let mut row = 0u32;
+        for index in 0..self.body.len() {
+            self.layout.starts.push(row);
+            row = row.saturating_add(self.body.rows_at(index, width as usize) as u32);
+        }
+        self.layout.starts.push(row);
+        self.layout.total = row as usize;
+    }
+
+    fn height(&self) -> usize {
+        self.layout.total
+    }
+
+    fn pinned_height(&self) -> usize {
+        if !self.wraps() {
+            return self.pinned.len();
+        }
+        let width = self.layout.width.max(1) as usize;
+        self.pinned
+            .iter()
+            .map(|line| wrapped_row_count(line, width))
+            .sum()
+    }
+
+    fn pinned_window(&self, height: usize) -> Vec<Line<'static>> {
+        let width = self.layout.width.max(1);
+        if !self.wraps() {
+            return self
+                .pinned
+                .iter()
+                .take(height)
+                .map(|line| clip_line(line, width as usize))
+                .collect();
+        }
+        window_lines(&self.pinned, width, 0, height)
+    }
+
+    /// The visual rows visible in a `height`-row viewport that starts at row
+    /// `start`. Only the lines overlapping the window are built, so scrolling a
+    /// large file never touches the rest of it. Reads the width recorded by
+    /// `measure`, so the rows can never be split differently than they were
+    /// counted.
+    fn window(&self, start: usize, height: usize) -> Vec<Line<'static>> {
+        if height == 0 {
+            return Vec::new();
+        }
+        let width = self.layout.width.max(1) as usize;
+        if !self.wraps() {
+            let end = start.saturating_add(height).min(self.body.len());
+            return (start.min(end)..end)
+                .map(|index| clip_line(&self.body.line(index), width))
+                .collect();
+        }
+        let end = start.saturating_add(height);
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(height);
+        // Binary search the cumulative offsets instead of walking the file.
+        let mut index = match self
+            .layout
+            .starts
+            .binary_search(&(start.min(u32::MAX as usize) as u32))
+        {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        while index < self.body.len() && out.len() < height {
+            let row = self.layout.starts.get(index).copied().unwrap_or(0) as usize;
+            for (offset, visual) in split_line(&self.body.line(index), width)
+                .into_iter()
+                .enumerate()
+            {
+                let global = row + offset;
+                if global >= start && global < end {
+                    out.push(visual);
+                }
+            }
+            index += 1;
+        }
+        out
+    }
+}
+
+impl PreviewBody {
+    fn len(&self) -> usize {
+        match self {
+            Self::Lines(lines) => lines.len(),
+            Self::Plain(plain) => plain.lines.len(),
+            Self::Table(table) => table.rows.len().saturating_sub(table.first_data_row),
+        }
+    }
+
+    fn line(&self, index: usize) -> Line<'static> {
+        match self {
+            Self::Lines(lines) => lines.get(index).cloned().unwrap_or_default(),
+            Self::Plain(plain) => plain
+                .lines
+                .get(index)
+                .map(|&(start, end)| {
+                    Line::styled(plain.content[start..end].to_string(), plain.style)
+                })
+                .unwrap_or_default(),
+            Self::Table(table) => table.data_line(index),
+        }
+    }
+
+    /// Wrapped rows the line occupies, measured without building it.
+    fn rows_at(&self, index: usize, width: usize) -> usize {
+        match self {
+            Self::Lines(lines) => lines
+                .get(index)
+                .map(|line| wrapped_row_count(line, width))
+                .unwrap_or(1),
+            Self::Plain(plain) => plain
+                .lines
+                .get(index)
+                .map(|&(start, end)| wrapped_str_rows(&plain.content[start..end], width))
+                .unwrap_or(1),
+            Self::Table(_) => 1,
+        }
+    }
+}
+
+fn file_preview_render(preview: &crate::model::FilePreview) -> PreviewRender {
+    let mut pinned = vec![file_preview_metadata(preview)];
     if preview.truncated {
-        lines.push(Line::styled(
-            "Preview truncated at 256 KiB",
+        pinned.push(Line::styled(
+            "Only part of this file could be read",
             Style::default().fg(Color::Yellow),
         ));
     }
-    lines.push(Line::raw(""));
+    let notice = |message: &str| {
+        vec![Line::styled(
+            message.to_string(),
+            Style::default().fg(MUTED),
+        )]
+    };
     match preview.kind {
-        FilePreviewKind::Markdown => lines.extend(markdown_lines(&preview.content)),
-        FilePreviewKind::Text => lines.extend(text_preview_lines(preview)),
-        FilePreviewKind::Image => lines.push(Line::styled(
-            "Image decoding has not started.",
-            Style::default().fg(MUTED),
-        )),
-        FilePreviewKind::Audio => lines.push(Line::styled(
-            "Audio playback is not implemented yet.",
-            Style::default().fg(MUTED),
-        )),
-        FilePreviewKind::Video => lines.push(Line::styled(
-            "Video decoding has not started.",
-            Style::default().fg(MUTED),
-        )),
-        FilePreviewKind::Binary => lines.push(Line::styled(
-            "Binary content is not rendered.",
-            Style::default().fg(MUTED),
-        )),
+        FilePreviewKind::Markdown if preview.content.len() <= RICH_RENDER_LIMIT => {
+            PreviewRender::lines(pinned, markdown_lines(&preview.content))
+        }
+        FilePreviewKind::Markdown => plain_render(pinned, &preview.content),
+        FilePreviewKind::Text => text_preview_render(pinned, preview),
+        FilePreviewKind::Image => {
+            PreviewRender::lines(pinned, notice("Image decoding has not started."))
+        }
+        FilePreviewKind::Audio => {
+            PreviewRender::lines(pinned, notice("Audio playback is not implemented yet."))
+        }
+        FilePreviewKind::Video => {
+            PreviewRender::lines(pinned, notice("Video decoding has not started."))
+        }
+        FilePreviewKind::Binary => {
+            PreviewRender::lines(pinned, notice("Binary content is not rendered."))
+        }
     }
-    Text::from(lines)
+}
+
+/// Keep the source as one string and remember where each line sits, so nothing
+/// but the visible rows is ever turned into styled spans.
+fn plain_render(pinned: Vec<Line<'static>>, content: &str) -> PreviewRender {
+    PreviewRender {
+        pinned,
+        body: PreviewBody::Plain(PlainBody {
+            lines: line_ranges(content),
+            content: content.to_string(),
+            style: Style::default(),
+        }),
+        layout: PreviewLayout::default(),
+    }
+}
+
+fn line_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            let mut end = index;
+            if end > start && content.as_bytes()[end - 1] == b'\r' {
+                end -= 1;
+            }
+            ranges.push((start, end));
+            start = index + 1;
+        }
+    }
+    if start < content.len() {
+        ranges.push((start, content.len()));
+    }
+    ranges
 }
 
 fn file_preview_metadata(preview: &crate::model::FilePreview) -> Line<'static> {
@@ -1745,19 +2041,29 @@ fn composited_media_color(
     )
 }
 
-fn text_preview_lines(preview: &crate::model::FilePreview) -> Vec<Line<'static>> {
+fn text_preview_render(
+    pinned: Vec<Line<'static>>,
+    preview: &crate::model::FilePreview,
+) -> PreviewRender {
     let extension = Path::new(&preview.path)
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let rich = preview.content.len() <= RICH_RENDER_LIMIT;
     match extension.as_str() {
-        "csv" => delimited_lines(&preview.content, b','),
-        "tsv" => delimited_lines(&preview.content, b'\t'),
-        "json" => parsed_json_lines(&preview.content)
-            .unwrap_or_else(|| syntax_lines(&preview.content, &preview.path, Some("json"))),
-        "jsonl" | "ndjson" => json_lines(&preview.content),
-        _ => syntax_lines(&preview.content, &preview.path, None),
+        "csv" => delimited_render(pinned, &preview.content, b','),
+        "tsv" => delimited_render(pinned, &preview.content, b'\t'),
+        "json" if rich => PreviewRender::lines(
+            pinned,
+            parsed_json_lines(&preview.content)
+                .unwrap_or_else(|| syntax_lines(&preview.content, &preview.path, Some("json"))),
+        ),
+        "jsonl" | "ndjson" if rich => PreviewRender::lines(pinned, json_lines(&preview.content)),
+        _ if rich => {
+            PreviewRender::lines(pinned, syntax_lines(&preview.content, &preview.path, None))
+        }
+        _ => plain_render(pinned, &preview.content),
     }
 }
 
@@ -1796,13 +2102,16 @@ fn json_lines(content: &str) -> Vec<Line<'static>> {
     rendered
 }
 
-fn delimited_lines(content: &str, delimiter: u8) -> Vec<Line<'static>> {
+/// Render delimited data as a numbered table. The column ruler and, when the
+/// first record looks like a header, that header row are pinned above the
+/// viewport so they stay in place while the reader pages through the file.
+fn delimited_render(mut pinned: Vec<Line<'static>>, content: &str, delimiter: u8) -> PreviewRender {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .delimiter(delimiter)
         .from_reader(content.as_bytes());
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for record in reader.records() {
         match record {
             Ok(record) => rows.push(
@@ -1812,14 +2121,135 @@ fn delimited_lines(content: &str, delimiter: u8) -> Vec<Line<'static>> {
                     .collect(),
             ),
             Err(error) => {
-                return vec![Line::styled(
-                    format!("Could not parse delimited data: {error}"),
-                    Style::default().fg(Color::Red),
-                )];
+                return PreviewRender::lines(
+                    pinned,
+                    vec![Line::styled(
+                        format!("Could not parse delimited data: {error}"),
+                        Style::default().fg(Color::Red),
+                    )],
+                );
             }
         }
     }
-    data_table_lines(&rows, false)
+    let first_data_row = usize::from(looks_like_header(&rows));
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![1; columns];
+    for (index, width) in widths.iter_mut().enumerate() {
+        *width = (index + 1).to_string().len();
+    }
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index]
+                .max(UnicodeWidthStr::width(cell.as_str()))
+                .min(32);
+        }
+    }
+    let gutter = rows
+        .len()
+        .saturating_sub(first_data_row)
+        .to_string()
+        .len()
+        .max(1);
+    pinned.push(table_line(
+        &"#".repeat(gutter),
+        &(1..=columns)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>(),
+        &widths,
+        gutter,
+        Style::default().fg(MUTED),
+    ));
+    if first_data_row == 1 {
+        pinned.push(table_line(
+            "",
+            &rows[0],
+            &widths,
+            gutter,
+            Style::default().fg(ACCENT).bold(),
+        ));
+    }
+    pinned.push(table_rule(&widths, gutter));
+    PreviewRender {
+        pinned,
+        body: PreviewBody::Table(TableBody {
+            rows,
+            widths,
+            gutter,
+            first_data_row,
+        }),
+        layout: PreviewLayout::default(),
+    }
+}
+
+impl TableBody {
+    fn data_line(&self, index: usize) -> Line<'static> {
+        let Some(row) = self.rows.get(self.first_data_row + index) else {
+            return Line::default();
+        };
+        table_line(
+            &(index + 1).to_string(),
+            row,
+            &self.widths,
+            self.gutter,
+            Style::default(),
+        )
+    }
+}
+
+/// A first record counts as a header when every field is a non-empty label that
+/// is not a number, which is what a spreadsheet export looks like.
+fn looks_like_header(rows: &[Vec<String>]) -> bool {
+    let Some(first) = rows.first() else {
+        return false;
+    };
+    rows.len() > 1
+        && !first.is_empty()
+        && first.iter().all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty() && cell.parse::<f64>().is_err()
+        })
+}
+
+/// One table row: a right-aligned number gutter followed by the cells, each
+/// padded to its column width so every row lines up.
+fn table_line(
+    number: &str,
+    cells: &[String],
+    widths: &[usize],
+    gutter: usize,
+    style: Style,
+) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let mut spans = vec![
+        Span::styled("│", muted),
+        Span::styled(
+            format!(" {number:>gutter$} ", gutter = gutter),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled("│", muted),
+    ];
+    for (column, width) in widths.iter().enumerate() {
+        let cell = cells.get(column).map(String::as_str).unwrap_or("");
+        spans.push(Span::styled(" ", style));
+        let (cell_spans, used) =
+            truncate_spans(vec![Span::styled(cell.to_string(), style)], *width);
+        spans.extend(cell_spans);
+        spans.push(Span::styled(
+            format!("{} ", " ".repeat(width.saturating_sub(used))),
+            style,
+        ));
+        spans.push(Span::styled("│", muted));
+    }
+    Line::from(spans)
+}
+
+fn table_rule(widths: &[usize], gutter: usize) -> Line<'static> {
+    let mut segments = vec!["─".repeat(gutter + 2)];
+    segments.extend(widths.iter().map(|width| "─".repeat(width + 2)));
+    Line::styled(
+        format!("├{}┤", segments.join("┼")),
+        Style::default().fg(MUTED),
+    )
 }
 
 fn syntax_lines(content: &str, path: &str, token: Option<&str>) -> Vec<Line<'static>> {
@@ -3195,25 +3625,26 @@ mod tests {
         // A single long logical line hard-wraps into ceil(len / width) rows and
         // the height estimate matches what is rendered.
         let long = "a".repeat(250);
-        let text = Text::from(vec![Line::raw(long)]);
-        assert_eq!(wrapped_row_count(&text.lines[0], 80), 4);
-        assert_eq!(wrapped_text_height(&text, 80), 4);
+        let mut render = PreviewRender::lines(Vec::new(), vec![Line::raw(long)]);
+        render.measure(80);
+        assert_eq!(render.height(), 4);
 
         // The window returns exactly the visible rows, none wider than the pane.
-        let top = preview_window(&text, 80, 0, 2);
+        let top = render.window(0, 2);
         assert_eq!(top.len(), 2);
         assert!(top.iter().all(|line| line.width() == 80));
 
         // Scrolling past the full rows yields only the short trailing remainder.
-        let tail = preview_window(&text, 80, 3, 2);
+        let tail = render.window(3, 2);
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].width(), 250 - 80 * 3);
 
         // Control / zero-width characters are stripped so they cannot shift the
         // column accounting and leave stray glyphs behind while scrolling.
-        let dirty = Text::from(vec![Line::raw("a\u{1b}b")]);
-        assert_eq!(wrapped_row_count(&dirty.lines[0], 80), 1);
-        let rendered: String = preview_window(&dirty, 80, 0, 1)[0]
+        let mut dirty = PreviewRender::lines(Vec::new(), vec![Line::raw("a\u{1b}b")]);
+        dirty.measure(80);
+        assert_eq!(dirty.height(), 1);
+        let rendered: String = dirty.window(0, 1)[0]
             .spans
             .iter()
             .flat_map(|span| span.content.chars())
@@ -3223,14 +3654,41 @@ mod tests {
 
     #[test]
     fn preview_window_scrolls_to_the_requested_row() {
-        let text = Text::from(
+        let mut render = PreviewRender::lines(
+            Vec::new(),
             (0..6)
                 .map(|index| Line::raw(format!("line{index}")))
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(wrapped_text_height(&text, 80), 6);
-        let window = preview_window(&text, 80, 2, 3);
-        let rendered: Vec<String> = window
+        render.measure(80);
+        assert_eq!(render.height(), 6);
+        assert_eq!(
+            preview_rows(&render.window(2, 3)),
+            ["line2", "line3", "line4"]
+        );
+    }
+
+    /// A large body is kept as source and only the visible rows are built, so
+    /// scrolling stays cheap; the rows still have to be exact.
+    #[test]
+    fn plain_previews_window_without_materialising_the_file() {
+        let content = (0..2_000)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+        let mut render = plain_render(Vec::new(), &content);
+        render.measure(80);
+        assert_eq!(render.height(), 2_000);
+        assert_eq!(
+            preview_rows(&render.window(1_998, 4)),
+            ["line-1998", "line-1999"]
+        );
+        // Re-measuring at the same width must not rebuild the row index.
+        render.measure(80);
+        assert_eq!(render.height(), 2_000);
+    }
+
+    fn preview_rows(lines: &[Line<'static>]) -> Vec<String> {
+        lines
             .iter()
             .map(|line| {
                 line.spans
@@ -3238,8 +3696,7 @@ mod tests {
                     .map(|span| span.content.as_ref())
                     .collect()
             })
-            .collect();
-        assert_eq!(rendered, vec!["line2", "line3", "line4"]);
+            .collect()
     }
 
     #[test]
@@ -3734,7 +4191,7 @@ mod tests {
 
     #[test]
     fn structured_previews_parse_and_highlight_common_text_formats() {
-        let json = file_preview_text(&crate::model::FilePreview {
+        let json = file_preview_render(&crate::model::FilePreview {
             path: "/tmp/data.json".into(),
             mime: "text/plain".into(),
             kind: FilePreviewKind::Text,
@@ -3745,9 +4202,9 @@ mod tests {
         let json_text = rendered_text(&json);
         assert!(json_text.contains("\"name\""));
         assert!(json_text.contains("\"muxloom\""));
-        assert!(json.height() > 3, "JSON should be pretty printed");
+        assert!(json.body.len() > 3, "JSON should be pretty printed");
 
-        let jsonl = file_preview_text(&crate::model::FilePreview {
+        let jsonl = file_preview_render(&crate::model::FilePreview {
             path: "/tmp/events.jsonl".into(),
             mime: "text/plain".into(),
             kind: FilePreviewKind::Text,
@@ -3759,7 +4216,7 @@ mod tests {
         assert!(jsonl_text.contains("record 1"));
         assert!(jsonl_text.contains("record 2"));
 
-        let csv = file_preview_text(&crate::model::FilePreview {
+        let csv = file_preview_render(&crate::model::FilePreview {
             path: "/tmp/data.csv".into(),
             mime: "text/plain".into(),
             kind: FilePreviewKind::Text,
@@ -3770,11 +4227,11 @@ mod tests {
         let csv_text = rendered_text(&csv);
         assert!(csv_text.contains("name"));
         assert!(csv_text.contains("muxloom"));
-        assert!(csv.lines.iter().any(|line| line.spans.iter().any(|span| {
+        assert!(csv.pinned.iter().any(|line| line.spans.iter().any(|span| {
             span.content.contains("name") && span.style.add_modifier.contains(Modifier::BOLD)
         })));
 
-        let rust = file_preview_text(&crate::model::FilePreview {
+        let rust = file_preview_render(&crate::model::FilePreview {
             path: "/tmp/main.rs".into(),
             mime: "text/plain".into(),
             kind: FilePreviewKind::Text,
@@ -3782,11 +4239,73 @@ mod tests {
             content: "fn main() {}".into(),
             truncated: false,
         });
-        assert!(rust.lines.iter().any(|line| {
+        assert!(preview_lines(&rust).iter().any(|line| {
             line.spans
                 .iter()
                 .any(|span| span.content.contains("fn") && span.style.fg.is_some())
         }));
+    }
+
+    /// A header stays pinned above the viewport while the body pages, and both
+    /// the ruler and the row gutter number what is on screen.
+    #[test]
+    fn delimited_previews_pin_the_header_and_number_rows_and_columns() {
+        let content = std::iter::once("name,count".to_string())
+            .chain((1..=40).map(|index| format!("row{index},{index}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut render = file_preview_render(&crate::model::FilePreview {
+            path: "/tmp/data.csv".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: content.len() as u64,
+            content,
+            truncated: false,
+        });
+        render.measure(60);
+        // Metadata, the column ruler, the header and the rule sit above the body.
+        let pinned = preview_rows(&render.pinned_window(render.pinned_height()));
+        assert!(
+            pinned
+                .iter()
+                .any(|row| row.contains("# ") && row.contains(" 1 ") && row.contains(" 2 "))
+        );
+        assert!(
+            pinned
+                .iter()
+                .any(|row| row.contains("name") && row.contains("count"))
+        );
+
+        // The header is not repeated in the body, and every row is numbered.
+        assert_eq!(render.height(), 40);
+        let top = preview_rows(&render.window(0, 2));
+        assert!(top[0].contains(" 1 ") && top[0].contains("row1"));
+        assert!(top[1].contains(" 2 ") && top[1].contains("row2"));
+
+        // Paging keeps the pinned block intact and renumbers the visible rows.
+        let paged = preview_rows(&render.window(38, 2));
+        assert!(paged[0].contains("39") && paged[0].contains("row39"));
+        assert!(paged[1].contains("40") && paged[1].contains("row40"));
+        assert_eq!(render.pinned_height(), pinned.len());
+    }
+
+    /// Without a header every record is data, so nothing is stolen from the top
+    /// of the file and the numbering starts at the first row.
+    #[test]
+    fn delimited_previews_without_a_header_number_every_record() {
+        let mut render = file_preview_render(&crate::model::FilePreview {
+            path: "/tmp/values.csv".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 12,
+            content: "1,2\n3,4".into(),
+            truncated: false,
+        });
+        render.measure(40);
+        assert_eq!(render.height(), 2);
+        let rows = preview_rows(&render.window(0, 2));
+        assert!(rows[0].contains("1") && rows[0].contains("2"));
+        assert!(rows[1].contains("3") && rows[1].contains("4"));
     }
 
     #[test]
@@ -3817,16 +4336,15 @@ mod tests {
         assert_eq!(span.style.fg, Some(Color::Rgb(0, 0, 255)));
     }
 
-    fn rendered_text(text: &Text<'_>) -> String {
-        text.lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// Every row of a rendered preview, pinned block first, so assertions can
+    /// look at the whole thing without going through the viewport.
+    fn preview_lines(render: &PreviewRender) -> Vec<Line<'static>> {
+        let mut lines = render.pinned.clone();
+        lines.extend((0..render.body.len()).map(|index| render.body.line(index)));
+        lines
+    }
+
+    fn rendered_text(render: &PreviewRender) -> String {
+        preview_rows(&preview_lines(render)).join("\n")
     }
 }
