@@ -1516,13 +1516,16 @@ END {
     }
 
     pub fn preview_file(&self, target: &Target, path: &str) -> Result<FilePreview> {
-        const LIMIT: u64 = 256 * 1024;
+        // One round trip covers most files. Anything larger comes back flagged
+        // and is completed over the chunked file stream, so a preview shows the
+        // whole file while no single frame carries more than this.
+        const FIRST_READ: u64 = 1024 * 1024;
         if !self.bridge_recently_failed(&target.id) {
             match self
                 .bridges
-                .preview_file(target, path.into(), LIMIT as usize)
+                .preview_file(target, path.into(), FIRST_READ as usize)
             {
-                Ok(preview) => return Ok(preview),
+                Ok(preview) => return Ok(self.complete_preview(target, path, preview)),
                 Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
                 Err(_) => self.mark_bridge_failed(&target.id),
             }
@@ -1557,10 +1560,10 @@ END {
                 kind=text
                 [ -n "$mime" ] || mime=text/plain
             fi
-            if [ "$size" -gt {LIMIT} ]; then truncated=1; else truncated=0; fi
+            truncated=0
             printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
             case "$kind" in
-                text|markdown) head -c {LIMIT} -- "$path" ;;
+                text|markdown) cat -- "$path" ;;
                 audio|video)
                     if command -v ffprobe >/dev/null 2>&1; then
                         ffprobe -v error -show_entries format=format_name,duration,size,bit_rate:stream=index,codec_name,codec_type,width,height,sample_rate,channels -of default=noprint_wrappers=1 -- "$path" 2>&1 | head -n 160
@@ -1574,6 +1577,39 @@ END {
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "preview file")?;
         parse_file_preview(&output.stdout)
+    }
+
+    /// Pull the rest of a text preview whose first response hit the per-frame
+    /// limit. The partial body is dropped rather than joined onto the stream:
+    /// the companion decodes lossily, so the length of the string it returned
+    /// is not the byte offset it stopped reading at. A failed completion keeps
+    /// the partial preview — the reader sees the start of the file and a note —
+    /// instead of turning a readable file into an error.
+    fn complete_preview(
+        &self,
+        target: &Target,
+        path: &str,
+        mut preview: FilePreview,
+    ) -> FilePreview {
+        if !preview.truncated
+            || !matches!(
+                preview.kind,
+                FilePreviewKind::Text | FilePreviewKind::Markdown
+            )
+        {
+            return preview;
+        }
+        match self.bridges.read_file(target, path.into()) {
+            Ok(bytes) => {
+                preview.content = String::from_utf8_lossy(&bytes).into_owned();
+                preview.truncated = false;
+            }
+            Err(error) => debug::log(
+                "runtime",
+                format!("preview completion failed for {path}: {error}"),
+            ),
+        }
+        preview
     }
 
     pub fn download_file(

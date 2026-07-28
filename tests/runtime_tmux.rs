@@ -373,6 +373,8 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
     std::fs::write(root.join("README.md"), "# Preview\n\n- item\n").unwrap();
     std::fs::write(root.join("script_without_extension"), "print('preview')\n").unwrap();
     std::fs::write(root.join("src/job.rs"), "fn main() {}\n").unwrap();
+    let large: String = (0..40_000).map(|index| format!("line {index}\n")).collect();
+    std::fs::write(root.join("large.log"), &large).unwrap();
     let upload = source_root.join("upload.txt");
     std::fs::write(&upload, "uploaded").unwrap();
 
@@ -406,6 +408,15 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
         .unwrap();
     assert_eq!(extensionless.kind, muxloom::model::FilePreviewKind::Text);
     assert!(extensionless.content.contains("print('preview')"));
+
+    // A preview is never cut short: a file well past any single read limit comes
+    // back whole, right down to its last line.
+    let big = runtime
+        .preview_file(&target, &root.join("large.log").display().to_string())
+        .unwrap();
+    assert!(!big.truncated);
+    assert_eq!(big.content.len(), large.len());
+    assert!(big.content.ends_with("line 39999\n"));
 
     assert_eq!(
         runtime
