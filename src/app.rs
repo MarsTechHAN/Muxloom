@@ -1350,7 +1350,15 @@ impl App {
     }
 
     fn handle_interactive_key(&mut self, key: KeyEvent) -> Action {
-        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        // PageUp/PageDown drive muxloom's own scrollback only when the emulator
+        // actually retains buffered lines to move through. Linear-flow agents
+        // (e.g. Claude Code) fill that buffer, so paging shows their history.
+        // Full-screen agents that repaint a fixed viewport in place (e.g. Codex)
+        // leave it empty and page their own transcript internally (Ctrl+T), so
+        // forward the keys to them — otherwise Codex could never page.
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            && self.attached_scrollback_can_move(key.code == KeyCode::PageUp)
+        {
             self.page_history(key.code == KeyCode::PageUp);
             return Action::Continue;
         }
@@ -1364,6 +1372,30 @@ impl App {
                 format!("Agent input failed: {}", short_error(&error.to_string()));
         }
         Action::Continue
+    }
+
+    /// Whether muxloom's own scrollback can move in the requested direction for
+    /// the attached terminal. When the emulator retains no scrollback at all,
+    /// the agent owns its screen and its paging, so we decline and let the key
+    /// pass through to it. `older` is PageUp (toward history).
+    fn attached_scrollback_can_move(&mut self, older: bool) -> bool {
+        if !self.attached_terminal_for_selected() {
+            // Read-only / archived history view: muxloom always owns paging.
+            return true;
+        }
+        let Some(terminal) = self.terminal.as_mut() else {
+            return false;
+        };
+        if terminal.max_scrollback() == 0 {
+            // No buffered history: a full-screen agent paging its own transcript.
+            return false;
+        }
+        if older {
+            true
+        } else {
+            // Only reclaim PageDown while we are actually scrolled up.
+            terminal.scrollback() > 0
+        }
     }
 
     fn activate_terminal(&mut self) {

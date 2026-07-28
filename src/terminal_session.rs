@@ -260,6 +260,19 @@ impl TerminalSession {
         self.parser.screen().scrollback()
     }
 
+    /// The deepest scrollback offset the emulator currently retains. It is 0
+    /// when the screen has no buffered history — e.g. a full-screen agent that
+    /// repaints a fixed viewport in place (Codex) rather than flowing lines off
+    /// the top (Claude Code). The live view is restored before returning, so
+    /// this reads as a side-effect-free query.
+    pub fn max_scrollback(&mut self) -> usize {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(usize::MAX);
+        let max = self.parser.screen().scrollback();
+        self.parser.set_scrollback(current);
+        max
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }
