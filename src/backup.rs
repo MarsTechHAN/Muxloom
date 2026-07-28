@@ -290,7 +290,9 @@ impl BackupStore {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
         }
     }
 
@@ -375,7 +377,10 @@ fn decode_frames(bytes: &[u8]) -> Result<Vec<u8>> {
         let plain = zstd::bulk::decompress(&bytes[start..end], raw_len)
             .context("failed to zstd-decompress backup frame")?;
         if plain.len() != raw_len {
-            bail!("backup frame length mismatch: expected {raw_len}, got {}", plain.len());
+            bail!(
+                "backup frame length mismatch: expected {raw_len}, got {}",
+                plain.len()
+            );
         }
         out.extend_from_slice(&plain);
         pos = end;
@@ -539,14 +544,18 @@ fn resolve_machine(machines: &mut Vec<MachineIdentity>, probe: &IdentityProbe, n
         .iter()
         .position(|m| !probe.alias.is_empty() && m.aliases.iter().any(|a| a == &probe.alias))
         .or_else(|| {
-            machines
-                .iter()
-                .position(|m| probe.fingerprints.iter().any(|f| m.fingerprints.contains(f)))
+            machines.iter().position(|m| {
+                probe
+                    .fingerprints
+                    .iter()
+                    .any(|f| m.fingerprints.contains(f))
+            })
         })
         .or_else(|| {
-            probe.endpoint.as_ref().and_then(|endpoint| {
-                machines.iter().position(|m| m.endpoints.contains(endpoint))
-            })
+            probe
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| machines.iter().position(|m| m.endpoints.contains(endpoint)))
         });
     match matched {
         Some(index) => {
@@ -624,7 +633,14 @@ pub fn run_sync(
     let mut index = store.load_index()?;
     let mut summary = SyncSummary::default();
     for target in targets {
-        match sync_target(runtime, &store, &mut index, target, include_ansi, ansi_max_bytes) {
+        match sync_target(
+            runtime,
+            &store,
+            &mut index,
+            target,
+            include_ansi,
+            ansi_max_bytes,
+        ) {
             Ok(stats) => {
                 summary.sessions += stats.sessions;
                 summary.transcripts += stats.transcripts;
@@ -688,8 +704,7 @@ pub fn sync_target(
                     "backup",
                     format!("capture {} on {} failed: {error:#}", session.id, target.id),
                 );
-            } else if let Err(error) =
-                store.retain_capture(&partition, &session.id, ansi_max_bytes)
+            } else if let Err(error) = store.retain_capture(&partition, &session.id, ansi_max_bytes)
             {
                 crate::debug::log("backup", format!("retain {} failed: {error:#}", session.id));
             }
@@ -711,7 +726,10 @@ pub fn sync_target(
         {
             crate::debug::log(
                 "backup",
-                format!("transcript {} on {} failed: {error:#}", session.id, target.id),
+                format!(
+                    "transcript {} on {} failed: {error:#}",
+                    session.id, target.id
+                ),
             );
         }
 
@@ -858,7 +876,9 @@ fn pick_native_candidate<'a>(
     {
         return Some(existing);
     }
-    candidates.iter().max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    candidates
+        .iter()
+        .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
 }
 
 fn now_unix() -> u64 {
@@ -925,7 +945,12 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                             .unwrap_or_default();
                         if role == "user" || role == "assistant" {
                             let body = content_to_text(payload.get("content"));
-                            push_message(&mut messages, role, body, string_field(&value, "timestamp"));
+                            push_message(
+                                &mut messages,
+                                role,
+                                body,
+                                string_field(&value, "timestamp"),
+                            );
                         }
                     }
                 }
@@ -943,7 +968,9 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                 if let Some(role) = value.get("type").and_then(Value::as_str)
                     && (role == "user" || role == "assistant")
                 {
-                    let content = value.get("message").and_then(|message| message.get("content"));
+                    let content = value
+                        .get("message")
+                        .and_then(|message| message.get("content"));
                     let body = content_to_text(content);
                     push_message(&mut messages, role, body, string_field(&value, "timestamp"));
                 }
@@ -1087,7 +1114,11 @@ pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<Sear
                     title: record.title.clone(),
                     role: "title".into(),
                     snippet: make_snippet(
-                        if record.title.is_empty() { &record.recap } else { &record.title },
+                        if record.title.is_empty() {
+                            &record.recap
+                        } else {
+                            &record.title
+                        },
                         &needle,
                     ),
                     score: 1,
@@ -1095,11 +1126,7 @@ pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<Sear
             }
         }
     }
-    hits.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(b.created_at.cmp(&a.created_at))
-    });
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.created_at.cmp(&a.created_at)));
     hits.truncate(limit);
     Ok(hits)
 }
@@ -1192,7 +1219,9 @@ mod tests {
             .append_frame("local", "s1", CAPTURE_BLOB, b"world")
             .unwrap();
         // A third empty append is a no-op and must not corrupt the stream.
-        store.append_frame("local", "s1", CAPTURE_BLOB, b"").unwrap();
+        store
+            .append_frame("local", "s1", CAPTURE_BLOB, b"")
+            .unwrap();
         let out = store.read_blob("local", "s1", CAPTURE_BLOB).unwrap();
         assert_eq!(out, b"hello world");
     }
@@ -1200,15 +1229,24 @@ mod tests {
     #[test]
     fn read_blob_is_empty_when_absent() {
         let store = temp_store();
-        assert!(store.read_blob("local", "missing", CAPTURE_BLOB).unwrap().is_empty());
+        assert!(
+            store
+                .read_blob("local", "missing", CAPTURE_BLOB)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(store.blob_len("local", "missing", CAPTURE_BLOB), 0);
     }
 
     #[test]
     fn write_blob_overwrites_with_single_frame() {
         let store = temp_store();
-        store.write_blob("local", "s1", TRANSCRIPT_BLOB, b"first").unwrap();
-        store.write_blob("local", "s1", TRANSCRIPT_BLOB, b"second value").unwrap();
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, b"first")
+            .unwrap();
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, b"second value")
+            .unwrap();
         let out = store.read_blob("local", "s1", TRANSCRIPT_BLOB).unwrap();
         assert_eq!(out, b"second value");
     }
@@ -1305,7 +1343,9 @@ mod tests {
             br#"{"type":"user","message":{"content":"q"}}"#,
         );
         let jsonl = messages_to_jsonl(&messages);
-        store.write_blob("local", "s1", MESSAGES_BLOB, jsonl.as_bytes()).unwrap();
+        store
+            .write_blob("local", "s1", MESSAGES_BLOB, jsonl.as_bytes())
+            .unwrap();
         let back = store.read_blob("local", "s1", MESSAGES_BLOB).unwrap();
         assert_eq!(back, jsonl.as_bytes());
         assert!(String::from_utf8_lossy(&back).contains("\"q\""));
@@ -1325,7 +1365,12 @@ mod tests {
                 })
                 .collect();
             store
-                .write_blob(target, session, MESSAGES_BLOB, messages_to_jsonl(&messages).as_bytes())
+                .write_blob(
+                    target,
+                    session,
+                    MESSAGES_BLOB,
+                    messages_to_jsonl(&messages).as_bytes(),
+                )
                 .unwrap();
             let mut index = store.load_index().unwrap();
             index.upsert(BackupRecord {
@@ -1342,7 +1387,10 @@ mod tests {
         write(
             "h20",
             "s2",
-            &[("user", "scroll scroll scroll again"), ("assistant", "press PageDown")],
+            &[
+                ("user", "scroll scroll scroll again"),
+                ("assistant", "press PageDown"),
+            ],
             200,
         );
 
@@ -1395,10 +1443,17 @@ mod tests {
             "[h]:9251 ECDSA SHA256:AAA\n", // duplicate token
         );
         let fingerprints = parse_known_host_fingerprints(text);
-        assert_eq!(fingerprints, vec!["SHA256:AAA".to_string(), "SHA256:BBB".to_string()]);
+        assert_eq!(
+            fingerprints,
+            vec!["SHA256:AAA".to_string(), "SHA256:BBB".to_string()]
+        );
     }
 
-    fn ssh_probe(alias: &str, fingerprints: &[&str], endpoint: Option<MachineEndpoint>) -> IdentityProbe {
+    fn ssh_probe(
+        alias: &str,
+        fingerprints: &[&str],
+        endpoint: Option<MachineEndpoint>,
+    ) -> IdentityProbe {
         IdentityProbe {
             alias: alias.to_string(),
             fingerprints: fingerprints.iter().map(|f| f.to_string()).collect(),
@@ -1426,17 +1481,32 @@ mod tests {
         let mut machines = Vec::new();
         resolve_machine(&mut machines, &ssh_probe("h20", &["SHA256:X"], None), 100);
         // A different alias but overlapping host-key fingerprint → same machine.
-        let key = resolve_machine(&mut machines, &ssh_probe("h20-alt", &["SHA256:X"], None), 150);
+        let key = resolve_machine(
+            &mut machines,
+            &ssh_probe("h20-alt", &["SHA256:X"], None),
+            150,
+        );
         assert_eq!(key, "h20", "fingerprint overlap keeps the first-seen key");
         assert_eq!(machines.len(), 1);
-        assert_eq!(machines[0].aliases, vec!["h20".to_string(), "h20-alt".to_string()]);
+        assert_eq!(
+            machines[0].aliases,
+            vec!["h20".to_string(), "h20-alt".to_string()]
+        );
     }
 
     #[test]
     fn resolve_machine_merges_by_endpoint_when_no_fingerprint() {
-        let endpoint = MachineEndpoint { host: "h".into(), user: "u".into(), port: "9".into() };
+        let endpoint = MachineEndpoint {
+            host: "h".into(),
+            user: "u".into(),
+            port: "9".into(),
+        };
         let mut machines = Vec::new();
-        resolve_machine(&mut machines, &ssh_probe("a", &[], Some(endpoint.clone())), 100);
+        resolve_machine(
+            &mut machines,
+            &ssh_probe("a", &[], Some(endpoint.clone())),
+            100,
+        );
         // No alias/fingerprint overlap, but same endpoint → same machine.
         let key = resolve_machine(&mut machines, &ssh_probe("b", &[], Some(endpoint)), 150);
         assert_eq!(key, "a");
@@ -1447,7 +1517,11 @@ mod tests {
     fn resolve_machine_alias_beats_fingerprint() {
         // Machine A owns alias "a"; machine B owns fingerprint "SHA256:X".
         let mut machines = vec![
-            MachineIdentity { key: "a".into(), aliases: vec!["a".into()], ..Default::default() },
+            MachineIdentity {
+                key: "a".into(),
+                aliases: vec!["a".into()],
+                ..Default::default()
+            },
             MachineIdentity {
                 key: "b".into(),
                 aliases: vec!["b".into()],

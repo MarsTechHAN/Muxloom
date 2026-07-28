@@ -2480,8 +2480,10 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new("Up/Down select   Enter launch   type to search other machines   Left/Esc back")
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(
+            "Up/Down select   Enter launch   type to search other machines   Left/Esc back",
+        )
+        .style(Style::default().fg(MUTED)),
         Rect::new(inner.x, footer_y, inner.width, 1),
     );
 }
@@ -2496,9 +2498,8 @@ fn draw_resume_history_panel(frame: &mut Frame<'_>, form: &ResumeForm, inner: Re
         format!(" Search all machines: {}", form.query)
     };
     frame.render_widget(
-        Paragraph::new(truncate(&query_line, inner.width as usize)).style(
-            Style::default().fg(if form.query.is_empty() { MUTED } else { ACCENT }),
-        ),
+        Paragraph::new(truncate(&query_line, inner.width as usize))
+            .style(Style::default().fg(if form.query.is_empty() { MUTED } else { ACCENT })),
         Rect::new(inner.x, search_y, inner.width, 1),
     );
     if !form.history_active() {
@@ -2529,7 +2530,11 @@ fn draw_resume_history_panel(frame: &mut Frame<'_>, form: &ResumeForm, inner: Re
             break;
         }
         let selected = index == form.history_selected;
-        let glyph = hit.kind.parse::<AgentKind>().map(|k| agent_visual(k).0).unwrap_or("•");
+        let glyph = hit
+            .kind
+            .parse::<AgentKind>()
+            .map(|k| agent_visual(k).0)
+            .unwrap_or("•");
         let title = if hit.title.trim().is_empty() {
             hit.snippet.as_str()
         } else {
