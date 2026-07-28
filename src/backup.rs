@@ -28,6 +28,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    model::{AgentKind, Target, Transport},
+    model::{AgentKind, LOCAL_TARGET_ID, Target, Transport},
     runtime::Runtime,
 };
 
@@ -90,27 +91,73 @@ impl BackupRecord {
     }
 }
 
-/// The on-disk index: a flat list of records (one per session; small).
+/// A resolved network endpoint for a machine: `ssh -G`'s effective
+/// `hostname`/`user`/`port`. The lowest-priority identity signal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct MachineEndpoint {
+    pub host: String,
+    pub user: String,
+    pub port: String,
+}
+
+/// A physical machine's stable identity, persisted in the backup index so that
+/// the same box is recognised across ssh-alias churn. Sessions are partitioned
+/// under [`MachineIdentity::key`] (assigned once, never changes). Matching a
+/// target to a machine is by priority: ssh alias > host-key fingerprint >
+/// endpoint (host+user+port). Every field is `#[serde(default)]` for forward
+/// compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct MachineIdentity {
+    /// Stable partition key = the alias first seen for this machine (or `local`).
+    pub key: String,
+    /// Every ssh alias observed to resolve to this machine.
+    pub aliases: Vec<String>,
+    /// Host-key SHA256 fingerprints (all key types) from the local known_hosts.
+    pub fingerprints: Vec<String>,
+    /// Resolved endpoints (host/user/port) observed for this machine.
+    pub endpoints: Vec<MachineEndpoint>,
+    /// Platform, filled lazily once (`uname` / local consts); empty until known.
+    pub os: String,
+    pub arch: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
+}
+
+/// The on-disk index: a flat list of records (one per session; small) plus the
+/// registry of known machines used to partition and de-alias those records.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BackupIndex {
     #[serde(default)]
     pub records: Vec<BackupRecord>,
+    #[serde(default)]
+    pub machines: Vec<MachineIdentity>,
 }
 
 impl BackupIndex {
-    /// Find a record's position by (target, session).
+    /// Find a record's position by (partition, session).
     pub fn position(&self, target_id: &str, session_id: &str) -> Option<usize> {
         self.records
             .iter()
             .position(|record| record.target_id == target_id && record.session_id == session_id)
     }
 
-    /// Insert or replace a record, keyed by (target, session).
+    /// Insert or replace a record, keyed by (partition, session).
     pub fn upsert(&mut self, record: BackupRecord) {
         match self.position(&record.target_id, &record.session_id) {
             Some(index) => self.records[index] = record,
             None => self.records.push(record),
         }
+    }
+
+    /// Machine key for an ssh alias, or the alias itself if never registered.
+    pub fn machine_key_for_alias(&self, alias: &str) -> String {
+        self.machines
+            .iter()
+            .find(|machine| machine.aliases.iter().any(|known| known == alias))
+            .map(|machine| machine.key.clone())
+            .unwrap_or_else(|| alias.to_string())
     }
 }
 
@@ -372,6 +419,201 @@ impl std::fmt::Display for SyncSummary {
 /// Run one backup pass over `targets` into the default store, updating the
 /// shared index. Errors on a single target are logged and skipped so one
 /// offline machine does not abort the whole pass.
+/// An identity probe for one target: the signals used to match it to a machine.
+/// SSH-only fields are empty for the local target (which matches by alias only).
+struct IdentityProbe {
+    /// The ssh alias (`local` for the local target); "" only if unknowable.
+    alias: String,
+    /// Host-key SHA256 fingerprints from the local known_hosts (all key types).
+    fingerprints: Vec<String>,
+    /// Resolved endpoint from `ssh -G`, when available.
+    endpoint: Option<MachineEndpoint>,
+}
+
+/// Parse `ssh -G <alias>` output into an endpoint. Keys are lowercased by ssh.
+fn parse_ssh_config_g(text: &str) -> MachineEndpoint {
+    let mut endpoint = MachineEndpoint::default();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("hostname"), Some(value)) => endpoint.host = value.to_string(),
+            (Some("user"), Some(value)) => endpoint.user = value.to_string(),
+            (Some("port"), Some(value)) => endpoint.port = value.to_string(),
+            _ => {}
+        }
+    }
+    endpoint
+}
+
+/// Extract every `SHA256:...` fingerprint token from `ssh-keygen -lF` output,
+/// de-duplicated. A host commonly has several keys (ed25519/rsa/ecdsa).
+fn parse_known_host_fingerprints(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        if token.starts_with("SHA256:") {
+            let token = token.to_string();
+            if !out.contains(&token) {
+                out.push(token);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve an ssh alias to a `hostname/user/port` endpoint via `ssh -G` (local,
+/// no connection). Returns None if ssh is missing or emits no hostname.
+fn ssh_endpoint(alias: &str) -> Option<MachineEndpoint> {
+    let output = Command::new("ssh").args(["-G", alias]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let endpoint = parse_ssh_config_g(&String::from_utf8_lossy(&output.stdout));
+    (!endpoint.host.is_empty()).then_some(endpoint)
+}
+
+/// Read the host-key fingerprints already trusted for an endpoint from the
+/// local known_hosts via `ssh-keygen -lF` (no network). Empty if not present
+/// yet (e.g. first sync before the host is trusted) — matching then falls back
+/// to the endpoint and self-heals next pass.
+fn known_host_fingerprints(host: &str, port: &str) -> Vec<String> {
+    let query = if port.is_empty() || port == "22" {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    match Command::new("ssh-keygen").args(["-lF", &query]).output() {
+        // ssh-keygen exits non-zero when the host is absent; that is not an error.
+        Ok(output) => parse_known_host_fingerprints(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Build the identity probe for a target using local commands only.
+fn probe_identity(target: &Target) -> IdentityProbe {
+    match &target.transport {
+        Transport::Local => IdentityProbe {
+            alias: LOCAL_TARGET_ID.to_string(),
+            fingerprints: Vec::new(),
+            endpoint: None,
+        },
+        Transport::Ssh { alias } => {
+            let endpoint = ssh_endpoint(alias);
+            let fingerprints = endpoint
+                .as_ref()
+                .map(|e| known_host_fingerprints(&e.host, &e.port))
+                .unwrap_or_default();
+            IdentityProbe {
+                alias: alias.clone(),
+                fingerprints,
+                endpoint,
+            }
+        }
+    }
+}
+
+/// Union the probe's signals into an existing machine record.
+fn merge_identity(machine: &mut MachineIdentity, probe: &IdentityProbe, now: u64) {
+    if !probe.alias.is_empty() && !machine.aliases.iter().any(|a| a == &probe.alias) {
+        machine.aliases.push(probe.alias.clone());
+    }
+    for fingerprint in &probe.fingerprints {
+        if !machine.fingerprints.contains(fingerprint) {
+            machine.fingerprints.push(fingerprint.clone());
+        }
+    }
+    if let Some(endpoint) = &probe.endpoint
+        && !machine.endpoints.contains(endpoint)
+    {
+        machine.endpoints.push(endpoint.clone());
+    }
+    if machine.first_seen == 0 {
+        machine.first_seen = now;
+    }
+    machine.last_seen = now;
+}
+
+/// Match a probe to a known machine by priority (alias > fingerprint > endpoint)
+/// and merge, or register a new machine. Returns the stable partition key.
+fn resolve_machine(machines: &mut Vec<MachineIdentity>, probe: &IdentityProbe, now: u64) -> String {
+    let matched = machines
+        .iter()
+        .position(|m| !probe.alias.is_empty() && m.aliases.iter().any(|a| a == &probe.alias))
+        .or_else(|| {
+            machines
+                .iter()
+                .position(|m| probe.fingerprints.iter().any(|f| m.fingerprints.contains(f)))
+        })
+        .or_else(|| {
+            probe.endpoint.as_ref().and_then(|endpoint| {
+                machines.iter().position(|m| m.endpoints.contains(endpoint))
+            })
+        });
+    match matched {
+        Some(index) => {
+            merge_identity(&mut machines[index], probe, now);
+            machines[index].key.clone()
+        }
+        None => {
+            let key = if !probe.alias.is_empty() {
+                probe.alias.clone()
+            } else if let Some(fingerprint) = probe.fingerprints.first() {
+                fingerprint.clone()
+            } else if let Some(endpoint) = &probe.endpoint {
+                format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port)
+            } else {
+                "unknown".to_string()
+            };
+            let mut machine = MachineIdentity {
+                key: key.clone(),
+                ..Default::default()
+            };
+            merge_identity(&mut machine, probe, now);
+            machines.push(machine);
+            key
+        }
+    }
+}
+
+/// Resolve a target to its stable machine partition key, updating the registry.
+fn resolve_partition(machines: &mut Vec<MachineIdentity>, target: &Target, now: u64) -> String {
+    let probe = probe_identity(target);
+    resolve_machine(machines, &probe, now)
+}
+
+/// Fill in a machine's platform once (cheap `uname`, or local consts), so an
+/// offline machine still shows what it is. No-op once known.
+fn enrich_platform(index: &mut BackupIndex, runtime: &Runtime, target: &Target, partition: &str) {
+    let already_known = index
+        .machines
+        .iter()
+        .any(|m| m.key == partition && !m.os.is_empty());
+    if already_known {
+        return;
+    }
+    let platform = match target.transport {
+        Transport::Local => Some((
+            std::env::consts::OS.to_string(),
+            std::env::consts::ARCH.to_string(),
+        )),
+        Transport::Ssh { .. } => runtime.probe_platform(target),
+    };
+    if let Some((os, arch)) = platform
+        && let Some(machine) = index.machines.iter_mut().find(|m| m.key == partition)
+    {
+        machine.os = os;
+        machine.arch = arch;
+    }
+}
+
+/// Machine key for an ssh alias against the on-disk registry (or the alias if
+/// unregistered). Used by the UI to compare machines, not just aliases.
+pub fn machine_key_for_alias(store: &BackupStore, alias: &str) -> String {
+    store
+        .load_index()
+        .map(|index| index.machine_key_for_alias(alias))
+        .unwrap_or_else(|_| alias.to_string())
+}
+
 pub fn run_sync(
     runtime: &Runtime,
     targets: &[Target],
@@ -408,6 +650,10 @@ pub fn sync_target(
 ) -> Result<SyncSummary> {
     let mut stats = SyncSummary::default();
     let is_local = matches!(target.transport, Transport::Local);
+    // Canonicalise the target to a stable machine key, then partition all
+    // storage/records under it (bridge calls below still use the real target).
+    let partition = resolve_partition(&mut index.machines, target, now_unix());
+    enrich_platform(index, runtime, target, &partition);
     let sessions = runtime
         .bridge_pool()
         .list_sessions(target)
@@ -415,10 +661,10 @@ pub fn sync_target(
 
     for session in sessions {
         let mut record = index
-            .position(&target.id, &session.id)
+            .position(&partition, &session.id)
             .map(|position| index.records[position].clone())
             .unwrap_or_default();
-        record.target_id = target.id.clone();
+        record.target_id = partition.clone();
         record.session_id = session.id.clone();
         record.kind = session.kind.clone();
         record.cwd = session.path.clone();
@@ -429,15 +675,21 @@ pub fn sync_target(
         record.archived = session.archived;
 
         if include_ansi {
-            if let Err(error) =
-                sync_capture(runtime, store, target, &session.id, &mut record, &mut stats)
-            {
+            if let Err(error) = sync_capture(
+                runtime,
+                store,
+                target,
+                &partition,
+                &session.id,
+                &mut record,
+                &mut stats,
+            ) {
                 crate::debug::log(
                     "backup",
                     format!("capture {} on {} failed: {error:#}", session.id, target.id),
                 );
             } else if let Err(error) =
-                store.retain_capture(&target.id, &session.id, ansi_max_bytes)
+                store.retain_capture(&partition, &session.id, ansi_max_bytes)
             {
                 crate::debug::log("backup", format!("retain {} failed: {error:#}", session.id));
             }
@@ -449,6 +701,7 @@ pub fn sync_target(
                 runtime,
                 store,
                 target,
+                &partition,
                 is_local,
                 kind,
                 &session,
@@ -484,10 +737,12 @@ const CAPTURE_BACKFILL_LINES: usize = 5_000;
 /// Mirror the session's raw `.ansi` capture incrementally via `read_history`
 /// (works over the local socket and SSH alike). Faithful raw bytes are appended
 /// as new zstd frames; only the delta beyond `ansi_lines_synced` is transferred.
+#[allow(clippy::too_many_arguments)]
 fn sync_capture(
     runtime: &Runtime,
     store: &BackupStore,
     target: &Target,
+    partition: &str,
     session_id: &str,
     record: &mut BackupRecord,
     stats: &mut SyncSummary,
@@ -498,7 +753,7 @@ fn sync_capture(
         .total_lines;
     if total < record.ansi_lines_synced {
         // Source rotated/shrank → restart the capture blob.
-        store.remove_blob(&target.id, session_id, CAPTURE_BLOB)?;
+        store.remove_blob(partition, session_id, CAPTURE_BLOB)?;
         record.ansi_lines_synced = 0;
     }
     if record.ansi_lines_synced == 0 {
@@ -512,7 +767,7 @@ fn sync_capture(
         if page.bytes.is_empty() {
             break;
         }
-        store.append_frame(&target.id, session_id, CAPTURE_BLOB, &page.bytes)?;
+        store.append_frame(partition, session_id, CAPTURE_BLOB, &page.bytes)?;
         stats.ansi_bytes += page.bytes.len() as u64;
         record.ansi_lines_synced += window;
     }
@@ -527,6 +782,7 @@ fn sync_transcript(
     runtime: &Runtime,
     store: &BackupStore,
     target: &Target,
+    partition: &str,
     is_local: bool,
     kind: AgentKind,
     session: &crate::daemon_protocol::DaemonSession,
@@ -557,7 +813,7 @@ fn sync_transcript(
     } else {
         let temp = std::env::temp_dir().join(format!(
             "muxloom-backup-{}-{}.jsonl",
-            sanitize(&target.id),
+            sanitize(partition),
             sanitize(&session.id)
         ));
         runtime
@@ -569,10 +825,10 @@ fn sync_transcript(
         data
     };
 
-    store.write_blob(&target.id, &session.id, TRANSCRIPT_BLOB, &data)?;
+    store.write_blob(partition, &session.id, TRANSCRIPT_BLOB, &data)?;
     let (messages, title) = extract_messages(kind, &data);
     store.write_blob(
-        &target.id,
+        partition,
         &session.id,
         MESSAGES_BLOB,
         messages_to_jsonl(&messages).as_bytes(),
@@ -994,6 +1250,7 @@ mod tests {
         .unwrap();
         let index = store.load_index().unwrap();
         assert_eq!(index.records.len(), 1);
+        assert!(index.machines.is_empty()); // new field defaults to empty
         let record = &index.records[0];
         assert_eq!(record.target_id, "h20");
         assert_eq!(record.ansi_lines_synced, 0); // defaulted
@@ -1117,5 +1374,112 @@ mod tests {
         );
         let out = store.read_blob("local", "s1", CAPTURE_BLOB).unwrap();
         assert_eq!(out, chunk.as_bytes());
+    }
+
+    #[test]
+    fn parses_ssh_config_g_endpoint() {
+        let text = "user tiger\nhostname 2605:340::2439\nport 9251\nforwardagent no\n";
+        let endpoint = parse_ssh_config_g(text);
+        assert_eq!(endpoint.host, "2605:340::2439");
+        assert_eq!(endpoint.user, "tiger");
+        assert_eq!(endpoint.port, "9251");
+    }
+
+    #[test]
+    fn parses_known_host_fingerprints_dedup() {
+        let text = concat!(
+            "# Host [h]:9251 found: line 56\n",
+            "[h]:9251 ED25519 SHA256:AAA\n",
+            "# Host [h]:9251 found: line 57\n",
+            "[h]:9251 RSA SHA256:BBB\n",
+            "[h]:9251 ECDSA SHA256:AAA\n", // duplicate token
+        );
+        let fingerprints = parse_known_host_fingerprints(text);
+        assert_eq!(fingerprints, vec!["SHA256:AAA".to_string(), "SHA256:BBB".to_string()]);
+    }
+
+    fn ssh_probe(alias: &str, fingerprints: &[&str], endpoint: Option<MachineEndpoint>) -> IdentityProbe {
+        IdentityProbe {
+            alias: alias.to_string(),
+            fingerprints: fingerprints.iter().map(|f| f.to_string()).collect(),
+            endpoint,
+        }
+    }
+
+    #[test]
+    fn resolve_machine_registers_then_reuses_by_alias() {
+        let mut machines = Vec::new();
+        let key = resolve_machine(&mut machines, &ssh_probe("h20", &["SHA256:X"], None), 100);
+        assert_eq!(key, "h20");
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].aliases, vec!["h20".to_string()]);
+        // Same alias again → same machine, no duplicate.
+        let key2 = resolve_machine(&mut machines, &ssh_probe("h20", &[], None), 200);
+        assert_eq!(key2, "h20");
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].last_seen, 200);
+        assert_eq!(machines[0].first_seen, 100);
+    }
+
+    #[test]
+    fn resolve_machine_merges_new_alias_by_fingerprint() {
+        let mut machines = Vec::new();
+        resolve_machine(&mut machines, &ssh_probe("h20", &["SHA256:X"], None), 100);
+        // A different alias but overlapping host-key fingerprint → same machine.
+        let key = resolve_machine(&mut machines, &ssh_probe("h20-alt", &["SHA256:X"], None), 150);
+        assert_eq!(key, "h20", "fingerprint overlap keeps the first-seen key");
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].aliases, vec!["h20".to_string(), "h20-alt".to_string()]);
+    }
+
+    #[test]
+    fn resolve_machine_merges_by_endpoint_when_no_fingerprint() {
+        let endpoint = MachineEndpoint { host: "h".into(), user: "u".into(), port: "9".into() };
+        let mut machines = Vec::new();
+        resolve_machine(&mut machines, &ssh_probe("a", &[], Some(endpoint.clone())), 100);
+        // No alias/fingerprint overlap, but same endpoint → same machine.
+        let key = resolve_machine(&mut machines, &ssh_probe("b", &[], Some(endpoint)), 150);
+        assert_eq!(key, "a");
+        assert_eq!(machines.len(), 1);
+    }
+
+    #[test]
+    fn resolve_machine_alias_beats_fingerprint() {
+        // Machine A owns alias "a"; machine B owns fingerprint "SHA256:X".
+        let mut machines = vec![
+            MachineIdentity { key: "a".into(), aliases: vec!["a".into()], ..Default::default() },
+            MachineIdentity {
+                key: "b".into(),
+                aliases: vec!["b".into()],
+                fingerprints: vec!["SHA256:X".into()],
+                ..Default::default()
+            },
+        ];
+        // A probe matching A by alias AND B by fingerprint must resolve to A.
+        let key = resolve_machine(&mut machines, &ssh_probe("a", &["SHA256:X"], None), 200);
+        assert_eq!(key, "a");
+        assert_eq!(machines.len(), 2, "no new machine created");
+    }
+
+    #[test]
+    fn resolve_machine_distinct_boxes_stay_separate() {
+        let mut machines = Vec::new();
+        let k1 = resolve_machine(&mut machines, &ssh_probe("a", &["SHA256:X"], None), 100);
+        let k2 = resolve_machine(&mut machines, &ssh_probe("b", &["SHA256:Y"], None), 100);
+        assert_ne!(k1, k2);
+        assert_eq!(machines.len(), 2);
+    }
+
+    #[test]
+    fn index_maps_alias_to_machine_key() {
+        let mut index = BackupIndex::default();
+        index.machines.push(MachineIdentity {
+            key: "h20".into(),
+            aliases: vec!["h20".into(), "h20-alt".into()],
+            ..Default::default()
+        });
+        assert_eq!(index.machine_key_for_alias("h20-alt"), "h20");
+        // Unknown alias falls back to itself.
+        assert_eq!(index.machine_key_for_alias("other"), "other");
     }
 }

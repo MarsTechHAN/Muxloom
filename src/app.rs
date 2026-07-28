@@ -4072,7 +4072,11 @@ impl App {
         launch: &LaunchForm,
         hit: &CrossMachineHit,
     ) -> String {
-        let same_machine = hit.target_id == launch.target.id;
+        // Compare machines, not raw aliases: hit.target_id is a stable machine
+        // key, so canonicalise the launch target's alias the same way before
+        // deciding whether the referenced conversation ran on a different box.
+        let launch_machine = backup_machine_key_for_alias(&launch.target.id);
+        let same_machine = hit.target_id == launch_machine;
         let mut prompt = String::new();
         if same_machine {
             prompt.push_str(&format!(
@@ -4085,7 +4089,7 @@ impl App {
                  not the machine you are running on now ({}). Its files, paths, and environment \
                  may not exist here — treat it purely as reference context, verify anything before \
                  relying on it, and do not assume the referenced workspace is present.",
-                hit.target_id, launch.target.id
+                hit.target_id, launch_machine
             ));
         }
         if !hit.title.trim().is_empty() {
@@ -5546,6 +5550,20 @@ fn backup_session_transcript(target_id: &str, session_id: &str, max_chars: usize
 #[cfg(not(feature = "controller"))]
 fn backup_session_transcript(_target_id: &str, _session_id: &str, _max_chars: usize) -> String {
     String::new()
+}
+
+/// Canonicalise an ssh alias to its stable backup machine key, so "same
+/// machine" comparisons survive alias churn. The daemon build has no registry,
+/// so its stub just returns the alias unchanged.
+#[cfg(feature = "controller")]
+fn backup_machine_key_for_alias(alias: &str) -> String {
+    let store = crate::backup::BackupStore::new(crate::backup::BackupStore::default_root());
+    crate::backup::machine_key_for_alias(&store, alias)
+}
+
+#[cfg(not(feature = "controller"))]
+fn backup_machine_key_for_alias(alias: &str) -> String {
+    alias.to_string()
 }
 
 fn history_reference_prompt(launch: &LaunchForm, candidate: &ResumeCandidate) -> String {

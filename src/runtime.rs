@@ -1908,6 +1908,21 @@ END {
             .with_context(|| format!("failed to execute command on {}", target.id))
     }
 
+    /// Best-effort `uname -s` / `uname -m` for a target's OS/arch, recorded once
+    /// in the backup machine registry. Returns None on any failure.
+    #[cfg(feature = "controller")]
+    pub(crate) fn probe_platform(&self, target: &Target) -> Option<(String, String)> {
+        let output = self.run_shell(target, "uname -s; uname -m", false).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines();
+        let os = lines.next()?.trim().to_string();
+        let arch = lines.next().unwrap_or("").trim().to_string();
+        (!os.is_empty()).then_some((os, arch))
+    }
+
     fn bridge_recently_failed(&self, target_id: &str) -> bool {
         self.bridge_failures
             .lock()
