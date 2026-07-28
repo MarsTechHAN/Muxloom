@@ -1274,15 +1274,21 @@ mod platform {
             } else {
                 FileEntryKind::Other
             };
+            let metadata = entry.metadata().ok();
             entries.push(FileEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().to_string_lossy().into_owned(),
                 kind,
                 size: if file_type.is_file() {
-                    entry.metadata().map_or(0, |metadata| metadata.len())
+                    metadata.as_ref().map_or(0, |metadata| metadata.len())
                 } else {
                     0
                 },
+                mtime: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |since_epoch| since_epoch.as_secs()),
             });
         }
         entries.sort_by(|left, right| {

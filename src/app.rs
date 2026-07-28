@@ -163,6 +163,14 @@ pub struct FileManagerForm {
     pub preview_scroll: u16,
     pub preview_max_scroll: u16,
     pub preview_page_rows: u16,
+    /// True while the view sits at the bottom of the preview. A refresh that
+    /// makes the file longer then follows the new tail instead of leaving the
+    /// reader stranded above the appended lines.
+    pub preview_follow_tail: bool,
+    /// `(size, mtime)` of the previewed file as of the listing that produced the
+    /// preview now on screen. A later listing with a different stamp means the
+    /// file changed and the preview needs re-fetching.
+    pub preview_stamp: Option<(u64, u64)>,
     pub preview_rendered: Option<Text<'static>>,
     pub query: String,
     pub search_request_id: Option<u64>,
@@ -233,6 +241,13 @@ pub const HELP_CONTENT_ROWS: usize = 52;
 const ANIMATION_FRAME_MS: u128 = 180;
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How often the browser re-lists the directory holding the open preview to
+/// notice that the file changed. Only runs while a preview is on screen, so an
+/// idle browser costs nothing on the wire.
+const FILE_MONITOR_INTERVAL: Duration = Duration::from_millis(1500);
+/// How long to wait for a monitor listing before assuming it was lost and
+/// polling again. Keeps a dropped reply from wedging the monitor for good.
+const FILE_MONITOR_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -447,6 +462,11 @@ pub struct App {
     pending_archived_resume: Option<ArchivedResume>,
     last_file_click: Option<FileClick>,
     last_machine_click: Option<FileClick>,
+    /// When the last freshness poll for the open preview was sent, and whether
+    /// its listing is still outstanding. Both are needed so a slow link makes
+    /// the monitor poll less often rather than queueing a listing per tick.
+    file_monitor_sent_at: Option<Instant>,
+    file_monitor_in_flight: bool,
     next_file_search_id: u64,
     update_slot: UpdateSlot,
     pub(crate) task_progress: Vec<(String, TaskKind, TaskProgress)>,
@@ -541,6 +561,8 @@ impl App {
             pending_archived_resume: None,
             last_file_click: None,
             last_machine_click: None,
+            file_monitor_sent_at: None,
+            file_monitor_in_flight: false,
             next_file_search_id: 0,
             update_slot: Arc::new(Mutex::new(None)),
             task_progress: Vec::new(),
@@ -589,6 +611,7 @@ impl App {
         self.poll_terminal();
         self.maybe_auto_submit_search();
         self.maybe_submit_file_search();
+        self.maybe_monitor_open_file();
         self.maybe_search_resume_history();
         if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
             self.refresh_daemon_activity();
@@ -824,8 +847,16 @@ impl App {
                 | KeyCode::PageDown
                 | KeyCode::Char('j')
                 | KeyCode::Char(' ') => Self::page_file_preview(&mut form, true),
-                KeyCode::Home | KeyCode::Char('g') => form.preview_scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => form.preview_scroll = form.preview_max_scroll,
+                KeyCode::Home | KeyCode::Char('g') => {
+                    form.preview_scroll = 0;
+                    form.preview_follow_tail = false;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    form.preview_scroll = form.preview_max_scroll;
+                    // Follow even a file that currently fits the pane, so jumping
+                    // to the end of a log keeps showing its newest lines.
+                    form.preview_follow_tail = true;
+                }
                 KeyCode::Char('c') => {
                     if let Some(entry) = form.entries.get(form.selected) {
                         self.clipboard_request = Some(entry.path.clone());
@@ -1098,12 +1129,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp if in_preview => {
                 form.preview_scroll = form.preview_scroll.saturating_sub(3);
+                Self::sync_preview_follow(&mut form);
             }
             MouseEventKind::ScrollDown if in_preview => {
                 form.preview_scroll = form
                     .preview_scroll
                     .saturating_add(3)
                     .min(form.preview_max_scroll);
+                Self::sync_preview_follow(&mut form);
             }
             MouseEventKind::ScrollUp if in_list => Self::move_file_selection(&mut form, -1),
             MouseEventKind::ScrollDown if in_list => Self::move_file_selection(&mut form, 1),
@@ -2298,10 +2331,15 @@ impl App {
                         return;
                     }
                     form.loading = false;
+                    self.file_monitor_in_flight = false;
                     match result {
                         Ok(FileListing { path, entries }) => {
                             form.directory_cache.insert(path.clone(), entries.clone());
                             form.path = path;
+                            // Every listing doubles as a freshness check for the
+                            // open preview, so an edit lands on screen without
+                            // re-reading the file on a timer.
+                            self.refresh_stale_preview(&mut form, &entries);
                             if form.query.starts_with('/') {
                                 form.error = None;
                                 self.file_manager = Some(form);
@@ -2390,6 +2428,7 @@ impl App {
                     && form.preview_requested_path.as_deref() == Some(path.as_str())
                 {
                     form.preview_loading = false;
+                    form.preview_requested_path = None;
                     match result {
                         Ok(preview) => {
                             if matches!(
@@ -2400,11 +2439,22 @@ impl App {
                                     Some((form.target.clone(), path.clone(), preview.kind));
                             }
                             form.preview_cache.insert(path.clone(), preview.clone());
-                            form.preview = Some(preview);
-                            form.preview_rendered = None;
+                            // A refresh that read back the same bytes must not
+                            // throw away the highlighted text; re-rendering it is
+                            // the expensive part of showing a preview.
+                            if form.preview.as_ref() != Some(&preview) {
+                                form.preview = Some(preview);
+                                form.preview_rendered = None;
+                            }
                             form.preview_error = None;
-                            form.preview_scroll = 0;
                         }
+                        // A failed refresh must not blank a file the user is
+                        // reading; keep what is on screen and try again on the
+                        // next change. Only a first read reports the error.
+                        Err(error) if form.preview.is_some() => debug::log(
+                            "files",
+                            format!("preview refresh failed path={path}: {error}"),
+                        ),
                         Err(error) => {
                             form.preview = None;
                             form.preview_error = Some(short_error(&error));
@@ -2826,8 +2876,18 @@ impl App {
             }
         }
         if let Some(current) = current
-            && let Some(form) = self.stashed_file_managers.remove(current)
+            && let Some(mut form) = self.stashed_file_managers.remove(current)
         {
+            // The stash can be minutes old, so re-list instead of showing what
+            // the directory looked like when the user last switched away. The
+            // cached entries stay on screen until the fresh listing lands.
+            if !form.query.starts_with('/') {
+                let request = Request::ListFiles {
+                    target: form.target.clone(),
+                    path: form.path.clone(),
+                };
+                form.loading = self.worker.requests.send(request).is_ok();
+            }
             self.file_manager = Some(form);
         }
     }
@@ -3622,6 +3682,8 @@ impl App {
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_page_rows: 1,
+            preview_follow_tail: false,
+            preview_stamp: None,
             preview_rendered: None,
             query: String::new(),
             search_request_id: None,
@@ -3645,6 +3707,10 @@ impl App {
     fn request_file_listing(&mut self, mut form: FileManagerForm) {
         form.loading = true;
         form.error = None;
+        // This listing supersedes anything the monitor has outstanding, which
+        // would otherwise be answered for the directory we are leaving.
+        self.file_monitor_sent_at = None;
+        self.file_monitor_in_flight = false;
         Self::clear_file_preview(&mut form);
         let request = Request::ListFiles {
             target: form.target.clone(),
@@ -3704,6 +3770,83 @@ impl App {
         let mut form = self.file_manager.take().expect("matched file manager");
         self.submit_file_search(&mut form);
         self.file_manager = Some(form);
+    }
+
+    /// Re-fetches the open preview when a fresh listing shows its file changed.
+    /// Media previews are skipped: their bytes stream separately, and re-opening
+    /// the decoder would restart playback under the viewer.
+    fn refresh_stale_preview(&self, form: &mut FileManagerForm, entries: &[FileEntry]) {
+        let Some(path) = form.preview_path.clone() else {
+            return;
+        };
+        if form.preview_requested_path.is_some() {
+            return; // A fetch is already on its way.
+        }
+        if form.preview.as_ref().is_some_and(|preview| {
+            matches!(
+                preview.kind,
+                FilePreviewKind::Image | FilePreviewKind::Video
+            )
+        }) {
+            return;
+        }
+        let Some(entry) = entries.iter().find(|entry| entry.path == path) else {
+            return;
+        };
+        let stamp = (entry.size, entry.mtime);
+        if form.preview_stamp == Some(stamp) {
+            return;
+        }
+        form.preview_stamp = Some(stamp);
+        self.request_preview_refresh(form, path);
+    }
+
+    /// Asks for a fresh copy of the open preview without disturbing what is on
+    /// screen: no spinner, no cleared body, and the scroll position is kept so
+    /// the reader stays where they were until the new content arrives.
+    fn request_preview_refresh(&self, form: &mut FileManagerForm, path: String) {
+        let request = Request::PreviewFile {
+            target: form.target.clone(),
+            path: path.clone(),
+        };
+        if self.worker.requests.send(request).is_ok() {
+            form.preview_requested_path = Some(path);
+        }
+    }
+
+    /// Watches the file behind the open preview. Re-listing the directory is far
+    /// cheaper than re-reading the file, so the poll only carries the entry
+    /// metadata; the preview itself is re-fetched from `Event::FilesListed` and
+    /// only when `(size, mtime)` actually moved.
+    fn maybe_monitor_open_file(&mut self) {
+        let Some(form) = self.file_manager.as_ref() else {
+            self.file_monitor_sent_at = None;
+            self.file_monitor_in_flight = false;
+            return;
+        };
+        // A loading listing is already on its way, and a search shows entries
+        // from elsewhere in the tree, so neither needs a poll.
+        if form.preview_path.is_none() || form.loading || form.query.starts_with('/') {
+            return;
+        }
+        let elapsed = self
+            .file_monitor_sent_at
+            .map(|sent| sent.elapsed())
+            .unwrap_or(FILE_MONITOR_TIMEOUT);
+        let due = if self.file_monitor_in_flight {
+            elapsed >= FILE_MONITOR_TIMEOUT
+        } else {
+            elapsed >= FILE_MONITOR_INTERVAL
+        };
+        if !due {
+            return;
+        }
+        let request = Request::ListFiles {
+            target: form.target.clone(),
+            path: form.path.clone(),
+        };
+        self.file_monitor_sent_at = Some(Instant::now());
+        self.file_monitor_in_flight = self.worker.requests.send(request).is_ok();
     }
 
     fn submit_file_search(&mut self, form: &mut FileManagerForm) {
@@ -3775,6 +3918,8 @@ impl App {
         form.preview_scroll = 0;
         form.preview_max_scroll = 0;
         form.preview_page_rows = 1;
+        form.preview_follow_tail = false;
+        form.preview_stamp = None;
         form.preview_rendered = None;
         form.preview_area = None;
         form.preview_text_area = None;
@@ -3945,6 +4090,15 @@ impl App {
                 form.preview_scroll.saturating_sub(step)
             };
         }
+        Self::sync_preview_follow(form);
+    }
+
+    /// A preview parked on its last row is treated as "following": later
+    /// refreshes scroll on to the new end of the file, the way a tail does.
+    /// Paging or scrolling anywhere else drops the follow again.
+    fn sync_preview_follow(form: &mut FileManagerForm) {
+        form.preview_follow_tail =
+            form.preview_max_scroll > 0 && form.preview_scroll >= form.preview_max_scroll;
     }
 
     fn queue_file_preloads(&self, form: &mut FileManagerForm) {
@@ -4002,17 +4156,25 @@ impl App {
         } else {
             Self::clear_file_preview(&mut form);
             form.preview_path = Some(entry.path.clone());
+            form.preview_stamp = Some((entry.size, entry.mtime));
             let mut media_kind = None;
             if let Some(preview) = form.preview_cache.get(&entry.path).cloned() {
-                if matches!(
+                let media = matches!(
                     preview.kind,
                     FilePreviewKind::Image | FilePreviewKind::Video
-                ) {
+                );
+                if media {
                     media_kind = Some(preview.kind);
                 }
                 form.preview = Some(preview);
                 form.preview_loading = false;
                 self.status_message = "Opened preloaded preview".into();
+                // The cache is only a head start: the file may well have changed
+                // since it was read, so confirm it against the target right away
+                // and swap the body in if the copy on screen is out of date.
+                if !media {
+                    self.request_preview_refresh(&mut form, entry.path.clone());
+                }
             } else {
                 form.preview_requested_path = Some(entry.path.clone());
                 form.preview_loading = true;
@@ -6959,6 +7121,7 @@ mod tests {
                     path: "/work/project/README.md".into(),
                     kind: FileEntryKind::File,
                     size: 42,
+                    mtime: 0,
                 }],
             }),
         });
@@ -7188,6 +7351,7 @@ mod tests {
                     path: "/work/project/src".into(),
                     kind: FileEntryKind::Directory,
                     size: 0,
+                    mtime: 0,
                 }],
             }),
         });
@@ -7313,18 +7477,21 @@ mod tests {
                         path: "/work/alpha.txt".into(),
                         kind: FileEntryKind::File,
                         size: 5,
+                        mtime: 0,
                     },
                     FileEntry {
                         name: "beta.rs".into(),
                         path: "/work/beta.rs".into(),
                         kind: FileEntryKind::File,
                         size: 12,
+                        mtime: 0,
                     },
                     FileEntry {
                         name: "src".into(),
                         path: "/work/src".into(),
                         kind: FileEntryKind::Directory,
                         size: 0,
+                        mtime: 0,
                     },
                 ],
             }),
@@ -7361,10 +7528,173 @@ mod tests {
                     .is_some_and(|preview| preview.content == "fn beta() {}")
                 && !form.preview_loading
         }));
+        // The cached body shows at once, but it is only a head start: a refresh
+        // goes out so an edit made since the preload still reaches the screen.
+        assert!(request_rx.try_iter().any(
+            |request| matches!(request, Request::PreviewFile { path, .. } if path == "/work/beta.rs")
+        ));
+    }
+
+    /// Builds an app whose worker requests land in the returned channel, with a
+    /// browser already showing `notes.log` previewed at scroll offset 4.
+    fn preview_monitor_app(
+        size: u64,
+        mtime: u64,
+    ) -> (App, std::sync::mpsc::Receiver<Request>, FileEntry) {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let entry = FileEntry {
+            name: "notes.log".into(),
+            path: "/work/notes.log".into(),
+            kind: FileEntryKind::File,
+            size,
+            mtime,
+        };
+        let mut form = blank_file_manager(Target::local(), None, "/work");
+        form.entries = vec![entry.clone()];
+        form.preview_path = Some(entry.path.clone());
+        form.preview_stamp = Some((size, mtime));
+        form.preview = Some(FilePreview {
+            path: entry.path.clone(),
+            mime: "text/plain".into(),
+            kind: crate::model::FilePreviewKind::Text,
+            size,
+            content: "first\n".into(),
+            truncated: false,
+        });
+        form.preview_scroll = 4;
+        form.preview_max_scroll = 4;
+        app.file_manager = Some(form);
+        (app, request_rx, entry)
+    }
+
+    #[test]
+    fn listing_refreshes_the_open_preview_only_when_the_file_changed() {
+        let (mut app, request_rx, entry) = preview_monitor_app(6, 1_700_000_000);
+        let listing = |entry: FileEntry| Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![entry],
+            }),
+        };
+
+        // An unchanged stamp must not put a preview read on the wire; that poll
+        // runs every second or two and the file can be a quarter of a megabyte.
+        app.handle_worker_event(listing(entry.clone()));
         assert!(
             !request_rx
                 .try_iter()
                 .any(|request| matches!(request, Request::PreviewFile { .. }))
+        );
+
+        let grown = FileEntry {
+            size: 12,
+            mtime: 1_700_000_050,
+            ..entry
+        };
+        app.handle_worker_event(listing(grown.clone()));
+        assert!(request_rx.try_iter().any(
+            |request| matches!(request, Request::PreviewFile { path, .. } if path == grown.path)
+        ));
+        // Nothing on screen changes yet: no spinner, and the body stays put
+        // until the fresh copy actually arrives.
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert!(!form.preview_loading);
+        assert_eq!(
+            form.preview
+                .as_ref()
+                .map(|preview| preview.content.as_str()),
+            Some("first\n")
+        );
+    }
+
+    #[test]
+    fn refreshed_preview_keeps_the_reader_where_they_were() {
+        let (mut app, _request_rx, entry) = preview_monitor_app(6, 1_700_000_000);
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work".into(),
+            result: Ok(FileListing {
+                path: "/work".into(),
+                entries: vec![FileEntry {
+                    size: 12,
+                    mtime: 1_700_000_050,
+                    ..entry.clone()
+                }],
+            }),
+        });
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            result: Ok(FilePreview {
+                path: entry.path.clone(),
+                mime: "text/plain".into(),
+                kind: crate::model::FilePreviewKind::Text,
+                size: 12,
+                content: "first\nsecond\n".into(),
+                truncated: false,
+            }),
+        });
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert_eq!(
+            form.preview
+                .as_ref()
+                .map(|preview| preview.content.as_str()),
+            Some("first\nsecond\n")
+        );
+        // A refresh is not a fresh open, so the view must not jump back to the
+        // top of the file under the reader.
+        assert_eq!(form.preview_scroll, 4);
+        assert!(form.preview_requested_path.is_none());
+    }
+
+    #[test]
+    fn preview_follows_the_tail_only_after_scrolling_to_the_bottom() {
+        let (mut app, _request_rx, _entry) = preview_monitor_app(6, 1_700_000_000);
+        app.focus = Focus::Recap;
+        let scroll_to_top = |app: &mut App| {
+            app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        };
+
+        scroll_to_top(&mut app);
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .map(|form| (form.preview_scroll, form.preview_follow_tail)),
+            Some((0, false))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .map(|form| (form.preview_scroll, form.preview_follow_tail)),
+            Some((4, true))
+        );
+
+        // Paging back up releases the tail so a refresh no longer drags the
+        // view forward.
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .map(|form| form.preview_follow_tail),
+            Some(false)
         );
     }
 
@@ -7427,12 +7757,14 @@ mod tests {
                         path: "/work/README.md".into(),
                         kind: FileEntryKind::File,
                         size: 300_000,
+                        mtime: 0,
                     },
                     FileEntry {
                         name: "src".into(),
                         path: "/work/src".into(),
                         kind: FileEntryKind::Directory,
                         size: 0,
+                        mtime: 0,
                     },
                 ],
             }),
@@ -7526,12 +7858,14 @@ mod tests {
                 path: "/work/old".into(),
                 kind: FileEntryKind::Directory,
                 size: 0,
+                mtime: 0,
             },
             FileEntry {
                 name: "new".into(),
                 path: "/work/new".into(),
                 kind: FileEntryKind::Directory,
                 size: 0,
+                mtime: 0,
             },
         ];
         form.selected = 0;
@@ -7550,12 +7884,14 @@ mod tests {
                         path: "/work/old".into(),
                         kind: FileEntryKind::Directory,
                         size: 0,
+                        mtime: 0,
                     },
                     FileEntry {
                         name: "new".into(),
                         path: "/work/new".into(),
                         kind: FileEntryKind::Directory,
                         size: 0,
+                        mtime: 0,
                     },
                 ],
             }),
@@ -7840,6 +8176,8 @@ mod tests {
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_page_rows: 1,
+            preview_follow_tail: false,
+            preview_stamp: None,
             preview_rendered: None,
             query: String::new(),
             search_request_id: None,
@@ -8159,6 +8497,7 @@ mod tests {
             path: "/work/README.md".into(),
             kind: FileEntryKind::File,
             size: 10,
+            mtime: 0,
         };
         let mut form = blank_file_manager(Target::local(), None, "/work");
         form.entries = vec![original.clone()];
@@ -8203,6 +8542,7 @@ mod tests {
                     path: "/work/stale.rs".into(),
                     kind: FileEntryKind::File,
                     size: 1,
+                    mtime: 0,
                 }],
             }),
         });
@@ -8216,12 +8556,14 @@ mod tests {
             path: "/work/src/job.rs".into(),
             kind: FileEntryKind::File,
             size: 20,
+            mtime: 0,
         };
         let second = FileEntry {
             name: "tests/job.rs".into(),
             path: "/work/tests/job.rs".into(),
             kind: FileEntryKind::File,
             size: 30,
+            mtime: 0,
         };
         app.handle_worker_event(Event::FilesSearched {
             target_id: "local".into(),

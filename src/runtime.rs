@@ -1419,15 +1419,21 @@ END {
                 Err(_) => self.mark_bridge_failed(&target.id),
             }
         }
+        // Size and modification time come from a single stat so the browser can
+        // tell that an open file changed without paying a second call per entry.
         let collect = r#"for entry do
-            if [ -L "$entry" ]; then kind=l; size=0;
-            elif [ -d "$entry" ]; then kind=d; size=0;
+            if [ -L "$entry" ]; then kind=l; size=0; mtime=0;
+            elif [ -d "$entry" ]; then kind=d; size=0; mtime=0;
             elif [ -f "$entry" ]; then
                 kind=f
-                size=$(stat -c %s -- "$entry" 2>/dev/null || stat -f %z "$entry" 2>/dev/null || wc -c < "$entry" | tr -d '[:space:]')
-            else kind=o; size=0; fi
+                meta=$(stat -c '%s %Y' -- "$entry" 2>/dev/null || stat -f '%z %m' "$entry" 2>/dev/null)
+                case "$meta" in
+                    *' '*) size=${meta%% *}; mtime=${meta##* } ;;
+                    *) size=$(wc -c < "$entry" | tr -d '[:space:]'); mtime=0 ;;
+                esac
+            else kind=o; size=0; mtime=0; fi
             name=${entry#./}
-            printf '%s\0%s\0%s\0' "$kind" "$size" "$name"
+            printf '%s\0%s\0%s\0%s\0' "$kind" "$size" "$mtime" "$name"
         done"#;
         let find = shell_join(&[
             "find",
@@ -2503,11 +2509,11 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
         .map(|path| String::from_utf8_lossy(path).to_string())
         .context("file listing did not include its canonical path")?;
     let values: Vec<_> = fields.filter(|field| !field.is_empty()).collect();
-    if values.len() % 3 != 0 {
+    if values.len() % 4 != 0 {
         bail!("file listing returned incomplete metadata");
     }
     let mut entries = Vec::new();
-    for fields in values.chunks_exact(3) {
+    for fields in values.chunks_exact(4) {
         let kind = match fields[0] {
             b"d" => FileEntryKind::Directory,
             b"f" => FileEntryKind::File,
@@ -2515,7 +2521,8 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
             _ => FileEntryKind::Other,
         };
         let size = String::from_utf8_lossy(fields[1]).parse().unwrap_or(0);
-        let name = String::from_utf8_lossy(fields[2]).to_string();
+        let mtime = String::from_utf8_lossy(fields[2]).parse().unwrap_or(0);
+        let name = String::from_utf8_lossy(fields[3]).to_string();
         if name.is_empty() || name.contains('/') {
             continue;
         }
@@ -2524,6 +2531,7 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
             name,
             kind,
             size,
+            mtime,
         });
     }
     entries.sort_by(|left, right| {
@@ -3129,13 +3137,14 @@ mod tests {
 
     #[test]
     fn parses_structured_file_listings_and_previews() {
-        let listing = b"/work/project\x00f\x005\x00z.txt\x00d\x000\x00src\x00f\x0012\x00a.md\x00";
+        let listing = b"/work/project\x00f\x005\x00170\x00z.txt\x00d\x000\x000\x00src\x00f\x0012\x001730000000\x00a.md\x00";
         let listing = parse_file_listing(listing).unwrap();
         assert_eq!(listing.path, "/work/project");
         assert_eq!(listing.entries.len(), 3);
         assert_eq!(listing.entries[0].name, "src");
         assert_eq!(listing.entries[1].name, "a.md");
         assert_eq!(listing.entries[1].size, 12);
+        assert_eq!(listing.entries[1].mtime, 1_730_000_000);
         assert_eq!(listing.entries[1].path, "/work/project/a.md");
 
         let preview = parse_file_preview(

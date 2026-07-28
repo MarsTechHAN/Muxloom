@@ -264,6 +264,11 @@ pub struct FileEntry {
     pub path: String,
     pub kind: FileEntryKind,
     pub size: u64,
+    /// Last modification time in whole seconds since the Unix epoch, or 0 when
+    /// the target could not report one. Paired with `size` it is the cheap
+    /// change stamp the browser polls to notice edits to an open file.
+    #[serde(default)]
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1515,7 +1515,13 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     form.preview_page_rows = inner.height.max(1);
-    form.preview_scroll = form.preview_scroll.min(form.preview_max_scroll);
+    // A reader parked at the end of the file stays there as it grows: the
+    // monitor swaps in longer content and the view follows to the new tail.
+    form.preview_scroll = if form.preview_follow_tail {
+        form.preview_max_scroll
+    } else {
+        form.preview_scroll.min(form.preview_max_scroll)
+    };
     // Wrap and window the preview ourselves instead of leaning on ratatui's
     // Paragraph scroll+wrap. That path miscounts wrapped rows for the very long
     // lines in JSON/JSONL session dumps and, once scrolled, leaves stray glyphs
@@ -3508,6 +3514,7 @@ mod tests {
                 path: "/work/README.md".into(),
                 kind: crate::model::FileEntryKind::File,
                 size: 42,
+                mtime: 0,
             }],
             selected: 0,
             loading: false,
@@ -3529,6 +3536,8 @@ mod tests {
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_page_rows: 1,
+            preview_follow_tail: false,
+            preview_stamp: None,
             preview_rendered: None,
             query: String::new(),
             search_request_id: None,
@@ -3615,6 +3624,112 @@ mod tests {
             .collect();
         assert!(rendered.contains("gpu-box: Downloading Claude 50%"));
         assert!(rendered.contains('█'));
+    }
+
+    #[test]
+    fn a_preview_parked_at_the_bottom_follows_the_file_as_it_grows() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.focus = Focus::Recap;
+        let mut form = FileManagerForm {
+            origin: FileManagerOrigin::TerminalPane,
+            target: Target::local(),
+            session_id: None,
+            path: "/work".into(),
+            entries: vec![crate::model::FileEntry {
+                name: "notes.log".into(),
+                path: "/work/notes.log".into(),
+                kind: crate::model::FileEntryKind::File,
+                size: 42,
+                mtime: 1,
+            }],
+            selected: 0,
+            loading: false,
+            error: None,
+            directory_cache: std::collections::HashMap::new(),
+            return_path: None,
+            preview_path: Some("/work/notes.log".into()),
+            preview: None,
+            preview_requested_path: None,
+            preview_loading: false,
+            preview_error: None,
+            preview_scroll: 0,
+            preview_max_scroll: 0,
+            preview_page_rows: 1,
+            preview_follow_tail: true,
+            preview_stamp: Some((42, 1)),
+            preview_rendered: None,
+            query: String::new(),
+            search_request_id: None,
+            searching: false,
+            search_edited_at: None,
+            preview_cache: std::collections::HashMap::new(),
+            preload_pending: std::collections::HashSet::new(),
+            entry_rows: Vec::new(),
+            list_area: None,
+            preview_area: None,
+            preview_text_area: None,
+            preview_visible: Vec::new(),
+            preview_selection: None,
+            media_playback: None,
+            media_frame: None,
+            media_loading: false,
+            media_error: None,
+        };
+        let log = |lines: usize| crate::model::FilePreview {
+            path: "/work/notes.log".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 42,
+            content: (1..=lines)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            truncated: false,
+        };
+        form.preview = Some(log(80));
+        app.file_manager = Some(form);
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = |terminal: &Terminal<TestBackend>| -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        assert!(rendered(&terminal).contains("line-80"));
+
+        // The monitor swaps in a longer file: the view must move on to the new
+        // last line rather than staying on the old one.
+        let form = app.file_manager.as_mut().unwrap();
+        form.preview = Some(log(120));
+        form.preview_rendered = None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let screen = rendered(&terminal);
+        assert!(screen.contains("line-120"));
+        assert!(!screen.contains("line-80"), "the old tail scrolled away");
+
+        // Scrolled off the bottom, the same refresh leaves the reader alone.
+        let form = app.file_manager.as_mut().unwrap();
+        form.preview_follow_tail = false;
+        form.preview_scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let screen = rendered(&terminal);
+        assert!(screen.contains("line-1 "));
+        assert!(!screen.contains("line-120"));
     }
 
     #[test]

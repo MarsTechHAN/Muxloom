@@ -142,6 +142,11 @@ CSV/TSV tables, images (truecolor half-blocks), and video (encoded bytes
 streamed to controller-side FFmpeg). Media stays encoded across SSH; the target
 never sends expanded RGB frames.
 
+An open preview is watched: edits on the target appear within a couple of
+seconds without reopening the file, and a preview parked on its last line
+follows the file as it grows. The watch only carries directory metadata, so the
+file itself is re-read only when its size or modification time actually moves.
+
 **Keys** — `Ctrl-f` open/close · type to match · `Enter`/`Right` open · `Left`
 up · `d` download · `c` copy path · drag preview text to copy · drag local files
 in to upload.
@@ -278,7 +283,7 @@ to the application while terminal input is active.
 | `Right`, `Enter`, double-click | Enter a directory or toggle Preview |
 | `Left`, right-click | Go to the parent directory |
 | Arrows, `PageUp` / `PageDown` | Page an opened preview |
-| `g` / `G`, `Home` / `End` | Jump to preview start or end |
+| `g` / `G`, `Home` / `End` | Jump to preview start or end; the end follows the file as it grows |
 | `c` | Copy the selected target-side full path |
 | Drag over preview text | Copy the selected preview text on release |
 | `d` | Download the selected file to `~/Downloads` |
