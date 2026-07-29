@@ -444,6 +444,11 @@ pub struct App {
     pub agent_viewport_height: u16,
     pub terminal: Option<TerminalSession>,
     pub terminal_session_id: Option<String>,
+    /// The text on the attached terminal's live screen, kept here so the reads
+    /// that ask what the agent is doing right now stay honest while the user
+    /// scrolls: the emulator answers with the rows on display, and those are
+    /// the past once the view has moved up into history.
+    terminal_screen: String,
     pub pending_terminal: Option<TerminalSession>,
     pub pending_terminal_session_id: Option<String>,
     pending_attach: Option<PendingAttach>,
@@ -544,6 +549,7 @@ impl App {
             agent_viewport_height: 20,
             terminal: None,
             terminal_session_id: None,
+            terminal_screen: String::new(),
             pending_terminal: None,
             pending_terminal_session_id: None,
             pending_attach: None,
@@ -1413,9 +1419,7 @@ impl App {
 
     pub fn recap_for(&self, session: &AgentSession) -> String {
         let source = if self.terminal_session_id.as_deref() == Some(&session.id) {
-            self.terminal
-                .as_ref()
-                .map(|terminal| terminal.screen().contents())
+            self.terminal.as_ref().map(|_| self.terminal_screen.clone())
         } else if self.selected_session_id.as_deref() == Some(&session.id)
             && !self.history.text.is_empty()
         {
@@ -1795,7 +1799,17 @@ impl App {
         self.terminal_selection = None;
         self.terminal = None;
         self.terminal_session_id = None;
+        self.terminal_screen.clear();
         self.clear_pending_terminal();
+    }
+
+    /// Reads the attached terminal's live screen into [`Self::terminal_screen`].
+    fn refresh_terminal_screen(&mut self) {
+        self.terminal_screen = self
+            .terminal
+            .as_mut()
+            .map(TerminalSession::live_contents)
+            .unwrap_or_default();
     }
 
     fn clear_pending_terminal(&mut self) {
@@ -1859,16 +1873,13 @@ impl App {
             .as_mut()
             .map(|terminal| (terminal.drain(), terminal.is_closed()))
             .unwrap_or((false, false));
-        if changed
-            && !closed
-            && let (Some(session_id), Some(screen)) = (
-                self.terminal_session_id.clone(),
-                self.terminal
-                    .as_ref()
-                    .map(|terminal| terminal.screen().contents()),
-            )
-        {
-            self.sync_live_agent_activity(&session_id, &screen);
+        if changed && !closed {
+            self.refresh_terminal_screen();
+            if let Some(session_id) = self.terminal_session_id.clone() {
+                let screen = std::mem::take(&mut self.terminal_screen);
+                self.sync_live_agent_activity(&session_id, &screen);
+                self.terminal_screen = screen;
+            }
         }
         if changed
             && !closed
@@ -1883,6 +1894,7 @@ impl App {
                 self.terminal_session_id.as_deref() == self.selected_session_id.as_deref();
             self.terminal = None;
             self.terminal_session_id = None;
+            self.terminal_screen.clear();
             self.interactive = false;
             if closed_selected && self.pending_terminal.is_none() && self.pending_attach.is_none() {
                 self.handle_selected_terminal_closed();
@@ -1925,6 +1937,7 @@ impl App {
             self.pending_terminal_take_input = false;
             self.terminal = terminal;
             self.terminal_session_id = session_id;
+            self.refresh_terminal_screen();
             self.interactive = take_input;
             self.terminal_retry_at = None;
             self.terminal_failures = 0;

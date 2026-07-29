@@ -268,6 +268,40 @@ impl TerminalSession {
         self.parser.screen()
     }
 
+    /// A session with no process behind it, for tests that only exercise the
+    /// emulator side.
+    #[cfg(test)]
+    fn detached(width: u16, height: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
+            inline: InlineScrollback::default(),
+            master: None,
+            writer: None,
+            child: None,
+            events: None,
+            daemon: None,
+            closed: false,
+            width,
+            height,
+        }
+    }
+
+    /// The text on the live screen, whatever the view is scrolled to. Reading
+    /// [`Self::screen`] instead answers with the rows the user is looking at,
+    /// which is the past — and past a screenful of scrollback, vt100 0.15 reads
+    /// them through a subtraction that underflows and returns more rows than
+    /// the screen has.
+    pub fn live_contents(&mut self) -> String {
+        let offset = self.parser.screen().scrollback();
+        if offset == 0 {
+            return self.parser.screen().contents();
+        }
+        self.parser.set_scrollback(0);
+        let contents = self.parser.screen().contents();
+        self.parser.set_scrollback(offset);
+        contents
+    }
+
     /// Move the visible window `rows` lines up into rendered scrollback (0 is the
     /// live bottom). vt100 clamps to what the buffer actually holds; read the
     /// applied position back with [`Self::scrollback`].
@@ -1213,6 +1247,30 @@ mod tests {
         assert_ne!(
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
+        );
+    }
+
+    #[test]
+    fn scrolling_up_does_not_change_what_the_agent_is_doing_now() {
+        let mut session = TerminalSession::detached(20, 4);
+        for line in 1..=12 {
+            session.parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        session.set_scrollback(3);
+
+        assert!(
+            session.screen().contents().contains("line9"),
+            "the user is looking at rows that scrolled off"
+        );
+        let live = session.live_contents();
+        assert!(
+            live.contains("line12") && !live.contains("line9"),
+            "the live screen is the bottom of the session, not the view: {live:?}"
+        );
+        assert_eq!(
+            session.scrollback(),
+            3,
+            "reading it leaves the user where they were"
         );
     }
 
