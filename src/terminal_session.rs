@@ -33,6 +33,7 @@ const SCROLLBACK_LINES: usize = 20_000;
 
 pub struct TerminalSession {
     parser: vt100::Parser,
+    inline: InlineScrollback,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -174,6 +175,7 @@ impl TerminalSession {
 
         Ok(Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
+            inline: InlineScrollback::default(),
             master: Some(pair.master),
             writer: Some(writer),
             child: Some(child),
@@ -200,6 +202,7 @@ impl TerminalSession {
         let stream = bridges.open_pty(target, session_id.into(), width, height)?;
         Ok(Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
+            inline: InlineScrollback::default(),
             master: None,
             writer: None,
             child: None,
@@ -220,7 +223,7 @@ impl TerminalSession {
         let mut changed = false;
         if let Some(daemon) = &mut self.daemon {
             while let Some(bytes) = daemon.stream.try_read() {
-                self.parser.process(&bytes);
+                self.inline.process(&mut self.parser, &bytes);
                 changed = true;
             }
             if daemon.stream.is_closed() && !self.closed {
@@ -231,7 +234,7 @@ impl TerminalSession {
             while let Ok(event) = events.try_recv() {
                 match event {
                     TerminalEvent::Output(bytes) => {
-                        self.parser.process(&bytes);
+                        self.inline.process(&mut self.parser, &bytes);
                         changed = true;
                     }
                     TerminalEvent::Closed => {
@@ -261,10 +264,10 @@ impl TerminalSession {
     }
 
     /// The deepest scrollback offset the emulator currently retains. It is 0
-    /// when the screen has no buffered history — e.g. a full-screen agent that
-    /// repaints a fixed viewport in place (Codex) rather than flowing lines off
-    /// the top (Claude Code). The live view is restored before returning, so
-    /// this reads as a side-effect-free query.
+    /// when the screen has no buffered history — an agent painting a
+    /// self-contained view on the alternate screen, say — rather than flowing
+    /// finished lines off the top. The live view is restored before returning,
+    /// so this reads as a side-effect-free query.
     pub fn max_scrollback(&mut self) -> usize {
         let current = self.parser.screen().scrollback();
         self.parser.set_scrollback(usize::MAX);
@@ -305,6 +308,7 @@ impl TerminalSession {
         }
         debug::log("pty", format!("resized to {width}x{height}"));
         resize_parser(&mut self.parser, height, width);
+        self.inline.reset();
         self.width = width;
         self.height = height;
         Ok(())
@@ -397,6 +401,192 @@ impl TerminalSession {
                 .context("failed to write to embedded terminal")?;
             writer.flush().context("failed to flush embedded terminal")
         }
+    }
+}
+
+/// Keeps the scrollback of agents that pin a footer with a scroll region.
+///
+/// Codex prints its transcript by setting a top-anchored region (`ESC[1;Nr`),
+/// parking the cursor on that region's last row and emitting a newline, so the
+/// finished line leaves the top of the screen while the composer below stays
+/// put. Terminals put that line in their scrollback because the region starts
+/// at the first row; vt100 only fills scrollback when the region spans the
+/// whole screen, so for these agents nothing was ever buffered and paging had
+/// nothing to show. Rewrite each such scroll as a whole-screen scroll — which
+/// vt100 does record — followed by an insert that puts the footer back exactly
+/// where the agent painted it.
+///
+/// Only newline-driven scrolls are rewritten. `ESC[S` and a line wrapping past
+/// the last column also scroll a region, but no agent muxloom drives prints its
+/// transcript that way, and both stay on vt100's own path.
+#[derive(Debug, Default)]
+struct InlineScrollback {
+    scan: Scan,
+    params: Vec<u8>,
+    /// Set while the agent holds a region that starts at the first row and ends
+    /// above the last one, holding that region's 0-based last row.
+    footer_top: Option<u16>,
+    private: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    /// An OSC/DCS/APC string, which runs until BEL or ST and may hold bytes
+    /// that would otherwise read as newlines.
+    Str,
+    StrEscape,
+}
+
+impl InlineScrollback {
+    /// Forget the tracked region. Resizing clamps vt100's own region in ways an
+    /// agent is about to overwrite anyway, and guessing wrong would move rows
+    /// the agent never asked to move, so start over and rewrite nothing until
+    /// the next `ESC[...r`.
+    fn reset(&mut self) {
+        self.scan = Scan::Ground;
+        self.params.clear();
+        self.private = false;
+        self.footer_top = None;
+    }
+
+    fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
+        let mut flushed = 0;
+        for index in 0..bytes.len() {
+            if !self.step(parser, bytes[index]) {
+                continue;
+            }
+            parser.process(&bytes[flushed..index]);
+            flushed = index;
+            if let Some(sequence) = self.scroll_rewrite(parser) {
+                parser.process(&sequence);
+                // The rewrite already scrolled; letting the newline through
+                // would scroll a second time.
+                flushed = index + 1;
+            }
+        }
+        parser.process(&bytes[flushed..]);
+    }
+
+    /// Advance the scanner by one byte, reporting whether it is a newline that
+    /// may need rewriting.
+    fn step(&mut self, parser: &vt100::Parser, byte: u8) -> bool {
+        match self.scan {
+            Scan::Ground => match byte {
+                0x1b => {
+                    self.scan = Scan::Escape;
+                    false
+                }
+                // LF, VT and FF all index the cursor down one row.
+                b'\n' | 0x0b | 0x0c => true,
+                _ => false,
+            },
+            Scan::Escape => {
+                self.scan = match byte {
+                    b'[' => {
+                        self.params.clear();
+                        self.private = false;
+                        Scan::Csi
+                    }
+                    b']' | b'P' | b'X' | b'^' | b'_' => Scan::Str,
+                    _ => Scan::Ground,
+                };
+                false
+            }
+            Scan::Csi => match byte {
+                // Private markers and intermediates: anything carrying them is
+                // not the plain DECSTBM we act on.
+                0x3c..=0x3f | 0x20..=0x2f => {
+                    self.private = true;
+                    false
+                }
+                0x30..=0x3b => {
+                    self.params.push(byte);
+                    false
+                }
+                0x40..=0x7e => {
+                    self.scan = Scan::Ground;
+                    if byte == b'r' && !self.private {
+                        self.track_region(parser);
+                    }
+                    false
+                }
+                _ => false,
+            },
+            Scan::Str => {
+                self.scan = match byte {
+                    0x07 => Scan::Ground,
+                    0x1b => Scan::StrEscape,
+                    _ => Scan::Str,
+                };
+                false
+            }
+            Scan::StrEscape => {
+                self.scan = if byte == b'\\' {
+                    Scan::Ground
+                } else {
+                    Scan::Str
+                };
+                false
+            }
+        }
+    }
+
+    /// Record the region a `DECSTBM` just installed, canonicalised the way
+    /// vt100 canonicalises it so the two never disagree about what is active.
+    fn track_region(&mut self, parser: &vt100::Parser) {
+        let (rows, _) = parser.screen().size();
+        let mut params = self
+            .params
+            .split(|byte| *byte == b';')
+            .map(|part| std::str::from_utf8(part).ok()?.parse::<u16>().ok());
+        let top = params.next().flatten().unwrap_or(0).max(1);
+        let bottom = match params.next().flatten().unwrap_or(0) {
+            0 => rows,
+            bottom => bottom,
+        };
+        let top = top - 1;
+        let bottom = bottom.saturating_sub(1).min(rows.saturating_sub(1));
+        self.footer_top = (top == 0 && top < bottom && bottom + 1 < rows).then_some(bottom);
+    }
+
+    /// The sequence that performs the pending scroll while keeping the line
+    /// that leaves the top of the screen, or `None` when vt100 already keeps it.
+    fn scroll_rewrite(&self, parser: &vt100::Parser) -> Option<Vec<u8>> {
+        let bottom = self.footer_top?;
+        let screen = parser.screen();
+        if screen.alternate_screen() {
+            // The alternate screen has no scrollback anywhere.
+            return None;
+        }
+        let (rows, _) = screen.size();
+        if bottom + 1 >= rows {
+            return None;
+        }
+        let (row, column) = screen.cursor_position();
+        if row != bottom {
+            // Not at the region's last row, so this newline only moves the
+            // cursor and no line leaves the screen.
+            return None;
+        }
+        // Scroll the whole screen so the top row is buffered, then insert the
+        // row the region scroll would have left blank, which pushes the footer
+        // back down and drops the blank row the whole-screen scroll added at
+        // the bottom. Both region changes home the cursor, so restore it last.
+        Some(
+            format!(
+                "\x1b[r\x1b[{rows};1H\n\
+                 \x1b[{footer};{rows}r\x1b[{footer};1H\x1b[L\
+                 \x1b[1;{footer}r\x1b[{};{}H",
+                row + 1,
+                column + 1,
+                footer = bottom + 1,
+            )
+            .into_bytes(),
+        )
     }
 }
 
@@ -621,6 +811,90 @@ mod tests {
             0,
             "returns to the live bottom"
         );
+    }
+
+    /// Feeds `stream` twice: straight into one parser, and through the
+    /// harvester into another in ragged chunks so the scanner has to survive
+    /// splits mid-sequence. Returns (raw, harvested).
+    fn feed_both(rows: u16, columns: u16, stream: &str) -> (vt100::Parser, vt100::Parser) {
+        let mut raw = vt100::Parser::new(rows, columns, SCROLLBACK_LINES);
+        raw.process(stream.as_bytes());
+        let mut kept = vt100::Parser::new(rows, columns, SCROLLBACK_LINES);
+        let mut inline = InlineScrollback::default();
+        for chunk in stream.as_bytes().chunks(7) {
+            inline.process(&mut kept, chunk);
+        }
+        (raw, kept)
+    }
+
+    fn deepest_scrollback(parser: &mut vt100::Parser) -> usize {
+        parser.set_scrollback(usize::MAX);
+        let deepest = parser.screen().scrollback();
+        parser.set_scrollback(0);
+        deepest
+    }
+
+    #[test]
+    fn scrolling_inside_a_pinned_footer_region_fills_the_scrollback() {
+        // The shape Codex prints its transcript with: a region anchored to the
+        // first row, the cursor parked on that region's last row, one newline
+        // per finished line, and a composer painted below the region.
+        let mut stream = String::from("\x1b[5;1Hprompt>\x1b[6;1Hstatus");
+        for line in 1..=8 {
+            stream.push_str(&format!(
+                "\x1b[1;4r\x1b[4;1H\r\n\x1b[Kline{line}\x1b[r\x1b[5;8H"
+            ));
+        }
+        let (mut raw, mut kept) = feed_both(6, 20, &stream);
+
+        assert_eq!(
+            kept.screen().contents(),
+            raw.screen().contents(),
+            "the visible screen must match what the agent painted"
+        );
+        assert_eq!(
+            kept.screen().contents_formatted(),
+            raw.screen().contents_formatted(),
+            "styling must survive the rewrite"
+        );
+        assert!(
+            kept.screen().contents().ends_with("prompt>\nstatus"),
+            "the pinned footer must stay below the region: {:?}",
+            kept.screen().contents()
+        );
+        assert_eq!(
+            deepest_scrollback(&mut raw),
+            0,
+            "vt100 alone keeps nothing from a region scroll"
+        );
+        assert_eq!(deepest_scrollback(&mut kept), 8);
+
+        kept.set_scrollback(4);
+        assert_eq!(
+            kept.screen().contents(),
+            "line1\nline2\nline3\nline4\nline5\nline6",
+            "paging up must reveal the finished lines"
+        );
+    }
+
+    #[test]
+    fn regions_that_do_not_start_at_the_top_are_left_to_vt100() {
+        // Only a region anchored to the first row pushes its top line out of
+        // the screen; anything else scrolls in place and keeps no history.
+        let (raw, mut kept) = feed_both(6, 20, "\x1b[2;4r\x1b[4;1H\r\nmiddle");
+
+        assert_eq!(kept.screen().contents(), raw.screen().contents());
+        assert_eq!(deepest_scrollback(&mut kept), 0);
+    }
+
+    #[test]
+    fn newlines_the_agent_writes_elsewhere_are_untouched() {
+        // A newline above the region's last row only moves the cursor, and a
+        // newline inside an OSC payload is not a newline at all.
+        let (raw, mut kept) = feed_both(6, 20, "\x1b[1;4r\x1b]0;ti\ntle\x07\x1b[2;1H\nplain");
+
+        assert_eq!(kept.screen().contents(), raw.screen().contents());
+        assert_eq!(deepest_scrollback(&mut kept), 0);
     }
 
     #[test]
