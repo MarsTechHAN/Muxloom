@@ -430,6 +430,11 @@ pub struct App {
     pub terminal_back: Option<Rect>,
     pub layout_debug_signature: Option<(u16, u16, u16, u16, bool, bool)>,
     pub attention_ids: Vec<String>,
+    /// Prompts the user has already been shown, keyed by session id and holding
+    /// the attention reason that was acknowledged. Opening a session clears its
+    /// reminder; the entry is dropped once the agent stops asking, so the next
+    /// prompt raises the reminder again even when it reads the same.
+    attention_ack: HashMap<String, String>,
     pub machine_list_state: ListState,
     pub agent_list_state: ListState,
     pub machine_rows: Vec<(usize, u16)>,
@@ -529,6 +534,7 @@ impl App {
             terminal_back: None,
             layout_debug_signature: None,
             attention_ids: Vec::new(),
+            attention_ack: HashMap::new(),
             machine_list_state: ListState::default(),
             agent_list_state: ListState::default(),
             machine_rows: Vec::new(),
@@ -1424,11 +1430,75 @@ impl App {
             .unwrap_or_else(|| "No recap yet".into())
     }
 
+    /// Whether a session's prompt still deserves a reminder. The session list
+    /// keeps showing `needs_attention` as the plain state it is; this is the
+    /// narrower question the banner, the jump list and the toasts ask, and it
+    /// goes quiet as soon as the user is looking at the prompt themselves.
+    pub fn attention_pending(&self, session: &AgentSession) -> bool {
+        session.needs_attention && !self.attention_acknowledged(session)
+    }
+
+    fn attention_acknowledged(&self, session: &AgentSession) -> bool {
+        if self.engaged_with(&session.id) {
+            return true;
+        }
+        self.attention_ack.get(&session.id).map(String::as_str)
+            == Some(session.attention_reason.as_deref().unwrap_or_default())
+    }
+
+    /// Whether the user is typing into this session right now. Its prompt is on
+    /// screen in front of them, so nothing about it needs announcing.
+    fn engaged_with(&self, session_id: &str) -> bool {
+        self.interactive && self.terminal_session_id.as_deref() == Some(session_id)
+    }
+
+    /// Records that the user has seen whatever the session is waiting on.
+    fn acknowledge_attention(&mut self, session_id: &str) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id && session.needs_attention)
+        else {
+            return;
+        };
+        let reason = session.attention_reason.clone().unwrap_or_default();
+        self.attention_ack.insert(session_id.to_string(), reason);
+    }
+
+    /// Keeps the acknowledgement map in step with the prompts that exist right
+    /// now. Call this wherever attention state is refreshed.
+    fn sync_attention_acks(&mut self) {
+        if self.interactive
+            && let Some(session_id) = self.terminal_session_id.clone()
+        {
+            self.acknowledge_attention(&session_id);
+        }
+        self.prune_attention_acks();
+    }
+
+    /// Forgets acknowledgements whose prompt is gone — the agent stopped asking,
+    /// asked something else, or the session itself went away.
+    fn prune_attention_acks(&mut self) {
+        let live: HashMap<&str, &str> = self
+            .sessions
+            .iter()
+            .filter(|session| session.needs_attention)
+            .map(|session| {
+                (
+                    session.id.as_str(),
+                    session.attention_reason.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        self.attention_ack
+            .retain(|id, reason| live.get(id.as_str()) == Some(&reason.as_str()));
+    }
+
     pub fn attention_sessions(&self) -> Vec<&AgentSession> {
         let mut sessions: Vec<_> = self
             .sessions
             .iter()
-            .filter(|session| session.needs_attention)
+            .filter(|session| self.attention_pending(session))
             .collect();
         sessions.sort_by(|left, right| {
             left.target_id
@@ -1501,6 +1571,9 @@ impl App {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        // Opening the session is how the user answers the prompt, so stop
+        // reminding them about it the moment they step in.
+        self.acknowledge_attention(&session.id);
         if session.dead {
             self.resume_archived_session(session);
         } else {
@@ -1896,15 +1969,16 @@ impl App {
         session.working = working;
         session.needs_attention = attention.is_some();
         session.attention_reason = attention;
+        let (working, needs_attention) = (session.working, session.needs_attention);
         if changed {
             debug::log(
                 "activity",
                 format!(
-                    "source=live-terminal target={} session={} kind={} working={} attention={}",
-                    target_id, session_id, kind, session.working, session.needs_attention
+                    "source=live-terminal target={target_id} session={session_id} kind={kind} working={working} attention={needs_attention}"
                 ),
             );
         }
+        self.sync_attention_acks();
     }
 
     fn handle_selected_terminal_closed(&mut self) {
@@ -1976,6 +2050,10 @@ impl App {
                     .filter(|session| session.target_id == target_id && session.needs_attention)
                     .map(|session| session.id.clone())
                     .collect();
+                let engaged = self
+                    .terminal_session_id
+                    .clone()
+                    .filter(|_| self.interactive);
                 if let Some(target) = self
                     .targets
                     .iter_mut()
@@ -1994,11 +2072,15 @@ impl App {
                                     .attention_reason
                                     .as_deref()
                                     .unwrap_or("input required");
-                                self.notifications.push(format!(
-                                    "{} / {} needs input ({reason})",
-                                    session.target_id,
-                                    session.display_label()
-                                ));
+                                // No toast for the session the user is already
+                                // typing into.
+                                if engaged.as_deref() != Some(session.id.as_str()) {
+                                    self.notifications.push(format!(
+                                        "{} / {} needs input ({reason})",
+                                        session.target_id,
+                                        session.display_label()
+                                    ));
+                                }
                                 debug::log(
                                     "attention",
                                     format!(
@@ -2027,6 +2109,7 @@ impl App {
                                 .retain(|session| session.target_id != target_id);
                             self.sessions.extend(sessions);
                             self.apply_session_labels();
+                            self.sync_attention_acks();
                         }
                         Err(error) => {
                             target.consecutive_failures =
@@ -2739,13 +2822,17 @@ impl App {
             }
         }
         for (session_id, label, reason) in notifications {
-            self.notifications
-                .push(format!("{target_id} / {label} needs input ({reason})"));
+            // No toast for the session the user is already typing into.
+            if !self.engaged_with(&session_id) {
+                self.notifications
+                    .push(format!("{target_id} / {label} needs input ({reason})"));
+            }
             debug::log(
                 "attention",
                 format!("new prompt target={target_id} session={session_id} reason={reason}"),
             );
         }
+        self.sync_attention_acks();
         if changed > 0 {
             debug::log(
                 "activity",
@@ -6387,6 +6474,82 @@ mod tests {
             Some("waiting for approval")
         );
         assert_eq!(app.notifications.len(), 1);
+    }
+
+    fn waiting_agent(reason: &str) -> AgentSession {
+        AgentSession {
+            id: "muxloomd-codex-waiting".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work".into(),
+            label: "waiting".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(10),
+            working: false,
+            needs_attention: true,
+            attention_reason: Some(reason.into()),
+            recap: None,
+        }
+    }
+
+    #[test]
+    fn opening_a_waiting_agent_clears_its_reminder_until_the_prompt_changes() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions = vec![waiting_agent("approval required")];
+
+        assert_eq!(app.attention_sessions().len(), 1);
+
+        app.acknowledge_attention("muxloomd-codex-waiting");
+        assert!(app.attention_sessions().is_empty());
+        // The session itself still reports what it is doing.
+        assert!(app.sessions[0].needs_attention);
+
+        app.sessions[0].attention_reason = Some("run tests?".into());
+        assert_eq!(app.attention_sessions().len(), 1);
+    }
+
+    #[test]
+    fn a_prompt_that_comes_back_after_being_answered_reminds_again() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions = vec![waiting_agent("approval required")];
+        app.acknowledge_attention("muxloomd-codex-waiting");
+        assert!(app.attention_sessions().is_empty());
+
+        app.sessions[0].needs_attention = false;
+        app.sessions[0].attention_reason = None;
+        app.sync_attention_acks();
+
+        app.sessions[0].needs_attention = true;
+        app.sessions[0].attention_reason = Some("approval required".into());
+        assert_eq!(app.attention_sessions().len(), 1);
+    }
+
+    #[test]
+    fn a_prompt_in_the_session_you_are_typing_in_never_announces_itself() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions = vec![AgentSession {
+            needs_attention: false,
+            attention_reason: None,
+            ..waiting_agent("")
+        }];
+        app.selected_session_id = Some("muxloomd-codex-waiting".into());
+        app.terminal_session_id = Some("muxloomd-codex-waiting".into());
+        app.interactive = true;
+        app.pending_activity_refreshes.insert("local".into());
+
+        app.handle_worker_event(Event::ActivityRefreshed {
+            target_id: "local".into(),
+            result: Ok(vec![waiting_agent("approval required")]),
+        });
+
+        assert!(app.sessions[0].needs_attention);
+        assert!(app.notifications.is_empty());
+        assert!(app.attention_sessions().is_empty());
+
+        // Stepping back out keeps it quiet: that prompt has been seen.
+        app.interactive = false;
+        assert!(app.attention_sessions().is_empty());
     }
 
     #[test]
