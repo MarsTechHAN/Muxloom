@@ -251,8 +251,10 @@ Codex/Claude 退出或第一次按 `x` 后进入 Archived，仍可查看和搜�
 
 提醒只检查当前屏幕底部物理行。Attached 和 legacy-inspected Session 会组合内置审批布局与
 每机器 Pattern；后台 daemon snapshot 当前只使用内置布局。新提醒会显示可点击 Banner、
-Waiting 状态、Bell 和 OSC 9，并对同一个 Prompt 去重。Attached Terminal 直接从实时帧
-更新 Working/Waiting，因此短推理不会被后台刷新间隔漏掉；其他会话由 daemon snapshot 更新。
+Waiting 状态、Bell 和 OSC 9，并对同一个 Prompt 去重。进入会话即消除它的 Banner——会话
+列表仍然显示 Waiting，直到 Agent 不再询问——之后的新 Prompt 会重新提醒。Attached
+Terminal 直接从实时帧更新 Working/Waiting，因此短推理不会被后台刷新间隔漏掉；其他会话
+由 daemon snapshot 更新。
 
 <a id="zh-files"></a>
 

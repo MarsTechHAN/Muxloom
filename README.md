@@ -118,7 +118,9 @@ Codex and Claude sessions animate **only** while their visible terminal is
 classified as working — cyan braille dots for Codex, an orange sparkle for
 Claude, both on a constant wall-clock cadence. When a session needs input it
 turns Waiting, raises a clickable banner, rings the bell, and emits a desktop
-notification.
+notification. Opening the session clears the banner — the session list keeps
+showing Waiting until the agent stops asking — and a later prompt raises it
+again.
 
 **Keys** — spinners are automatic · `a` show/hide archived · click the attention
 banner to jump to the session.
