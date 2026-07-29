@@ -186,9 +186,10 @@ Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色
 Terminal 输入激活后，普通方向键、文字、粘贴和组合键直接进入 PTY；未加 Modifier 的方向键
 不会切换 Pane。`Shift+Enter` 或 `Option+Enter` 插入换行，`Ctrl-c`/`Ctrl-d` 原样转发。
 `PageUp`/`PageDown` 按页浏览历史，滚轮每次移动一行。已连接会话的回滚读取仿真器自身渲染的
-scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而非线性化日志；daemon 在
-attach 时回放保留的输出，退出并重新启动 controller 后 scrollback 仍会恢复。回滚时以及打开
-文件浏览器时都可以选择并复制内容。
+scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而非线性化日志。attach 时
+即可回滚数千行：这些行由 daemon 从会话日志渲染而来，因此即便 Agent 把保留输出几乎都花在
+重绘帧上、真正完成的行寥寥无几，重新启动 controller 之后仍有足够的历史可以翻。回滚时以及
+打开文件浏览器时都可以选择并复制内容。
 
 鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。Machine 单击只选择，双击才启用或
 禁用。可以拖动所有布局分隔线；

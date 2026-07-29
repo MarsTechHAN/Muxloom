@@ -705,11 +705,18 @@ impl BridgeConnection {
         }
     }
 
-    pub fn open_pty(&self, session_id: String, columns: u16, rows: u16) -> Result<BridgeStream> {
+    pub fn open_pty(
+        &self,
+        session_id: String,
+        columns: u16,
+        rows: u16,
+        scrollback_rows: usize,
+    ) -> Result<BridgeStream> {
         self.open_stream(OpenStream::Pty {
             session_id,
             columns,
             rows,
+            scrollback_rows,
         })
     }
 
@@ -1542,9 +1549,10 @@ impl BridgePool {
         session_id: String,
         columns: u16,
         rows: u16,
+        scrollback_rows: usize,
     ) -> Result<BridgeStream> {
         self.connection_for_target(target)?
-            .open_pty(session_id, columns, rows)
+            .open_pty(session_id, columns, rows, scrollback_rows)
     }
 
     pub fn download_file(

@@ -3,7 +3,7 @@ mod platform {
     use std::{
         collections::HashMap,
         fs::{self, File, OpenOptions},
-        io::{self, BufRead, BufReader, Read, Write},
+        io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
         os::unix::{
             fs::PermissionsExt,
             net::{UnixListener, UnixStream},
@@ -35,10 +35,16 @@ mod platform {
         },
         recap::extract_recap,
         runtime::{agent_is_working, attention_reason},
-        terminal_session::resize_parser,
+        terminal_session::{render_scrollback_seed, resize_parser},
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+    /// How much of a session's log to render when seeding a client's scrollback.
+    /// The render costs time in proportion to this, and a redraw-heavy session
+    /// can spend megabytes per finished line, so this trades depth for the delay
+    /// before a freshly attached pane fills: a quarter of a second on the worst
+    /// log measured, which still bought it a dozen screenfuls of history.
+    const SCROLLBACK_SEED_BYTES: u64 = 16 * 1024 * 1024;
     static METADATA_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
@@ -412,6 +418,7 @@ mod platform {
                             session_id,
                             columns,
                             rows,
+                            scrollback_rows,
                         } => {
                             let session = daemon_session(&state, &session_id)?;
                             session.resize(columns, rows)?;
@@ -436,11 +443,35 @@ mod platform {
                                 },
                             );
                             write_stream_opened(&writer, &frame, None)?;
+                            // The retained output only repaints the screen. The
+                            // history above it is rendered here so the client
+                            // starts with scrollback the raw ring never held.
+                            // Rendering takes long enough that the session can
+                            // write during it, so the retained output is taken
+                            // afterwards: it then covers everything the render
+                            // was too early to see.
+                            let seed = session
+                                .scrollback_seed(
+                                    columns,
+                                    rows,
+                                    RECENT_OUTPUT_LIMIT,
+                                    scrollback_rows,
+                                )
+                                .unwrap_or_else(|error| {
+                                    eprintln!("muxloomd scrollback seed failed: {error}");
+                                    Vec::new()
+                                });
                             let recent = session
                                 .recent_output
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
+                            for chunk in seed.chunks(DATA_CHUNK_SIZE) {
+                                write_frame(
+                                    &writer,
+                                    &Frame::data(frame.stream_id, 0, chunk, true),
+                                )?;
+                            }
                             for chunk in recent.chunks(DATA_CHUNK_SIZE) {
                                 write_frame(
                                     &writer,
@@ -1566,6 +1597,47 @@ mod platform {
             Ok(())
         }
 
+        /// Render the history that sits above the retained output into rows an
+        /// attaching client can replay into its scrollback.
+        ///
+        /// `retained` is how many trailing bytes the client replays for itself;
+        /// rendering stops that far short of the log's end so the rows meet that
+        /// replay instead of repeating what it is about to redraw.
+        /// Only the tail of the log is read: a redraw-heavy agent spends most of
+        /// its output on frames, so this budget buys far more history than the
+        /// same number of raw bytes would, and it bounds what an attach costs on
+        /// a log that has been growing for days.
+        fn scrollback_seed(
+            &self,
+            columns: u16,
+            rows: u16,
+            retained: usize,
+            keep: usize,
+        ) -> Result<Vec<u8>> {
+            if keep == 0 {
+                return Ok(Vec::new());
+            }
+            let mut file = match File::open(&self.history_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to open history {}", self.history_path.display())
+                    });
+                }
+            };
+            let end = file
+                .metadata()?
+                .len()
+                .saturating_sub(retained.try_into().unwrap_or(u64::MAX));
+            let start = end.saturating_sub(SCROLLBACK_SEED_BYTES);
+            if end == start {
+                return Ok(Vec::new());
+            }
+            file.seek(SeekFrom::Start(start))?;
+            render_scrollback_seed(BufReader::new(file).take(end - start), columns, rows, keep)
+        }
+
         fn record_output(&self, bytes: &[u8]) {
             self.line_count.fetch_add(
                 bytes.iter().filter(|&&byte| byte == b'\n').count(),
@@ -2346,6 +2418,7 @@ mod platform {
                     session_id: session_id.into(),
                     columns: 80,
                     rows: 24,
+                    scrollback_rows: 0,
                 },
             )
             .unwrap()

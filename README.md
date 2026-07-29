@@ -129,9 +129,11 @@ banner to jump to the session.
 
 Attach to any session and interact directly. Back-scroll reads the emulator's
 own rendered scrollback, so live-redrawing TUIs stay readable instead of
-collapsing into a linearized log, and the daemon replays retained output on
-attach so scrollback survives relaunching the controller. Drag to select and
-copy — while scrolled back, and while the file browser is open.
+collapsing into a linearized log. Attaching starts with thousands of rows of
+history: the daemon renders them from the session's log, so a redraw-heavy
+agent that spends its retained output on frames rather than finished lines is
+still deep to page through after the controller is relaunched. Drag to select
+and copy — while scrolled back, and while the file browser is open.
 
 **Keys** — `Enter` attach · `PageUp`/`PageDown` or wheel scroll · drag to select
 · `Cmd`/`Ctrl+C` copy · `Shift`/`Option+Enter` newline.
@@ -406,7 +408,8 @@ flowchart LR
 **Persistence.** `muxloomd` directly owns each PTY and child process; the
 dashboard and SSH bridge are subscribers, so either can disconnect without
 terminating the session. The daemon keeps append-only ANSI history on the
-target and replays retained output on attach.
+target, and an attach gets the tail of that log rendered into scrollback rows
+followed by the retained output that repaints the screen.
 
 **Transport.** Each remote target uses one long-lived, non-PTY SSH process. A
 framed protocol multiplexes request and stream IDs over it, completing requests

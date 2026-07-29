@@ -26,10 +26,21 @@ enum TerminalEvent {
 /// Rows of rendered scrollback the embedded emulator retains. Scrolling reads
 /// from this buffer so back-scroll shows the emulator's actual lines instead of
 /// linearizing the raw output log, which mangles live-redrawing TUIs. vt100
-/// grows the buffer lazily, so this cap only bounds a long-lived session; on
-/// re-attach the daemon replays its retained output (up to 2 MiB) to refill it,
-/// so scrollback survives quitting and relaunching the controller.
+/// grows the buffer lazily, so this cap only bounds a long-lived session.
 const SCROLLBACK_LINES: usize = 20_000;
+
+/// Rows of rendered scrollback to ask the daemon for when attaching.
+///
+/// The raw output the daemon retains repaints the screen but is a poor source
+/// of history: a redraw-heavy agent can spend the whole 2 MiB ring on frames
+/// that commit only a handful of transcript lines, which left a fresh attach
+/// with less than a screenful to page through. The daemon renders these rows
+/// from the session's full log instead, so scrolling starts out deep.
+pub(crate) const SCROLLBACK_SEED_ROWS: usize = 2_000;
+
+/// Rows a seed may carry at most, whatever a client asks for. Bounds both the
+/// daemon's transient emulator and the bytes an attach puts on the wire.
+pub(crate) const SCROLLBACK_SEED_ROWS_LIMIT: usize = 5_000;
 
 pub struct TerminalSession {
     parser: vt100::Parser,
@@ -199,7 +210,13 @@ impl TerminalSession {
         }
         let width = width.max(20);
         let height = height.max(5);
-        let stream = bridges.open_pty(target, session_id.into(), width, height)?;
+        let stream = bridges.open_pty(
+            target,
+            session_id.into(),
+            width,
+            height,
+            SCROLLBACK_SEED_ROWS,
+        )?;
         Ok(Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             inline: InlineScrollback::default(),
@@ -426,6 +443,10 @@ struct InlineScrollback {
     /// Set while the agent holds a region that starts at the first row and ends
     /// above the last one, holding that region's 0-based last row.
     footer_top: Option<u16>,
+    /// The region the agent last installed, as 0-based inclusive rows. Kept
+    /// whole — not just the footer form — so a seed can hand the region to
+    /// another emulator that never saw the `ESC[...r` that set it.
+    region: Option<(u16, u16)>,
     private: bool,
 }
 
@@ -451,6 +472,7 @@ impl InlineScrollback {
         self.params.clear();
         self.private = false;
         self.footer_top = None;
+        self.region = None;
     }
 
     fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
@@ -550,7 +572,15 @@ impl InlineScrollback {
         };
         let top = top - 1;
         let bottom = bottom.saturating_sub(1).min(rows.saturating_sub(1));
+        self.region = (top < bottom).then_some((top, bottom));
         self.footer_top = (top == 0 && top < bottom && bottom + 1 < rows).then_some(bottom);
+    }
+
+    /// The `DECSTBM` that reinstalls the tracked region, for handing an
+    /// emulator the region without replaying the stream that set it.
+    fn region_sequence(&self) -> Option<String> {
+        let (top, bottom) = self.region?;
+        Some(format!("\x1b[{};{}r", top + 1, bottom + 1))
     }
 
     /// The sequence that performs the pending scroll while keeping the line
@@ -588,6 +618,107 @@ impl InlineScrollback {
             .into_bytes(),
         )
     }
+}
+
+/// Render `stream` — a session's older raw output — into bytes that refill an
+/// attaching emulator's scrollback with the lines that scrolled off it.
+///
+/// The caller replays the newest raw output itself to repaint the screen, so
+/// `stream` must stop where that replay begins: everything still on screen at
+/// that point is the replay's to redraw, and everything above it comes back as
+/// the rendered rows returned here. Feeding those rows to a fresh emulator ahead
+/// of the replay leaves it with the same history a terminal that had watched the
+/// whole session would hold.
+pub(crate) fn render_scrollback_seed(
+    mut stream: impl Read,
+    columns: u16,
+    rows: u16,
+    keep: usize,
+) -> Result<Vec<u8>> {
+    let columns = columns.max(20);
+    let rows = rows.max(5);
+    let keep = keep.min(SCROLLBACK_SEED_ROWS_LIMIT);
+    if keep == 0 {
+        return Ok(Vec::new());
+    }
+    let mut parser = vt100::Parser::new(rows, columns, keep);
+    let mut inline = InlineScrollback::default();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => inline.process(&mut parser, &buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read session history"),
+        }
+    }
+    if parser.screen().alternate_screen() {
+        // vt100 only reaches the scrollback of the grid it is showing, and a
+        // full-screen app is drawn on one that has none. Step off it so the
+        // history underneath can be rendered; the replay repaints the app.
+        parser.process(b"\x1b[?1049l");
+    }
+    let (cursor_row, cursor_column) = parser.screen().cursor_position();
+    let input_modes = parser.screen().input_mode_formatted();
+    // Growing the screen below resizes its rows, and vt100 drops a row's wrap
+    // flag whenever it is resized, so read them off while they are still set.
+    let screen_wraps: Vec<bool> = (0..rows)
+        .map(|row| parser.screen().row_wrapped(row))
+        .collect();
+    parser.set_scrollback(usize::MAX);
+    let depth = parser.screen().scrollback();
+    if depth == 0 {
+        // Nothing has scrolled off yet, so the raw output the client is about
+        // to replay is the whole session and this would only repeat it.
+        return Ok(Vec::new());
+    }
+
+    // vt100 0.15 reads rows past the first screenful of scrollback through a
+    // subtraction that underflows, so grow the screen to span the buffer and
+    // the screen at once before asking for them. Taking both together is also
+    // what keeps a line that wrapped across their boundary in one piece. This
+    // emulator is discarded here, and rows that already scrolled off are never
+    // reflowed by a resize.
+    let tall = u16::try_from(depth)
+        .unwrap_or(u16::MAX)
+        .saturating_add(rows);
+    parser.set_size(tall, columns);
+    parser.set_scrollback(depth);
+    let deep = parser.screen();
+    let mut seed = b"\x1b[r\x1b[m\x1b[2J\x1b[H".to_vec();
+    let mut wrapped = false;
+    for (index, row) in deep
+        .rows_formatted(0, columns)
+        .take(depth + usize::from(rows))
+        .enumerate()
+    {
+        // A line the agent ran off the right edge has to run off the client's
+        // edge too. Its continuation is rendered assuming the cursor arrived
+        // there by wrapping, so breaking the line here would misplace that
+        // text and split one line into two.
+        if index > 0 && !wrapped {
+            seed.extend_from_slice(b"\r\n");
+        }
+        wrapped = match index.checked_sub(depth) {
+            Some(screen_row) => screen_wraps.get(screen_row).copied().unwrap_or(false),
+            None => u16::try_from(index).is_ok_and(|row| deep.row_wrapped(row)),
+        };
+        seed.extend_from_slice(&row);
+        // Every row is rendered as if the terminal started it with default
+        // attributes, so leave it that way for the next one.
+        seed.extend_from_slice(b"\x1b[m");
+    }
+    // The last screenful written is the screen the session left off on, and
+    // everything above it scrolled into history on the way past. Agents redraw
+    // only what changed, so handing over that screen rather than a blank one
+    // is what keeps the replay from papering history with its gaps.
+    seed.extend_from_slice(&input_modes);
+    if let Some(region) = inline.region_sequence() {
+        // Installing a region homes the cursor, so put it back afterwards.
+        seed.extend_from_slice(region.as_bytes());
+    }
+    seed.extend_from_slice(format!("\x1b[{};{}H", cursor_row + 1, cursor_column + 1).as_bytes());
+    Ok(seed)
 }
 
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
@@ -895,6 +1026,175 @@ mod tests {
 
         assert_eq!(kept.screen().contents(), raw.screen().contents());
         assert_eq!(deepest_scrollback(&mut kept), 0);
+    }
+
+    /// The stream a Codex-shaped agent writes for `lines`: a region anchored
+    /// to the top, one newline per finished line, and a footer below it.
+    fn transcript(lines: std::ops::RangeInclusive<u32>) -> String {
+        let mut stream = String::from("\x1b[5;1Hprompt>\x1b[6;1Hstatus");
+        for line in lines {
+            stream.push_str(&format!(
+                "\x1b[1;4r\x1b[4;1H\r\n\x1b[Kline{line}\x1b[r\x1b[5;8H"
+            ));
+        }
+        stream
+    }
+
+    /// A screen tall enough that these tests can read every row they seed:
+    /// vt100 0.15 computes a screenful past the scrollback offset, which
+    /// underflows once the offset passes the screen height. Release builds
+    /// wrap and still render the right rows, but a test build aborts.
+    const SEED_ROWS: u16 = 40;
+    const SEED_COLUMNS: u16 = 20;
+
+    /// Replays `stream` into a client the way an attach does — rendered
+    /// history up to `split`, then the raw output the daemon still holds —
+    /// and returns it beside a parser that watched the whole session go by.
+    fn seed_and_continue(
+        stream: &str,
+        split: usize,
+        keep: usize,
+    ) -> (vt100::Parser, vt100::Parser) {
+        let (seeded, rest) = stream.as_bytes().split_at(split);
+        let seed = render_scrollback_seed(seeded, SEED_COLUMNS, SEED_ROWS, keep).expect("seed");
+        let mut client = vt100::Parser::new(SEED_ROWS, SEED_COLUMNS, SCROLLBACK_LINES);
+        let mut inline = InlineScrollback::default();
+        inline.process(&mut client, &seed);
+        for chunk in rest.chunks(7) {
+            inline.process(&mut client, chunk);
+        }
+        (client, feed_both(SEED_ROWS, SEED_COLUMNS, stream).1)
+    }
+
+    fn assert_same_history(client: &mut vt100::Parser, whole: &mut vt100::Parser) {
+        assert_eq!(
+            client.screen().contents(),
+            whole.screen().contents(),
+            "the screen a client lands on"
+        );
+        let depth = deepest_scrollback(whole);
+        assert_eq!(deepest_scrollback(client), depth, "rows to page through");
+        for offset in 1..=depth {
+            client.set_scrollback(offset);
+            whole.set_scrollback(offset);
+            assert_eq!(
+                client.screen().contents(),
+                whole.screen().contents(),
+                "scrolled back {offset} rows"
+            );
+        }
+        client.set_scrollback(0);
+        whole.set_scrollback(0);
+    }
+
+    #[test]
+    fn a_seed_hands_a_client_history_the_raw_output_never_held() {
+        // The whole session is rendered into the seed, so the client can page
+        // back through it without replaying a byte of the original stream.
+        let stream = transcript(1..=30);
+        let (mut client, mut whole) = seed_and_continue(&stream, stream.len(), 100);
+
+        assert_eq!(deepest_scrollback(&mut whole), 30);
+        assert_same_history(&mut client, &mut whole);
+    }
+
+    #[test]
+    fn a_seed_leaves_no_seam_where_the_replayed_output_takes_over() {
+        // What an attach actually does: rendered history up to the point the
+        // daemon still has raw output for, then that output. The agent only
+        // repaints what changed, so the seam shows up as blank rows if the
+        // seed stops short of handing over the screen it left off on.
+        let stream = transcript(1..=30);
+        // Split where the agent finished a line, the way a session's log is
+        // whole up to the point the daemon's retained output picks it up.
+        let split = transcript(1..=15).len();
+        let (mut client, mut whole) = seed_and_continue(&stream, split, 100);
+
+        assert_same_history(&mut client, &mut whole);
+    }
+
+    #[test]
+    fn a_seed_keeps_a_line_that_ran_off_the_right_edge_whole() {
+        // An overlong line is two rows that read as one. The client has to
+        // learn that from the seed, since nothing else says they are joined.
+        let mut stream = String::new();
+        for line in 1..=30 {
+            stream.push_str(&format!("line{line:02} {}\r\n", "x".repeat(28)));
+        }
+        let (mut client, mut whole) = seed_and_continue(&stream, stream.len(), 100);
+
+        let depth = deepest_scrollback(&mut whole);
+        assert!(
+            (1..=depth).any(|offset| {
+                whole.set_scrollback(offset);
+                whole
+                    .screen()
+                    .contents()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .chars()
+                    .count()
+                    > usize::from(SEED_COLUMNS)
+            }),
+            "the fixture must produce a wrapped row"
+        );
+        whole.set_scrollback(0);
+        assert_same_history(&mut client, &mut whole);
+    }
+
+    #[test]
+    fn a_seed_keeps_only_the_rows_it_was_asked_for() {
+        let stream = transcript(1..=30);
+        let seed =
+            render_scrollback_seed(stream.as_bytes(), SEED_COLUMNS, SEED_ROWS, 10).expect("seed");
+        let mut client = vt100::Parser::new(SEED_ROWS, SEED_COLUMNS, SCROLLBACK_LINES);
+        InlineScrollback::default().process(&mut client, &seed);
+
+        assert_eq!(deepest_scrollback(&mut client), 10);
+        client.set_scrollback(10);
+        assert!(
+            client.screen().contents().starts_with("line17"),
+            "the newest rows are the ones worth keeping: {:?}",
+            client.screen().contents()
+        );
+    }
+
+    #[test]
+    fn nothing_to_seed_costs_nothing() {
+        assert!(
+            render_scrollback_seed(b"".as_slice(), SEED_COLUMNS, SEED_ROWS, 100)
+                .expect("seed")
+                .is_empty(),
+            "a session with no output"
+        );
+        assert!(
+            render_scrollback_seed(transcript(1..=30).as_bytes(), SEED_COLUMNS, SEED_ROWS, 0)
+                .expect("seed")
+                .is_empty(),
+            "a client that asked for no history"
+        );
+        assert!(
+            render_scrollback_seed(b"hello".as_slice(), SEED_COLUMNS, SEED_ROWS, 100)
+                .expect("seed")
+                .is_empty(),
+            "a session still on its first screen, which the replay repaints"
+        );
+    }
+
+    #[test]
+    fn a_seed_leaves_an_alternate_screen_to_the_replay() {
+        // Restoring a full-screen app's display onto the primary screen would
+        // paste it into the history, so the seed stops at the rows below it.
+        let stream = format!("{}\x1b[?1049hfull screen", transcript(1..=30));
+        let seed =
+            render_scrollback_seed(stream.as_bytes(), SEED_COLUMNS, SEED_ROWS, 100).expect("seed");
+        let mut client = vt100::Parser::new(SEED_ROWS, SEED_COLUMNS, SCROLLBACK_LINES);
+        InlineScrollback::default().process(&mut client, &seed);
+
+        assert!(!client.screen().alternate_screen());
+        assert!(!client.screen().contents().contains("full screen"));
+        assert_eq!(deepest_scrollback(&mut client), 30);
     }
 
     #[test]

@@ -347,6 +347,10 @@ pub enum OpenStream {
         session_id: String,
         columns: u16,
         rows: u16,
+        /// Rows of rendered scrollback to replay ahead of the retained raw
+        /// output. Absent from older clients, which get the raw output alone.
+        #[serde(default)]
+        scrollback_rows: usize,
     },
     File {
         path: String,
