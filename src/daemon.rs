@@ -39,12 +39,16 @@ mod platform {
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
-    /// How much of a session's log to render when seeding a client's scrollback.
-    /// The render costs time in proportion to this, and a redraw-heavy session
-    /// can spend megabytes per finished line, so this trades depth for the delay
-    /// before a freshly attached pane fills: a quarter of a second on the worst
-    /// log measured, which still bought it a dozen screenfuls of history.
-    const SCROLLBACK_SEED_BYTES: u64 = 16 * 1024 * 1024;
+    /// The least of a session's log to render when seeding a client's
+    /// scrollback. Enough on its own for an agent that writes its transcript
+    /// out plainly, and cheap enough to read whether or not it is.
+    const SCROLLBACK_SEED_BYTES_MIN: u64 = 16 * 1024 * 1024;
+    /// The most of it to render. How much output a session spends per finished
+    /// line varies by three orders of magnitude between agents, so the window is
+    /// measured out in rows below and this only stops a log that has been
+    /// growing for days from being read back to its beginning: the render costs
+    /// roughly two seconds here, and an attach waits for it.
+    const SCROLLBACK_SEED_BYTES_MAX: u64 = 128 * 1024 * 1024;
     static METADATA_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
@@ -1603,10 +1607,11 @@ mod platform {
         /// `retained` is how many trailing bytes the client replays for itself;
         /// rendering stops that far short of the log's end so the rows meet that
         /// replay instead of repeating what it is about to redraw.
-        /// Only the tail of the log is read: a redraw-heavy agent spends most of
-        /// its output on frames, so this budget buys far more history than the
-        /// same number of raw bytes would, and it bounds what an attach costs on
-        /// a log that has been growing for days.
+        /// Only the tail of the log is read, and how much of it is measured out
+        /// in the rows asked for rather than in bytes: a redraw-heavy agent
+        /// spends tens of kilobytes on the frames around one finished line, so a
+        /// window that hands one agent its whole session leaves another with a
+        /// screenful.
         fn scrollback_seed(
             &self,
             columns: u16,
@@ -1630,7 +1635,14 @@ mod platform {
                 .metadata()?
                 .len()
                 .saturating_sub(retained.try_into().unwrap_or(u64::MAX));
-            let start = end.saturating_sub(SCROLLBACK_SEED_BYTES);
+            let start = seed_start(
+                &mut file,
+                end,
+                keep,
+                SCROLLBACK_SEED_BYTES_MIN,
+                SCROLLBACK_SEED_BYTES_MAX,
+            )
+            .with_context(|| format!("failed to scan history {}", self.history_path.display()))?;
             if end == start {
                 return Ok(Vec::new());
             }
@@ -1749,6 +1761,43 @@ mod platform {
                 lines.saturating_add(buffer[..read].iter().filter(|&&byte| byte == b'\n').count());
         }
         Ok(lines)
+    }
+
+    /// Where in a session's log to start rendering to reach `keep` rows of
+    /// scrollback, given that the render stops at `end`.
+    ///
+    /// A row only leaves the screen when something scrolls it off, and almost
+    /// everything that does costs a newline byte, so counting them backwards
+    /// says where the rows cannot be any further back than. It is a floor and
+    /// not an answer: an agent redrawing a pane writes newlines that scroll
+    /// nothing, so the count is taken with room to spare and clamped to a window
+    /// that is neither pointlessly small (`least`) nor unbounded (`most`).
+    fn seed_start(file: &mut File, end: u64, keep: usize, least: u64, most: u64) -> Result<u64> {
+        let floor = end.saturating_sub(most);
+        let ceiling = end.saturating_sub(least);
+        if ceiling == 0 {
+            return Ok(0);
+        }
+        let wanted = keep.saturating_mul(3) / 2;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut cursor = end;
+        let mut newlines = 0usize;
+        while cursor > floor && newlines < wanted {
+            let step = (cursor - floor).min(buffer.len() as u64);
+            cursor -= step;
+            file.seek(SeekFrom::Start(cursor))?;
+            let window = &mut buffer[..step as usize];
+            file.read_exact(window)?;
+            newlines =
+                newlines.saturating_add(window.iter().filter(|&&byte| byte == b'\n').count());
+        }
+        if newlines < wanted && cursor > 0 {
+            eprintln!(
+                "muxloomd scrollback seed stopped {} MiB back with {newlines} lines of the {wanted} it looks for",
+                most / (1024 * 1024)
+            );
+        }
+        Ok(cursor.min(ceiling))
     }
 
     fn read_history_file(
@@ -2101,6 +2150,63 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Writes a log whose every `spacing`-th byte is a newline.
+        fn log_with_lines(name: &str, len: usize, spacing: usize) -> File {
+            let path = test_state(name).paths.history.join("log.ansi");
+            let mut bytes = vec![b'x'; len];
+            for offset in (spacing..len).step_by(spacing) {
+                bytes[offset] = b'\n';
+            }
+            fs::write(&path, &bytes).unwrap();
+            File::open(&path).unwrap()
+        }
+
+        #[test]
+        fn a_seed_reads_back_as_far_as_the_rows_it_was_asked_for() {
+            const MIB: u64 = 1024 * 1024;
+            // A line every 4 KiB: 256 of them per mebibyte read.
+            let mut file = log_with_lines("seed-start", 6 * MIB as usize, 4096);
+            let end = 6 * MIB;
+
+            // 400 rows are looked for with room to spare, so the scan stops
+            // three mebibytes back, where the 600th line from the end is.
+            assert_eq!(
+                seed_start(&mut file, end, 400, MIB, 4 * MIB).unwrap(),
+                end - 3 * MIB
+            );
+            // Asking for more rows than the log can show reads back as far as
+            // it is allowed to and no further.
+            assert_eq!(
+                seed_start(&mut file, end, 100_000, MIB, 4 * MIB).unwrap(),
+                end - 4 * MIB
+            );
+            // A handful of rows still reads a whole window: the scan only says
+            // where the rows cannot be further back than, and starting a render
+            // that late would leave a client with almost nothing.
+            assert_eq!(
+                seed_start(&mut file, end, 1, MIB, 4 * MIB).unwrap(),
+                end - MIB
+            );
+            // A log shorter than one window is rendered from its beginning.
+            assert_eq!(
+                seed_start(&mut file, MIB / 2, 400, MIB, 4 * MIB).unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn a_log_of_redraws_is_read_back_the_same_distance_as_one_of_lines() {
+            // Nothing in the window ever committed a line, which is what an
+            // agent that repaints a full-screen pane looks like. The scan must
+            // not answer with the whole log for want of newlines.
+            const MIB: u64 = 1024 * 1024;
+            let mut file = log_with_lines("seed-start-redraw", 6 * MIB as usize, usize::MAX);
+            assert_eq!(
+                seed_start(&mut file, 6 * MIB, 400, MIB, 4 * MIB).unwrap(),
+                6 * MIB - 4 * MIB
+            );
+        }
 
         #[test]
         fn resolve_executable_prefers_path_over_a_cwd_named_entry() {
