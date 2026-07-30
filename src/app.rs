@@ -20,7 +20,7 @@ use crate::{
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
     recap::extract_recap,
-    runtime::{Runtime, agent_is_working, attention_reason},
+    runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
     ssh_config,
     terminal_session::TerminalSession,
     worker::{Event, Request, ScanRequest, TaskKind, Worker},
@@ -52,6 +52,7 @@ pub struct LaunchForm {
     pub kind: AgentKind,
     pub path: String,
     pub label: String,
+    pub temporary: bool,
     pub field: LaunchField,
 }
 
@@ -236,13 +237,13 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 52;
+pub const HELP_CONTENT_ROWS: usize = 53;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
 /// constant regardless of how frequently the UI redraws.
 const ANIMATION_FRAME_MS: u128 = 180;
-const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How often the browser re-lists the directory holding the open preview to
 /// notice that the file changed. Only runs while a preview is on screen, so an
@@ -477,6 +478,9 @@ pub struct App {
     clipboard_request: Option<String>,
     pending_install_launch: Option<(LaunchForm, Option<String>, Option<String>)>,
     pending_archived_resume: Option<ArchivedResume>,
+    /// A successful launch is not selectable until the next daemon scan returns
+    /// it. Keep the intended target across any older scan already in flight.
+    pending_launch_selection: Option<(String, String, u8)>,
     last_file_click: Option<FileClick>,
     last_machine_click: Option<FileClick>,
     /// When the last freshness poll for the open preview was sent, and whether
@@ -578,6 +582,7 @@ impl App {
             clipboard_request: None,
             pending_install_launch: None,
             pending_archived_resume: None,
+            pending_launch_selection: None,
             last_file_click: None,
             last_machine_click: None,
             file_monitor_sent_at: None,
@@ -754,6 +759,10 @@ impl App {
             }
             KeyCode::Char('a') if self.focus == Focus::Agents => {
                 self.toggle_archived();
+                Action::Continue
+            }
+            KeyCode::Char('t') if self.focus == Focus::Agents => {
+                self.launch_temporary_agent();
                 Action::Continue
             }
             KeyCode::Char('n') => {
@@ -1376,6 +1385,7 @@ impl App {
             .filter(|session| {
                 (self.state.flatten || selected_target == Some(session.target_id.as_str()))
                     && !(session.dead && session.kind == AgentKind::Terminal)
+                    && !(session.dead && is_temporary_session_id(&session.id))
                     && (!session.dead || self.state.show_archived)
             })
             .collect();
@@ -1399,6 +1409,7 @@ impl App {
             .filter(|session| {
                 session.dead
                     && session.kind != AgentKind::Terminal
+                    && !is_temporary_session_id(&session.id)
                     && (self.state.flatten || selected_target == Some(session.target_id.as_str()))
             })
             .count()
@@ -1609,6 +1620,7 @@ impl App {
             kind: session.kind,
             path: session.path.clone(),
             label: session.label.clone(),
+            temporary: false,
             field: LaunchField::Kind,
         };
         let request = Request::ScanResumes {
@@ -1868,16 +1880,19 @@ impl App {
     }
 
     fn poll_terminal(&mut self) {
-        let (changed, closed) = self
+        let (changed, closed, codex_working_hint) = self
             .terminal
             .as_mut()
-            .map(|terminal| (terminal.drain(), terminal.is_closed()))
-            .unwrap_or((false, false));
+            .map(|terminal| {
+                let changed = terminal.drain();
+                (changed, terminal.is_closed(), terminal.codex_working_hint())
+            })
+            .unwrap_or((false, false, None));
         if changed && !closed {
             self.refresh_terminal_screen();
             if let Some(session_id) = self.terminal_session_id.clone() {
                 let screen = std::mem::take(&mut self.terminal_screen);
-                self.sync_live_agent_activity(&session_id, &screen);
+                self.sync_live_agent_activity(&session_id, &screen, codex_working_hint);
                 self.terminal_screen = screen;
             }
         }
@@ -1956,7 +1971,12 @@ impl App {
         }
     }
 
-    fn sync_live_agent_activity(&mut self, session_id: &str, screen: &str) {
+    fn sync_live_agent_activity(
+        &mut self,
+        session_id: &str,
+        screen: &str,
+        codex_working_hint: Option<bool>,
+    ) {
         let Some(index) = self
             .sessions
             .iter()
@@ -1974,7 +1994,12 @@ impl App {
 
         let attention =
             attention_reason(kind, screen, self.config.attention_patterns_for(&target_id));
-        let working = attention.is_none() && agent_is_working(kind, screen);
+        let working = attention.is_none()
+            && if kind == AgentKind::Codex {
+                codex_working_hint.unwrap_or_else(|| agent_is_working(kind, screen))
+            } else {
+                agent_is_working(kind, screen)
+            };
         let session = &mut self.sessions[index];
         let changed = session.working != working
             || session.needs_attention != attention.is_some()
@@ -2055,6 +2080,7 @@ impl App {
                 progress,
             } => self.set_task_progress(target_id, operation, progress),
             Event::Scanned { target_id, result } => {
+                let scan_succeeded = result.is_ok();
                 self.clear_task_progress(&target_id, TaskKind::Connect);
                 self.pending_scans.remove(&target_id);
                 let previous_attention: HashSet<_> = self
@@ -2140,13 +2166,59 @@ impl App {
                         }
                     }
                 }
-                self.ensure_session_selection();
+                let launched = self
+                    .pending_launch_selection
+                    .as_ref()
+                    .filter(|(pending_target, _, _)| pending_target == &target_id)
+                    .cloned();
+                let launched_available = launched.as_ref().is_some_and(|(_, session_id, _)| {
+                    self.sessions
+                        .iter()
+                        .any(|session| session.id == *session_id)
+                });
+                if let Some((_, session_id, _)) = launched.filter(|_| launched_available) {
+                    if let Some(target_index) = self
+                        .targets
+                        .iter()
+                        .position(|target| target.target.id == target_id)
+                    {
+                        self.set_selected_target(target_index);
+                    }
+                    self.focus = Focus::Agents;
+                    self.select_session(session_id);
+                    self.pending_launch_selection = None;
+                } else {
+                    self.ensure_session_selection();
+                }
                 if self
                     .selected_session()
                     .is_some_and(|session| session.target_id == target_id)
                     && (!self.has_terminal_for_selected() || self.history_offset > 0)
                 {
                     self.request_history();
+                }
+                let rescan_for_launch = if scan_succeeded {
+                    match self.pending_launch_selection.as_mut() {
+                        Some((pending_target, _, completed_scans))
+                            if pending_target == &target_id && *completed_scans == 0 =>
+                        {
+                            *completed_scans = 1;
+                            true
+                        }
+                        Some((pending_target, session_id, _)) if pending_target == &target_id => {
+                            self.status_message = format!(
+                                "Launched session {session_id} exited before it could be selected"
+                            );
+                            self.pending_launch_selection = None;
+                            false
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if rescan_for_launch {
+                    self.refresh_target(&target_id);
                 }
             }
             Event::ActivityRefreshed { target_id, result } => {
@@ -2216,7 +2288,8 @@ impl App {
                         let legacy_tmux = session_id.starts_with("muxloom-");
                         self.selected_sessions_by_target
                             .insert(target_id.clone(), session_id.clone());
-                        self.selected_session_id = Some(session_id);
+                        self.pending_launch_selection =
+                            Some((target_id.clone(), session_id.clone(), 0));
                         // Land on the new agent in the Agents pane rather than
                         // leaving focus on the machine/folder sidebar.
                         self.focus = Focus::Agents;
@@ -3264,6 +3337,13 @@ impl App {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        if is_temporary_session_id(&session.id) {
+            self.history = HistoryPage::default();
+            self.history_loading = false;
+            self.pending_capture = None;
+            self.status_message = "Temporal Chat does not retain history".into();
+            return;
+        }
         let desired_offset = self.history_offset;
         let viewport_lines = self.agent_viewport_height.max(1) as usize;
         let chunk_lines = self.config.history_chunk_lines.max(viewport_lines + 50);
@@ -3510,31 +3590,7 @@ impl App {
     }
 
     fn open_launch(&mut self) {
-        // In grouped mode the machine sidebar is authoritative, even if an old
-        // session selection still points at a different host.
-        let target = if !self.state.flatten {
-            self.targets
-                .get(self.selected_target)
-                .filter(|status| status.enabled)
-                .map(|status| status.target.clone())
-        } else {
-            self.selected_session()
-                .and_then(|session| self.target(&session.target_id))
-                .cloned()
-                .or_else(|| {
-                    self.targets
-                        .get(self.selected_target)
-                        .filter(|status| status.enabled)
-                        .map(|status| status.target.clone())
-                })
-        }
-        .or_else(|| {
-            self.targets
-                .iter()
-                .find(|status| status.enabled)
-                .map(|status| status.target.clone())
-        });
-        let Some(target) = target else {
+        let Some(target) = self.launch_target() else {
             self.status_message = "Enable a machine before launching an agent".into();
             return;
         };
@@ -3542,8 +3598,8 @@ impl App {
             .selected_session()
             .filter(|session| session.target_id == target.id)
             .map(|session| session.path.clone());
-        // Default to the directory this machine was last launched in, then the
-        // highlighted agent's folder, then the local cwd (or "." for remotes).
+        // Normal agents keep the existing preference for the machine's last
+        // launch directory before the highlighted agent's folder.
         let path = self
             .state
             .last_launch_dirs
@@ -3565,8 +3621,76 @@ impl App {
             kind: AgentKind::Codex,
             path,
             label: String::new(),
+            temporary: false,
             field: LaunchField::Kind,
         }));
+    }
+
+    fn launch_target(&self) -> Option<Target> {
+        // In grouped mode the machine sidebar is authoritative, even if an old
+        // session selection still points at a different host.
+        (if !self.state.flatten {
+            self.targets
+                .get(self.selected_target)
+                .filter(|status| status.enabled)
+                .map(|status| status.target.clone())
+        } else {
+            self.selected_session()
+                .and_then(|session| self.target(&session.target_id))
+                .cloned()
+                .or_else(|| {
+                    self.targets
+                        .get(self.selected_target)
+                        .filter(|status| status.enabled)
+                        .map(|status| status.target.clone())
+                })
+        })
+        .or_else(|| {
+            self.targets
+                .iter()
+                .find(|status| status.enabled)
+                .map(|status| status.target.clone())
+        })
+    }
+
+    fn user_folder(&self, target: &Target) -> String {
+        if target.id == LOCAL_TARGET_ID {
+            env::var("HOME").unwrap_or_else(|_| {
+                env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .display()
+                    .to_string()
+            })
+        } else {
+            "~".into()
+        }
+    }
+
+    fn launch_temporary_agent(&mut self) {
+        let Some(target) = self.launch_target() else {
+            self.status_message = "Enable a machine before starting a Temporal Chat".into();
+            return;
+        };
+        let selected_path = self
+            .selected_session()
+            .filter(|session| session.target_id == target.id)
+            .map(|session| session.path.clone());
+        let path = selected_path
+            .or_else(|| self.state.last_launch_dirs.get(&target.id).cloned())
+            .unwrap_or_else(|| self.user_folder(&target));
+        self.confirm_or_submit_launch(
+            LaunchForm {
+                target,
+                kind: AgentKind::Codex,
+                path,
+                label: "Temporal Chat".into(),
+                temporary: true,
+                field: LaunchField::Kind,
+            },
+            None,
+            None,
+        );
+        self.status_message = "Starting Temporal Chat...".into();
     }
 
     fn open_path_picker(&mut self, launch: LaunchForm) {
@@ -4520,7 +4644,9 @@ impl App {
         self.modal = Some(Modal::ConfirmKill {
             session_id: session.id.clone(),
             label: session.display_label().into(),
-            archive: !session.dead && session.kind != AgentKind::Terminal,
+            archive: !session.dead
+                && session.kind != AgentKind::Terminal
+                && !is_temporary_session_id(&session.id),
         });
     }
 
@@ -5126,6 +5252,7 @@ impl App {
             kind: form.kind,
             path: form.path,
             label: form.label,
+            temporary: form.temporary,
             resume_id,
             initial_prompt,
         };
@@ -5385,13 +5512,21 @@ impl App {
                 }
                 line = line.saturating_sub(*height);
             }
-            if let Some((target_index, _item_line)) = hit {
+            if let Some((target_index, item_line)) = hit {
                 self.set_selected_target(target_index);
                 self.ensure_session_selection();
                 let target_id = self.targets[target_index].target.id.clone();
-                if self.is_machine_double_click(&target_id) {
+                // Border + list highlight + two-character state marker put the
+                // rendered `[x]` checkbox in these three columns.
+                let checkbox_start = area.x.saturating_add(5);
+                let checkbox_end = checkbox_start.saturating_add(3);
+                let checkbox_hit =
+                    item_line == 0 && (checkbox_start..checkbox_end).contains(&column);
+                if checkbox_hit && self.is_machine_double_click(&target_id) {
                     self.last_machine_click = None;
                     self.toggle_target(target_index);
+                } else if !checkbox_hit {
+                    self.last_machine_click = None;
                 }
             } else {
                 self.last_machine_click = None;
@@ -6358,6 +6493,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 path: ".".into(),
                 label: String::new(),
+                temporary: false,
                 field: LaunchField::Path,
             },
             path: "/work".into(),
@@ -6411,12 +6547,30 @@ mod tests {
             recap: None,
         });
 
-        app.sync_live_agent_activity("muxloomd-codex-live", "• Working (1s • esc to interrupt)");
+        app.sync_live_agent_activity(
+            "muxloomd-codex-live",
+            "• Working (1s • esc to interrupt)",
+            None,
+        );
         assert!(app.sessions[0].working);
 
         app.sync_live_agent_activity(
             "muxloomd-codex-live",
             "› Ask Codex anything\ngpt-5.6-sol xhigh · /work",
+            None,
+        );
+        assert!(!app.sessions[0].working);
+
+        app.sync_live_agent_activity(
+            "muxloomd-codex-live",
+            "partially erased status line",
+            Some(true),
+        );
+        assert!(app.sessions[0].working);
+        app.sync_live_agent_activity(
+            "muxloomd-codex-live",
+            "• Working (1s • esc to interrupt)",
+            Some(false),
         );
         assert!(!app.sessions[0].working);
     }
@@ -8286,6 +8440,7 @@ mod tests {
                 kind: AgentKind::Terminal,
                 path: ".".into(),
                 label: String::new(),
+                temporary: false,
                 field: LaunchField::Path,
             },
             path: "/tmp/project".into(),
@@ -8327,6 +8482,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 path: "/tmp/project".into(),
                 label: String::new(),
+                temporary: false,
                 field: LaunchField::Path,
             },
             candidates: Vec::new(),
@@ -8369,6 +8525,7 @@ mod tests {
             kind: AgentKind::Codex,
             path: String::new(),
             label: String::new(),
+            temporary: false,
             field: LaunchField::Path,
         }));
 
@@ -8449,18 +8606,175 @@ mod tests {
 
     #[test]
     fn launching_focuses_the_agents_pane() {
-        let mut app = ux_test_app(vec![Target::local()]);
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            std::env::temp_dir().join(format!(
+                "muxloom-launch-focus-test-{}.json",
+                std::process::id()
+            )),
+            vec![Target::local()],
+            worker,
+        );
         app.focus = Focus::Machines;
+        // Simulate an older discovery request that was already in flight when
+        // the launch completed.
+        app.pending_scans.insert("local".into());
         app.handle_worker_event(Event::Launched {
             target_id: "local".into(),
             notice: None,
             result: Ok("muxloomd-codex-1-2-0".into()),
         });
         assert_eq!(app.focus, Focus::Agents);
+        assert_ne!(
+            app.selected_session_id.as_deref(),
+            Some("muxloomd-codex-1-2-0")
+        );
+
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((crate::model::Probe::default(), Vec::new())),
+        });
+        assert!(matches!(receive_request(&request_rx), Request::Scan(_)));
+
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((
+                crate::model::Probe::default(),
+                vec![AgentSession {
+                    id: "muxloomd-codex-1-2-0".into(),
+                    target_id: "local".into(),
+                    kind: AgentKind::Codex,
+                    path: "/work/new".into(),
+                    label: "new agent".into(),
+                    created_at: 1,
+                    dead: false,
+                    pid: Some(1),
+                    working: false,
+                    needs_attention: false,
+                    attention_reason: None,
+                    recap: None,
+                }],
+            )),
+        });
         assert_eq!(
             app.selected_session_id.as_deref(),
             Some("muxloomd-codex-1-2-0")
         );
+        assert!(app.pending_launch_selection.is_none());
+        assert_eq!(app.focus, Focus::Agents);
+    }
+
+    #[test]
+    fn temporary_chat_uses_current_folder_and_is_destroyed_without_history() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        state
+            .last_launch_dirs
+            .insert("local".into(), "/work/last".into());
+        let state_path =
+            std::env::temp_dir().join(format!("muxloom-temporal-test-{}.json", std::process::id()));
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].probe.codex = true;
+        app.sessions.push(AgentSession {
+            id: "muxloomd-codex-current".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/current".into(),
+            label: "current".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloomd-codex-current".into());
+        app.focus = Focus::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let Request::Launch { request, .. } = receive_request(&request_rx) else {
+            panic!("Temporal Chat did not launch immediately");
+        };
+        assert_eq!(request.kind, AgentKind::Codex);
+        assert_eq!(request.path, "/work/current");
+        assert_eq!(request.label, "Temporal Chat");
+        assert!(request.temporary);
+        assert!(request.resume_id.is_none() && request.initial_prompt.is_none());
+
+        app.sessions.clear();
+        app.selected_session_id = None;
+        app.state
+            .last_launch_dirs
+            .insert("local".into(), "/work/last".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let Request::Launch { request, .. } = receive_request(&request_rx) else {
+            panic!("Temporal Chat did not use the last launch folder");
+        };
+        assert_eq!(request.path, "/work/last");
+
+        app.state.last_launch_dirs.remove("local");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let Request::Launch { request, .. } = receive_request(&request_rx) else {
+            panic!("Temporal Chat did not fall back to the user folder");
+        };
+        assert_eq!(request.path, app.user_folder(&Target::local()));
+
+        app.sessions.push(AgentSession {
+            id: "muxloomd-temporal-codex-test".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/current".into(),
+            label: "Temporal Chat".into(),
+            created_at: 2,
+            dead: false,
+            pid: Some(2),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloomd-temporal-codex-test".into());
+        app.request_history();
+        assert_eq!(app.status_message, "Temporal Chat does not retain history");
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmKill { archive: false, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(receive_request(&request_rx), Request::Kill { .. }));
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
@@ -8600,19 +8914,25 @@ mod tests {
         assert_eq!(app.selected_target, 1);
         assert!(app.targets[1].enabled, "single click only selects");
 
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 40,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        });
         app.handle_mouse(click_remote);
         assert!(
             app.targets[1].enabled,
-            "an intervening click cancels the double-click gesture"
+            "double-clicking outside [x] must only select"
         );
         app.handle_mouse(click_remote);
-        assert!(!app.targets[1].enabled, "double click toggles the machine");
+        assert!(app.targets[1].enabled);
+
+        let click_checkbox = MouseEvent {
+            column: 6,
+            ..click_remote
+        };
+        app.handle_mouse(click_checkbox);
+        assert!(app.targets[1].enabled, "first checkbox click only selects");
+        app.handle_mouse(click_checkbox);
+        assert!(
+            !app.targets[1].enabled,
+            "double-click inside [x] toggles the machine"
+        );
     }
 
     #[test]
@@ -8672,6 +8992,7 @@ mod tests {
             kind: AgentKind::Codex,
             path: "/work/project".into(),
             label: "handoff".into(),
+            temporary: false,
             field: LaunchField::Path,
         };
         let claude = ResumeCandidate {

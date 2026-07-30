@@ -35,7 +35,7 @@ mod platform {
         },
         recap::extract_recap,
         runtime::{agent_is_working, attention_reason},
-        terminal_session::{render_scrollback_seed, resize_parser},
+        terminal_session::{CodexActivity, render_scrollback_seed, resize_parser},
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -128,6 +128,7 @@ mod platform {
         child: Mutex<Box<dyn Child + Send + Sync>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
+        codex_activity: Mutex<CodexActivity>,
         recent_output: Mutex<Vec<u8>>,
         history_path: PathBuf,
         metadata_path: PathBuf,
@@ -260,6 +261,11 @@ mod platform {
                         "metadata filename does not match session id {}",
                         metadata.id
                     );
+                }
+                if metadata.temporary {
+                    let _ = fs::remove_file(paths.history.join(format!("{}.ansi", metadata.id)));
+                    let _ = fs::remove_file(&path);
+                    bail!("discarded stale temporary session");
                 }
                 if !metadata.dead && !metadata.archived {
                     bail!("metadata still describes a live PTY");
@@ -708,7 +714,7 @@ mod platform {
 
     fn handle_request(
         writer: &Arc<Mutex<UnixStream>>,
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         request_id: u64,
         request: DaemonRequest,
     ) -> Result<()> {
@@ -821,6 +827,7 @@ mod platform {
                 kind,
                 path,
                 label,
+                temporary,
                 executable,
                 args,
                 environment,
@@ -841,6 +848,7 @@ mod platform {
                     kind,
                     path,
                     label,
+                    temporary,
                     executable,
                     args,
                     environment,
@@ -957,7 +965,7 @@ mod platform {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&session_id);
                 if let Some(session) = live {
-                    session.archive()?;
+                    session.stop()?;
                     let _ = fs::remove_file(&session.history_path);
                     let _ = fs::remove_file(&session.metadata_path);
                 } else {
@@ -1067,11 +1075,12 @@ mod platform {
 
     #[allow(clippy::too_many_arguments)]
     fn launch_session(
-        state: &DaemonState,
+        state: &Arc<DaemonState>,
         session_id: String,
         kind: String,
         path: String,
         label: String,
+        temporary: bool,
         executable: String,
         args: Vec<String>,
         environment: Vec<(String, String)>,
@@ -1080,6 +1089,11 @@ mod platform {
         rows: u16,
     ) -> Result<Arc<ManagedSession>> {
         validate_session_id(&session_id)?;
+        let path = if path == "~" {
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        } else {
+            path
+        };
         if state
             .sessions
             .lock()
@@ -1160,15 +1174,18 @@ mod platform {
         let writer = pair.master.take_writer()?;
         let history_path = state.paths.history.join(format!("{session_id}.ansi"));
         let metadata_path = state.paths.sessions.join(format!("{session_id}.json"));
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&history_path)?;
+        if !temporary {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&history_path)?;
+        }
         let metadata = DaemonSession {
             id: session_id.clone(),
             kind,
             path,
             label,
+            temporary,
             created_at,
             pid,
             dead: false,
@@ -1185,6 +1202,7 @@ mod platform {
             child: Mutex::new(child),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
+            codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             history_path,
             metadata_path,
@@ -1200,17 +1218,22 @@ mod platform {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id, Arc::clone(&session));
         let managed = Arc::clone(&session);
+        let reader_state = Arc::clone(state);
         thread::spawn(move || {
-            let mut history = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&managed.history_path)
-            {
-                Ok(history) => history,
-                Err(error) => {
-                    eprintln!("muxloomd history open failed: {error}");
-                    managed.mark_dead();
-                    return;
+            let mut history = if managed.temporary() {
+                None
+            } else {
+                match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&managed.history_path)
+                {
+                    Ok(history) => Some(history),
+                    Err(error) => {
+                        eprintln!("muxloomd history open failed: {error}");
+                        managed.mark_dead();
+                        return;
+                    }
                 }
             };
             let mut buffer = vec![0; DATA_CHUNK_SIZE];
@@ -1219,7 +1242,9 @@ mod platform {
                     Ok(0) => break,
                     Ok(read) => {
                         let bytes = &buffer[..read];
-                        let _ = history.write_all(bytes);
+                        if let Some(history) = history.as_mut() {
+                            let _ = history.write_all(bytes);
+                        }
                         managed.record_output(bytes);
                         managed.broadcast(bytes);
                     }
@@ -1227,8 +1252,20 @@ mod platform {
                     Err(_) => break,
                 }
             }
-            let _ = history.flush();
-            managed.mark_dead();
+            if let Some(history) = history.as_mut() {
+                let _ = history.flush();
+            }
+            if managed.temporary() {
+                reader_state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&managed.session_id());
+                let _ = fs::remove_file(&managed.history_path);
+                let _ = fs::remove_file(&managed.metadata_path);
+            } else {
+                managed.mark_dead();
+            }
         });
         Ok(session)
     }
@@ -1472,6 +1509,9 @@ mod platform {
                     .metadata
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if metadata.temporary {
+                    bail!("temporary sessions cannot be archived");
+                }
                 metadata.archived = true;
                 metadata.dead = true;
                 metadata.pid = None;
@@ -1497,6 +1537,9 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
         ) -> Result<(Vec<u8>, usize, usize)> {
+            if self.snapshot().temporary {
+                return Ok((Vec::new(), 0, 0));
+            }
             read_history_file(
                 &self.history_path,
                 self.line_count()?,
@@ -1511,11 +1554,29 @@ mod platform {
             query: &str,
             max_matches: usize,
         ) -> Result<Vec<DaemonHistoryMatch>> {
+            if self.snapshot().temporary {
+                return Ok(Vec::new());
+            }
             search_history_file(&self.history_path, query, max_matches)
         }
     }
 
     impl ManagedSession {
+        fn session_id(&self) -> String {
+            self.metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .id
+                .clone()
+        }
+
+        fn temporary(&self) -> bool {
+            self.metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .temporary
+        }
+
         fn snapshot(&self) -> DaemonSession {
             let mut snapshot = self
                 .metadata
@@ -1529,13 +1590,15 @@ mod platform {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .screen()
                 .contents();
-            let recent = self
-                .recent_output
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let recent = {
+                let recent = self
+                    .recent_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                String::from_utf8_lossy(&recent).into_owned()
+            };
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
-                let output = String::from_utf8_lossy(&recent);
-                snapshot.recap = extract_recap(kind, &output);
+                snapshot.recap = extract_recap(kind, &recent);
                 if snapshot.dead || snapshot.archived {
                     snapshot.pid = None;
                     snapshot.working = false;
@@ -1544,8 +1607,17 @@ mod platform {
                 } else {
                     snapshot.attention_reason = attention_reason(kind, &visible_screen, &[]);
                     snapshot.needs_attention = snapshot.attention_reason.is_some();
-                    snapshot.working =
-                        !snapshot.needs_attention && agent_is_working(kind, &visible_screen);
+                    let working_hint = self
+                        .codex_activity
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .working();
+                    snapshot.working = !snapshot.needs_attention
+                        && if kind == AgentKind::Codex {
+                            working_hint.unwrap_or_else(|| agent_is_working(kind, &visible_screen))
+                        } else {
+                            agent_is_working(kind, &visible_screen)
+                        };
                 }
             }
             snapshot
@@ -1589,15 +1661,22 @@ mod platform {
         }
 
         fn archive(&self) -> Result<()> {
+            if self.temporary() {
+                bail!("temporary sessions cannot be archived");
+            }
             self.archived.store(true, Ordering::Relaxed);
+            self.stop()?;
+            self.mark_dead();
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<()> {
             let mut child = self
                 .child
                 .lock()
                 .map_err(|_| anyhow!("session child is poisoned"))?;
             let _ = child.kill();
             let _ = child.wait();
-            drop(child);
-            self.mark_dead();
             Ok(())
         }
 
@@ -1619,7 +1698,7 @@ mod platform {
             retained: usize,
             keep: usize,
         ) -> Result<Vec<u8>> {
-            if keep == 0 {
+            if keep == 0 || self.temporary() {
                 return Ok(Vec::new());
             }
             let mut file = match File::open(&self.history_path) {
@@ -1656,6 +1735,10 @@ mod platform {
                 Ordering::Relaxed,
             );
             self.screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .process(bytes);
+            self.codex_activity
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .process(bytes);
@@ -1715,6 +1798,9 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
         ) -> Result<(Vec<u8>, usize, usize)> {
+            if self.temporary() {
+                return Ok((Vec::new(), 0, 0));
+            }
             read_history_file(
                 &self.history_path,
                 self.line_count.load(Ordering::Relaxed),
@@ -1729,6 +1815,9 @@ mod platform {
             query: &str,
             max_matches: usize,
         ) -> Result<Vec<DaemonHistoryMatch>> {
+            if self.temporary() {
+                return Ok(Vec::new());
+            }
             search_history_file(&self.history_path, query, max_matches)
         }
     }
@@ -2332,6 +2421,7 @@ mod platform {
                     kind: "terminal".into(),
                     path: "/tmp".into(),
                     label: "handover guard".into(),
+                    temporary: false,
                     executable: "/bin/cat".into(),
                     args: vec![],
                     environment: vec![],
@@ -2399,6 +2489,7 @@ mod platform {
                 "codex".into(),
                 "/tmp".into(),
                 "visible working state".into(),
+                false,
                 "/bin/sh".into(),
                 vec![
                     "-c".into(),
@@ -2423,6 +2514,80 @@ mod platform {
         }
 
         #[test]
+        fn codex_title_spinner_survives_partial_visible_redraws() {
+            let state = test_state("title-working");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-codex-title-working".into(),
+                "codex".into(),
+                "/tmp".into(),
+                "title working state".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+
+            session.record_output("\x1b]0;⠋ project\x07\x1b[2J\x1b[HWork".as_bytes());
+            assert!(session.snapshot().working);
+            session.record_output(b"\x1b[2K\r");
+            assert!(
+                session.snapshot().working,
+                "erasing the visible status must not erase the title signal"
+            );
+            session.record_output(b"\x1b]0;project\x07");
+            assert!(!session.snapshot().working);
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn temporary_session_never_creates_history_or_becomes_archived() {
+            let state = test_state("temporary");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-temporal-codex-test";
+            let session = launch_session(
+                &state,
+                session_id.into(),
+                "codex".into(),
+                "/tmp".into(),
+                "Temporal Chat".into(),
+                true,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+
+            assert!(session.snapshot().temporary);
+            assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
+            assert_eq!(session.read_history(0, 100).unwrap(), (Vec::new(), 0, 0));
+            assert!(session.search_history("anything", 10).unwrap().is_empty());
+            assert!(session.archive().is_err());
+
+            session.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.sessions.lock().unwrap().contains_key(session_id)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!state.sessions.lock().unwrap().contains_key(session_id));
+            assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
+            assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
         fn archived_sessions_reload_with_searchable_history_after_restart() {
             let initial = test_state("persisted-archive");
             let paths = initial.paths.clone();
@@ -2435,6 +2600,7 @@ mod platform {
                     kind: "claude".into(),
                     path: "/tmp/project".into(),
                     label: "persisted archive".into(),
+                    temporary: false,
                     created_at: 42,
                     pid: None,
                     dead: true,
@@ -2495,6 +2661,7 @@ mod platform {
                     kind: "terminal".into(),
                     path: "/tmp".into(),
                     label: "cat".into(),
+                    temporary: false,
                     executable: "/bin/cat".into(),
                     args: vec![],
                     environment: vec![],

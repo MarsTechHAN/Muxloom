@@ -38,7 +38,7 @@ use serde_json::Value;
 
 use crate::{
     model::{AgentKind, LOCAL_TARGET_ID, Target, Transport},
-    runtime::Runtime,
+    runtime::{Runtime, is_temporary_session_id},
 };
 
 /// zstd level for at-rest compression. Level 12 already crushes the redundant
@@ -676,6 +676,9 @@ pub fn sync_target(
         .with_context(|| format!("failed to list sessions on {}", target.id))?;
 
     for session in sessions {
+        if session.temporary || is_temporary_session_id(&session.id) {
+            continue;
+        }
         let mut record = index
             .position(&partition, &session.id)
             .map(|position| index.records[position].clone())

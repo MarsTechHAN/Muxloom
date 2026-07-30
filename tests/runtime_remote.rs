@@ -35,6 +35,7 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         kind: AgentKind::Codex,
         path: "/tmp".into(),
         label: "remote native companion smoke".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };

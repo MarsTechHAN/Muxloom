@@ -225,6 +225,8 @@ pub enum DaemonRequest {
         kind: String,
         path: String,
         label: String,
+        #[serde(default)]
+        temporary: bool,
         executable: String,
         args: Vec<String>,
         environment: Vec<(String, String)>,
@@ -330,6 +332,8 @@ pub struct DaemonSession {
     pub kind: String,
     pub path: String,
     pub label: String,
+    #[serde(default)]
+    pub temporary: bool,
     pub created_at: u64,
     pub pid: Option<u32>,
     pub dead: bool,

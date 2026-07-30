@@ -238,6 +238,7 @@ pub struct LaunchRequest {
     pub kind: AgentKind,
     pub path: String,
     pub label: String,
+    pub temporary: bool,
     pub resume_id: Option<String>,
     /// Initial prompt for a fresh session. Used when another agent runtime's
     /// history is referenced instead of passed as an incompatible resume id.

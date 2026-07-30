@@ -23,6 +23,7 @@ use crate::{
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
+    runtime::is_temporary_session_id,
 };
 
 const ACCENT: Color = Color::Rgb(112, 184, 255);
@@ -115,7 +116,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let archived = app
         .sessions
         .iter()
-        .filter(|session| session.dead && session.kind != AgentKind::Terminal)
+        .filter(|session| {
+            session.dead
+                && session.kind != AgentKind::Terminal
+                && !is_temporary_session_id(&session.id)
+        })
         .count();
     let launch_target = app
         .targets
@@ -536,10 +541,15 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         if session.dead || !session.working {
             continue;
         }
-        let group = if app.state.flatten {
-            format!("{}  {}", session.target_id, session.path)
+        let folder = if is_temporary_session_id(&session.id) {
+            "Temporal Chat"
         } else {
-            session.path.clone()
+            &session.path
+        };
+        let group = if app.state.flatten {
+            format!("{}  {folder}", session.target_id)
+        } else {
+            folder.to_string()
         };
         let active = working_by_group.entry(group).or_default();
         match session.kind {
@@ -564,10 +574,15 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             previous_group.clear();
             archive_header_added = true;
         }
-        let group = if app.state.flatten {
-            format!("{}  {}", session.target_id, session.path)
+        let folder = if is_temporary_session_id(&session.id) {
+            "Temporal Chat"
         } else {
-            session.path.clone()
+            &session.path
+        };
+        let group = if app.state.flatten {
+            format!("{}  {folder}", session.target_id)
+        } else {
+            folder.to_string()
         };
         if group != previous_group {
             let active = working_by_group.get(&group).copied().unwrap_or_default();
@@ -626,6 +641,16 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Color::Gray
         };
         let selected = app.selected_session_id.as_deref() == Some(&session.id);
+        let attention_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let agent_style = |normal| {
+            if session.needs_attention {
+                attention_style
+            } else {
+                normal
+            }
+        };
         let activity = if session.needs_attention {
             "!"
         } else if session.working && !session.dead {
@@ -636,15 +661,17 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 activity,
-                Style::default()
-                    .fg(if session.needs_attention {
-                        Color::Yellow
-                    } else if session.kind == AgentKind::Claude {
-                        CLAUDE
-                    } else {
-                        CODEX
-                    })
-                    .add_modifier(Modifier::BOLD),
+                agent_style(
+                    Style::default()
+                        .fg(if session.needs_attention {
+                            Color::Yellow
+                        } else if session.kind == AgentKind::Claude {
+                            CLAUDE
+                        } else {
+                            CODEX
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
             Span::raw(" "),
             Span::styled(
@@ -652,35 +679,39 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     session.display_label(),
                     area.width.saturating_sub(10) as usize,
                 ),
-                Style::default().fg(Color::White),
+                agent_style(Style::default().fg(Color::White)),
             ),
         ])];
         if selected {
             let value_width = area.width.saturating_sub(14) as usize;
             lines.push(Line::from(vec![
-                Span::styled("    folder  ", Style::default().fg(MUTED)),
+                Span::styled("    folder  ", agent_style(Style::default().fg(MUTED))),
                 Span::styled(
-                    truncate(&session.path, value_width),
-                    Style::default().fg(Color::Gray),
+                    truncate(folder, value_width),
+                    agent_style(Style::default().fg(Color::Gray)),
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    recap   ", Style::default().fg(MUTED)),
+                Span::styled("    recap   ", agent_style(Style::default().fg(MUTED))),
                 Span::styled(
                     truncate(&app.recap_for(&session), value_width),
-                    Style::default().fg(Color::White),
+                    agent_style(Style::default().fg(Color::White)),
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    status  ", Style::default().fg(MUTED)),
+                Span::styled("    status  ", agent_style(Style::default().fg(MUTED))),
                 Span::styled(
                     format!("{icon} {runtime_name}  {state}"),
-                    Style::default().fg(state_color),
+                    agent_style(Style::default().fg(state_color)),
                 ),
             ]));
         }
         let height = lines.len() as u16;
-        items.push(ListItem::new(lines));
+        items.push(ListItem::new(lines).style(if session.needs_attention {
+            attention_style
+        } else {
+            Style::default()
+        }));
         row_ids.push((Some(session.id), height));
     }
     if archived_count > 0 && !app.state.show_archived {
@@ -690,7 +721,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     if items.is_empty() {
         items.push(ListItem::new(Line::styled(
-            "No sessions. Press n to launch one.",
+            "No sessions. Press n to launch or t for a Temporal Chat.",
             Style::default().fg(MUTED),
         )));
         row_ids.push((None, 1));
@@ -1106,19 +1137,19 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let help = if app.interactive {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
-        "  n new  Enter open  Ctrl-f files  / search  q quit"
+        "  n new  t temporal  Enter open  / search  q quit"
     } else {
         match app.focus {
             Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
-                        "  Enter open  a collapse  / search  n new  q quit  ? more"
+                        "  Enter open  a collapse  / search  n new  t temporal  q quit"
                     } else {
-                        "  Enter open  a expand  / search  n new  q quit  ? more"
+                        "  Enter open  a expand  / search  n new  t temporal  q quit"
                     }
                 } else {
-                    "  Enter open  / search  n new  q quit  ? more"
+                    "  Enter open  / search  n new  t temporal  q quit  ? more"
                 }
             }
             Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
@@ -2563,6 +2594,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         Line::raw(""),
         help_header("Launch"),
         help_row("n / Ctrl-n", "Start the runtime and path flow"),
+        help_row(
+            "t in Agents",
+            "Start a no-history Temporal Chat in the current folder",
+        ),
         help_row("Left / Right", "Choose Codex, Claude, or Terminal"),
         help_row("Tab", "Move between launch fields"),
         help_row("Enter on path", "Open the local or remote folder picker"),
@@ -2586,18 +2621,15 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Mouse drag",
             "Select and copy terminal text; Alt-drag forwards",
         ),
-        help_row(
-            "x",
-            "Archive live agents; permanently remove archived agents",
-        ),
+        help_row("x", "Archive live agents; directly destroy a Temporal Chat"),
         help_row("a", "Expand or collapse Archived sessions"),
         help_row("e", "Rename the selected agent's display name"),
         help_row("Up twice at top", "Open the first agent waiting for input"),
         Line::raw(""),
         help_header("Machines"),
         help_row(
-            "Space / double-click",
-            "Enable or disable; single-click selects",
+            "Space / double-click [x]",
+            "Enable or disable; clicks elsewhere only select",
         ),
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
@@ -3607,6 +3639,64 @@ mod tests {
     }
 
     #[test]
+    fn waiting_agent_item_is_entirely_yellow_bold() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.focus = Focus::Agents;
+        app.sessions.push(AgentSession {
+            id: "muxloomd-temporal-codex-waiting".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/hidden-for-temporal".into(),
+            label: "approval needed".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: true,
+            attention_reason: Some("command approval".into()),
+            recap: Some("approve the command".into()),
+        });
+        app.selected_session_id = Some("muxloomd-temporal-codex-waiting".into());
+
+        let backend = TestBackend::new(70, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Temporal Chat"));
+        assert!(!rendered.contains("hidden-for-temporal"));
+
+        // Row 1 is the folder heading; the selected agent occupies rows 2-5.
+        for y in 2..=5 {
+            for x in 1..69 {
+                let cell = buffer.cell((x, y)).unwrap();
+                assert_eq!(cell.fg, Color::Yellow, "cell {x},{y} was not yellow");
+                assert!(
+                    cell.modifier.contains(Modifier::BOLD),
+                    "cell {x},{y} was not bold"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn running_agent_effect_glyphs_are_single_column() {
         for kind in [AgentKind::Codex, AgentKind::Claude] {
             for frame in 0..16 {
@@ -3901,6 +3991,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 path: "/work".into(),
                 label: String::new(),
+                temporary: false,
                 field: LaunchField::Path,
             },
             path: "/work".into(),
@@ -3929,6 +4020,7 @@ mod tests {
                 kind: AgentKind::Claude,
                 path: "/work".into(),
                 label: String::new(),
+                temporary: false,
                 field: LaunchField::Path,
             },
             candidates: vec![crate::model::ResumeCandidate {

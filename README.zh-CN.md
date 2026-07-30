@@ -102,7 +102,7 @@ muxloom update [--config PATH]
 ### 首次使用
 
 1. 启动 `muxloom`。本机默认启用，具体 SSH Alias 会显示在 Machines。
-2. 单击选择远端机器，按 `Space` 或双击该机器启用；未启用的机器不会探测。
+2. 单击选择远端机器，按 `Space` 或在 `[x]` 上双击启用；未启用的机器不会探测。
 3. 按 `n`，启动目标就是当前选中的机器。
 4. 选择 Codex、Claude 或 Terminal，选择工作目录，并可填写 Label。
 5. 选择 `New session`，或从当前精确目录下同时扫描出的 Codex/Claude 历史中 Resume/Reference。
@@ -157,7 +157,8 @@ Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 A
 Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色旋转盲文 spinner
 （`⠋⠙⠹…`），Claude 使用橙色 sparkle（`✻✽✶✳`），与 Claude Code 自身循环的字形一致。
 两者均按墙钟时间推进，速度不随重绘频率变化。Terminal、Idle、Waiting、Archived
-不播放动画。
+不播放动画。Codex Working 直接跟随 OSC 标题 spinner，因此 CLI 擦除并逐字符重绘可见
+`Working` 行时也不会漏判；Waiting Agent 的整个条目会变成黄色加粗。
 
 <a id="zh-controls"></a>
 
@@ -172,8 +173,9 @@ Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色
 | `Alt-1` / `Alt-2` / `Alt-3` | 跳到 Machines / Agents / Terminal |
 | `Space`（Machines） | 启用或禁用机器 |
 | `n` / `Ctrl-n` | 在当前机器进入 New/Resume 流程 |
+| `t`（Agents） | 在当前目录直接启动无历史的 Temporal Chat |
 | `Enter` | 打开 Terminal 或确认表单 |
-| `x` | Live Agent 归档；Archived Agent 永久删除 |
+| `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
 | `a` | 展开或收起 Archived |
 | `/` / `Ctrl-p` | 搜索全部会话历史 |
 | `Ctrl-f` | 按当前上下文展开或关闭 Files |
@@ -191,8 +193,8 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 重绘帧上、真正完成的行寥寥无几，重新启动 controller 之后仍有足够的历史可以翻。回滚时以及
 打开文件浏览器时都可以选择并复制内容。
 
-鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。Machine 单击只选择，双击才启用或
-禁用。可以拖动所有布局分隔线；
+鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。Machine 单击只选择；只有在 `[x]`
+范围内双击才会启用或禁用。可以拖动所有布局分隔线；
 直接拖选 Terminal 文本会在松开时复制，`Alt+拖拽` 则转发给启用 Mouse Reporting 的程序。
 
 <a id="zh-configuration"></a>
@@ -250,12 +252,16 @@ Codex/Claude 退出或第一次按 `x` 后进入 Archived，仍可查看和搜�
 原机器、Runtime 和目录尝试 Resume 最新历史；再次按 `x` 才永久删除 daemon 元数据与历史。
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
+在 Agents 面板按 `t` 会立即启动 Codex `Temporal Chat`。目录依次取当前选中 Agent 的目录、
+该机器上次启动目录、目标用户 Home；该会话不写 Muxloom ANSI History，也用单次 Codex 配置
+关闭 Transcript 持久化，不进入搜索或备份。按 `x` 会直接停止并删除，不进入 Archived。
+
 提醒只检查当前屏幕底部物理行。Attached 和 legacy-inspected Session 会组合内置审批布局与
-每机器 Pattern；后台 daemon snapshot 当前只使用内置布局。新提醒会显示可点击 Banner、
-Waiting 状态、Bell 和 OSC 9，并对同一个 Prompt 去重。进入会话即消除它的 Banner——会话
+每机器 Pattern；后台 daemon snapshot 当前只使用内置布局。新提醒会把整个 Agent 条目显示为
+黄色加粗，并显示可点击 Banner、Waiting 状态、Bell 和 OSC 9，对同一个 Prompt 去重。进入会话即消除它的 Banner——会话
 列表仍然显示 Waiting，直到 Agent 不再询问——之后的新 Prompt 会重新提醒。Attached
-Terminal 直接从实时帧更新 Working/Waiting，因此短推理不会被后台刷新间隔漏掉；其他会话
-由 daemon snapshot 更新。
+Terminal 直接从实时帧更新 Working/Waiting，Codex 还读取持续变化的 OSC 标题 spinner，
+因此短推理和可见状态行重绘不会被后台刷新间隔漏掉；其他会话由 daemon snapshot 更新。
 
 <a id="zh-files"></a>
 

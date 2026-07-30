@@ -35,6 +35,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
         kind: AgentKind::Codex,
         path: std::env::temp_dir().display().to_string(),
         label: "integration smoke".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -166,6 +167,7 @@ fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
         kind: AgentKind::Codex,
         path: std::env::temp_dir().display().to_string(),
         label: "tmux fallback".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -201,6 +203,7 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
         kind: AgentKind::Claude,
         path: std::env::temp_dir().display().to_string(),
         label: "pty smoke".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -251,6 +254,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
         kind: AgentKind::Terminal,
         path: std::env::temp_dir().display().to_string(),
         label: "ordinary terminal".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -285,6 +289,7 @@ fn exited_terminal_is_removed_instead_of_archived() {
         kind: AgentKind::Terminal,
         path: std::env::temp_dir().display().to_string(),
         label: "short terminal".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -325,6 +330,7 @@ fn live_agent_can_be_archived_before_permanent_removal() {
         kind: AgentKind::Codex,
         path: std::env::temp_dir().display().to_string(),
         label: "archive lifecycle".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };
@@ -460,6 +466,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         kind: AgentKind::Codex,
         path: std::env::temp_dir().display().to_string(),
         label: "history and resize".into(),
+        temporary: false,
         resume_id: None,
         initial_prompt: None,
     };

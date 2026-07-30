@@ -32,6 +32,7 @@ use crate::{
 const SESSION_PREFIX: &str = "muxloom-";
 const DAEMON_SESSION_PREFIX: &str = "muxloomd-";
 const LEGACY_SESSION_PREFIX: &str = "ad-";
+const TEMPORARY_SESSION_MARKER: &str = "temporal-";
 pub const SSH_CONTROL_PERSIST_OPTION: &str = "ControlPersist=600";
 pub const SSH_SERVER_ALIVE_INTERVAL_OPTION: &str = "ServerAliveInterval=15";
 pub const SSH_SERVER_ALIVE_COUNT_OPTION: &str = "ServerAliveCountMax=3";
@@ -45,6 +46,7 @@ const CLAUDE_RELEASES: &str = "https://storage.googleapis.com/claude-code-dist-8
 const CODEX_RELEASES: &str = "https://github.com/openai/codex/releases/download";
 const CODEX_LATEST: &str = "https://github.com/openai/codex/releases/latest";
 const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
+const CODEX_NO_HISTORY_CONFIG: &str = "history.persistence=\"none\"";
 
 #[derive(Debug, Clone)]
 struct TargetPlatform {
@@ -222,13 +224,21 @@ impl Runtime {
                 .into_iter()
                 .filter_map(|session| daemon_agent_session(&target.id, session))
                 .collect::<Vec<_>>();
-            let dead_terminals = sessions
+            let disposable = sessions
                 .iter()
-                .filter(|session| session.dead && session.kind == AgentKind::Terminal)
+                .filter(|session| {
+                    session.dead
+                        && (session.kind == AgentKind::Terminal
+                            || is_temporary_session_id(&session.id))
+                })
                 .map(|session| session.id.clone())
                 .collect::<Vec<_>>();
-            sessions.retain(|session| !(session.dead && session.kind == AgentKind::Terminal));
-            for session_id in dead_terminals {
+            sessions.retain(|session| {
+                !(session.dead
+                    && (session.kind == AgentKind::Terminal
+                        || is_temporary_session_id(&session.id)))
+            });
+            for session_id in disposable {
                 let _ = self.bridges.delete(target, session_id);
             }
             debug::log(
@@ -308,15 +318,21 @@ impl Runtime {
         ensure_success(&output, "target probe")?;
         let (probe, mut sessions) =
             parse_discovery(&target.id, &String::from_utf8_lossy(&output.stdout))?;
-        let mut dead_terminals: Vec<_> = sessions
+        let mut disposable: Vec<_> = sessions
             .iter()
-            .filter(|session| session.dead && session.kind == AgentKind::Terminal)
+            .filter(|session| {
+                session.dead
+                    && (session.kind == AgentKind::Terminal || is_temporary_session_id(&session.id))
+            })
             .map(|session| session.id.clone())
             .collect();
-        dead_terminals.sort();
-        dead_terminals.dedup();
-        sessions.retain(|session| !(session.dead && session.kind == AgentKind::Terminal));
-        for session_id in &dead_terminals {
+        disposable.sort();
+        disposable.dedup();
+        sessions.retain(|session| {
+            !(session.dead
+                && (session.kind == AgentKind::Terminal || is_temporary_session_id(&session.id)))
+        });
+        for session_id in &disposable {
             if let Err(error) = self.kill(target, session_id) {
                 debug::log(
                     "runtime",
@@ -330,13 +346,13 @@ impl Runtime {
         debug::log(
             "runtime",
             format!(
-                "probe done target={} tmux={} codex={} claude={} sessions={} dead_terminals_cleaned={}",
+                "probe done target={} tmux={} codex={} claude={} sessions={} disposable_sessions_cleaned={}",
                 target.id,
                 probe.tmux,
                 probe.codex,
                 probe.claude,
                 sessions.len(),
-                dead_terminals.len()
+                disposable.len()
             ),
         );
         Ok((probe, sessions))
@@ -380,7 +396,12 @@ impl Runtime {
             .as_secs();
         let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let session_id = format!(
-            "{DAEMON_SESSION_PREFIX}{}-{now}-{}-{sequence}",
+            "{DAEMON_SESSION_PREFIX}{}{}-{now}-{}-{sequence}",
+            if request.temporary {
+                TEMPORARY_SESSION_MARKER
+            } else {
+                ""
+            },
             request.kind.as_str(),
             std::process::id()
         );
@@ -388,6 +409,7 @@ impl Runtime {
         let args = launch_arguments(
             command,
             request.kind,
+            request.temporary,
             request.resume_id.as_deref(),
             request.initial_prompt.as_deref(),
         );
@@ -397,6 +419,7 @@ impl Runtime {
             request.kind.as_str().into(),
             request.path.clone(),
             label,
+            request.temporary,
             command.command.clone(),
             args,
             environment.to_vec(),
@@ -448,7 +471,12 @@ impl Runtime {
     ) -> Result<String> {
         let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
         let session_id = format!(
-            "{SESSION_PREFIX}{}-{now}-{}-{sequence}",
+            "{SESSION_PREFIX}{}{}-{now}-{}-{sequence}",
+            if request.temporary {
+                TEMPORARY_SESSION_MARKER
+            } else {
+                ""
+            },
             request.kind.as_str(),
             std::process::id()
         );
@@ -462,13 +490,21 @@ impl Runtime {
                     command_line(
                         command,
                         request.kind,
+                        request.temporary,
                         request.resume_id.as_deref(),
                         request.initial_prompt.as_deref(),
                     )
                 ))
             };
+        let working_path = if request.path == "~" {
+            let output = self.run_shell(&request.target, "printf '%s' \"$HOME\"", false)?;
+            ensure_success(&output, "resolve target home directory")?;
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            request.path.clone()
+        };
         let label = request.label.replace(['\t', '\n', '\r'], " ");
-        let metadata_path = request.path.replace(['\t', '\n', '\r'], " ");
+        let metadata_path = working_path.replace(['\t', '\n', '\r'], " ");
         let bootstrap = format!("{session_id}-bootstrap");
         let agent_target = format!("{session_id}:agent");
         let commands = [
@@ -499,7 +535,7 @@ impl Runtime {
                 "-n",
                 "agent",
                 "-c",
-                &request.path,
+                &working_path,
             ]),
             shell_join(&[
                 "tmux",
@@ -2431,12 +2467,7 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     let tail = attention_tail(screen).to_lowercase();
     let interruptible = tail.contains("esc to interrupt");
     match kind {
-        AgentKind::Codex => {
-            interruptible
-                && (tail.contains("working (")
-                    || tail.contains("background terminal running")
-                    || tail.contains("to view…"))
-        }
+        AgentKind::Codex => interruptible,
         AgentKind::Claude => {
             interruptible
                 && (tail.contains("running…")
@@ -2924,10 +2955,11 @@ fn login_shell_command(command: &str) -> String {
 fn command_line(
     command: &CommandConfig,
     kind: AgentKind,
+    temporary: bool,
     resume_id: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> String {
-    let args = launch_arguments(command, kind, resume_id, initial_prompt);
+    let args = launch_arguments(command, kind, temporary, resume_id, initial_prompt);
     let mut values = Vec::with_capacity(args.len() + 1);
     values.push(command.command.as_str());
     values.extend(args.iter().map(String::as_str));
@@ -2937,6 +2969,7 @@ fn command_line(
 fn launch_arguments(
     command: &CommandConfig,
     kind: AgentKind,
+    temporary: bool,
     resume_id: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> Vec<String> {
@@ -2949,6 +2982,15 @@ fn launch_arguments(
             .any(|argument| argument == CODEX_NO_ALT_SCREEN_ARG)
     {
         args.push(CODEX_NO_ALT_SCREEN_ARG.into());
+    }
+    if kind == AgentKind::Codex
+        && temporary
+        && !args.iter().any(|argument| {
+            argument == CODEX_NO_HISTORY_CONFIG
+                || argument.strip_prefix("-c=") == Some(CODEX_NO_HISTORY_CONFIG)
+        })
+    {
+        args.extend(["-c".into(), CODEX_NO_HISTORY_CONFIG.into()]);
     }
     if let Some(resume_id) = resume_id {
         match kind {
@@ -3147,6 +3189,10 @@ pub(crate) fn is_managed_session_id(session_id: &str) -> bool {
         && session_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+pub(crate) fn is_temporary_session_id(session_id: &str) -> bool {
+    session_id.starts_with("muxloomd-temporal-") || session_id.starts_with("muxloom-temporal-")
 }
 
 pub fn is_daemon_session_id(session_id: &str) -> bool {
@@ -3386,6 +3432,10 @@ mod tests {
 
         let codex_working = "• Working (7s • esc to interrupt) · 1 background terminal running";
         assert!(agent_is_working(AgentKind::Codex, codex_working));
+        assert!(agent_is_working(
+            AgentKind::Codex,
+            "• Refactoring terminal state (12s • esc to interrupt)"
+        ));
         assert!(!agent_is_working(AgentKind::Codex, idle_prompt));
         let claude_working = concat!(
             "Bash(sleep 20)\n",
@@ -3500,7 +3550,7 @@ mod tests {
             ..CommandConfig::default()
         };
         assert_eq!(
-            command_line(&command, AgentKind::Codex, Some("session id"), None),
+            command_line(&command, AgentKind::Codex, false, Some("session id"), None),
             "codex --full-auto --no-alt-screen resume 'session id'"
         );
         let command = CommandConfig {
@@ -3509,13 +3559,14 @@ mod tests {
             ..CommandConfig::default()
         };
         assert_eq!(
-            command_line(&command, AgentKind::Claude, Some("abc"), None),
+            command_line(&command, AgentKind::Claude, false, Some("abc"), None),
             "claude --resume abc"
         );
         assert_eq!(
             command_line(
                 &command,
                 AgentKind::Claude,
+                false,
                 None,
                 Some("Read /tmp/source history.jsonl")
             ),
@@ -3531,9 +3582,41 @@ mod tests {
             ..CommandConfig::default()
         };
         assert_eq!(
-            launch_arguments(&command, AgentKind::Codex, None, Some("keep this history")),
+            launch_arguments(
+                &command,
+                AgentKind::Codex,
+                false,
+                None,
+                Some("keep this history")
+            ),
             ["--no-alt-screen", "--full-auto", "keep this history"]
         );
+    }
+
+    #[test]
+    fn temporary_codex_disables_transcript_persistence_for_only_that_launch() {
+        let command = CommandConfig {
+            command: "codex".into(),
+            args: vec!["--full-auto".into()],
+            ..CommandConfig::default()
+        };
+
+        assert_eq!(
+            launch_arguments(&command, AgentKind::Codex, true, None, None),
+            [
+                "--full-auto",
+                "--no-alt-screen",
+                "-c",
+                "history.persistence=\"none\""
+            ]
+        );
+        assert_eq!(
+            launch_arguments(&command, AgentKind::Codex, false, None, None),
+            ["--full-auto", "--no-alt-screen"]
+        );
+        assert!(is_temporary_session_id("muxloomd-temporal-codex-1"));
+        assert!(is_temporary_session_id("muxloom-temporal-codex-1"));
+        assert!(!is_temporary_session_id("muxloomd-codex-1"));
     }
 
     #[test]

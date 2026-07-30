@@ -10,7 +10,7 @@ use crate::{
         HistoryMatch, HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind,
         SearchResult, Target, TaskProgress,
     },
-    runtime::Runtime,
+    runtime::{Runtime, is_temporary_session_id},
 };
 
 #[derive(Debug, Clone)]
@@ -438,6 +438,9 @@ impl Worker {
                         let mut results = Vec::new();
                         let mut history_jobs = Vec::new();
                         for (target, session) in sessions {
+                            if is_temporary_session_id(&session.id) {
+                                continue;
+                            }
                             if let Some((score, snippet)) = best_name_match(&session, &query) {
                                 results.push((
                                     search_result(&session, SearchMatchKind::Name, snippet, None),

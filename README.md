@@ -85,8 +85,8 @@ config. Enabling a target authorizes periodic BatchMode probing; disabled
 targets are never touched.
 
 **Keys** — `Space` enable/disable · `Ctrl-r` refresh · `v` hide disabled hosts ·
-single-click select · double-click enable/disable. Each machine remembers its
-last selected agent while you move between targets.
+single-click select · double-click directly on `[x]` enable/disable. Each
+machine remembers its last selected agent while you move between targets.
 
 ### 🚀 Start and resume agents
 
@@ -101,6 +101,12 @@ with the source history file referenced in its initial prompt.
 **Keys** — `n` open · type to fuzzy-match a folder · `Left`/`Right` navigate ·
 `Enter` confirm.
 
+From the Agents pane, `t` immediately starts a Codex **Temporal Chat** in the
+selected agent's folder, then the machine's last launch folder, then that
+user's home folder. Temporal Chat stores neither Muxloom ANSI history nor a
+Codex transcript, is excluded from search and backup, and `x` destroys it
+instead of archiving it.
+
 ### 🧭 Responsive layout
 
 Panes follow the rendered geometry: landscape places navigation beside the
@@ -114,13 +120,14 @@ jump to a pane · `f` grouped/flat · drag any divider to resize.
 
 ### ✦ Working status and attention
 
-Codex and Claude sessions animate **only** while their visible terminal is
-classified as working — cyan braille dots for Codex, an orange sparkle for
-Claude, both on a constant wall-clock cadence. When a session needs input it
-turns Waiting, raises a clickable banner, rings the bell, and emits a desktop
-notification. Opening the session clears the banner — the session list keeps
-showing Waiting until the agent stops asking — and a later prompt raises it
-again.
+Codex and Claude sessions animate **only** while classified as working — cyan
+braille dots for Codex, an orange sparkle for Claude, both on a constant
+wall-clock cadence. Codex activity follows its OSC title spinner, so status
+updates survive the CLI erasing and repainting the visible `Working` line. When
+a session needs input its entire agent item turns bold yellow, it raises a
+clickable banner, rings the bell, and emits a desktop notification. Opening the
+session clears the banner — the session list keeps showing Waiting until the
+agent stops asking — and a later prompt raises it again.
 
 **Keys** — spinners are automatic · `a` show/hide archived · click the attention
 banner to jump to the session.
@@ -257,10 +264,11 @@ the full categorized help inside the TUI.
 | Windows/Linux `Alt+Arrow` | Move focus to the visible neighboring pane |
 | `Alt-1`, `Alt-2`, `Alt-3` | Focus Machines, Agents, or Terminal |
 | `Up` / `Down`, `j` / `k` | Move the current selection |
-| `Space` in Machines | Enable or disable a target |
+| `Space` in Machines | Enable or disable a target; mouse double-click must land on `[x]` |
 | `n`, `Ctrl-n` | Start the New/Resume flow on the selected target |
+| `t` in Agents | Start a no-history Temporal Chat in the current folder |
 | `Enter` | Open the selected terminal or confirm the current form |
-| `x` | Archive a live agent; delete an already archived agent |
+| `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
 | `Ctrl-f` | Open or close Files in the current context |
@@ -304,10 +312,10 @@ to the application while terminal input is active.
 | `Esc` | Close Preview, then clear a query, then close Files |
 
 Clicking a pane focuses it; machine and session rows, Archive, Back, and the
-attention banner are clickable. A machine row needs a double-click to toggle
-enabled state; a single click only selects it. When the embedded program enables mouse
-reporting, Muxloom forwards encoded mouse events unless the gesture is reserved
-for text selection.
+attention banner are clickable. A machine only toggles when the double-click
+lands directly on its `[x]`; clicks elsewhere only select it. When the embedded
+program enables mouse reporting, Muxloom forwards encoded mouse events unless
+the gesture is reserved for text selection.
 
 ## Configuration
 
