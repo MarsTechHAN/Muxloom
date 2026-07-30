@@ -193,6 +193,8 @@ jobs:
               (cd dist && zip -qr "$package.zip" "$package")
               (cd dist && sha256sum "$package.zip" > "$package.zip.sha256")
             else
+              chmod +x "$root/$executable" "$root/ffmpeg" "$root/muxloomd"
+              chmod +x "$root"/companions/*/muxloomd
               tar -C dist -czf "dist/$package.tar.gz" "$package"
               (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
             fi

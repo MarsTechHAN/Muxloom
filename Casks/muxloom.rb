@@ -13,6 +13,19 @@ cask "muxloom" do
   auto_updates true
   depends_on macos: :big_sur
 
+  preflight do
+    system_command "/bin/chmod",
+                   args: [
+                     "+x",
+                     "#{staged_path}/muxloom/muxloom",
+                     "#{staged_path}/muxloom/muxloomd",
+                     "#{staged_path}/muxloom/ffmpeg",
+                     "#{staged_path}/muxloom/companions/aarch64-apple-darwin/muxloomd",
+                     "#{staged_path}/muxloom/companions/x86_64-apple-darwin/muxloomd",
+                     "#{staged_path}/muxloom/companions/x86_64-unknown-linux-musl/muxloomd",
+                   ]
+  end
+
   command_wrapper "muxloom",
                   executable: "#{staged_path}/muxloom/muxloom"
 end
