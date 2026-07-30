@@ -330,8 +330,10 @@ Controller，就继续用兼容协议运行。空闲后才 Drain、自行退出�
 Generation。History 和 Metadata 始终保留在状态目录。
 
 Terminal 字节由 `vt100::Parser` 维护 Alternate Screen、光标、颜色、样式、Mouse Mode、
-Application Cursor 和 Bracketed Paste，并由 Ratatui 限制在对应 Pane 内。切换 Agent 时保留
-旧画面，后台等待新 PTY 首帧后再原子替换，避免闪白。
+Application Cursor 和 Bracketed Paste，并由 Ratatui 限制在对应 Pane 内。Muxloom 会用
+`--no-alt-screen` 启动 Codex，让对话记录进入回滚缓冲，而不是在整屏重绘时丢失；该设置只
+影响由 Muxloom 启动的 Codex 进程。切换 Agent 时保留旧画面，后台等待新 PTY 首帧后再原子
+替换，避免闪白。
 
 主要模块职责见英文部分的 [Source map](#en-architecture)。
 

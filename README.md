@@ -422,8 +422,10 @@ compatible protocol until idle, then drains and exits.
 
 **Terminal rendering.** `vt100::Parser` maintains alternate-screen state,
 cursor, colors, styles, mouse mode, application cursor keys, bracketed paste,
-and scrollback. Switching sessions keeps the old frame visible until the new
-stream produces its first frame.
+and scrollback. Muxloom starts Codex with `--no-alt-screen` so its transcript
+flows into that scrollback instead of being lost to full-viewport redraws; this
+only affects Codex processes launched by Muxloom. Switching sessions keeps the
+old frame visible until the new stream produces its first frame.
 
 ### Source map
 

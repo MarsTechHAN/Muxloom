@@ -44,6 +44,7 @@ static TUNNEL_START_LOCK: Mutex<()> = Mutex::new(());
 const CLAUDE_RELEASES: &str = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
 const CODEX_RELEASES: &str = "https://github.com/openai/codex/releases/download";
 const CODEX_LATEST: &str = "https://github.com/openai/codex/releases/latest";
+const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
 
 #[derive(Debug, Clone)]
 struct TargetPlatform {
@@ -384,20 +385,12 @@ impl Runtime {
             std::process::id()
         );
         let label = request.label.replace(['\t', '\n', '\r'], " ");
-        let mut args = command.args.clone();
-        if let Some(resume_id) = request.resume_id.as_deref() {
-            match request.kind {
-                AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
-                AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
-                AgentKind::Terminal => {}
-            }
-        }
-        if request.resume_id.is_none()
-            && request.kind != AgentKind::Terminal
-            && let Some(prompt) = request.initial_prompt.as_ref()
-        {
-            args.push(prompt.clone());
-        }
+        let args = launch_arguments(
+            command,
+            request.kind,
+            request.resume_id.as_deref(),
+            request.initial_prompt.as_deref(),
+        );
         let daemon_launch = self.bridges.launch(
             &request.target,
             session_id.clone(),
@@ -2934,13 +2927,33 @@ fn command_line(
     resume_id: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> String {
-    let mut values = Vec::with_capacity(command.args.len() + 3);
+    let args = launch_arguments(command, kind, resume_id, initial_prompt);
+    let mut values = Vec::with_capacity(args.len() + 1);
     values.push(command.command.as_str());
-    values.extend(command.args.iter().map(String::as_str));
+    values.extend(args.iter().map(String::as_str));
+    shell_join(&values)
+}
+
+fn launch_arguments(
+    command: &CommandConfig,
+    kind: AgentKind,
+    resume_id: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> Vec<String> {
+    let mut args = command.args.clone();
+    // Keep this session-local instead of changing the user's global Codex
+    // configuration. The flag must precede the `resume` subcommand.
+    if kind == AgentKind::Codex
+        && !args
+            .iter()
+            .any(|argument| argument == CODEX_NO_ALT_SCREEN_ARG)
+    {
+        args.push(CODEX_NO_ALT_SCREEN_ARG.into());
+    }
     if let Some(resume_id) = resume_id {
         match kind {
-            AgentKind::Codex => values.extend(["resume", resume_id]),
-            AgentKind::Claude => values.extend(["--resume", resume_id]),
+            AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
+            AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
             AgentKind::Terminal => {}
         }
     }
@@ -2948,9 +2961,9 @@ fn command_line(
         && kind != AgentKind::Terminal
         && let Some(prompt) = initial_prompt
     {
-        values.push(prompt);
+        args.push(prompt.into());
     }
-    shell_join(&values)
+    args
 }
 
 fn interactive_shell_command(command: &str) -> String {
@@ -3488,7 +3501,7 @@ mod tests {
         };
         assert_eq!(
             command_line(&command, AgentKind::Codex, Some("session id"), None),
-            "codex --full-auto resume 'session id'"
+            "codex --full-auto --no-alt-screen resume 'session id'"
         );
         let command = CommandConfig {
             command: "claude".into(),
@@ -3507,6 +3520,19 @@ mod tests {
                 Some("Read /tmp/source history.jsonl")
             ),
             "claude 'Read /tmp/source history.jsonl'"
+        );
+    }
+
+    #[test]
+    fn codex_launches_inline_without_duplicate_flags() {
+        let command = CommandConfig {
+            command: "codex".into(),
+            args: vec!["--no-alt-screen".into(), "--full-auto".into()],
+            ..CommandConfig::default()
+        };
+        assert_eq!(
+            launch_arguments(&command, AgentKind::Codex, None, Some("keep this history")),
+            ["--no-alt-screen", "--full-auto", "keep this history"]
         );
     }
 
