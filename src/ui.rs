@@ -1204,6 +1204,49 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                 area,
             );
         }
+        Modal::ConfirmArchivedResume {
+            launch,
+            remove_archive,
+            ..
+        } => {
+            let area = centered_rect(72, 12, outer);
+            frame.render_widget(Clear, area);
+            let checkbox = if *remove_archive { "[x]" } else { "[ ]" };
+            let text = vec![
+                Line::raw(""),
+                Line::raw(format!("Resume '{}' as a new running agent?", launch.label)),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled(
+                        checkbox,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" Remove the previous Archived entry after resume"),
+                ]),
+                Line::styled(
+                    "The old archive is removed only after the new agent starts successfully.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::styled(
+                    "This choice is remembered for future resumes.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Space toggle    Enter/y resume    Esc/n cancel",
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" Resume archived agent ", true)),
+                area,
+            );
+        }
         Modal::ConfirmInstall { launch, .. } => {
             let area = centered_rect(68, 11, outer);
             frame.render_widget(Clear, area);

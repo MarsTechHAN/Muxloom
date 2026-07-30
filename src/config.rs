@@ -309,6 +309,8 @@ pub struct State {
     pub portrait_terminal_percent: u16,
     pub portrait_machine_percent: u16,
     pub show_archived: bool,
+    /// Whether a successful resume removes the superseded Archived entry.
+    pub remove_archive_after_resume: bool,
     /// Last working directory used to launch an agent, per machine (target id).
     pub last_launch_dirs: BTreeMap<String, String>,
     /// Custom display names for agents, keyed by session id.
@@ -327,6 +329,7 @@ impl Default for State {
             portrait_terminal_percent: 65,
             portrait_machine_percent: 45,
             show_archived: false,
+            remove_archive_after_resume: true,
             last_launch_dirs: BTreeMap::new(),
             session_labels: BTreeMap::new(),
         }
@@ -592,5 +595,6 @@ mod tests {
         assert_eq!(state.portrait_terminal_percent, 65);
         assert_eq!(state.portrait_machine_percent, 45);
         assert_eq!(state.file_width, 34);
+        assert!(state.remove_archive_after_resume);
     }
 }

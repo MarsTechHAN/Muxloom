@@ -43,6 +43,7 @@ pub enum Request {
         request: LaunchRequest,
         command: CommandConfig,
         environment: Vec<(String, String)>,
+        remove_archive_session_id: Option<String>,
     },
     Install {
         target: Target,
@@ -55,6 +56,10 @@ pub enum Request {
         session_id: String,
     },
     Archive {
+        target: Target,
+        session_id: String,
+    },
+    RemoveResumedArchive {
         target: Target,
         session_id: String,
     },
@@ -147,6 +152,7 @@ pub enum Event {
         target_id: String,
         notice: Option<String>,
         result: Result<String, String>,
+        remove_archive_session_id: Option<String>,
     },
     Installed {
         target_id: String,
@@ -158,6 +164,11 @@ pub enum Event {
         result: Result<(), String>,
     },
     Archived {
+        target_id: String,
+        session_id: String,
+        result: Result<(), String>,
+    },
+    ResumedArchiveRemoved {
         target_id: String,
         session_id: String,
         result: Result<(), String>,
@@ -370,6 +381,7 @@ impl Worker {
                         request,
                         command,
                         environment,
+                        remove_archive_session_id,
                     } => {
                         let target_id = request.target.id.clone();
                         let result = runtime
@@ -386,6 +398,7 @@ impl Worker {
                             target_id,
                             notice,
                             result,
+                            remove_archive_session_id,
                         });
                     }
                     Request::Install {
@@ -449,6 +462,25 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::Archived {
+                            target_id,
+                            session_id,
+                            result,
+                        });
+                    }
+                    Request::RemoveResumedArchive { target, session_id } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .kill(&target, &session_id)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!(
+                                    "resumed archive removal failed target={target_id} session={session_id}: {error}"
+                                ),
+                            );
+                        }
+                        let _ = events.send(Event::ResumedArchiveRemoved {
                             target_id,
                             session_id,
                             result,

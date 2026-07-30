@@ -190,6 +190,10 @@ in to upload.
 `/` searches every enabled target's history — live and archived — ranked by
 label and folder, then recap, then remaining history. Each session carries a
 recap line, and archived agents stay searchable and resumable.
+Resuming an Archived agent asks whether to remove the superseded archive after
+the new agent starts successfully. Removal is enabled by default, can be toggled
+with `Space`, and the choice is remembered; launch or cleanup failure keeps the
+archive intact.
 
 **Keys** — `/` or `Ctrl-p` search · `Enter` jump to a result · `x`
 archive/delete · `a` show archived.

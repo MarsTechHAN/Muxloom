@@ -98,6 +98,14 @@ struct ArchivedResume {
     launch: LaunchForm,
 }
 
+#[derive(Debug, Clone)]
+struct PendingInstallLaunch {
+    launch: LaunchForm,
+    resume_id: Option<String>,
+    initial_prompt: Option<String>,
+    remove_archive_session_id: Option<String>,
+}
+
 /// An attach running on a background thread. Attaching dials the daemon bridge
 /// (or spawns ssh/tmux), which takes seconds on a poor link, so the render loop
 /// hands the work off and picks the result up on a later tick.
@@ -250,6 +258,13 @@ pub enum Modal {
         launch: LaunchForm,
         resume_id: Option<String>,
         initial_prompt: Option<String>,
+        remove_archive_session_id: Option<String>,
+    },
+    ConfirmArchivedResume {
+        source_session_id: String,
+        launch: LaunchForm,
+        resume_id: String,
+        remove_archive: bool,
     },
     ConfirmHistoryReference {
         form: ResumeForm,
@@ -515,7 +530,7 @@ pub struct App {
     pending_terminal_has_output: bool,
     pending_terminal_take_input: bool,
     clipboard_request: Option<String>,
-    pending_install_launch: Option<(LaunchForm, Option<String>, Option<String>)>,
+    pending_install_launch: Option<PendingInstallLaunch>,
     pending_archived_resume: Option<ArchivedResume>,
     /// A successful launch is not selectable until the next daemon scan returns
     /// it. Keep the intended target across any older scan already in flight.
@@ -2370,6 +2385,7 @@ impl App {
                 target_id,
                 notice,
                 result,
+                remove_archive_session_id,
             } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 match result {
@@ -2401,6 +2417,9 @@ impl App {
                         } else {
                             format!("Agent launched on {target_id} with muxloomd")
                         };
+                        if let Some(session_id) = remove_archive_session_id {
+                            self.remove_resumed_archive(&target_id, session_id);
+                        }
                         self.refresh_target(&target_id);
                     }
                     Err(error) => {
@@ -2419,12 +2438,16 @@ impl App {
                     Ok(message) => {
                         self.status_message = message;
                         self.refresh_target(&target_id);
-                        if let Some((launch, resume_id, initial_prompt)) =
-                            self.pending_install_launch.take()
-                            && launch.target.id == target_id
-                            && launch.kind == kind
+                        if let Some(pending) = self.pending_install_launch.take()
+                            && pending.launch.target.id == target_id
+                            && pending.launch.kind == kind
                         {
-                            self.submit_launch(launch, resume_id, initial_prompt);
+                            self.submit_launch(
+                                pending.launch,
+                                pending.resume_id,
+                                pending.initial_prompt,
+                                pending.remove_archive_session_id,
+                            );
                         }
                     }
                     Err(error) => {
@@ -2473,6 +2496,41 @@ impl App {
                     }
                     Err(error) => {
                         self.status_message = format!("Archive failed: {}", short_error(&error));
+                    }
+                }
+            }
+            Event::ResumedArchiveRemoved {
+                target_id,
+                session_id,
+                result,
+            } => {
+                self.busy_operations = self.busy_operations.saturating_sub(1);
+                match result {
+                    Ok(()) => {
+                        self.sessions.retain(|session| session.id != session_id);
+                        if self.selected_session_id.as_deref() == Some(&session_id) {
+                            self.selected_session_id = None;
+                        }
+                        if self
+                            .selected_sessions_by_target
+                            .get(&target_id)
+                            .is_some_and(|selected| selected == &session_id)
+                        {
+                            self.selected_sessions_by_target.remove(&target_id);
+                        }
+                        self.history_cache
+                            .remove(&history_cache_key(&target_id, &session_id));
+                        self.state.session_labels.remove(&session_id);
+                        self.status_message =
+                            "Agent resumed; the previous Archived entry was removed".into();
+                        self.persist_state();
+                        self.refresh_target(&target_id);
+                    }
+                    Err(error) => {
+                        self.status_message = format!(
+                            "Agent resumed, but the previous Archived entry was kept: {}",
+                            short_error(&error)
+                        );
                     }
                 }
             }
@@ -2566,11 +2624,12 @@ impl App {
                                         candidates.len()
                                     ),
                                 );
-                                self.confirm_or_submit_launch(
-                                    pending.launch,
-                                    Some(candidate.id.clone()),
-                                    None,
-                                );
+                                self.modal = Some(Modal::ConfirmArchivedResume {
+                                    source_session_id: pending.source_session_id,
+                                    launch: pending.launch,
+                                    resume_id: candidate.id.clone(),
+                                    remove_archive: self.state.remove_archive_after_resume,
+                                });
                             } else {
                                 self.request_history();
                                 self.status_message = format!(
@@ -5150,17 +5209,58 @@ impl App {
                 launch,
                 resume_id,
                 initial_prompt,
+                remove_archive_session_id,
             } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    self.install_and_launch(launch, resume_id, initial_prompt)
-                }
+                KeyCode::Char('y') | KeyCode::Enter => self.install_and_launch(
+                    launch,
+                    resume_id,
+                    initial_prompt,
+                    remove_archive_session_id,
+                ),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => {
                     self.modal = Some(Modal::ConfirmInstall {
                         launch,
                         resume_id,
                         initial_prompt,
+                        remove_archive_session_id,
                     })
+                }
+            },
+            Modal::ConfirmArchivedResume {
+                source_session_id,
+                launch,
+                resume_id,
+                mut remove_archive,
+            } => match key.code {
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                    remove_archive = !remove_archive;
+                    self.modal = Some(Modal::ConfirmArchivedResume {
+                        source_session_id,
+                        launch,
+                        resume_id,
+                        remove_archive,
+                    });
+                }
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.state.remove_archive_after_resume = remove_archive;
+                    self.persist_state();
+                    let archive = remove_archive.then_some(source_session_id);
+                    self.confirm_or_submit_launch_with_archive(
+                        launch,
+                        Some(resume_id),
+                        None,
+                        archive,
+                    );
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => {
+                    self.modal = Some(Modal::ConfirmArchivedResume {
+                        source_session_id,
+                        launch,
+                        resume_id,
+                        remove_archive,
+                    });
                 }
             },
             Modal::ConfirmHistoryReference { form, candidate } => match key.code {
@@ -5521,6 +5621,7 @@ impl App {
         form: LaunchForm,
         resume_id: Option<String>,
         initial_prompt: Option<String>,
+        remove_archive_session_id: Option<String>,
     ) {
         if form.path.trim().is_empty() {
             self.status_message = "Launch cancelled: working directory is required".into();
@@ -5552,6 +5653,7 @@ impl App {
                 request,
                 command,
                 environment,
+                remove_archive_session_id,
             })
             .is_ok()
         {
@@ -5566,6 +5668,16 @@ impl App {
         resume_id: Option<String>,
         initial_prompt: Option<String>,
     ) {
+        self.confirm_or_submit_launch_with_archive(form, resume_id, initial_prompt, None);
+    }
+
+    fn confirm_or_submit_launch_with_archive(
+        &mut self,
+        form: LaunchForm,
+        resume_id: Option<String>,
+        initial_prompt: Option<String>,
+        remove_archive_session_id: Option<String>,
+    ) {
         let available = self
             .targets
             .iter()
@@ -5576,12 +5688,13 @@ impl App {
                 AgentKind::Terminal => true,
             });
         if available || form.kind == AgentKind::Terminal {
-            self.submit_launch(form, resume_id, initial_prompt);
+            self.submit_launch(form, resume_id, initial_prompt, remove_archive_session_id);
         } else {
             self.modal = Some(Modal::ConfirmInstall {
                 launch: form,
                 resume_id,
                 initial_prompt,
+                remove_archive_session_id,
             });
         }
     }
@@ -5591,6 +5704,7 @@ impl App {
         launch: LaunchForm,
         resume_id: Option<String>,
         initial_prompt: Option<String>,
+        remove_archive_session_id: Option<String>,
     ) {
         let command = self
             .config
@@ -5607,7 +5721,12 @@ impl App {
             environment,
         };
         if self.worker.requests.send(request).is_ok() {
-            self.pending_install_launch = Some((launch.clone(), resume_id, initial_prompt));
+            self.pending_install_launch = Some(PendingInstallLaunch {
+                launch: launch.clone(),
+                resume_id,
+                initial_prompt,
+                remove_archive_session_id,
+            });
             self.busy_operations += 1;
             self.status_message =
                 format!("Installing {} on {}...", launch.kind, launch.target.label);
@@ -5661,6 +5780,27 @@ impl App {
         {
             self.busy_operations += 1;
             self.status_message = "Closing agent session...".into();
+        }
+    }
+
+    fn remove_resumed_archive(&mut self, target_id: &str, session_id: String) {
+        let Some(target) = self.target(target_id).cloned() else {
+            self.status_message =
+                "Agent resumed, but its previous Archived entry could not be located".into();
+            return;
+        };
+        if self
+            .worker
+            .requests
+            .send(Request::RemoveResumedArchive { target, session_id })
+            .is_ok()
+        {
+            self.busy_operations += 1;
+            self.status_message = "Agent resumed; removing the previous Archived entry...".into();
+        } else {
+            self.status_message =
+                "Agent resumed, but the cleanup worker was unavailable; the previous Archived entry was kept"
+                    .into();
         }
     }
 
@@ -7701,11 +7841,19 @@ mod tests {
             events: event_rx,
             bridges: crate::bridge::BridgePool::default(),
         };
+        let state_path = std::env::temp_dir().join(format!(
+            "muxloom-archived-resume-state-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let mut app = App::new(
             config,
             PathBuf::from("unused-config.toml"),
             State::default(),
-            PathBuf::from("unused-state.json"),
+            state_path.clone(),
             vec![Target::local()],
             worker,
         );
@@ -7751,16 +7899,207 @@ mod tests {
                 updated_at: "2026-07-22T12:00:00Z".into(),
             }]),
         });
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmArchivedResume {
+                ref source_session_id,
+                ref resume_id,
+                remove_archive: true,
+                ..
+            }) if source_session_id == "muxloom-codex-dead" && resume_id == "thread-id"
+        ));
+        assert!(request_rx.try_recv().is_err());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match receive_request(&request_rx) {
-            Request::Launch { request, .. } => {
+            Request::Launch {
+                request,
+                remove_archive_session_id,
+                ..
+            } => {
                 assert_eq!(request.target.id, "local");
                 assert_eq!(request.kind, AgentKind::Codex);
                 assert_eq!(request.path, "/work/project");
                 assert_eq!(request.label, "fix renderer");
                 assert_eq!(request.resume_id.as_deref(), Some("thread-id"));
+                assert_eq!(
+                    remove_archive_session_id.as_deref(),
+                    Some("muxloom-codex-dead")
+                );
             }
             request => panic!("expected archived resume launch, got {request:?}"),
         }
+        assert!(
+            State::load(&state_path)
+                .unwrap()
+                .remove_archive_after_resume
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn archived_resume_can_keep_the_old_entry_and_remembers_the_choice() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "muxloom-keep-archive-state-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].probe.codex = true;
+        app.modal = Some(Modal::ConfirmArchivedResume {
+            source_session_id: "old-archive".into(),
+            launch: LaunchForm {
+                target: Target::local(),
+                kind: AgentKind::Codex,
+                path: "/work/project".into(),
+                label: "resume me".into(),
+                temporary: false,
+                field: LaunchField::Kind,
+            },
+            resume_id: "thread-id".into(),
+            remove_archive: true,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmArchivedResume {
+                remove_archive: false,
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::Launch {
+                remove_archive_session_id: None,
+                ..
+            }
+        ));
+        assert!(!app.state.remove_archive_after_resume);
+        assert!(
+            !State::load(&state_path)
+                .unwrap()
+                .remove_archive_after_resume
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn old_archive_is_removed_only_after_a_successful_resumed_launch() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "muxloom-remove-archive-state-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "old-archive".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "old".into(),
+            created_at: 1,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+
+        app.handle_worker_event(Event::Launched {
+            target_id: "local".into(),
+            notice: None,
+            result: Ok("new-session".into()),
+            remove_archive_session_id: Some("old-archive".into()),
+        });
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::RemoveResumedArchive {
+                ref session_id,
+                ..
+            } if session_id == "old-archive"
+        ));
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.id == "old-archive")
+        );
+
+        app.handle_worker_event(Event::ResumedArchiveRemoved {
+            target_id: "local".into(),
+            session_id: "old-archive".into(),
+            result: Ok(()),
+        });
+        assert!(
+            app.sessions
+                .iter()
+                .all(|session| session.id != "old-archive")
+        );
+
+        app.sessions.push(AgentSession {
+            id: "failed-archive".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            label: "failed".into(),
+            created_at: 2,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.handle_worker_event(Event::Launched {
+            target_id: "local".into(),
+            notice: None,
+            result: Err("resume failed".into()),
+            remove_archive_session_id: Some("failed-archive".into()),
+        });
+        assert!(request_rx.try_recv().is_err());
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.id == "failed-archive")
+        );
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
@@ -7834,6 +8173,7 @@ mod tests {
             target_id: "remote".into(),
             notice: Some("muxloomd bootstrap failed".into()),
             result: Ok("muxloom-codex-legacy".into()),
+            remove_archive_session_id: None,
         });
 
         assert!(matches!(
@@ -9051,6 +9391,7 @@ mod tests {
             target_id: "local".into(),
             notice: None,
             result: Ok("muxloomd-codex-1-2-0".into()),
+            remove_archive_session_id: None,
         });
         assert_eq!(app.focus, Focus::Agents);
         assert_ne!(

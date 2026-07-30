@@ -263,7 +263,9 @@ Assistant 行并排除工具/状态行；仍无法识别时，回退到最后一
 全部会话，排序优先级是 Label/名称/路径、当前 Recap 与 Recap History、其他 History。
 
 Codex/Claude 退出或第一次按 `x` 后进入 Archived，仍可查看和搜索。打开 Archived 会按
-原机器、Runtime 和目录尝试 Resume 最新历史；再次按 `x` 才永久删除 daemon 元数据与历史。
+原机器、Runtime 和目录尝试 Resume 最新历史。确认框默认勾选在新 Agent 成功启动后移除旧
+Archived 条目，按 `Space` 可选择保留，该选择会持久记忆；启动或清理失败时旧归档保持不变。
+再次按 `x` 才永久删除 daemon 元数据与历史。
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
 在 Agents 面板按 `t` 会先选择 Codex 或 Claude，再启动 `Temporal Chat`。目录依次取当前选中
