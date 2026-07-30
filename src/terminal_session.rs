@@ -281,7 +281,7 @@ impl TerminalSession {
     /// A session with no process behind it, for tests that only exercise the
     /// emulator side.
     #[cfg(test)]
-    fn detached(width: u16, height: u16) -> Self {
+    pub(crate) fn detached(width: u16, height: u16) -> Self {
         Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             inline: InlineScrollback::default(),
@@ -295,6 +295,11 @@ impl TerminalSession {
             width,
             height,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_output_for_test(&mut self, bytes: &[u8]) {
+        self.inline.process(&mut self.parser, bytes);
     }
 
     /// The text on the live screen, whatever the view is scrolled to. Reading

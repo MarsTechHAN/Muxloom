@@ -841,9 +841,9 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     app.resize_agent_viewport(inner.width, inner.height);
 
-    if app.attached_terminal_for_selected() {
-        // A live emulator scrolls through its own rendered scrollback, so
-        // back-scroll shows real lines instead of a mangled raw-log replay.
+    if app.attached_history_is_buffered() {
+        // Recent history comes from the emulator so terminal rows stay exact.
+        // Older rows fall through to the daemon's append-only history pages.
         let offset = app.history_offset;
         let show_cursor = app.interactive && offset == 0;
         let selection = app.terminal_selection;

@@ -1578,7 +1578,7 @@ impl App {
             true
         } else {
             // Only reclaim PageDown while we are actually scrolled up.
-            terminal.scrollback() > 0
+            self.history_offset > 0
         }
     }
 
@@ -1854,6 +1854,18 @@ impl App {
         self.terminal.is_some()
             && self.selected_session_id.is_some()
             && self.terminal_session_id.as_deref() == self.selected_session_id.as_deref()
+    }
+
+    /// True when the selected history position is still represented by the
+    /// attached emulator. Older positions are rendered from daemon history.
+    pub(crate) fn attached_history_is_buffered(&mut self) -> bool {
+        if !self.attached_terminal_for_selected() {
+            return false;
+        }
+        let offset = self.history_offset;
+        self.terminal
+            .as_mut()
+            .is_some_and(|terminal| offset <= terminal.max_scrollback())
     }
 
     fn sync_terminal_size(&mut self) {
@@ -3560,9 +3572,8 @@ impl App {
         }
     }
 
-    /// Scroll a live attached terminal through the emulator's own rendered
-    /// scrollback. `history_offset` mirrors the emulator offset (rows up from the
-    /// live bottom); the emulator clamps to what its buffer holds.
+    /// Scroll recent history through the attached emulator, then continue into
+    /// the daemon's append-only log once the emulator buffer is exhausted.
     fn scroll_attached_terminal(&mut self, older: bool, lines: usize) {
         let step = lines.max(1);
         let desired = if older {
@@ -3570,23 +3581,25 @@ impl App {
         } else {
             self.history_offset.saturating_sub(step)
         };
+        let mut buffered = false;
         if let Some(terminal) = self.terminal.as_mut() {
-            terminal.set_scrollback(desired);
-            self.history_offset = terminal.scrollback();
-        }
-        if older && self.history_offset < desired {
-            self.status_message = if self.history_offset == 0 {
-                "This terminal has no scrollback yet".into()
+            let maximum = terminal.max_scrollback();
+            if desired <= maximum {
+                terminal.set_scrollback(desired);
+                self.history_offset = terminal.scrollback();
+                buffered = true;
             } else {
-                format!(
-                    "Reached the oldest buffered line ({} up)",
-                    self.history_offset
-                )
-            };
+                terminal.set_scrollback(maximum);
+                self.history_offset = desired;
+            }
+        }
+        if buffered {
+            self.history_loading = false;
+            self.history_message.clear();
+        } else {
+            self.request_history();
         }
         self.terminal_selection = None;
-        self.history_loading = false;
-        self.history_message.clear();
     }
 
     fn open_launch(&mut self) {
@@ -5687,7 +5700,7 @@ impl App {
     fn copy_terminal_selection(&mut self) -> bool {
         // Make sure the emulator is at the same scrollback position that is on
         // screen, so a selection made while scrolled back copies what is shown.
-        if self.attached_terminal_for_selected() {
+        if self.attached_history_is_buffered() {
             let offset = self.history_offset;
             if let Some(terminal) = self.terminal.as_mut() {
                 terminal.set_scrollback(offset);
@@ -5702,13 +5715,13 @@ impl App {
         true
     }
 
-    fn selected_terminal_text(&self) -> Option<String> {
+    fn selected_terminal_text(&mut self) -> Option<String> {
         let selection = self.terminal_selection?;
         if selection.anchor == selection.cursor {
             return None;
         }
         let (start, end) = selection.normalized();
-        let text = if self.attached_terminal_for_selected() {
+        let text = if self.attached_history_is_buffered() {
             let screen = self.terminal.as_ref()?.screen();
             let (rows, columns) = screen.size();
             if rows == 0 || columns == 0 {
@@ -7133,6 +7146,102 @@ mod tests {
         app.history_offset = 10;
         app.scroll_history(true, 20);
         assert_eq!(app.history_offset, 12);
+    }
+
+    #[test]
+    fn attached_claude_pages_into_daemon_history_past_emulator_buffer() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-claude-history-{nonce}"));
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            root.join("state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].state = ConnectionState::Online;
+        app.sessions.push(AgentSession {
+            id: "muxloomd-claude-long-history".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work".into(),
+            label: "long history".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloomd-claude-long-history".into());
+        app.terminal_session_id = Some("muxloomd-claude-long-history".into());
+        app.agent_viewport_width = 20;
+        app.agent_viewport_height = 5;
+
+        let mut terminal = TerminalSession::detached(20, 5);
+        let output = (1..=40)
+            .map(|line| format!("line-{line}\r\n"))
+            .collect::<String>();
+        terminal.process_output_for_test(output.as_bytes());
+        let buffered_boundary = terminal.max_scrollback();
+        assert!(buffered_boundary > 3);
+        terminal.set_scrollback(buffered_boundary);
+        app.terminal = Some(terminal);
+        app.history_offset = buffered_boundary;
+
+        app.scroll_history(true, 3);
+
+        assert_eq!(app.history_offset, buffered_boundary + 3);
+        assert!(!app.attached_history_is_buffered());
+        let requested_offset = match receive_request(&request_rx) {
+            Request::Capture {
+                session_id,
+                offset_from_bottom,
+                ..
+            } => {
+                assert_eq!(session_id, "muxloomd-claude-long-history");
+                assert!(offset_from_bottom <= app.history_offset);
+                offset_from_bottom
+            }
+            request => panic!("expected history capture, got {request:?}"),
+        };
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(HistoryPage {
+                text: (0..500)
+                    .map(|line| format!("daemon-line-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                history_size: 1_000,
+                pane_height: 5,
+                pane_width: 20,
+                offset_from_bottom: requested_offset,
+            }),
+        });
+        assert_eq!(app.history.offset_from_bottom, buffered_boundary + 3);
+        assert!(app.history.text.contains("daemon-line"));
+        assert!(!app.attached_history_is_buffered());
+
+        app.scroll_history(false, 3);
+        assert_eq!(app.history_offset, buffered_boundary);
+        assert!(app.attached_history_is_buffered());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
