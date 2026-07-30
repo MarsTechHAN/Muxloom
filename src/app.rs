@@ -57,6 +57,13 @@ pub struct LaunchForm {
 }
 
 #[derive(Debug, Clone)]
+pub struct TemporalForm {
+    pub target: Target,
+    pub kind: AgentKind,
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
 struct ArchivedResume {
     source_session_id: String,
     launch: LaunchForm,
@@ -203,6 +210,7 @@ struct FileClick {
 #[derive(Debug, Clone)]
 pub enum Modal {
     Launch(LaunchForm),
+    Temporal(TemporalForm),
     ConfirmKill {
         session_id: String,
         label: String,
@@ -762,7 +770,7 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char('t') if self.focus == Focus::Agents => {
-                self.launch_temporary_agent();
+                self.open_temporary_agent();
                 Action::Continue
             }
             KeyCode::Char('n') => {
@@ -3679,7 +3687,7 @@ impl App {
         }
     }
 
-    fn launch_temporary_agent(&mut self) {
+    fn open_temporary_agent(&mut self) {
         let Some(target) = self.launch_target() else {
             self.status_message = "Enable a machine before starting a Temporal Chat".into();
             return;
@@ -3691,11 +3699,19 @@ impl App {
         let path = selected_path
             .or_else(|| self.state.last_launch_dirs.get(&target.id).cloned())
             .unwrap_or_else(|| self.user_folder(&target));
+        self.modal = Some(Modal::Temporal(TemporalForm {
+            target,
+            kind: AgentKind::Codex,
+            path,
+        }));
+    }
+
+    fn launch_temporary_agent(&mut self, form: TemporalForm) {
         self.confirm_or_submit_launch(
             LaunchForm {
-                target,
-                kind: AgentKind::Codex,
-                path,
+                target: form.target,
+                kind: form.kind,
+                path: form.path,
                 label: "Temporal Chat".into(),
                 temporary: true,
                 field: LaunchField::Kind,
@@ -5032,6 +5048,26 @@ impl App {
                     self.modal = Some(Modal::Launch(form));
                 }
                 _ => self.modal = Some(Modal::Launch(form)),
+            },
+            Modal::Temporal(mut form) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                    form.kind = match form.kind {
+                        AgentKind::Codex => AgentKind::Claude,
+                        AgentKind::Claude | AgentKind::Terminal => AgentKind::Codex,
+                    };
+                    self.modal = Some(Modal::Temporal(form));
+                }
+                KeyCode::Char('c') => {
+                    form.kind = AgentKind::Codex;
+                    self.modal = Some(Modal::Temporal(form));
+                }
+                KeyCode::Char('l') => {
+                    form.kind = AgentKind::Claude;
+                    self.modal = Some(Modal::Temporal(form));
+                }
+                KeyCode::Enter => self.launch_temporary_agent(form),
+                _ => self.modal = Some(Modal::Temporal(form)),
             },
             Modal::RenameAgent {
                 session_id,
@@ -8785,7 +8821,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_chat_uses_current_folder_and_is_destroyed_without_history() {
+    fn temporary_chat_chooses_runtime_uses_current_folder_and_is_destroyed_without_history() {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
         let worker = Worker {
@@ -8809,6 +8845,7 @@ mod tests {
             worker,
         );
         app.targets[0].probe.codex = true;
+        app.targets[0].probe.claude = true;
         app.sessions.push(AgentSession {
             id: "muxloomd-codex-current".into(),
             target_id: "local".into(),
@@ -8827,10 +8864,27 @@ mod tests {
         app.focus = Focus::Agents;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Temporal(TemporalForm {
+                kind: AgentKind::Codex,
+                ref path,
+                ..
+            })) if path == "/work/current"
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Temporal(TemporalForm {
+                kind: AgentKind::Claude,
+                ..
+            }))
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let Request::Launch { request, .. } = receive_request(&request_rx) else {
-            panic!("Temporal Chat did not launch immediately");
+            panic!("Temporal Chat did not launch after runtime selection");
         };
-        assert_eq!(request.kind, AgentKind::Codex);
+        assert_eq!(request.kind, AgentKind::Claude);
         assert_eq!(request.path, "/work/current");
         assert_eq!(request.label, "Temporal Chat");
         assert!(request.temporary);
@@ -8842,6 +8896,7 @@ mod tests {
             .last_launch_dirs
             .insert("local".into(), "/work/last".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let Request::Launch { request, .. } = receive_request(&request_rx) else {
             panic!("Temporal Chat did not use the last launch folder");
         };
@@ -8849,6 +8904,7 @@ mod tests {
 
         app.state.last_launch_dirs.remove("local");
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let Request::Launch { request, .. } = receive_request(&request_rx) else {
             panic!("Temporal Chat did not fall back to the user folder");
         };

@@ -1172,6 +1172,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
     match modal {
         Modal::Launch(form) => draw_launch_modal(frame, form, outer),
+        Modal::Temporal(form) => draw_temporal_modal(frame, form, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
             frame.render_widget(Clear, area);
@@ -2596,7 +2597,7 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("n / Ctrl-n", "Start the runtime and path flow"),
         help_row(
             "t in Agents",
-            "Start a no-history Temporal Chat in the current folder",
+            "Choose Codex or Claude for a no-history Temporal Chat",
         ),
         help_row("Left / Right", "Choose Codex, Claude, or Terminal"),
         help_row("Tab", "Move between launch fields"),
@@ -3310,6 +3311,42 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
         UnicodeWidthStr::width(text.as_str()).min(row.width.saturating_sub(1) as usize) as u16,
     );
     frame.set_cursor_position((x, row.y));
+}
+
+fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, outer: Rect) {
+    let area = centered_rect(62, 9, outer);
+    frame.render_widget(Clear, area);
+    let block = panel(" Temporal Chat ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Choose agent runtime"), rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            segment(" CODEX ", form.kind == AgentKind::Codex, CODEX),
+            Span::raw("  "),
+            segment(" CLAUDE ", form.kind == AgentKind::Claude, CLAUDE),
+            Span::styled("  Left/Right", Style::default().fg(MUTED)),
+        ])),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("Folder: {}", form.path)).style(Style::default().fg(Color::Gray)),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter start    Esc cancel").style(Style::default().fg(MUTED)),
+        rows[4],
+    );
 }
 
 fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
