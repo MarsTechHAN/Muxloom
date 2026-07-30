@@ -2792,6 +2792,13 @@ fn parse_codex_resume(
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
                 let payload = value.get("payload")?;
+                if payload
+                    .get("source")
+                    .and_then(|source| source.get("subagent"))
+                    .is_some()
+                {
+                    return None;
+                }
                 id = payload
                     .get("id")
                     .and_then(Value::as_str)
@@ -3544,6 +3551,26 @@ mod tests {
             parse_resume_candidates(AgentKind::Claude, "/other", claude).is_empty(),
             "resume candidates must match the exact working directory"
         );
+    }
+
+    #[test]
+    fn codex_resume_candidates_exclude_newer_subagent_threads() {
+        let sessions = concat!(
+            "\u{1e}SESSION\n",
+            "/home/test/.codex/sessions/rollout-main.jsonl\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"main-thread\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T09:00:00Z\",\"source\":\"cli\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"main prompt\"}}\n",
+            "\u{1e}SESSION\n",
+            "/home/test/.codex/sessions/rollout-subagent.jsonl\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"subagent-thread\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T10:00:00Z\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"main-thread\",\"depth\":1}}}}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"delegated prompt\"}}\n"
+        );
+
+        let candidates = parse_resume_candidates(AgentKind::Codex, "/work/project", sessions);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "main-thread");
+        assert_eq!(candidates[0].first_message.as_deref(), Some("main prompt"));
     }
 
     #[test]
