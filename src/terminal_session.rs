@@ -40,6 +40,7 @@ pub(crate) const SCROLLBACK_SEED_ROWS: usize = 2_000;
 
 /// Rows a seed may carry at most, whatever a client asks for. Bounds both the
 /// daemon's transient emulator and the bytes an attach puts on the wire.
+#[cfg(any(unix, test))]
 pub(crate) const SCROLLBACK_SEED_ROWS_LIMIT: usize = 5_000;
 
 pub struct TerminalSession {
@@ -681,6 +682,7 @@ impl InlineScrollback {
 
     /// The `DECSTBM` that reinstalls the tracked region, for handing an
     /// emulator the region without replaying the stream that set it.
+    #[cfg(any(unix, test))]
     fn region_sequence(&self) -> Option<String> {
         let (top, bottom) = self.region?;
         Some(format!("\x1b[{};{}r", top + 1, bottom + 1))
@@ -732,6 +734,7 @@ impl InlineScrollback {
 /// the rendered rows returned here. Feeding those rows to a fresh emulator ahead
 /// of the replay leaves it with the same history a terminal that had watched the
 /// whole session would hold.
+#[cfg(any(unix, test))]
 pub(crate) fn render_scrollback_seed(
     mut stream: impl Read,
     columns: u16,
