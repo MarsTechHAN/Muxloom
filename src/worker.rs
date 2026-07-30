@@ -28,6 +28,9 @@ pub enum Request {
     RefreshActivity {
         target: Target,
     },
+    DetectPorts {
+        target: Target,
+    },
     Capture {
         target: Target,
         session_id: String,
@@ -130,6 +133,10 @@ pub enum Event {
     ActivityRefreshed {
         target_id: String,
         result: Result<Vec<AgentSession>, String>,
+    },
+    PortsDetected {
+        target_id: String,
+        result: Result<Vec<u16>, String>,
     },
     Captured {
         target_id: String,
@@ -314,6 +321,19 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::ActivityRefreshed { target_id, result });
+                    }
+                    Request::DetectPorts { target } => {
+                        let target_id = target.id.clone();
+                        let result = runtime
+                            .tcp_listener_ports(&target)
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "forward",
+                                format!("port detection failed target={target_id}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::PortsDetected { target_id, result });
                     }
                     Request::Capture {
                         target,

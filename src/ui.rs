@@ -18,11 +18,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         App, FileManagerForm, FileManagerOrigin, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
-        LaunchForm, Modal, PaneLayout, PathPickerForm, ResumeForm, SearchForm, SettingsForm,
-        SettingsScope,
+        LaunchForm, Modal, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
+        SettingsForm, SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
+    port_forward::PortForwardState,
     runtime::is_temporary_session_id,
 };
 
@@ -1137,19 +1138,19 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let help = if app.interactive {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
-        "  n new  t temporal  Enter open  / search  q quit"
+        "  n new  t temporal  p ports  Enter open  / search  q quit"
     } else {
         match app.focus {
             Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
-                        "  Enter open  a collapse  / search  n new  t temporal  q quit"
+                        "  Enter open  a collapse  p ports  / search  n new  t temporal  q quit"
                     } else {
-                        "  Enter open  a expand  / search  n new  t temporal  q quit"
+                        "  Enter open  a expand  p ports  / search  n new  t temporal  q quit"
                     }
                 } else {
-                    "  Enter open  / search  n new  t temporal  q quit  ? more"
+                    "  Enter open  p ports  / search  n new  t temporal  q quit  ? more"
                 }
             }
             Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
@@ -1173,6 +1174,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
     match modal {
         Modal::Launch(form) => draw_launch_modal(frame, form, outer),
         Modal::Temporal(form) => draw_temporal_modal(frame, form, outer),
+        Modal::PortForward(form) => draw_port_forward_modal(frame, form, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
             frame.render_widget(Clear, area);
@@ -2625,6 +2627,8 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("x", "Archive live agents; directly destroy a Temporal Chat"),
         help_row("a", "Expand or collapse Archived sessions"),
         help_row("e", "Rename the selected agent's display name"),
+        help_row("p", "Configure local forwarding to the selected machine"),
+        help_row("d in Ports", "Stop the highlighted active forward"),
         help_row("Up twice at top", "Open the first agent waiting for input"),
         Line::raw(""),
         help_header("Machines"),
@@ -3347,6 +3351,151 @@ fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, o
         Paragraph::new("Enter start    Esc cancel").style(Style::default().fg(MUTED)),
         rows[4],
     );
+}
+
+fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer: Rect) {
+    let area = centered_rect(78, 20, outer);
+    frame.render_widget(Clear, area);
+    let title = format!(
+        " Port forwarding - {} ",
+        truncate(&form.target.label, area.width.saturating_sub(24) as usize)
+    );
+    let block = panel(&title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let labels = ["Remote host", "Remote port", "Local port"];
+    let values = [&form.remote_host, &form.remote_port, &form.local_port];
+    let label_width = 15;
+    for (index, (label, value)) in labels.iter().zip(values).enumerate() {
+        let active = form.selected == index;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{label:<label_width$}"),
+                    Style::default().fg(if active { ACCENT } else { Color::Gray }),
+                ),
+                Span::styled(
+                    value.as_str(),
+                    if active {
+                        Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
+                ),
+            ])),
+            Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+        );
+    }
+
+    let detected = if form.loading {
+        "Detecting listeners...".into()
+    } else if form.detected_ports.is_empty() {
+        "Detected: none".into()
+    } else {
+        format!(
+            "Detected: {}",
+            form.detected_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join("  ")
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(&detected, inner.width as usize)).style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.y + 4, inner.width, 1),
+    );
+
+    frame.render_widget(
+        Paragraph::new("Active forwards").style(Style::default().fg(Color::Gray).bold()),
+        Rect::new(inner.x, inner.y + 6, inner.width, 1),
+    );
+    let selected_active = form.active_index();
+    let active_start = selected_active
+        .map(|index| index.saturating_add(1).saturating_sub(6))
+        .unwrap_or(0);
+    if form.active.is_empty() {
+        frame.render_widget(
+            Paragraph::new("None").style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, inner.y + 7, inner.width, 1),
+        );
+    }
+    for (visible, (index, forward)) in form
+        .active
+        .iter()
+        .enumerate()
+        .skip(active_start)
+        .take(6)
+        .enumerate()
+    {
+        let (status, color) = match &forward.state {
+            PortForwardState::Starting => ("starting".to_string(), Color::Yellow),
+            PortForwardState::Active => ("active".to_string(), Color::Green),
+            PortForwardState::Error(error) => {
+                (format!("error: {}", truncate(error, 28)), Color::Red)
+            }
+        };
+        let selected = selected_active == Some(index);
+        let folder = forward
+            .folder
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&forward.folder);
+        let mapping = format!(
+            "127.0.0.1:{} -> {}:{}  {}  {status}",
+            forward.local_port, forward.remote_host, forward.remote_port, folder
+        );
+        frame.render_widget(
+            Paragraph::new(truncate(&mapping, inner.width as usize)).style(
+                Style::default().fg(color).bg(if selected {
+                    Color::Rgb(42, 48, 58)
+                } else {
+                    Color::Reset
+                }),
+            ),
+            Rect::new(inner.x, inner.y + 7 + visible as u16, inner.width, 1),
+        );
+    }
+
+    let message = form
+        .error
+        .as_ref()
+        .or(form.detection_error.as_ref())
+        .map(|error| truncate(error, inner.width as usize))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(message).style(Style::default().fg(Color::Red)),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(2),
+            inner.width,
+            1,
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "Tab field/forward   Left/Right detected port   Enter start   d stop   Esc close",
+        )
+        .style(Style::default().fg(MUTED)),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+    if form.selected < PortForwardForm::FIELD_COUNT {
+        let value = values[form.selected];
+        let cursor = inner
+            .x
+            .saturating_add(label_width as u16)
+            .saturating_add(UnicodeWidthStr::width(value.as_str()) as u16)
+            .min(inner.x + inner.width.saturating_sub(1));
+        frame.set_cursor_position((cursor, inner.y + form.selected as u16));
+    }
 }
 
 fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {

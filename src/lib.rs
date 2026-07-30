@@ -10,6 +10,7 @@ pub mod debug;
 pub mod http;
 pub mod media;
 pub mod model;
+pub mod port_forward;
 pub mod recap;
 pub mod runtime;
 pub mod ssh_config;

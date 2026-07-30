@@ -1,9 +1,10 @@
 #[cfg(unix)]
 mod platform {
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         fs::{self, File, OpenOptions},
         io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+        net::{Shutdown, TcpStream},
         os::unix::{
             fs::PermissionsExt,
             net::{UnixListener, UnixStream},
@@ -154,6 +155,9 @@ mod platform {
             temporary_path: PathBuf,
             destination: PathBuf,
             remaining: u64,
+        },
+        Tcp {
+            socket: TcpStream,
         },
     }
 
@@ -533,6 +537,36 @@ mod platform {
                             );
                             write_stream_opened(&writer, &frame, Some(size))?;
                         }
+                        OpenStream::Tcp { host, port } => {
+                            match TcpStream::connect((host.as_str(), port)) {
+                                Ok(socket) => {
+                                    socket.set_nodelay(true)?;
+                                    let reader = socket.try_clone()?;
+                                    subscriptions
+                                        .insert(frame.stream_id, ClientStream::Tcp { socket });
+                                    write_stream_opened(&writer, &frame, None)?;
+                                    flow.open(frame.stream_id);
+                                    let writer = Arc::clone(&writer);
+                                    let flow = Arc::clone(&flow);
+                                    let stream_id = frame.stream_id;
+                                    thread::spawn(move || {
+                                        if let Err(error) =
+                                            stream_tcp(&writer, &flow, stream_id, reader)
+                                        {
+                                            eprintln!(
+                                                "muxloomd TCP stream {stream_id} failed: {error:#}"
+                                            );
+                                        }
+                                        flow.close(stream_id);
+                                    });
+                                }
+                                Err(error) => write_stream_error(
+                                    &writer,
+                                    &frame,
+                                    format!("cannot connect to {host}:{port}: {error}"),
+                                )?,
+                            }
+                        }
                     },
                     FrameKind::Data => {
                         if let Some(stream) = subscriptions.get_mut(&frame.stream_id) {
@@ -550,6 +584,7 @@ mod platform {
                                     file.write_all(&payload)?;
                                     *remaining -= payload.len() as u64;
                                 }
+                                ClientStream::Tcp { socket } => socket.write_all(&payload)?,
                             }
                         }
                     }
@@ -593,6 +628,22 @@ mod platform {
                     initial_window: INITIAL_STREAM_WINDOW,
                     total_bytes,
                 },
+            )?,
+        )
+    }
+
+    fn write_stream_error(
+        writer: &Arc<Mutex<UnixStream>>,
+        frame: &Frame,
+        message: String,
+    ) -> Result<()> {
+        write_frame(
+            writer,
+            &Frame::json(
+                FrameKind::Error,
+                frame.stream_id,
+                frame.request_id,
+                &DaemonResponse::Error { message },
             )?,
         )
     }
@@ -657,6 +708,27 @@ mod platform {
         )
     }
 
+    fn stream_tcp(
+        writer: &Arc<Mutex<UnixStream>>,
+        flow: &StreamFlow,
+        stream_id: u32,
+        mut socket: TcpStream,
+    ) -> Result<()> {
+        let mut buffer = vec![0; DATA_CHUNK_SIZE];
+        loop {
+            let read = socket.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            flow.consume(stream_id, read)?;
+            write_frame(writer, &Frame::data(stream_id, 0, &buffer[..read], false))?;
+        }
+        write_frame(
+            writer,
+            &Frame::new(FrameKind::CloseStream, stream_id, 0, vec![]),
+        )
+    }
+
     fn close_client_stream(stream: ClientStream) -> Result<()> {
         match stream {
             ClientStream::Pty {
@@ -691,6 +763,10 @@ mod platform {
                     )
                 })
             }
+            ClientStream::Tcp { socket } => {
+                let _ = socket.shutdown(Shutdown::Both);
+                Ok(())
+            }
         }
     }
 
@@ -708,6 +784,9 @@ mod platform {
             }
             ClientStream::Upload { temporary_path, .. } => {
                 let _ = fs::remove_file(temporary_path);
+            }
+            ClientStream::Tcp { socket } => {
+                let _ = socket.shutdown(Shutdown::Both);
             }
         }
     }
@@ -748,6 +827,8 @@ mod platform {
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
+                            "tcp-forward-v1".into(),
+                            "tcp-listeners-v1".into(),
                             "handover-drain-v1".into(),
                         ],
                     },
@@ -804,6 +885,13 @@ mod platform {
                     &DaemonResponse::Executables { available },
                 )
             }
+            DaemonRequest::ListTcpListeners => write_response(
+                writer,
+                request_id,
+                &DaemonResponse::TcpListeners {
+                    ports: tcp_listener_ports()?,
+                },
+            ),
             DaemonRequest::ListSessions => {
                 let mut sessions: Vec<_> = state
                     .sessions
@@ -1979,6 +2067,48 @@ mod platform {
         Ok(())
     }
 
+    fn tcp_listener_ports() -> Result<Vec<u16>> {
+        let ports = BTreeSet::new();
+        #[cfg(target_os = "linux")]
+        let mut ports = ports;
+        #[cfg(target_os = "linux")]
+        for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let table = match fs::read_to_string(path) {
+                Ok(table) => table,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read TCP listeners from {path}"));
+                }
+            };
+            collect_linux_tcp_listeners(&table, &mut ports);
+        }
+        Ok(ports.into_iter().collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_linux_tcp_listeners(table: &str, ports: &mut BTreeSet<u16>) {
+        for line in table.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let _slot = fields.next();
+            let Some(local_address) = fields.next() else {
+                continue;
+            };
+            let _remote_address = fields.next();
+            if fields.next() != Some("0A") {
+                continue;
+            }
+            let Some((_, port)) = local_address.rsplit_once(':') else {
+                continue;
+            };
+            if let Ok(port) = u16::from_str_radix(port, 16)
+                && port >= 1024
+            {
+                ports.insert(port);
+            }
+        }
+    }
+
     fn write_response(
         writer: &Arc<Mutex<UnixStream>>,
         request_id: u64,
@@ -2736,6 +2866,120 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn tcp_stream_forwards_bytes_over_the_existing_daemon_connection() {
+            use std::net::TcpListener;
+
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let upstream_handle = thread::spawn(move || {
+                let (mut socket, _) = upstream.accept().unwrap();
+                let mut request = [0_u8; 4];
+                socket.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"ping");
+                socket.write_all(b"pong").unwrap();
+            });
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let state = test_state("tcp-forward");
+            let root = state.paths.root.clone();
+            let daemon_handle = thread::spawn(move || serve_client(server, state));
+            let stream_id = stream::MEDIA_BASE + 7;
+            Frame::json(
+                FrameKind::OpenStream,
+                stream_id,
+                0,
+                &OpenStream::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::OpenStream && frame.stream_id == stream_id {
+                    break;
+                }
+            }
+            Frame::data(stream_id, 0, b"ping", false)
+                .write_to(&mut client)
+                .unwrap();
+            let mut response = Vec::new();
+            while response.len() < 4 {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Data && frame.stream_id == stream_id {
+                    let payload = frame.decoded_payload().unwrap();
+                    response.extend_from_slice(&payload);
+                    Frame::window_update(stream_id, payload.len() as u32)
+                        .write_to(&mut client)
+                        .unwrap();
+                }
+            }
+            assert_eq!(response, b"pong");
+            Frame::new(FrameKind::CloseStream, stream_id, 0, vec![])
+                .write_to(&mut client)
+                .unwrap();
+            upstream_handle.join().unwrap();
+
+            let refused_stream = stream_id + 1;
+            Frame::json(
+                FrameKind::OpenStream,
+                refused_stream,
+                0,
+                &OpenStream::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Error && frame.stream_id == refused_stream {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Error { message } if message.contains("cannot connect")
+                    ));
+                    break;
+                }
+            }
+            Frame::json(FrameKind::Request, 0, 99, &DaemonRequest::Ping)
+                .unwrap()
+                .write_to(&mut client)
+                .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 99 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Pong { .. }
+                    ));
+                    break;
+                }
+            }
+            drop(client);
+            daemon_handle.join().unwrap().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_tcp_listener_parser_returns_only_unprivileged_listeners() {
+            let table = "  sl  local_address rem_address   st\n\
+                         0: 0100007F:0016 00000000:0000 0A\n\
+                         1: 00000000:0BB8 00000000:0000 0A\n\
+                         2: 00000000:1435 00000000:0000 01\n";
+            let mut ports = BTreeSet::new();
+            collect_linux_tcp_listeners(table, &mut ports);
+            assert_eq!(ports.into_iter().collect::<Vec<_>>(), [3000]);
         }
 
         #[test]

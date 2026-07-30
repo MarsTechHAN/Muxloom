@@ -19,6 +19,7 @@ use crate::{
         FileListing, FilePreview, FilePreviewKind, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
+    port_forward::{PortForwardManager, PortForwardSummary},
     recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
     ssh_config,
@@ -61,6 +62,34 @@ pub struct TemporalForm {
     pub target: Target,
     pub kind: AgentKind,
     pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortForwardForm {
+    pub target: Target,
+    pub session_id: String,
+    pub folder: String,
+    pub remote_host: String,
+    pub remote_port: String,
+    pub local_port: String,
+    pub detected_ports: Vec<u16>,
+    pub active: Vec<PortForwardSummary>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub detection_error: Option<String>,
+}
+
+impl PortForwardForm {
+    pub const FIELD_COUNT: usize = 3;
+
+    pub fn row_count(&self) -> usize {
+        Self::FIELD_COUNT + self.active.len()
+    }
+
+    pub fn active_index(&self) -> Option<usize> {
+        self.selected.checked_sub(Self::FIELD_COUNT)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +240,7 @@ struct FileClick {
 pub enum Modal {
     Launch(LaunchForm),
     Temporal(TemporalForm),
+    PortForward(PortForwardForm),
     ConfirmKill {
         session_id: String,
         label: String,
@@ -245,7 +275,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 53;
+pub const HELP_CONTENT_ROWS: usize = 55;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -424,6 +454,7 @@ pub struct App {
     pub history_offset: usize,
     pub interactive: bool,
     pub modal: Option<Modal>,
+    port_forwards: PortForwardManager,
     pub file_manager: Option<FileManagerForm>,
     /// File browsers stashed while another machine is selected, keyed by target
     /// id. The active machine's browser lives in `file_manager`; switching
@@ -541,6 +572,7 @@ impl App {
             history_offset: 0,
             interactive: false,
             modal: None,
+            port_forwards: PortForwardManager::default(),
             file_manager: None,
             stashed_file_managers: HashMap::new(),
             file_dirs: HashMap::new(),
@@ -637,6 +669,10 @@ impl App {
         self.animation_frame =
             (self.animation_epoch.elapsed().as_millis() / ANIMATION_FRAME_MS) as u64;
         self.drain_worker();
+        if let Some(Modal::PortForward(form)) = self.modal.as_mut() {
+            form.active = self.port_forwards.summaries_for(&form.target.id);
+            form.selected = form.selected.min(form.row_count().saturating_sub(1));
+        }
         self.drain_update_slot();
         self.poll_media();
         self.poll_attach();
@@ -771,6 +807,10 @@ impl App {
             }
             KeyCode::Char('t') if self.focus == Focus::Agents => {
                 self.open_temporary_agent();
+                Action::Continue
+            }
+            KeyCode::Char('p') if self.focus == Focus::Agents => {
+                self.open_port_forward();
                 Action::Continue
             }
             KeyCode::Char('n') => {
@@ -1335,6 +1375,10 @@ impl App {
                         value.push_str(&text);
                         form.error = None;
                     }
+                }
+                Modal::PortForward(form) if form.selected < PortForwardForm::FIELD_COUNT => {
+                    port_forward_value(form).push_str(&text);
+                    form.error = None;
                 }
                 _ => {
                     self.status_message = "Select a text field before pasting".into();
@@ -2245,6 +2289,31 @@ impl App {
                 self.pending_activity_refreshes.remove(&target_id);
                 if let Ok(sessions) = result {
                     self.apply_activity_refresh(&target_id, &sessions);
+                }
+            }
+            Event::PortsDetected { target_id, result } => {
+                if let Some(Modal::PortForward(form)) = self.modal.as_mut()
+                    && form.target.id == target_id
+                {
+                    form.loading = false;
+                    match result {
+                        Ok(ports) => {
+                            let mut detected: std::collections::BTreeSet<_> =
+                                form.detected_ports.iter().copied().collect();
+                            detected.extend(ports);
+                            form.detected_ports = detected.into_iter().collect();
+                            form.detection_error = None;
+                            if form.remote_port.trim().is_empty()
+                                && let Some(port) = form.detected_ports.first()
+                            {
+                                form.remote_port = port.to_string();
+                                form.local_port = port.to_string();
+                            }
+                        }
+                        Err(error) => {
+                            form.detection_error = Some(short_error(&error));
+                        }
+                    }
                 }
             }
             Event::Captured {
@@ -3722,6 +3791,114 @@ impl App {
         self.status_message = "Starting Temporal Chat...".into();
     }
 
+    fn open_port_forward(&mut self) {
+        let Some(session) = self.selected_session().cloned() else {
+            self.status_message = "Select an agent before configuring port forwarding".into();
+            return;
+        };
+        let Some(target) = self.target(&session.target_id).cloned() else {
+            self.status_message = "The selected agent's machine is unavailable".into();
+            return;
+        };
+        let visible = if self.attached_terminal_for_selected() {
+            self.terminal
+                .as_mut()
+                .map(TerminalSession::live_contents)
+                .unwrap_or_default()
+        } else {
+            self.history.text.clone()
+        };
+        let detected_ports = detected_ports_in_text(&visible);
+        let remote_port = detected_ports
+            .first()
+            .map(u16::to_string)
+            .unwrap_or_default();
+        let mut form = PortForwardForm {
+            target: target.clone(),
+            session_id: session.id,
+            folder: session.path,
+            remote_host: "127.0.0.1".into(),
+            local_port: remote_port.clone(),
+            remote_port,
+            detected_ports,
+            active: self.port_forwards.summaries_for(&target.id),
+            selected: 1,
+            loading: true,
+            error: None,
+            detection_error: None,
+        };
+        if self
+            .worker
+            .requests
+            .send(Request::DetectPorts { target })
+            .is_err()
+        {
+            form.loading = false;
+            form.detection_error = Some("Port detector is unavailable".into());
+        }
+        self.modal = Some(Modal::PortForward(form));
+    }
+
+    fn start_port_forward(&mut self, mut form: PortForwardForm) {
+        let result = (|| -> Result<PortForwardSummary, String> {
+            let remote_host = form.remote_host.trim();
+            if remote_host.is_empty() {
+                return Err("Remote host is required".into());
+            }
+            let remote_port: u16 = form
+                .remote_port
+                .trim()
+                .parse()
+                .map_err(|_| "Remote port must be 1-65535".to_string())?;
+            if remote_port == 0 {
+                return Err("Remote port must be 1-65535".into());
+            }
+            let local_port = if form.local_port.trim().is_empty() {
+                remote_port
+            } else {
+                form.local_port
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "Local port must be 0-65535".to_string())?
+            };
+            self.port_forwards
+                .start(
+                    self.worker.bridges.clone(),
+                    form.target.clone(),
+                    form.session_id.clone(),
+                    form.folder.clone(),
+                    remote_host.into(),
+                    remote_port,
+                    local_port,
+                )
+                .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(forward) => {
+                form.error = None;
+                form.active = self.port_forwards.summaries_for(&form.target.id);
+                self.status_message = format!(
+                    "Forwarding 127.0.0.1:{} to {}:{} on {}",
+                    forward.local_port, forward.remote_host, forward.remote_port, forward.target_id
+                );
+            }
+            Err(error) => form.error = Some(short_error(&error)),
+        }
+        self.modal = Some(Modal::PortForward(form));
+    }
+
+    fn stop_port_forward(&mut self, mut form: PortForwardForm) {
+        if let Some(index) = form.active_index()
+            && let Some(forward) = form.active.get(index)
+            && self.port_forwards.stop(forward.id)
+        {
+            self.status_message = format!("Stopped local port {}", forward.local_port);
+        }
+        form.active = self.port_forwards.summaries_for(&form.target.id);
+        form.selected = form.selected.min(form.row_count().saturating_sub(1));
+        self.modal = Some(Modal::PortForward(form));
+    }
+
     fn open_path_picker(&mut self, launch: LaunchForm) {
         let path = if launch.path.trim().is_empty() {
             ".".into()
@@ -5069,6 +5246,69 @@ impl App {
                 KeyCode::Enter => self.launch_temporary_agent(form),
                 _ => self.modal = Some(Modal::Temporal(form)),
             },
+            Modal::PortForward(mut form) => match key.code {
+                KeyCode::Esc | KeyCode::Char('p') => {}
+                KeyCode::Tab | KeyCode::Down => {
+                    form.selected = (form.selected + 1) % form.row_count().max(1);
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.selected = form
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or(form.row_count().saturating_sub(1));
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                KeyCode::Left | KeyCode::Right
+                    if form.selected == 1 && !form.detected_ports.is_empty() =>
+                {
+                    let old_remote = form.remote_port.clone();
+                    let current = old_remote.parse::<u16>().ok();
+                    let index = current
+                        .and_then(|port| {
+                            form.detected_ports
+                                .iter()
+                                .position(|candidate| *candidate == port)
+                        })
+                        .unwrap_or(0);
+                    let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                    let next = shifted(index, form.detected_ports.len(), delta);
+                    form.remote_port = form.detected_ports[next].to_string();
+                    if form.local_port.trim().is_empty() || form.local_port == old_remote {
+                        form.local_port = form.remote_port.clone();
+                    }
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                KeyCode::Char('d') if form.active_index().is_some() => self.stop_port_forward(form),
+                KeyCode::Enter if form.active_index().is_none() => self.start_port_forward(form),
+                KeyCode::Backspace if form.selected < PortForwardForm::FIELD_COUNT => {
+                    port_forward_value(&mut form).pop();
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                KeyCode::Char('u')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && form.selected < PortForwardForm::FIELD_COUNT =>
+                {
+                    port_forward_value(&mut form).clear();
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                KeyCode::Char(character)
+                    if form.selected < PortForwardForm::FIELD_COUNT
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    port_forward_value(&mut form).push(character);
+                    form.error = None;
+                    self.modal = Some(Modal::PortForward(form));
+                }
+                _ => self.modal = Some(Modal::PortForward(form)),
+            },
             Modal::RenameAgent {
                 session_id,
                 mut value,
@@ -5852,6 +6092,38 @@ fn shifted(current: usize, length: usize, delta: isize) -> usize {
         return 0;
     }
     (current as isize + delta).rem_euclid(length as isize) as usize
+}
+
+fn port_forward_value(form: &mut PortForwardForm) -> &mut String {
+    match form.selected {
+        0 => &mut form.remote_host,
+        1 => &mut form.remote_port,
+        2 => &mut form.local_port,
+        _ => unreachable!("active forward rows are not editable"),
+    }
+}
+
+fn detected_ports_in_text(text: &str) -> Vec<u16> {
+    let text = text.to_ascii_lowercase();
+    let mut ports = std::collections::BTreeSet::new();
+    for marker in ["localhost:", "127.0.0.1:", "0.0.0.0:", "[::1]:"] {
+        let mut rest = text.as_str();
+        while let Some(position) = rest.find(marker) {
+            let after = &rest[position + marker.len()..];
+            let digits: String = after
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .take(5)
+                .collect();
+            if let Ok(port) = digits.parse::<u16>()
+                && port >= 1024
+            {
+                ports.insert(port);
+            }
+            rest = after;
+        }
+    }
+    ports.into_iter().collect()
 }
 
 fn focus_navigation_direction(key: KeyEvent) -> Option<FocusDirection> {
@@ -8940,6 +9212,74 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(receive_request(&request_rx), Request::Kill { .. }));
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn port_detection_extracts_loopback_urls_and_ignores_privileged_ports() {
+        assert_eq!(
+            detected_ports_in_text(
+                "ready at http://localhost:3000 and HTTPS://127.0.0.1:8443/x; ssh 127.0.0.1:22"
+            ),
+            [3000, 8443]
+        );
+        assert_eq!(
+            detected_ports_in_text("Vite: http://0.0.0.0:5173 and http://[::1]:9000"),
+            [5173, 9000]
+        );
+    }
+
+    #[test]
+    fn agents_p_opens_port_settings_and_merges_daemon_listener_detection() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloomd-claude-forward".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/web".into(),
+            label: "web".into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        });
+        app.selected_session_id = Some("muxloomd-claude-forward".into());
+        app.focus = Focus::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::DetectPorts { target } if target.id == "local"
+        ));
+        app.handle_worker_event(Event::PortsDetected {
+            target_id: "local".into(),
+            result: Ok(vec![5173, 3000, 5173]),
+        });
+        let Some(Modal::PortForward(form)) = app.modal else {
+            panic!("port-forward settings did not stay open");
+        };
+        assert_eq!(form.folder, "/work/web");
+        assert_eq!(form.detected_ports, [3000, 5173]);
+        assert_eq!(form.remote_port, "3000");
+        assert_eq!(form.local_port, "3000");
     }
 
     #[test]

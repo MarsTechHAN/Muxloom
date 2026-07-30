@@ -107,11 +107,20 @@ with the source history file referenced in its initial prompt.
 **Keys** — `n` open · type to fuzzy-match a folder · `Left`/`Right` navigate ·
 `Enter` confirm.
 
-From the Agents pane, `t` immediately starts a Codex **Temporal Chat** in the
-selected agent's folder, then the machine's last launch folder, then that
-user's home folder. Temporal Chat stores neither Muxloom ANSI history nor a
-Codex transcript, is excluded from search and backup, and `x` destroys it
-instead of archiving it.
+From the Agents pane, `t` opens a Codex/Claude chooser for a **Temporal Chat** in
+the selected agent's folder, then the machine's last launch folder, then that
+user's home folder. Temporal Chat stores no Muxloom ANSI history and is excluded
+from search and backup; Codex also runs with transcript persistence disabled.
+`x` destroys it instead of archiving it.
+
+Press `p` in Agents by folder to forward a service on the selected machine to
+controller loopback. Set the remote host/port and local port (`0` allocates one),
+then use `127.0.0.1:LOCAL_PORT`. Linux companions detect non-privileged listening
+ports natively; every platform also extracts loopback URLs visible in the agent
+terminal. Manual entry remains available when detection is unavailable. TCP
+traffic is multiplexed through the target's persistent bridge, and `d` stops a
+highlighted forward without touching the remote process. Local listeners live
+only for the current Muxloom controller process.
 
 ### 🧭 Responsive layout
 
@@ -282,7 +291,8 @@ the full categorized help inside the TUI.
 | `Up` / `Down`, `j` / `k` | Move the current selection |
 | `Space` in Machines | Enable or disable a target; mouse double-click must land on `[x]` |
 | `n`, `Ctrl-n` | Start the New/Resume flow on the selected target |
-| `t` in Agents | Start a no-history Temporal Chat in the current folder |
+| `t` in Agents | Choose Codex or Claude for a no-history Temporal Chat |
+| `p` in Agents | Configure local port forwarding for the selected machine |
 | `Enter` | Open the selected terminal or confirm the current form |
 | `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
 | `a` | Show or hide archived agents |
@@ -436,9 +446,9 @@ target, and an attach gets the tail of that log rendered into scrollback rows
 followed by the retained output that repaints the screen.
 
 **Transport.** Each remote target uses one long-lived, non-PTY SSH process. A
-framed protocol multiplexes request and stream IDs over it, completing requests
-out of order with stream-credit backpressure and heartbeats; large payloads use
-LZ4 only when useful. Companion bootstrap compares SHA-256 fingerprints computed
+framed protocol multiplexes request, PTY, file, media, and TCP-forward stream IDs
+over it, completing requests out of order with stream-credit backpressure and
+heartbeats; large payloads use LZ4 only when useful. Companion bootstrap compares SHA-256 fingerprints computed
 by the Rust binaries and ships a missing or stale binary atomically over the
 same SSH stdin. Daemon replacement is non-disruptive: a new binary cannot
 replace a daemon that owns live PTYs, so the old generation serves the
@@ -463,6 +473,7 @@ old frame visible until the new stream produces its first frame.
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |
 | `src/daemon.rs` | PTY supervisor, history, archive, files, search |
+| `src/port_forward.rs` | Controller loopback listeners and TCP stream proxying |
 | `src/bin/muxloomd.rs` | Companion `serve`, `bridge`, and `status` commands |
 | `src/terminal_session.rs` | Live parser, input encoding, resize safety |
 | `src/media.rs` | Image/video decode and playback updates |

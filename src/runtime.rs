@@ -1253,6 +1253,10 @@ impl Runtime {
         parse_history_page(&String::from_utf8_lossy(&output.stdout), offset_from_bottom)
     }
 
+    pub fn tcp_listener_ports(&self, target: &Target) -> Result<Vec<u16>> {
+        self.bridges.tcp_listener_ports(target)
+    }
+
     pub fn capture(&self, target: &Target, session_id: &str, lines: usize) -> Result<String> {
         Ok(self
             .capture_page(target, session_id, 0, lines, 80, 24)?

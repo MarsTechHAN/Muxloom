@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -93,6 +93,7 @@ struct ConnectionState {
     next_request: AtomicU64,
     next_stream: AtomicU64,
     alive: AtomicBool,
+    capabilities: Mutex<HashSet<String>>,
 }
 
 /// Outbound side of one bridge connection. Frames are queued here and written
@@ -215,6 +216,7 @@ fn spawn_writer(
 enum StreamEvent {
     Data(Vec<u8>),
     Closed,
+    Error(String),
 }
 
 pub struct BridgeStream {
@@ -226,19 +228,31 @@ pub struct BridgeStream {
 
 impl BridgeStream {
     pub fn try_read(&mut self) -> Option<Vec<u8>> {
+        self.try_read_result().ok().flatten()
+    }
+
+    pub fn try_read_result(&mut self) -> Result<Option<Vec<u8>>> {
         match self.events.try_recv() {
-            Ok(StreamEvent::Data(bytes)) => Some(bytes),
+            Ok(StreamEvent::Data(bytes)) => Ok(Some(bytes)),
+            Ok(StreamEvent::Error(message)) => {
+                self.closed = true;
+                Err(anyhow!(message))
+            }
             Ok(StreamEvent::Closed) | Err(mpsc::TryRecvError::Disconnected) => {
                 self.closed = true;
-                None
+                Ok(None)
             }
-            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
         }
     }
 
     pub fn read_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         match self.events.recv_timeout(timeout) {
             Ok(StreamEvent::Data(bytes)) => Ok(Some(bytes)),
+            Ok(StreamEvent::Error(message)) => {
+                self.closed = true;
+                Err(anyhow!(message))
+            }
             Ok(StreamEvent::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.closed = true;
                 Ok(None)
@@ -432,10 +446,18 @@ impl BridgeConnection {
             BridgeReply {
                 response:
                     DaemonResponse::Hello {
-                        protocol_version, ..
+                        protocol_version,
+                        capabilities,
+                        ..
                     },
                 ..
             } if protocol_version == PROTOCOL_VERSION => {
+                *connection
+                    .state
+                    .capabilities
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    capabilities.into_iter().collect();
                 debug::log(
                     "bridge",
                     format!("connected target={target} via one persistent bridge"),
@@ -468,6 +490,7 @@ impl BridgeConnection {
             next_request: AtomicU64::new(1),
             next_stream: AtomicU64::new(u64::from(stream::PTY_BASE)),
             alive: AtomicBool::new(true),
+            capabilities: Mutex::new(HashSet::new()),
         });
         spawn_writer(frames, Arc::downgrade(&state), writer);
         spawn_reader(Arc::clone(&state), reader);
@@ -632,6 +655,14 @@ impl BridgeConnection {
         }
     }
 
+    pub fn tcp_listener_ports(&self) -> Result<Vec<u16>> {
+        self.require_capability("tcp-listeners-v1")?;
+        match self.request(DaemonRequest::ListTcpListeners)?.response {
+            DaemonResponse::TcpListeners { ports } => Ok(ports),
+            response => bail!("unexpected TCP-listener response: {response:?}"),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &self,
@@ -720,6 +751,27 @@ impl BridgeConnection {
             rows,
             scrollback_rows,
         })
+    }
+
+    pub fn open_tcp(&self, host: String, port: u16) -> Result<BridgeStream> {
+        self.require_capability("tcp-forward-v1")?;
+        self.open_stream(OpenStream::Tcp { host, port })
+    }
+
+    fn require_capability(&self, capability: &str) -> Result<()> {
+        if self
+            .state
+            .capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(capability)
+        {
+            Ok(())
+        } else {
+            bail!(
+                "active muxloomd generation does not support {capability}; keep running agents active and retry after its deferred upgrade"
+            )
+        }
     }
 
     pub fn open_file(
@@ -839,6 +891,21 @@ fn spawn_reader(state: Arc<ConnectionState>, mut reader: impl Read + Send + 'sta
                             state
                                 .writer
                                 .send(Frame::window_update(frame.stream_id, consumed))?;
+                        }
+                    }
+                    FrameKind::Error if frame.stream_id != 0 => {
+                        let response = frame.decode_json::<DaemonResponse>()?;
+                        let message = match response {
+                            DaemonResponse::Error { message } => message,
+                            response => format!("unexpected stream error: {response:?}"),
+                        };
+                        if let Some(stream) = state
+                            .streams
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&frame.stream_id)
+                        {
+                            let _ = stream.send(StreamEvent::Error(message));
                         }
                     }
                     FrameKind::Response | FrameKind::Error => {
@@ -1439,6 +1506,10 @@ impl BridgePool {
         self.probe_executables_with_progress(target, executables, |_| {})
     }
 
+    pub fn tcp_listener_ports(&self, target: &Target) -> Result<Vec<u16>> {
+        self.connection_for_target(target)?.tcp_listener_ports()
+    }
+
     pub fn probe_executables_with_progress(
         &self,
         target: &Target,
@@ -1557,6 +1628,15 @@ impl BridgePool {
     ) -> Result<BridgeStream> {
         self.connection_for_target(target)?
             .open_pty(session_id, columns, rows, scrollback_rows)
+    }
+
+    pub fn open_tcp(&self, target: &Target, host: String, port: u16) -> Result<BridgeStream> {
+        self.connection_for_target(target)?.open_tcp(host, port)
+    }
+
+    pub fn ensure_tcp_forward(&self, target: &Target) -> Result<()> {
+        self.connection_for_target(target)?
+            .require_capability("tcp-forward-v1")
     }
 
     pub fn download_file(
@@ -1768,6 +1848,25 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_streams_are_not_sent_to_an_older_daemon_generation() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let reader = client.try_clone().unwrap();
+        let connection = BridgeConnection::from_parts("old-daemon".into(), reader, client, None);
+        let error = connection
+            .open_tcp("127.0.0.1".into(), 3000)
+            .err()
+            .expect("missing capability must reject the stream");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support tcp-forward-v1")
+        );
+        connection.state.shutdown();
+        drop(server);
+    }
 
     #[cfg(unix)]
     #[test]

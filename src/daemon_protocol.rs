@@ -219,6 +219,7 @@ pub enum DaemonRequest {
     ProbeExecutables {
         executables: Vec<String>,
     },
+    ListTcpListeners,
     ListSessions,
     Launch {
         session_id: String,
@@ -292,6 +293,9 @@ pub enum DaemonResponse {
     HandoverDeferred,
     Executables {
         available: Vec<String>,
+    },
+    TcpListeners {
+        ports: Vec<u16>,
     },
     Sessions {
         sessions: Vec<DaemonSession>,
@@ -369,6 +373,10 @@ pub enum OpenStream {
     Upload {
         path: String,
         size: u64,
+    },
+    Tcp {
+        host: String,
+        port: u16,
     },
 }
 

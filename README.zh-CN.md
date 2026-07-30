@@ -186,7 +186,8 @@ Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色
 | `Alt-1` / `Alt-2` / `Alt-3` | 跳到 Machines / Agents / Terminal |
 | `Space`（Machines） | 启用或禁用机器 |
 | `n` / `Ctrl-n` | 在当前机器进入 New/Resume 流程 |
-| `t`（Agents） | 在当前目录直接启动无历史的 Temporal Chat |
+| `t`（Agents） | 选择 Codex 或 Claude，在当前目录启动无历史的 Temporal Chat |
+| `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
 | `a` | 展开或收起 Archived |
@@ -265,9 +266,16 @@ Codex/Claude 退出或第一次按 `x` 后进入 Archived，仍可查看和搜�
 原机器、Runtime 和目录尝试 Resume 最新历史；再次按 `x` 才永久删除 daemon 元数据与历史。
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
-在 Agents 面板按 `t` 会立即启动 Codex `Temporal Chat`。目录依次取当前选中 Agent 的目录、
-该机器上次启动目录、目标用户 Home；该会话不写 Muxloom ANSI History，也用单次 Codex 配置
-关闭 Transcript 持久化，不进入搜索或备份。按 `x` 会直接停止并删除，不进入 Archived。
+在 Agents 面板按 `t` 会先选择 Codex 或 Claude，再启动 `Temporal Chat`。目录依次取当前选中
+Agent 的目录、该机器上次启动目录、目标用户 Home；该会话不写 Muxloom ANSI History，也不
+进入搜索或备份；Codex 还会用单次配置关闭 Transcript 持久化。按 `x` 会直接停止并删除，
+不进入 Archived。
+
+在 Agents by folder 按 `p` 可把所选机器上的服务转发到 Controller 的 Loopback。填写远端
+Host/Port 与本地 Port（`0` 表示自动分配），之后访问 `127.0.0.1:LOCAL_PORT`。Linux companion
+会原生探测非特权监听端口；所有平台也会从 Agent 当前终端中可见的 Loopback URL 提取候选。
+探测不可用时仍可手动填写。TCP 流量复用该机器已有的持久 Bridge；选中活动转发按 `d` 停止，
+不会停止远端服务或 Agent。本地 Listener 只在当前 Muxloom Controller 进程期间存在。
 
 提醒只检查当前屏幕底部物理行。Attached 和 legacy-inspected Session 会组合内置审批布局与
 每机器 Pattern；后台 daemon snapshot 当前只使用内置布局。新提醒会把整个 Agent 条目显示为
@@ -336,7 +344,7 @@ Controller 用 FFmpeg 解码和按时间渲染。目标不需要 FFmpeg，也不
 Ratatui 绘制；文件、搜索、Probe 和 Runtime 操作通过强类型 Request/Event 在 Worker 执行。
 
 每个远端目标的正常 daemon 数据面使用一条不分配 PTY 的 SSH 长连接。Versioned Frame
-使用 Request ID 和 Stream ID 复用并发操作，Credit Window 提供背压，Heartbeat 检测
+使用 Request ID 和 Stream ID 复用并发操作、PTY、文件、媒体与 TCP 转发，Credit Window 提供背压，Heartbeat 检测
 断线，大数据只在值得时使用 LZ4。daemon Bridge 的 Reverse Tunnel 作为同一 SSH 进程的
 `-R` 参数；legacy 和 staging 兼容路径仍可能使用 ControlMaster 或 `scp`。
 
