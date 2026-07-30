@@ -10,6 +10,12 @@
   <a href="https://github.com/MarsTechHAN/Muxloom/releases">Releases</a>
 </p>
 
+**Homebrew（macOS）**
+
+```bash
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew install --cask muxloom
+```
+
 > [!NOTE]
 > 本中文文档由英文 [README](./README.md) 翻译而来，可能落后于最新英文版；如有出入，以英文版为准。
 
@@ -54,6 +60,13 @@ Bootstrap 和明确选择的兼容路径可能临时复用单独的 SSH ControlM
 <a id="zh-install"></a>
 
 ### 安装
+
+通过上游 tap 安装完整发布包，其中包括配套 daemon、companion 二进制与媒体工具：
+
+```bash
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+brew install --cask muxloom
+```
 
 从 [GitHub Releases](https://github.com/MarsTechHAN/Muxloom/releases) 下载对应控制机的
 压缩包。请保留解压后的目录结构，`muxloom` 会相对自身查找 `muxloomd`、其他目标架构

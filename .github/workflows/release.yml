@@ -201,6 +201,19 @@ jobs:
           package_target aarch64-apple-darwin muxloom tar.gz
           package_target x86_64-apple-darwin muxloom tar.gz
           package_target x86_64-pc-windows-msvc muxloom.exe zip
+          package_cask() {
+            target="$1"
+            arch="$2"
+            source="dist/muxloom-${version}-${target}"
+            cask_root="cask/${target}/muxloom"
+            asset="muxloom-macos-${arch}.tar.gz"
+            mkdir -p "$cask_root"
+            cp -R "$source/." "$cask_root/"
+            tar -C "cask/$target" -czf "dist/$asset" muxloom
+            (cd dist && sha256sum "$asset" > "$asset.sha256")
+          }
+          package_cask aarch64-apple-darwin aarch64
+          package_cask x86_64-apple-darwin x86_64
           for companion_target in \
             x86_64-unknown-linux-musl \
             aarch64-apple-darwin \

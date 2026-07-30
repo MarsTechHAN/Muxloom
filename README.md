@@ -14,6 +14,12 @@
 
 </div>
 
+**Homebrew (macOS)**
+
+```bash
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew install --cask muxloom
+```
+
 > [!IMPORTANT]
 > Muxloom manages terminal sessions; it does not replace Codex or Claude Code.
 > Those CLIs run normally on the selected target. A detached `muxloomd` process
@@ -180,6 +186,16 @@ recap line, and archived agents stay searchable and resumable.
 archive/delete · `a` show archived.
 
 ## Install
+
+### Homebrew (macOS)
+
+Install the release bundle and its bundled daemon, companion binaries, and
+media helper through the upstream tap:
+
+```bash
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+brew install --cask muxloom
+```
 
 ### Release bundle
 
