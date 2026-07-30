@@ -199,6 +199,8 @@ Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色
 | `r` / `Ctrl-r` | 立即刷新 |
 | `q` | 退出 Dashboard，不停止 Agent |
 
+所有列表都停在第一项和最后一项，不会循环；鼠标滚轮每次只移动一项。
+
 Terminal 输入激活后，普通方向键、文字、粘贴和组合键直接进入 PTY；未加 Modifier 的方向键
 不会切换 Pane。`Shift+Enter` 或 `Option+Enter` 插入换行，`Ctrl-c`/`Ctrl-d` 原样转发。
 `PageUp`/`PageDown` 按页浏览历史，滚轮每次移动一行。已连接会话的回滚读取仿真器自身渲染的
@@ -308,7 +310,7 @@ Pane（Pane-focus 快捷键或点击）即可在那里输入或操作，Files �
 | `/pattern` | 递归搜索当前目录下的文件名，支持 `*` 和 `**` 通配符 |
 | `Right`、`Enter`、双击 | 进入目录或展开/收起 Preview |
 | `Left`、右键 | 返回父目录 |
-| 方向键、`PageUp` / `PageDown` | 对打开内容翻页，末尾继续向后会折回 |
+| 方向键、`PageUp` / `PageDown` | 对打开内容翻页，并停在开头或末尾 |
 | `g` / `G`、`Home` / `End` | 跳到 Preview 开头或末尾；停在末尾时会随文件增长自动跟随 |
 | `c` | 复制目标机器上的完整路径 |
 | 在 Preview 上拖拽 | 松开鼠标时复制选中的 Preview 文本 |

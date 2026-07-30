@@ -1086,9 +1086,18 @@ impl App {
             }
             match modal {
                 Modal::Help(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(3),
+                    MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(1),
                     MouseEventKind::ScrollDown => {
-                        form.offset = form.offset.saturating_add(3).min(HELP_CONTENT_ROWS - 1)
+                        form.offset = form.offset.saturating_add(1).min(HELP_CONTENT_ROWS - 1)
+                    }
+                    _ => {}
+                },
+                Modal::Settings(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        form.selected = clamped_index(form.selected, form.values.len(), -1)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        form.selected = clamped_index(form.selected, form.values.len(), 1)
                     }
                     _ => {}
                 },
@@ -1107,6 +1116,47 @@ impl App {
                         {
                             form.selected = *index;
                         }
+                    }
+                    _ => {}
+                },
+                Modal::PathPicker(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp if !form.loading => {
+                        form.selected =
+                            clamped_index(form.selected, matched_directories(form).len(), -1)
+                    }
+                    MouseEventKind::ScrollDown if !form.loading => {
+                        form.selected =
+                            clamped_index(form.selected, matched_directories(form).len(), 1)
+                    }
+                    _ => {}
+                },
+                Modal::Resume(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        if form.history_active() {
+                            form.history_selected =
+                                clamped_index(form.history_selected, form.history_hits.len(), -1);
+                        } else if !form.loading {
+                            form.selected =
+                                clamped_index(form.selected, form.candidates.len() + 1, -1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if form.history_active() {
+                            form.history_selected =
+                                clamped_index(form.history_selected, form.history_hits.len(), 1);
+                        } else if !form.loading {
+                            form.selected =
+                                clamped_index(form.selected, form.candidates.len() + 1, 1);
+                        }
+                    }
+                    _ => {}
+                },
+                Modal::PortForward(form) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        form.selected = clamped_index(form.selected, form.row_count(), -1)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        form.selected = clamped_index(form.selected, form.row_count(), 1)
                     }
                     _ => {}
                 },
@@ -1227,13 +1277,13 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::ScrollUp if in_preview => {
-                form.preview_scroll = form.preview_scroll.saturating_sub(3);
+                form.preview_scroll = form.preview_scroll.saturating_sub(1);
                 Self::sync_preview_follow(&mut form);
             }
             MouseEventKind::ScrollDown if in_preview => {
                 form.preview_scroll = form
                     .preview_scroll
-                    .saturating_add(3)
+                    .saturating_add(1)
                     .min(form.preview_max_scroll);
                 Self::sync_preview_follow(&mut form);
             }
@@ -3342,7 +3392,7 @@ impl App {
                     .iter()
                     .position(|index| *index == self.selected_target)
                     .unwrap_or(0);
-                self.set_selected_target(visible[shifted(current, visible.len(), delta)]);
+                self.set_selected_target(visible[clamped_index(current, visible.len(), delta)]);
                 self.release_terminal_input("Machine selected");
                 self.history_offset = 0;
                 self.ensure_session_selection();
@@ -3362,7 +3412,7 @@ impl App {
                     .as_ref()
                     .and_then(|selected| ids.iter().position(|id| id == selected))
                     .unwrap_or(0);
-                let next = shifted(current, ids.len(), delta);
+                let next = clamped_index(current, ids.len(), delta);
                 self.select_session(ids[next].clone());
             }
             Focus::Recap => self.page_history(delta < 0),
@@ -4563,7 +4613,7 @@ impl App {
             form.selected = 0;
             return;
         }
-        form.selected = shifted(form.selected, form.entries.len(), delta);
+        form.selected = clamped_index(form.selected, form.entries.len(), delta);
         form.return_path = None;
         Self::clear_file_preview(form);
     }
@@ -4588,19 +4638,12 @@ impl App {
         if form.preview_max_scroll == 0 {
             form.preview_scroll = 0;
         } else if forward {
-            form.preview_scroll = if form.preview_scroll >= form.preview_max_scroll {
-                0
-            } else {
-                form.preview_scroll
-                    .saturating_add(step)
-                    .min(form.preview_max_scroll)
-            };
+            form.preview_scroll = form
+                .preview_scroll
+                .saturating_add(step)
+                .min(form.preview_max_scroll);
         } else {
-            form.preview_scroll = if form.preview_scroll == 0 {
-                form.preview_max_scroll
-            } else {
-                form.preview_scroll.saturating_sub(step)
-            };
+            form.preview_scroll = form.preview_scroll.saturating_sub(step);
         }
         Self::sync_preview_follow(form);
     }
@@ -4988,15 +5031,12 @@ impl App {
             Modal::Settings(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Tab | KeyCode::Down => {
-                    form.selected = (form.selected + 1) % form.values.len();
+                    form.selected = clamped_index(form.selected, form.values.len(), 1);
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    form.selected = form
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(form.values.len() - 1);
+                    form.selected = clamped_index(form.selected, form.values.len(), -1);
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
@@ -5030,11 +5070,11 @@ impl App {
             Modal::Search(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Up | KeyCode::BackTab if !form.results.is_empty() => {
-                    form.selected = shifted(form.selected, form.results.len(), -1);
+                    form.selected = clamped_index(form.selected, form.results.len(), -1);
                     self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Down | KeyCode::Tab if !form.results.is_empty() => {
-                    form.selected = shifted(form.selected, form.results.len(), 1);
+                    form.selected = clamped_index(form.selected, form.results.len(), 1);
                     self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Enter
@@ -5070,11 +5110,13 @@ impl App {
             Modal::PathPicker(mut form) => match key.code {
                 KeyCode::Esc => self.modal = Some(Modal::Launch(form.launch)),
                 KeyCode::Up if !matched_directories(&form).is_empty() => {
-                    form.selected = shifted(form.selected, matched_directories(&form).len(), -1);
+                    form.selected =
+                        clamped_index(form.selected, matched_directories(&form).len(), -1);
                     self.modal = Some(Modal::PathPicker(form));
                 }
                 KeyCode::Down if !matched_directories(&form).is_empty() => {
-                    form.selected = shifted(form.selected, matched_directories(&form).len(), 1);
+                    form.selected =
+                        clamped_index(form.selected, matched_directories(&form).len(), 1);
                     self.modal = Some(Modal::PathPicker(form));
                 }
                 KeyCode::Left if !form.loading => {
@@ -5146,11 +5188,15 @@ impl App {
                     let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                     if form.history_active() {
                         if !form.history_hits.is_empty() {
-                            form.history_selected =
-                                shifted(form.history_selected, form.history_hits.len(), delta);
+                            form.history_selected = clamped_index(
+                                form.history_selected,
+                                form.history_hits.len(),
+                                delta,
+                            );
                         }
                     } else if !form.loading {
-                        form.selected = shifted(form.selected, form.candidates.len() + 1, delta);
+                        form.selected =
+                            clamped_index(form.selected, form.candidates.len() + 1, delta);
                     }
                     self.modal = Some(Modal::Resume(form));
                 }
@@ -5349,15 +5395,12 @@ impl App {
             Modal::PortForward(mut form) => match key.code {
                 KeyCode::Esc | KeyCode::Char('p') => {}
                 KeyCode::Tab | KeyCode::Down => {
-                    form.selected = (form.selected + 1) % form.row_count().max(1);
+                    form.selected = clamped_index(form.selected, form.row_count(), 1);
                     form.error = None;
                     self.modal = Some(Modal::PortForward(form));
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    form.selected = form
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(form.row_count().saturating_sub(1));
+                    form.selected = clamped_index(form.selected, form.row_count(), -1);
                     form.error = None;
                     self.modal = Some(Modal::PortForward(form));
                 }
@@ -5374,7 +5417,7 @@ impl App {
                         })
                         .unwrap_or(0);
                     let delta = if key.code == KeyCode::Left { -1 } else { 1 };
-                    let next = shifted(index, form.detected_ports.len(), delta);
+                    let next = clamped_index(index, form.detected_ports.len(), delta);
                     form.remote_port = form.detected_ports[next].to_string();
                     if form.local_port.trim().is_empty() || form.local_port == old_remote {
                         form.local_port = form.remote_port.clone();
@@ -6198,24 +6241,22 @@ impl App {
             self.scroll_history(up, 1);
             return;
         }
-        if let Some(area) = self
+        if let Some(_area) = self
             .pane_layout
             .machines
             .filter(|area| inside(*area, column, row))
         {
             self.focus = Focus::Machines;
-            let page = (area.height.saturating_sub(2) / 2).max(1) as isize;
-            self.move_selection(if up { -page } else { page });
+            self.move_selection(if up { -1 } else { 1 });
             return;
         }
-        if let Some(area) = self
+        if let Some(_area) = self
             .pane_layout
             .agents
             .filter(|area| inside(*area, column, row))
         {
             self.focus = Focus::Agents;
-            let page = area.height.saturating_sub(2).max(1) as isize;
-            self.move_selection(if up { -page } else { page });
+            self.move_selection(if up { -1 } else { 1 });
         }
     }
 
@@ -6227,11 +6268,16 @@ impl App {
     }
 }
 
-fn shifted(current: usize, length: usize, delta: isize) -> usize {
+fn clamped_index(current: usize, length: usize, delta: isize) -> usize {
     if length == 0 {
         return 0;
     }
-    (current as isize + delta).rem_euclid(length as isize) as usize
+    let current = current.min(length - 1);
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(length - 1)
+    }
 }
 
 fn port_forward_value(form: &mut PortForwardForm) -> &mut String {
@@ -6940,11 +6986,11 @@ mod tests {
     }
 
     #[test]
-    fn shifted_wraps_and_pages_in_both_directions() {
-        assert_eq!(shifted(0, 3, -1), 2);
-        assert_eq!(shifted(2, 3, 1), 0);
-        assert_eq!(shifted(1, 5, 7), 3);
-        assert_eq!(shifted(1, 5, -7), 4);
+    fn list_indices_clamp_at_the_first_and_last_item() {
+        assert_eq!(clamped_index(0, 3, -1), 0);
+        assert_eq!(clamped_index(2, 3, 1), 2);
+        assert_eq!(clamped_index(1, 5, 7), 4);
+        assert_eq!(clamped_index(1, 5, -7), 0);
         assert_eq!(parent_path("/work/project"), "/work");
         assert_eq!(parent_path("/"), "/");
         assert_eq!(child_path("/work", "project"), "/work/project");
@@ -7462,6 +7508,38 @@ mod tests {
         app.drag_divider(80, 10);
         assert_eq!(app.state.file_width, 39);
         assert_eq!(app.state.agents_width, 40);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_one_item_and_stops_at_list_boundaries() {
+        let mut app = ux_test_app(vec![
+            Target::local(),
+            Target::ssh("gpu-a"),
+            Target::ssh("gpu-b"),
+        ]);
+        app.pane_layout.machines = Some(Rect::new(0, 0, 30, 20));
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_target, 1);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_target, 2);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_target, 2);
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_target, 1);
+
+        app.modal = Some(Modal::Help(HelpForm { offset: 0 }));
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Help(HelpForm { offset: 1 }))
+        ));
     }
 
     #[test]
@@ -8291,7 +8369,7 @@ mod tests {
             form.preview_max_scroll = 20;
             form.preview_page_rows = 8;
         }
-        for expected in [8, 16, 20, 0] {
+        for expected in [8, 16, 20, 20] {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             assert_eq!(
                 app.file_manager.as_ref().map(|form| form.preview_scroll),
@@ -8301,7 +8379,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
             app.file_manager.as_ref().map(|form| form.preview_scroll),
-            Some(20)
+            Some(12)
         );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(

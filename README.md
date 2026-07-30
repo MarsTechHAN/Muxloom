@@ -309,7 +309,8 @@ the full categorized help inside the TUI.
 | `?` / `q` | Open help / exit without stopping managed sessions |
 
 Focus shortcuts follow the rendered geometry; unmodified arrows stay available
-to the application while terminal input is active.
+to the application while terminal input is active. List navigation stops at the
+first and last item, and each mouse-wheel event moves exactly one item.
 
 ### Terminal input and history
 
@@ -332,7 +333,7 @@ to the application while terminal input is active.
 | `/pattern` | Search filenames recursively below the current directory; supports `*` and `**` |
 | `Right`, `Enter`, double-click | Enter a directory or toggle Preview |
 | `Left`, right-click | Go to the parent directory |
-| Arrows, `PageUp` / `PageDown` | Page an opened preview |
+| Arrows, `PageUp` / `PageDown` | Page an opened preview, stopping at its start and end |
 | `g` / `G`, `Home` / `End` | Jump to preview start or end; the end follows the file as it grows |
 | `c` | Copy the selected target-side full path |
 | Drag over preview text | Copy the selected preview text on release |
