@@ -2405,16 +2405,14 @@ impl App {
                                 self.clamp_history_to_buffered_rows();
                             }
                             if self.selected_session_id.as_deref() == Some(&session_id)
-                                && self.history_offset > page.history_size
+                                && let Some(oldest) = page.oldest_offset()
+                                && self.history_offset > oldest
                             {
-                                self.history_offset = page.history_size;
-                                self.status_message = if page.history_size == 0 {
+                                self.history_offset = oldest;
+                                self.status_message = if oldest == 0 {
                                     "This terminal has no older scrollback".into()
                                 } else {
-                                    format!(
-                                        "Reached the oldest available history ({} lines)",
-                                        page.history_size
-                                    )
+                                    format!("Reached the oldest available history ({oldest} lines)")
                                 };
                             }
                             self.store_history_page(&target_id, &session_id, page);
@@ -3564,7 +3562,10 @@ impl App {
             let next_capture = capture_offset.saturating_add(stride);
             if desired_offset.saturating_sub(capture_offset) > stride / 2
                 && self.pending_capture.is_none()
-                && next_capture <= self.history.history_size
+                && self
+                    .history
+                    .oldest_offset()
+                    .is_none_or(|oldest| next_capture <= oldest)
             {
                 self.send_history_capture(&session, next_capture, chunk_lines, false);
             }
@@ -3768,18 +3769,24 @@ impl App {
         }
         if older {
             let next = self.history_offset.saturating_add(lines.max(1));
-            self.history_offset = if self.history.total_lines() > 0 {
-                let maximum = self.history.history_size;
-                if next > maximum {
-                    self.status_message = if maximum == 0 {
-                        "This terminal has no older scrollback".into()
-                    } else {
-                        format!("Reached the oldest available history ({maximum} lines)")
-                    };
+            // A page that still expects older history has measured only its own
+            // reach, so there is nothing to clamp against yet: ask for the next
+            // one and let the answer say how far back the session goes.
+            let limit = (self.history.total_lines() > 0)
+                .then(|| self.history.oldest_offset())
+                .flatten();
+            self.history_offset = match limit {
+                Some(maximum) => {
+                    if next > maximum {
+                        self.status_message = if maximum == 0 {
+                            "This terminal has no older scrollback".into()
+                        } else {
+                            format!("Reached the oldest available history ({maximum} lines)")
+                        };
+                    }
+                    next.min(maximum)
                 }
-                next.min(maximum)
-            } else {
-                next
+                None => next,
             };
         } else {
             self.history_offset = self.history_offset.saturating_sub(lines.max(1));
@@ -6515,7 +6522,12 @@ fn materialize_history_page(
     desired_offset: usize,
     viewport_lines: usize,
 ) -> Option<HistoryPage> {
-    if source.offset_from_bottom > source.history_size || desired_offset > source.history_size {
+    // `history_size` bounds the page only once it has stopped expecting older
+    // history; until then it measures how far this page reached, and the chunk
+    // it holds is what limits the slice.
+    if let Some(oldest) = source.oldest_offset()
+        && (source.offset_from_bottom > oldest || desired_offset > oldest)
+    {
         return None;
     }
     let delta = desired_offset.checked_sub(source.offset_from_bottom)?;
@@ -6534,6 +6546,7 @@ fn materialize_history_page(
         pane_width: source.pane_width,
         offset_from_bottom: desired_offset,
         rendered: source.rendered,
+        more_history: source.more_history,
     })
 }
 
@@ -7716,6 +7729,7 @@ mod tests {
             pane_width: 80,
             offset_from_bottom: 0,
             rendered: true,
+            more_history: false,
         };
         let page = materialize_history_page(&source, 3, 20).unwrap();
         assert!(page.text.ends_with("line-96"));
@@ -7744,10 +7758,57 @@ mod tests {
             pane_width: 80,
             offset_from_bottom: 10,
             rendered: true,
+            more_history: false,
         };
         app.history_offset = 10;
         app.scroll_history(true, 20);
         assert_eq!(app.history_offset, 12);
+    }
+
+    #[test]
+    fn history_scroll_keeps_going_while_older_rows_are_still_expected() {
+        // Rendering a page replays only as far back as the page was asked to
+        // reach, so its history_size measures that reach and not the session.
+        // Read as a boundary it ends the history after a single page, which is
+        // what left Codex able to scroll a little and no further.
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.history = HistoryPage {
+            text: "oldest\nnewest".into(),
+            history_size: 40,
+            pane_height: 40,
+            pane_width: 80,
+            offset_from_bottom: 0,
+            rendered: true,
+            more_history: true,
+        };
+        app.history_offset = 0;
+        app.status_message.clear();
+
+        app.scroll_history(true, 38);
+        assert_eq!(app.history_offset, 38);
+        app.scroll_history(true, 38);
+        assert_eq!(
+            app.history_offset, 76,
+            "past the reach of the page it holds"
+        );
+        assert!(app.history.has_older());
+        assert!(app.status_message.is_empty(), "{}", app.status_message);
+
+        // Only once a page falls short of the offset it was asked for does the
+        // history end, and then the view stops there.
+        app.history.more_history = false;
+        app.scroll_history(true, 38);
+        assert_eq!(app.history_offset, 40);
+        assert!(app.status_message.contains("oldest available history"));
     }
 
     #[test]
@@ -7834,6 +7895,7 @@ mod tests {
             pane_width: 20,
             offset_from_bottom,
             rendered,
+            more_history: rendered,
         }
     }
 

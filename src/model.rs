@@ -344,6 +344,12 @@ pub struct HistoryPage {
     /// through. Pages of raw log lines leave it false.
     #[serde(default)]
     pub rendered: bool,
+    /// Whether rows older than this page are expected to exist. Rendering a
+    /// page reaches only as far back as it was asked to, so `history_size`
+    /// measures that reach rather than the session, and on its own would read
+    /// as the end of the history after a single page.
+    #[serde(default)]
+    pub more_history: bool,
 }
 
 impl HistoryPage {
@@ -352,6 +358,12 @@ impl HistoryPage {
     }
 
     pub fn has_older(&self) -> bool {
-        self.offset_from_bottom < self.history_size
+        self.more_history || self.offset_from_bottom < self.history_size
+    }
+
+    /// The oldest offset the page can vouch for, or `None` while older history
+    /// is still expected and no limit is known yet.
+    pub fn oldest_offset(&self) -> Option<usize> {
+        (!self.more_history).then_some(self.history_size)
     }
 }

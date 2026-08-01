@@ -1215,6 +1215,10 @@ impl Runtime {
                 pane_width: usize::from(history.columns),
                 offset_from_bottom: history.offset_from_bottom,
                 rendered: history.rendered,
+                // A rendered page is replayed only as deep as it was asked to
+                // go, so reaching the offset that was asked for says nothing
+                // about the log ending there; falling short of it does.
+                more_history: history.rendered && history.offset_from_bottom >= offset_from_bottom,
             });
         }
         // Derive capture coordinates from the pane's actual height. History
@@ -2405,6 +2409,9 @@ fn parse_history_page(output: &str, offset_from_bottom: usize) -> Result<History
         // tmux keeps its scrollback as rendered rows and captures it that way,
         // so a pane it hands back is already in the unit rows are counted in.
         rendered: true,
+        // `#{history_size}` measures the whole pane, so it already says where
+        // the history ends.
+        more_history: false,
     })
 }
 
