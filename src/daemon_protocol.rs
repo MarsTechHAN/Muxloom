@@ -244,6 +244,12 @@ pub enum DaemonRequest {
         session_id: String,
         offset_from_bottom: usize,
         lines: usize,
+        /// Ask for the rows a terminal would have shown instead of raw log
+        /// lines, so `offset_from_bottom` and `lines` count rendered rows. A
+        /// daemon that predates this ignores it and answers in log lines,
+        /// which [`DaemonResponse::HistoryComplete::rendered`] reports back.
+        #[serde(default)]
+        rendered: bool,
     },
     SearchHistory {
         session_id: String,
@@ -309,6 +315,11 @@ pub enum DaemonResponse {
         columns: u16,
         rows: u16,
         offset_from_bottom: usize,
+        /// Whether the page holds rendered rows. Absent from daemons that only
+        /// read raw log lines, so it defaults to false and a client can tell
+        /// the two apart.
+        #[serde(default)]
+        rendered: bool,
     },
     HistoryMatches {
         matches: Vec<DaemonHistoryMatch>,

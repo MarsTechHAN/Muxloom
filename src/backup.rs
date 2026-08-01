@@ -770,7 +770,9 @@ fn sync_capture(
 ) -> Result<()> {
     let bridges = runtime.bridge_pool();
     let total = bridges
-        .read_history(target, session_id.to_string(), 0, 1)?
+        // The backup mirrors the append-only log itself, so it asks for raw
+        // lines rather than rendered rows.
+        .read_history(target, session_id.to_string(), 0, 1, false)?
         .total_lines;
     if total < record.ansi_lines_synced {
         // Source rotated/shrank → restart the capture blob.
@@ -784,7 +786,7 @@ fn sync_capture(
     while record.ansi_lines_synced < total {
         let window = (total - record.ansi_lines_synced).min(CAPTURE_CHUNK_LINES);
         let offset = total - (record.ansi_lines_synced + window);
-        let page = bridges.read_history(target, session_id.to_string(), offset, window)?;
+        let page = bridges.read_history(target, session_id.to_string(), offset, window, false)?;
         if page.bytes.is_empty() {
             break;
         }

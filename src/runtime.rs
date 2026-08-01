@@ -1195,9 +1195,16 @@ impl Runtime {
         validate_session_id(session_id)?;
         let lines = lines.max(1);
         if is_daemon_session_id(session_id) {
-            let history =
-                self.bridges
-                    .read_history(target, session_id.into(), offset_from_bottom, lines)?;
+            // Pages are for looking at, so they are asked for as rendered rows:
+            // the same unit tmux captures in, and the one an attached emulator
+            // scrolls through.
+            let history = self.bridges.read_history(
+                target,
+                session_id.into(),
+                offset_from_bottom,
+                lines,
+                true,
+            )?;
             let pane_height = usize::from(history.rows);
             return Ok(HistoryPage {
                 text: String::from_utf8_lossy(&history.bytes)
@@ -1207,6 +1214,7 @@ impl Runtime {
                 pane_height,
                 pane_width: usize::from(history.columns),
                 offset_from_bottom: history.offset_from_bottom,
+                rendered: history.rendered,
             });
         }
         // Derive capture coordinates from the pane's actual height. History
@@ -2394,6 +2402,9 @@ fn parse_history_page(output: &str, offset_from_bottom: usize) -> Result<History
             .get(3)
             .and_then(|value| value.parse().ok())
             .unwrap_or(offset_from_bottom),
+        // tmux keeps its scrollback as rendered rows and captures it that way,
+        // so a pane it hands back is already in the unit rows are counted in.
+        rendered: true,
     })
 }
 

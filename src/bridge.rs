@@ -82,6 +82,9 @@ pub struct BridgeHistory {
     pub columns: u16,
     pub rows: u16,
     pub offset_from_bottom: usize,
+    /// Whether the daemon answered in rendered rows. A daemon that only reads
+    /// raw log lines leaves this false, whatever was asked for.
+    pub rendered: bool,
 }
 
 struct ConnectionState {
@@ -576,11 +579,13 @@ impl BridgeConnection {
         session_id: String,
         offset_from_bottom: usize,
         lines: usize,
+        rendered: bool,
     ) -> Result<BridgeHistory> {
         let reply = self.request(DaemonRequest::ReadHistory {
             session_id,
             offset_from_bottom,
             lines,
+            rendered,
         })?;
         match reply.response {
             DaemonResponse::HistoryComplete {
@@ -588,12 +593,14 @@ impl BridgeConnection {
                 columns,
                 rows,
                 offset_from_bottom,
+                rendered,
             } => Ok(BridgeHistory {
                 bytes: reply.data,
                 total_lines,
                 columns,
                 rows,
                 offset_from_bottom,
+                rendered,
             }),
             response => bail!("unexpected history response: {response:?}"),
         }
@@ -1526,9 +1533,14 @@ impl BridgePool {
         session_id: String,
         offset_from_bottom: usize,
         lines: usize,
+        rendered: bool,
     ) -> Result<BridgeHistory> {
-        self.connection_for_target(target)?
-            .read_history(session_id, offset_from_bottom, lines)
+        self.connection_for_target(target)?.read_history(
+            session_id,
+            offset_from_bottom,
+            lines,
+            rendered,
+        )
     }
 
     pub fn search_history(

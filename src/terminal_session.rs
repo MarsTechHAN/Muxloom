@@ -741,7 +741,7 @@ impl InlineScrollback {
 /// whole session would hold.
 #[cfg(any(unix, test))]
 pub(crate) fn render_scrollback_seed(
-    mut stream: impl Read,
+    stream: impl Read,
     columns: u16,
     rows: u16,
     keep: usize,
@@ -752,23 +752,7 @@ pub(crate) fn render_scrollback_seed(
     if keep == 0 {
         return Ok(Vec::new());
     }
-    let mut parser = vt100::Parser::new(rows, columns, keep);
-    let mut inline = InlineScrollback::default();
-    let mut buffer = vec![0; 64 * 1024];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => inline.process(&mut parser, &buffer[..read]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).context("failed to read session history"),
-        }
-    }
-    if parser.screen().alternate_screen() {
-        // vt100 only reaches the scrollback of the grid it is showing, and a
-        // full-screen app is drawn on one that has none. Step off it so the
-        // history underneath can be rendered; the replay repaints the app.
-        parser.process(b"\x1b[?1049l");
-    }
+    let (mut parser, inline) = replay_history(stream, columns, rows, keep)?;
     let (cursor_row, cursor_column) = parser.screen().cursor_position();
     let input_modes = parser.screen().input_mode_formatted();
     // Growing the screen below resizes its rows, and vt100 drops a row's wrap
@@ -830,6 +814,99 @@ pub(crate) fn render_scrollback_seed(
     }
     seed.extend_from_slice(format!("\x1b[{};{}H", cursor_row + 1, cursor_column + 1).as_bytes());
     Ok(seed)
+}
+
+/// Replay `stream` into a throwaway emulator that keeps `keep` rows of
+/// scrollback, so its rendered rows can be read back afterwards.
+#[cfg(any(unix, test))]
+fn replay_history(
+    mut stream: impl Read,
+    columns: u16,
+    rows: u16,
+    keep: usize,
+) -> Result<(vt100::Parser, InlineScrollback)> {
+    let mut parser = vt100::Parser::new(rows, columns, keep);
+    let mut inline = InlineScrollback::default();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => inline.process(&mut parser, &buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read session history"),
+        }
+    }
+    if parser.screen().alternate_screen() {
+        // vt100 only reaches the scrollback of the grid it is showing, and a
+        // full-screen app is drawn on one that has none. Step off it so the
+        // history underneath can be rendered; the replay repaints the app.
+        parser.process(b"\x1b[?1049l");
+    }
+    Ok((parser, inline))
+}
+
+/// Render `stream` — the tail of a session's raw output — into the rows a
+/// terminal would have shown, and return the `wanted` of them that end
+/// `offset_from_bottom` rows above the newest.
+///
+/// A raw log line is a redraw instruction, not a line of the terminal: agents
+/// repaint whole screens, so slicing the log by lines shows fragments of paint
+/// rather than what was on screen. Reading history back in rows also keeps it
+/// in the unit an attached emulator scrolls in, so a client can page out of its
+/// own buffer and into these without the view jumping somewhere unrelated.
+///
+/// Returns the rows, how many the render reached in all (its scrollback plus
+/// the screen), and the offset it could honour — the caller only gets as far
+/// back as the window it handed over reaches.
+#[cfg(any(unix, test))]
+pub(crate) fn render_history_rows(
+    stream: impl Read,
+    columns: u16,
+    rows: u16,
+    offset_from_bottom: usize,
+    wanted: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let columns = columns.max(20);
+    let rows = rows.max(5);
+    let wanted = wanted.max(1);
+    let (mut parser, _) = replay_history(
+        stream,
+        columns,
+        rows,
+        offset_from_bottom.saturating_add(wanted),
+    )?;
+    parser.set_scrollback(usize::MAX);
+    let depth = parser.screen().scrollback();
+    let total = depth.saturating_add(usize::from(rows));
+    let actual_offset = offset_from_bottom.min(depth);
+    // Same reach-past-the-first-screenful trick as the scrollback seed: grow
+    // the screen to span the buffer so vt100 0.15 can be asked for every row at
+    // once. The emulator is discarded here, and rows that already scrolled off
+    // are never reflowed by a resize.
+    let tall = u16::try_from(depth)
+        .unwrap_or(u16::MAX)
+        .saturating_add(rows);
+    parser.set_size(tall, columns);
+    parser.set_scrollback(depth);
+    let deep = parser.screen();
+    let end = total - actual_offset;
+    let start = end.saturating_sub(wanted);
+    let mut page = Vec::new();
+    for (index, row) in deep
+        .rows_formatted(0, columns)
+        .take(end)
+        .enumerate()
+        .skip(start)
+    {
+        if index > start {
+            page.push(b'\n');
+        }
+        page.extend_from_slice(&row);
+        // Every row is rendered as if the terminal started it with default
+        // attributes, so leave it that way for the next one.
+        page.extend_from_slice(b"\x1b[m");
+    }
+    Ok((page, total, actual_offset))
 }
 
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
@@ -1323,6 +1400,90 @@ mod tests {
         assert!(!client.screen().alternate_screen());
         assert!(!client.screen().contents().contains("full screen"));
         assert_eq!(deepest_scrollback(&mut client), 30);
+    }
+
+    /// The text of a rendered history page, with the attributes taken back off.
+    fn page_text(page: &[u8]) -> String {
+        let text = String::from_utf8(page.to_vec()).expect("utf-8 page");
+        let mut plain = String::with_capacity(text.len());
+        let mut characters = text.chars();
+        while let Some(character) = characters.next() {
+            if character != '\x1b' {
+                plain.push(character);
+                continue;
+            }
+            // Step over the sequence's introducer before looking for the final
+            // byte, which shares its range.
+            characters.next();
+            for escape in characters.by_ref() {
+                if ('@'..='~').contains(&escape) {
+                    break;
+                }
+            }
+        }
+        plain
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn a_history_page_reads_back_the_rows_an_emulator_would_scroll_to() {
+        // What makes a page a continuation of an attached emulator rather than
+        // a jump: at the same offset it holds the same rows, because both count
+        // rows a terminal showed instead of lines an agent wrote.
+        let stream = transcript(1..=30);
+        let mut whole = feed_both(SEED_ROWS, SEED_COLUMNS, &stream).1;
+        let depth = deepest_scrollback(&mut whole);
+        assert_eq!(depth, 30);
+
+        for offset in [0, 7, depth] {
+            let (page, total, actual) = render_history_rows(
+                stream.as_bytes(),
+                SEED_COLUMNS,
+                SEED_ROWS,
+                offset,
+                usize::from(SEED_ROWS),
+            )
+            .expect("page");
+
+            assert_eq!(actual, offset, "the offset the page was read at");
+            assert_eq!(total, depth + usize::from(SEED_ROWS), "rows in all");
+            whole.set_scrollback(offset);
+            assert_eq!(
+                page_text(&page),
+                whole.screen().contents().trim_end(),
+                "the screen {offset} rows up"
+            );
+        }
+        whole.set_scrollback(0);
+    }
+
+    #[test]
+    fn a_history_page_stops_at_the_oldest_row_the_window_reaches() {
+        // The daemon hands over a window of the log, and rows older than it
+        // simply are not in there. Saying so is what lets the caller widen the
+        // window instead of believing the history ended.
+        let stream = transcript(1..=30);
+        let (page, total, actual) = render_history_rows(
+            stream.as_bytes(),
+            SEED_COLUMNS,
+            SEED_ROWS,
+            500,
+            usize::from(SEED_ROWS),
+        )
+        .expect("page");
+
+        assert_eq!(actual, 30, "as far back as the rows go");
+        assert_eq!(total, 30 + usize::from(SEED_ROWS));
+        assert!(
+            page_text(&page).trim_start().starts_with("line1\n"),
+            "the oldest rows: {:?}",
+            page_text(&page)
+        );
     }
 
     #[test]

@@ -339,6 +339,11 @@ pub struct HistoryPage {
     pub pane_height: usize,
     pub pane_width: usize,
     pub offset_from_bottom: usize,
+    /// Whether the page holds the rows a terminal would have shown, which is
+    /// what makes its offsets count the same thing an attached emulator scrolls
+    /// through. Pages of raw log lines leave it false.
+    #[serde(default)]
+    pub rendered: bool,
 }
 
 impl HistoryPage {

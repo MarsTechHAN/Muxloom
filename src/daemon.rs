@@ -36,7 +36,9 @@ mod platform {
         },
         recap::extract_recap,
         runtime::{agent_is_working, attention_reason},
-        terminal_session::{CodexActivity, render_scrollback_seed, resize_parser},
+        terminal_session::{
+            CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
+        },
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -964,11 +966,12 @@ mod platform {
                 session_id,
                 offset_from_bottom,
                 lines,
+                rendered,
             } => {
                 let (history, total_lines, actual_offset, columns, rows) =
                     if let Ok(session) = daemon_session(state, &session_id) {
                         let (history, total_lines, actual_offset) =
-                            session.read_history(offset_from_bottom, lines)?;
+                            session.read_history(offset_from_bottom, lines, rendered)?;
                         (
                             history,
                             total_lines,
@@ -979,7 +982,7 @@ mod platform {
                     } else {
                         let session = persisted_session(state, &session_id)?;
                         let (history, total_lines, actual_offset) =
-                            session.read_history(offset_from_bottom, lines)?;
+                            session.read_history(offset_from_bottom, lines, rendered)?;
                         (
                             history,
                             total_lines,
@@ -997,6 +1000,7 @@ mod platform {
                         columns,
                         rows,
                         offset_from_bottom: actual_offset,
+                        rendered,
                     },
                 )
             }
@@ -1624,9 +1628,21 @@ mod platform {
             &self,
             offset_from_bottom: usize,
             lines: usize,
+            rendered: bool,
         ) -> Result<(Vec<u8>, usize, usize)> {
             if self.snapshot().temporary {
                 return Ok((Vec::new(), 0, 0));
+            }
+            if rendered {
+                return render_history_file(
+                    &self.history_path,
+                    self.columns,
+                    self.rows,
+                    offset_from_bottom,
+                    lines,
+                    SCROLLBACK_SEED_BYTES_MIN,
+                    SCROLLBACK_SEED_BYTES_MAX,
+                );
             }
             read_history_file(
                 &self.history_path,
@@ -1885,14 +1901,27 @@ mod platform {
             &self,
             offset_from_bottom: usize,
             lines: usize,
+            rendered: bool,
         ) -> Result<(Vec<u8>, usize, usize)> {
             if self.temporary() {
                 return Ok((Vec::new(), 0, 0));
             }
+            let rows = self.rows.load(Ordering::Relaxed);
+            if rendered {
+                return render_history_file(
+                    &self.history_path,
+                    self.columns.load(Ordering::Relaxed),
+                    rows,
+                    offset_from_bottom,
+                    lines,
+                    SCROLLBACK_SEED_BYTES_MIN,
+                    SCROLLBACK_SEED_BYTES_MAX,
+                );
+            }
             read_history_file(
                 &self.history_path,
                 self.line_count.load(Ordering::Relaxed),
-                self.rows.load(Ordering::Relaxed),
+                rows,
                 offset_from_bottom,
                 lines,
             )
@@ -1975,6 +2004,44 @@ mod platform {
             );
         }
         Ok(cursor.min(ceiling))
+    }
+
+    /// Read a session's history back as rendered rows rather than raw log
+    /// lines, by replaying the tail of the log through an emulator.
+    ///
+    /// How far back a window of bytes reaches in rows depends entirely on what
+    /// the agent writes — a full-screen redraw costs a screenful of bytes and
+    /// moves the history along by nothing — so the render starts at a window of
+    /// `least` bytes and widens until it reaches the rows that were asked for,
+    /// it has read the log from the start, or it has read `most`.
+    fn render_history_file(
+        path: &Path,
+        columns: u16,
+        rows: u16,
+        offset_from_bottom: usize,
+        lines: usize,
+        least: u64,
+        most: u64,
+    ) -> Result<(Vec<u8>, usize, usize)> {
+        let mut file = File::open(path)
+            .with_context(|| format!("failed to open history {}", path.display()))?;
+        let end = file.metadata()?.len();
+        let mut window = least.max(1);
+        loop {
+            let start = end.saturating_sub(window);
+            file.seek(SeekFrom::Start(start))?;
+            let page = render_history_rows(
+                BufReader::new(&mut file).take(end - start),
+                columns,
+                rows,
+                offset_from_bottom,
+                lines,
+            )?;
+            if page.2 >= offset_from_bottom || start == 0 || window >= most {
+                return Ok(page);
+            }
+            window = window.saturating_mul(4).min(most);
+        }
     }
 
     fn read_history_file(
@@ -2428,6 +2495,46 @@ mod platform {
         }
 
         #[test]
+        fn a_history_page_widens_its_window_until_it_reaches_the_rows_asked_for() {
+            // A log of full-screen redraws: every frame repaints the same two
+            // rows, so a window of it holds far fewer rows of history than its
+            // size suggests. The render has to keep reading back until the row
+            // that was asked for is inside the window.
+            let path = test_state("render-history").paths.history.join("log.ansi");
+            let mut log = String::new();
+            for line in 1..=400 {
+                log.push_str(&format!("\x1b[1;1H\x1b[Kline{line}"));
+                for row in 2..=5 {
+                    log.push_str(&format!("\x1b[{row};1H\x1b[Kpaint{row}"));
+                }
+                log.push_str("\x1b[5;1H\r\n");
+            }
+            fs::write(&path, &log).unwrap();
+            // Small enough that reaching 300 rows back takes several widenings.
+            let window = (log.len() / 8) as u64;
+
+            let (page, total, offset) =
+                render_history_file(&path, 20, 5, 300, 40, window, log.len() as u64).unwrap();
+            let page = String::from_utf8_lossy(&page).into_owned();
+
+            assert_eq!(offset, 300, "the row that was asked for");
+            assert!(total > 300, "rows in all: {total}");
+            assert!(page.contains("line9"), "rows from back then: {page:?}");
+            assert!(
+                !page.contains("line400"),
+                "and not the newest ones: {page:?}"
+            );
+
+            // A window that may not widen answers with what it could reach.
+            let (_, _, shallow) =
+                render_history_file(&path, 20, 5, 300, 40, window, window).unwrap();
+            assert!(
+                shallow < 300,
+                "as far back as one window reaches: {shallow}"
+            );
+        }
+
+        #[test]
         fn resolve_executable_prefers_path_over_a_cwd_named_entry() {
             // Simulate `~/Works`, which contains a `claude` *directory* that
             // portable-pty would otherwise exec (and abort on) instead of the
@@ -2700,7 +2807,10 @@ mod platform {
 
             assert!(session.snapshot().temporary);
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
-            assert_eq!(session.read_history(0, 100).unwrap(), (Vec::new(), 0, 0));
+            assert_eq!(
+                session.read_history(0, 100, false).unwrap(),
+                (Vec::new(), 0, 0)
+            );
             assert!(session.search_history("anything", 10).unwrap().is_empty());
             assert!(session.archive().is_err());
 
@@ -2758,7 +2868,7 @@ mod platform {
                     snapshot.recap.as_deref(),
                     Some("completed the persistent work")
                 );
-                let (history, total_lines, offset) = persisted.read_history(0, 10).unwrap();
+                let (history, total_lines, offset) = persisted.read_history(0, 10, false).unwrap();
                 assert_eq!(total_lines, 3);
                 assert_eq!(offset, 0);
                 assert_eq!(
