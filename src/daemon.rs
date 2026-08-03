@@ -35,7 +35,9 @@ mod platform {
             FilePreviewKind,
         },
         recap::extract_recap,
-        runtime::{agent_is_working, attention_reason},
+        runtime::{
+            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, is_temporary_session_id,
+        },
         terminal_session::{
             CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
         },
@@ -225,7 +227,7 @@ mod platform {
 
     impl DaemonState {
         fn new(paths: DaemonPaths) -> Self {
-            let persisted_sessions = load_persisted_sessions(&paths);
+            let persisted_sessions = recover_persisted_sessions(&paths);
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
@@ -240,71 +242,289 @@ mod platform {
         }
     }
 
-    fn load_persisted_sessions(paths: &DaemonPaths) -> HashMap<String, Arc<PersistedSession>> {
+    /// Load what a previous daemon left in the state directory, recovering the
+    /// sessions it was killed before it could finish with.
+    ///
+    /// A daemon that stops without warning — SIGKILL, an OOM kill, a lost
+    /// machine — leaves metadata that still claims a live PTY. That claim can
+    /// never be honoured: a PTY master does not outlive the process that opened
+    /// it, so there is nothing left to re-attach to. What does survive is the
+    /// record and the log beside it, so each interrupted session is retired
+    /// into the archive with its history intact. Dropping them, which is what
+    /// this did before, lost every running agent of a killed daemon: the
+    /// sessions did not come back and could not even be reached in the archive.
+    fn recover_persisted_sessions(paths: &DaemonPaths) -> HashMap<String, Arc<PersistedSession>> {
         let mut sessions = HashMap::new();
-        let entries = match fs::read_dir(&paths.sessions) {
-            Ok(entries) => entries,
-            Err(error) => {
-                eprintln!(
-                    "muxloomd could not read persisted sessions {}: {error}",
-                    paths.sessions.display()
-                );
-                return sessions;
+        match fs::read_dir(&paths.sessions) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json")
+                        || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                    {
+                        continue;
+                    }
+                    match load_persisted_session(paths, &path) {
+                        Ok(Some((id, session))) => {
+                            sessions.insert(id, session);
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "muxloomd ignored persisted session {}: {error:#}",
+                            path.display()
+                        ),
+                    }
+                }
             }
+            Err(error) => eprintln!(
+                "muxloomd could not read persisted sessions {}: {error}",
+                paths.sessions.display()
+            ),
+        }
+        adopt_orphaned_histories(paths, &mut sessions);
+        sessions
+    }
+
+    /// Read one session's metadata back, repairing what an interrupted daemon
+    /// left behind. `Ok(None)` means the record was discarded rather than
+    /// loaded, which only a stale temporary session is.
+    fn load_persisted_session(
+        paths: &DaemonPaths,
+        path: &Path,
+    ) -> Result<Option<(String, Arc<PersistedSession>)>> {
+        let mut metadata: DaemonSession = serde_json::from_slice(&fs::read(path)?)?;
+        validate_session_id(&metadata.id)?;
+        if path.file_stem().and_then(|value| value.to_str()) != Some(metadata.id.as_str()) {
+            bail!(
+                "metadata filename does not match session id {}",
+                metadata.id
+            );
+        }
+        let history_path = paths.history.join(format!("{}.ansi", metadata.id));
+        if metadata.temporary {
+            let _ = fs::remove_file(&history_path);
+            let _ = fs::remove_file(path);
+            eprintln!("muxloomd discarded stale temporary session {}", metadata.id);
+            return Ok(None);
+        }
+        if !history_path.exists() {
+            // A delete removes the log before the metadata, so a daemon killed
+            // between the two leaves a record with nothing to read. Give it an
+            // empty log rather than dropping the record: a history directory
+            // that is missing for some other reason must not be read as an
+            // instruction to erase every session in it.
+            if let Err(error) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&history_path)
+            {
+                eprintln!(
+                    "muxloomd could not restore the history of session {}: {error}",
+                    metadata.id
+                );
+            } else {
+                eprintln!(
+                    "muxloomd loaded session {} without the history it recorded",
+                    metadata.id
+                );
+            }
+        }
+        let interrupted = !metadata.dead && !metadata.archived;
+        if interrupted {
+            recover_interrupted_session(&mut metadata, &history_path);
+        }
+        metadata.dead = true;
+        metadata.pid = None;
+        metadata.working = false;
+        metadata.needs_attention = false;
+        metadata.attention_reason = None;
+        if interrupted && let Err(error) = persist_session_metadata(path, &metadata) {
+            eprintln!(
+                "muxloomd could not record the recovery of session {}: {error:#}",
+                metadata.id
+            );
+        }
+        let id = metadata.id.clone();
+        Ok(Some((
+            id,
+            Arc::new(PersistedSession {
+                metadata: Mutex::new(metadata),
+                history_path,
+                metadata_path: path.to_path_buf(),
+                line_count: OnceLock::new(),
+                columns: 80,
+                rows: 24,
+            }),
+        )))
+    }
+
+    /// Retire a session whose daemon was killed before it could record how the
+    /// session ended.
+    ///
+    /// The PTY is gone with the daemon that owned it, so recovery here means
+    /// recovering the record: the recap the interrupted daemon never wrote is
+    /// rebuilt from the tail of the log, and a note is appended so the archived
+    /// transcript says why it stops where it does.
+    fn recover_interrupted_session(metadata: &mut DaemonSession, history_path: &Path) {
+        let orphan = metadata.pid.filter(|pid| process_alive(*pid));
+        if metadata.recap.is_none()
+            && let Ok(kind) = metadata.kind.parse::<AgentKind>()
+            && let Some(tail) = history_tail(history_path, RECENT_OUTPUT_LIMIT as u64)
+        {
+            metadata.recap = extract_recap(kind, &String::from_utf8_lossy(&tail));
+        }
+        let note = match orphan {
+            Some(pid) => format!(
+                "\r\n[muxloom] muxloomd stopped unexpectedly; this session was archived. \
+                 Its process {pid} outlived the daemon and can no longer be reached.\r\n"
+            ),
+            None => "\r\n[muxloom] muxloomd stopped unexpectedly; this session was archived.\r\n"
+                .to_string(),
+        };
+        if let Err(error) = append_history_note(history_path, note.as_bytes()) {
+            eprintln!(
+                "muxloomd could not note the interruption of session {}: {error:#}",
+                metadata.id
+            );
+        }
+        eprintln!(
+            "muxloomd recovered interrupted session {} into the archive{}",
+            metadata.id,
+            match orphan {
+                Some(pid) => format!("; its process {pid} is still running unattached"),
+                None => String::new(),
+            }
+        );
+    }
+
+    /// Rebuild records for logs whose metadata did not survive.
+    ///
+    /// The log is the session; the JSON beside it only describes it. Metadata
+    /// that a power cut truncated, or that never reached the disk at all, used
+    /// to leave a complete transcript unreachable forever. The session id still
+    /// carries the kind and the creation time, which is enough to archive the
+    /// log so it stays readable and searchable.
+    fn adopt_orphaned_histories(
+        paths: &DaemonPaths,
+        sessions: &mut HashMap<String, Arc<PersistedSession>>,
+    ) {
+        let Ok(entries) = fs::read_dir(&paths.history) else {
+            return;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json")
+            let history_path = entry.path();
+            if history_path.extension().and_then(|value| value.to_str()) != Some("ansi")
                 || !entry.file_type().is_ok_and(|kind| kind.is_file())
             {
                 continue;
             }
-            let loaded = (|| -> Result<(String, Arc<PersistedSession>)> {
-                let mut metadata: DaemonSession = serde_json::from_slice(&fs::read(&path)?)?;
-                validate_session_id(&metadata.id)?;
-                if path.file_stem().and_then(|value| value.to_str()) != Some(metadata.id.as_str()) {
-                    bail!(
-                        "metadata filename does not match session id {}",
-                        metadata.id
-                    );
-                }
-                if metadata.temporary {
-                    let _ = fs::remove_file(paths.history.join(format!("{}.ansi", metadata.id)));
-                    let _ = fs::remove_file(&path);
-                    bail!("discarded stale temporary session");
-                }
-                if !metadata.dead && !metadata.archived {
-                    bail!("metadata still describes a live PTY");
-                }
-                metadata.dead = true;
-                metadata.pid = None;
-                metadata.working = false;
-                metadata.needs_attention = false;
-                metadata.attention_reason = None;
-                let id = metadata.id.clone();
-                Ok((
-                    id.clone(),
-                    Arc::new(PersistedSession {
-                        metadata: Mutex::new(metadata),
-                        history_path: paths.history.join(format!("{id}.ansi")),
-                        metadata_path: path.clone(),
-                        line_count: OnceLock::new(),
-                        columns: 80,
-                        rows: 24,
-                    }),
-                ))
-            })();
-            match loaded {
-                Ok((id, session)) => {
-                    sessions.insert(id, session);
-                }
-                Err(error) => eprintln!(
-                    "muxloomd ignored persisted session {}: {error:#}",
-                    path.display()
-                ),
+            let Some(id) = history_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if sessions.contains_key(&id) || validate_session_id(&id).is_err() {
+                continue;
             }
+            let metadata_path = paths.sessions.join(format!("{id}.json"));
+            if is_temporary_session_id(&id) {
+                // A temporary session leaves no transcript behind by design.
+                let _ = fs::remove_file(&history_path);
+                let _ = fs::remove_file(&metadata_path);
+                continue;
+            }
+            let Some((kind, created_at)) = session_origin_from_id(&id) else {
+                eprintln!(
+                    "muxloomd left an unrecognized session log in place: {}",
+                    history_path.display()
+                );
+                continue;
+            };
+            let recap = history_tail(&history_path, RECENT_OUTPUT_LIMIT as u64)
+                .and_then(|tail| extract_recap(kind, &String::from_utf8_lossy(&tail)));
+            let metadata = DaemonSession {
+                id: id.clone(),
+                kind: kind.as_str().into(),
+                // The working directory lived only in the lost metadata. Home
+                // keeps the record listable; a resume asks for a folder anyway.
+                path: "~".into(),
+                label: "recovered session".into(),
+                temporary: false,
+                created_at,
+                pid: None,
+                dead: true,
+                archived: true,
+                recap,
+                working: false,
+                needs_attention: false,
+                attention_reason: None,
+            };
+            if let Err(error) = persist_session_metadata(&metadata_path, &metadata) {
+                eprintln!("muxloomd could not record recovered session {id}: {error:#}");
+            }
+            eprintln!("muxloomd recovered session log {id} without its metadata");
+            sessions.insert(
+                id,
+                Arc::new(PersistedSession {
+                    metadata: Mutex::new(metadata),
+                    history_path,
+                    metadata_path,
+                    line_count: OnceLock::new(),
+                    columns: 80,
+                    rows: 24,
+                }),
+            );
         }
-        sessions
+    }
+
+    /// What a session id still says about the session once its metadata is
+    /// gone: the agent that ran and when the controller created it.
+    fn session_origin_from_id(session_id: &str) -> Option<(AgentKind, u64)> {
+        let mut fields = session_id
+            .strip_prefix(DAEMON_SESSION_PREFIX)?
+            .splitn(3, '-');
+        let kind = fields.next()?.parse::<AgentKind>().ok()?;
+        let created_at = fields.next().and_then(|value| value.parse().ok())?;
+        Some((kind, created_at))
+    }
+
+    /// Whether `pid` still names a live process.
+    ///
+    /// A child normally goes with the daemon that owned it: closing the last
+    /// descriptor of its PTY master hangs the terminal up and the foreground
+    /// group is sent SIGHUP. One that ignores the hangup outlives it, but
+    /// unreachably — nothing can re-open a master another process created. So
+    /// this only reports; it never signals. After a reboot the recorded number
+    /// is as likely to belong to a stranger as to the agent that ran.
+    fn process_alive(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// The last `limit` bytes of a session log, which is where an agent leaves
+    /// whatever it has to say for itself.
+    fn history_tail(path: &Path, limit: u64) -> Option<Vec<u8>> {
+        let mut file = File::open(path).ok()?;
+        let end = file.seek(SeekFrom::End(0)).ok()?;
+        file.seek(SeekFrom::Start(end.saturating_sub(limit))).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        Some(tail)
+    }
+
+    fn append_history_note(path: &Path, note: &[u8]) -> Result<()> {
+        let mut history = OpenOptions::new().append(true).open(path)?;
+        history.write_all(note)?;
+        history.flush()?;
+        Ok(())
     }
 
     pub fn serve(paths: &DaemonPaths) -> Result<()> {
@@ -330,26 +550,71 @@ mod platform {
             pid: paths.pid.clone(),
         };
         let state = Arc::new(DaemonState::new(paths.clone()));
-        listener.set_nonblocking(true)?;
-        while !state.shutdown.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    let state = Arc::clone(&state);
-                    thread::spawn(move || {
-                        if let Err(error) = serve_client(stream, state) {
-                            eprintln!("muxloomd client closed: {error:#}");
-                        }
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => return Err(error).context("muxloomd accept failed"),
+        // Every one of these signals terminates the process by default, taking
+        // the session metadata down still claiming a live PTY. Catching them
+        // costs one flag and lets the daemon write down how its sessions ended
+        // instead of leaving the next generation to work it out from the logs.
+        let signalled = Arc::new(AtomicBool::new(false));
+        for signal in [
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGHUP,
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGQUIT,
+        ] {
+            if let Err(error) = signal_hook::flag::register(signal, Arc::clone(&signalled)) {
+                eprintln!("muxloomd could not handle signal {signal}: {error}");
             }
         }
-        Ok(())
+        listener.set_nonblocking(true)?;
+        let result = (|| -> Result<()> {
+            while !state.shutdown.load(Ordering::Acquire) && !signalled.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        let state = Arc::clone(&state);
+                        thread::spawn(move || {
+                            if let Err(error) = serve_client(stream, state) {
+                                eprintln!("muxloomd client closed: {error:#}");
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => return Err(error).context("muxloomd accept failed"),
+                }
+            }
+            Ok(())
+        })();
+        retire_live_sessions(&state);
+        result
+    }
+
+    /// Write down that the sessions this daemon owns end with it.
+    ///
+    /// Their children are hung up as soon as the PTY masters close, so the
+    /// metadata would otherwise outlive the sessions claiming they are running.
+    /// Recording it here is what keeps a stop that the daemon can see — a
+    /// handover, SIGTERM, a machine shutting down — out of the recovery path.
+    fn retire_live_sessions(state: &DaemonState) {
+        let sessions: Vec<_> = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            if session.temporary() {
+                let _ = fs::remove_file(&session.history_path);
+                let _ = fs::remove_file(&session.metadata_path);
+                continue;
+            }
+            if !session.snapshot().dead {
+                session.mark_dead();
+            }
+        }
     }
 
     struct SocketGuard {
@@ -1934,7 +2199,13 @@ mod platform {
         let nonce = METADATA_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temporary = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
         let result = (|| -> Result<()> {
-            fs::write(&temporary, serde_json::to_vec_pretty(metadata)?)?;
+            let mut file = File::create(&temporary)?;
+            file.write_all(&serde_json::to_vec_pretty(metadata)?)?;
+            // Reach the disk before the rename publishes the name. A crash in
+            // between is exactly the case this metadata exists to survive, and
+            // an unsynced rename can leave the record empty rather than stale.
+            file.sync_all()?;
+            drop(file);
             fs::rename(&temporary, path)?;
             Ok(())
         })();
@@ -2947,6 +3218,212 @@ mod platform {
                 assert_eq!(matches[0].line_number, 2);
             }
 
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        fn live_metadata(session_id: &str, kind: &str, pid: Option<u32>) -> DaemonSession {
+            DaemonSession {
+                id: session_id.into(),
+                kind: kind.into(),
+                path: "/tmp/project".into(),
+                label: "interrupted work".into(),
+                temporary: false,
+                created_at: 7,
+                pid,
+                dead: false,
+                archived: false,
+                recap: None,
+                working: true,
+                needs_attention: false,
+                attention_reason: None,
+            }
+        }
+
+        #[test]
+        fn a_killed_daemon_recovers_its_sessions_into_the_archive() {
+            let initial = test_state("interrupted");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-claude-1700000000-9-0";
+            let metadata_path = paths.sessions.join(format!("{session_id}.json"));
+            persist_session_metadata(
+                &metadata_path,
+                &live_metadata(session_id, "claude", Some(u32::MAX)),
+            )
+            .unwrap();
+            fs::write(
+                paths.history.join(format!("{session_id}.ansi")),
+                b"first line\n\xe2\x8f\xba refactored the parser\nlast line\n",
+            )
+            .unwrap();
+
+            for restart in 0..2 {
+                let restarted = DaemonState::new(paths.clone());
+                let persisted = persisted_session(&restarted, session_id)
+                    .expect("an interrupted session must survive its daemon");
+                let snapshot = persisted.snapshot();
+                assert!(snapshot.dead, "restart {restart} left the session live");
+                assert!(snapshot.pid.is_none() && !snapshot.working);
+                assert_eq!(snapshot.label, "interrupted work");
+                assert_eq!(snapshot.path, "/tmp/project");
+                assert_eq!(snapshot.recap.as_deref(), Some("refactored the parser"));
+                let matches = persisted
+                    .search_history("stopped unexpectedly", 10)
+                    .unwrap();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "restart {restart} must note the interruption exactly once"
+                );
+                assert_eq!(persisted.search_history("first line", 10).unwrap().len(), 1);
+            }
+
+            let recorded: DaemonSession =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            assert!(recorded.dead && recorded.pid.is_none());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn an_interrupted_temporary_session_is_still_discarded() {
+            let initial = test_state("interrupted-temporary");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-temporal-codex-1700000000-9-0";
+            let mut metadata = live_metadata(session_id, "codex", Some(u32::MAX));
+            metadata.temporary = true;
+            persist_session_metadata(
+                &paths.sessions.join(format!("{session_id}.json")),
+                &metadata,
+            )
+            .unwrap();
+            fs::write(
+                paths.history.join(format!("{session_id}.ansi")),
+                b"scratch\n",
+            )
+            .unwrap();
+
+            let restarted = DaemonState::new(paths.clone());
+            assert!(restarted.persisted_sessions.lock().unwrap().is_empty());
+            assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
+            assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_session_log_outliving_its_metadata_is_archived_from_the_log_alone() {
+            let initial = test_state("orphan-history");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-codex-1700000042-9-3";
+            // A metadata write the crash truncated reads back as nothing.
+            fs::write(paths.sessions.join(format!("{session_id}.json")), b"").unwrap();
+            fs::write(
+                paths.history.join(format!("{session_id}.ansi")),
+                b"early output\n\xe2\x80\xa2 shipped the release\n",
+            )
+            .unwrap();
+            fs::write(paths.history.join("not-a-muxloom-log.ansi"), b"unrelated\n").unwrap();
+
+            let restarted = DaemonState::new(paths.clone());
+            let persisted = persisted_session(&restarted, session_id)
+                .expect("a log without metadata must still be reachable");
+            let snapshot = persisted.snapshot();
+            assert!(snapshot.dead && snapshot.archived);
+            assert_eq!(snapshot.kind, "codex");
+            assert_eq!(snapshot.created_at, 1_700_000_042);
+            assert_eq!(snapshot.recap.as_deref(), Some("shipped the release"));
+            assert_eq!(
+                persisted.search_history("early output", 10).unwrap().len(),
+                1
+            );
+            assert!(
+                paths.history.join("not-a-muxloom-log.ansi").exists(),
+                "an unrecognized log must be left alone, not deleted"
+            );
+            // The rebuilt record is written back, so the next start is ordinary.
+            assert!(
+                DaemonState::new(paths.clone())
+                    .persisted_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(session_id)
+            );
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_session_whose_history_is_gone_still_loads_and_reads() {
+            let initial = test_state("history-gone");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-claude-1700000000-9-1";
+            let metadata_path = paths.sessions.join(format!("{session_id}.json"));
+            let mut metadata = live_metadata(session_id, "claude", None);
+            metadata.dead = true;
+            metadata.archived = true;
+            persist_session_metadata(&metadata_path, &metadata).unwrap();
+
+            let restarted = DaemonState::new(paths.clone());
+            let persisted = persisted_session(&restarted, session_id)
+                .expect("a missing log must not erase the session that recorded it");
+            let history = persisted.read_history(0, 10, false).unwrap();
+            assert!(history.rows.is_empty() && history.total_lines == 0);
+            assert!(persisted.search_history("anything", 10).unwrap().is_empty());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_daemon_that_stops_records_how_its_live_sessions_ended() {
+            let state = test_state("retire");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-claude-1700000000-9-2";
+            launch_session(
+                &state,
+                session_id.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "still running".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                5,
+                80,
+                24,
+            )
+            .unwrap();
+            let live: DaemonSession = serde_json::from_slice(
+                &fs::read(paths.sessions.join(format!("{session_id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert!(!live.dead);
+
+            retire_live_sessions(&state);
+            let restarted = DaemonState::new(paths.clone());
+            let snapshot = persisted_session(&restarted, session_id)
+                .unwrap()
+                .snapshot();
+            assert!(snapshot.dead && snapshot.pid.is_none() && !snapshot.working);
+            assert_eq!(snapshot.label, "still running");
+            assert!(
+                persisted_session(&restarted, session_id)
+                    .unwrap()
+                    .search_history("stopped unexpectedly", 10)
+                    .unwrap()
+                    .is_empty(),
+                "an orderly stop must not be reported as a crash"
+            );
+            for session in state
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                session.stop().unwrap();
+            }
             fs::remove_dir_all(paths.root).unwrap();
         }
 

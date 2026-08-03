@@ -30,7 +30,7 @@ use crate::{
 };
 
 const SESSION_PREFIX: &str = "muxloom-";
-const DAEMON_SESSION_PREFIX: &str = "muxloomd-";
+pub(crate) const DAEMON_SESSION_PREFIX: &str = "muxloomd-";
 const LEGACY_SESSION_PREFIX: &str = "ad-";
 const TEMPORARY_SESSION_MARKER: &str = "temporal-";
 pub const SSH_CONTROL_PERSIST_OPTION: &str = "ControlPersist=600";
