@@ -508,6 +508,15 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         "daemon history capture should retain SGR styling"
     );
     assert_eq!(oldest.offset_from_bottom, oldest.history_size);
+    // Reading the log from its beginning leaves nothing above the page,
+    // however far the page was asked to reach, so the size it reports is where
+    // scrolling stops. Without that the view pages off the top of the session
+    // and asks for rows no capture can answer.
+    assert_eq!(
+        page.oldest_offset(),
+        Some(page.history_size),
+        "a page read from the start of the log ends the history"
+    );
     assert!(
         matches
             .iter()

@@ -968,39 +968,30 @@ mod platform {
                 lines,
                 rendered,
             } => {
-                let (history, total_lines, actual_offset, columns, rows) =
+                let (history, columns, rows) =
                     if let Ok(session) = daemon_session(state, &session_id) {
-                        let (history, total_lines, actual_offset) =
-                            session.read_history(offset_from_bottom, lines, rendered)?;
+                        let history = session.read_history(offset_from_bottom, lines, rendered)?;
                         (
                             history,
-                            total_lines,
-                            actual_offset,
                             session.columns.load(Ordering::Relaxed),
                             session.rows.load(Ordering::Relaxed),
                         )
                     } else {
                         let session = persisted_session(state, &session_id)?;
-                        let (history, total_lines, actual_offset) =
-                            session.read_history(offset_from_bottom, lines, rendered)?;
-                        (
-                            history,
-                            total_lines,
-                            actual_offset,
-                            session.columns,
-                            session.rows,
-                        )
+                        let history = session.read_history(offset_from_bottom, lines, rendered)?;
+                        (history, session.columns, session.rows)
                     };
-                write_chunks(writer, stream::HISTORY, request_id, &history)?;
+                write_chunks(writer, stream::HISTORY, request_id, &history.rows)?;
                 write_response(
                     writer,
                     request_id,
                     &DaemonResponse::HistoryComplete {
-                        total_lines,
+                        total_lines: history.total_lines,
                         columns,
                         rows,
-                        offset_from_bottom: actual_offset,
+                        offset_from_bottom: history.offset_from_bottom,
                         rendered,
+                        reached_start: history.reached_start,
                     },
                 )
             }
@@ -1629,9 +1620,9 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
             rendered: bool,
-        ) -> Result<(Vec<u8>, usize, usize)> {
+        ) -> Result<HistoryRead> {
             if self.snapshot().temporary {
-                return Ok((Vec::new(), 0, 0));
+                return Ok(HistoryRead::empty());
             }
             if rendered {
                 return render_history_file(
@@ -1902,9 +1893,9 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
             rendered: bool,
-        ) -> Result<(Vec<u8>, usize, usize)> {
+        ) -> Result<HistoryRead> {
             if self.temporary() {
-                return Ok((Vec::new(), 0, 0));
+                return Ok(HistoryRead::empty());
             }
             let rows = self.rows.load(Ordering::Relaxed);
             if rendered {
@@ -2006,14 +1997,45 @@ mod platform {
         Ok(cursor.min(ceiling))
     }
 
+    /// A page of a session's history as one read returns it.
+    struct HistoryRead {
+        rows: Vec<u8>,
+        /// How many rows the read found in all, its screen included.
+        total_lines: usize,
+        /// The offset the read could honour, which falls short of the one asked
+        /// for when the history does not reach that far.
+        offset_from_bottom: usize,
+        /// Whether the read started at the beginning of the log.
+        ///
+        /// This is what separates a page that has found the oldest row there is
+        /// from one that only reached as far back as it was asked to. A render
+        /// replays a window of the log, so on its own `total_lines` measures
+        /// that window; only a read that began at byte zero measures the
+        /// session, and a client needs the difference to know where to stop
+        /// scrolling.
+        reached_start: bool,
+    }
+
+    impl HistoryRead {
+        /// The answer for a session that keeps no transcript.
+        fn empty() -> Self {
+            Self {
+                rows: Vec::new(),
+                total_lines: 0,
+                offset_from_bottom: 0,
+                reached_start: true,
+            }
+        }
+    }
+
     /// Read a session's history back as rendered rows rather than raw log
     /// lines, by replaying the tail of the log through an emulator.
     ///
     /// How far back a window of bytes reaches in rows depends entirely on what
     /// the agent writes — a full-screen redraw costs a screenful of bytes and
     /// moves the history along by nothing — so the render starts at a window of
-    /// `least` bytes and widens until it reaches the rows that were asked for,
-    /// it has read the log from the start, or it has read `most`.
+    /// `least` bytes and widens until it holds the rows that were asked for, it
+    /// has read the log from the start, or it has read `most`.
     fn render_history_file(
         path: &Path,
         columns: u16,
@@ -2022,23 +2044,34 @@ mod platform {
         lines: usize,
         least: u64,
         most: u64,
-    ) -> Result<(Vec<u8>, usize, usize)> {
+    ) -> Result<HistoryRead> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
         let end = file.metadata()?.len();
+        let wanted = lines.max(1);
         let mut window = least.max(1);
         loop {
             let start = end.saturating_sub(window);
             file.seek(SeekFrom::Start(start))?;
-            let page = render_history_rows(
+            let (page, total_lines, actual_offset) = render_history_rows(
                 BufReader::new(&mut file).take(end - start),
                 columns,
                 rows,
                 offset_from_bottom,
-                lines,
+                wanted,
             )?;
-            if page.2 >= offset_from_bottom || start == 0 || window >= most {
-                return Ok(page);
+            // Reaching the row that was asked for is not enough: the rows above
+            // it have to be there too. A page that arrives short cannot be
+            // scrolled through, and the request for the next one rounds back to
+            // this same offset and asks for it again.
+            let filled = total_lines.saturating_sub(actual_offset) >= wanted;
+            if (actual_offset >= offset_from_bottom && filled) || start == 0 || window >= most {
+                return Ok(HistoryRead {
+                    rows: page,
+                    total_lines,
+                    offset_from_bottom: actual_offset,
+                    reached_start: start == 0,
+                });
             }
             window = window.saturating_mul(4).min(most);
         }
@@ -2050,7 +2083,7 @@ mod platform {
         rows: u16,
         offset_from_bottom: usize,
         lines: usize,
-    ) -> Result<(Vec<u8>, usize, usize)> {
+    ) -> Result<HistoryRead> {
         let scrollback = total_lines.saturating_sub(usize::from(rows));
         let actual_offset = offset_from_bottom.min(scrollback);
         let end = total_lines.saturating_sub(actual_offset);
@@ -2071,7 +2104,14 @@ mod platform {
             }
             line += 1;
         }
-        Ok((output, total_lines, actual_offset))
+        Ok(HistoryRead {
+            rows: output,
+            total_lines,
+            offset_from_bottom: actual_offset,
+            // Raw reads count the whole log, so `total_lines` already measures
+            // the session rather than the reach of one page.
+            reached_start: true,
+        })
     }
 
     fn search_history_file(
@@ -2513,12 +2553,12 @@ mod platform {
             // Small enough that reaching 300 rows back takes several widenings.
             let window = (log.len() / 8) as u64;
 
-            let (page, total, offset) =
+            let read =
                 render_history_file(&path, 20, 5, 300, 40, window, log.len() as u64).unwrap();
-            let page = String::from_utf8_lossy(&page).into_owned();
+            let page = String::from_utf8_lossy(&read.rows).into_owned();
 
-            assert_eq!(offset, 300, "the row that was asked for");
-            assert!(total > 300, "rows in all: {total}");
+            assert_eq!(read.offset_from_bottom, 300, "the row that was asked for");
+            assert!(read.total_lines > 300, "rows in all: {}", read.total_lines);
             assert!(page.contains("line9"), "rows from back then: {page:?}");
             assert!(
                 !page.contains("line400"),
@@ -2526,12 +2566,41 @@ mod platform {
             );
 
             // A window that may not widen answers with what it could reach.
-            let (_, _, shallow) =
-                render_history_file(&path, 20, 5, 300, 40, window, window).unwrap();
+            let shallow = render_history_file(&path, 20, 5, 300, 40, window, window).unwrap();
             assert!(
-                shallow < 300,
-                "as far back as one window reaches: {shallow}"
+                shallow.offset_from_bottom < 300,
+                "as far back as one window reaches: {}",
+                shallow.offset_from_bottom
             );
+            assert!(
+                !shallow.reached_start,
+                "and says it never got to the top of the log"
+            );
+        }
+
+        #[test]
+        fn a_history_page_that_read_the_whole_log_says_so() {
+            // Without this a client has no boundary to stop a scroll at: the
+            // size a rendered page reports measures the window it replayed, so
+            // one that reached the row asked for always reads as "there may be
+            // more above" -- and the view scrolls off the top of the session.
+            let path = test_state("render-history-top")
+                .paths
+                .history
+                .join("log.ansi");
+            let log: String = (1..=30).map(|line| format!("line{line}\r\n")).collect();
+            fs::write(&path, &log).unwrap();
+
+            let read = render_history_file(&path, 20, 5, 0, 500, 16 * 1024, 64 * 1024).unwrap();
+            assert!(read.reached_start, "a 30-row log is read whole");
+            assert_eq!(read.offset_from_bottom, 0);
+            // The rows above the screen are the ones a client may scroll to.
+            assert!(read.total_lines >= 30, "rows in all: {}", read.total_lines);
+
+            // Asking past the oldest row answers with the oldest row there is.
+            let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
+            assert!(read.reached_start);
+            assert_eq!(read.offset_from_bottom, read.total_lines - 5);
         }
 
         #[test]
@@ -2807,10 +2876,8 @@ mod platform {
 
             assert!(session.snapshot().temporary);
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
-            assert_eq!(
-                session.read_history(0, 100, false).unwrap(),
-                (Vec::new(), 0, 0)
-            );
+            let history = session.read_history(0, 100, false).unwrap();
+            assert!(history.rows.is_empty() && history.total_lines == 0);
             assert!(session.search_history("anything", 10).unwrap().is_empty());
             assert!(session.archive().is_err());
 
@@ -2868,11 +2935,11 @@ mod platform {
                     snapshot.recap.as_deref(),
                     Some("completed the persistent work")
                 );
-                let (history, total_lines, offset) = persisted.read_history(0, 10, false).unwrap();
-                assert_eq!(total_lines, 3);
-                assert_eq!(offset, 0);
+                let history = persisted.read_history(0, 10, false).unwrap();
+                assert_eq!(history.total_lines, 3);
+                assert_eq!(history.offset_from_bottom, 0);
                 assert_eq!(
-                    String::from_utf8_lossy(&history),
+                    String::from_utf8_lossy(&history.rows),
                     "first line\npersistent result\nlast line\n"
                 );
                 let matches = persisted.search_history("PERSISTENT", 10).unwrap();

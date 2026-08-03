@@ -85,6 +85,10 @@ pub struct BridgeHistory {
     /// Whether the daemon answered in rendered rows. A daemon that only reads
     /// raw log lines leaves this false, whatever was asked for.
     pub rendered: bool,
+    /// Whether the read reached the beginning of the log, so `total_lines`
+    /// measures the session rather than how far this page happened to reach.
+    /// A daemon that predates the field leaves this false.
+    pub reached_start: bool,
 }
 
 struct ConnectionState {
@@ -594,6 +598,7 @@ impl BridgeConnection {
                 rows,
                 offset_from_bottom,
                 rendered,
+                reached_start,
             } => Ok(BridgeHistory {
                 bytes: reply.data,
                 total_lines,
@@ -601,6 +606,7 @@ impl BridgeConnection {
                 rows,
                 offset_from_bottom,
                 rendered,
+                reached_start,
             }),
             response => bail!("unexpected history response: {response:?}"),
         }

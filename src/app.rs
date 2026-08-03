@@ -3769,13 +3769,7 @@ impl App {
         }
         if older {
             let next = self.history_offset.saturating_add(lines.max(1));
-            // A page that still expects older history has measured only its own
-            // reach, so there is nothing to clamp against yet: ask for the next
-            // one and let the answer say how far back the session goes.
-            let limit = (self.history.total_lines() > 0)
-                .then(|| self.history.oldest_offset())
-                .flatten();
-            self.history_offset = match limit {
+            self.history_offset = match self.history_reach() {
                 Some(maximum) => {
                     if next > maximum {
                         self.status_message = if maximum == 0 {
@@ -3801,24 +3795,54 @@ impl App {
         }
     }
 
+    /// How far back the page on screen can vouch for.
+    ///
+    /// `None` while nothing has been measured yet, or while older rows are
+    /// still expected: a rendered page replays the log only as deep as it was
+    /// asked to reach, so until one says it read the log whole its size is the
+    /// reach of that page rather than a boundary to stop a scroll at.
+    fn history_reach(&self) -> Option<usize> {
+        (self.history.total_lines() > 0)
+            .then(|| self.history.oldest_offset())
+            .flatten()
+    }
+
     /// Scroll recent history through the attached emulator, then continue into
     /// the daemon's history pages once the emulator buffer is exhausted.
     fn scroll_attached_terminal(&mut self, older: bool, lines: usize) {
         let step = lines.max(1);
-        let desired = if older {
+        let mut desired = if older {
             self.history_offset.saturating_add(step)
         } else {
             self.history_offset.saturating_sub(step)
         };
+        let boundary = self
+            .terminal
+            .as_mut()
+            .map_or(0, TerminalSession::max_scrollback);
+        // Once the daemon has read the session whole there is nothing above its
+        // oldest row to ask for, so stop there rather than send the view -- and
+        // a capture request per step -- past the top of the history. The
+        // emulator's own buffer still counts: it wraps at the pane's width
+        // rather than the session's, so it can hold rows the daemon does not.
+        if older
+            && let Some(oldest) = self.history_reach().map(|oldest| oldest.max(boundary))
+            && desired > oldest
+        {
+            desired = oldest;
+            self.status_message = if oldest == 0 {
+                "This terminal has no older scrollback".into()
+            } else {
+                format!("Reached the oldest available history ({oldest} lines)")
+            };
+        }
         let mut buffered = false;
         if let Some(terminal) = self.terminal.as_mut() {
-            let boundary = terminal.max_scrollback();
+            terminal.set_scrollback(desired.min(boundary));
             if desired <= boundary {
-                terminal.set_scrollback(desired);
                 self.history_offset = terminal.scrollback();
                 buffered = true;
             } else {
-                terminal.set_scrollback(boundary);
                 self.history_offset = desired;
             }
         }
@@ -7879,6 +7903,57 @@ mod tests {
         app.scroll_history(true, 3);
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(request_rx.try_recv().is_err(), "no further capture");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attached_paging_stops_at_the_oldest_row_the_daemon_holds() {
+        // A page that read the log from its beginning measures the session, so
+        // there is nothing above its oldest row to ask for. Scrolling past it
+        // leaves the view on an offset no page can answer -- blank, and
+        // spending a capture per keystroke on the same reply -- which is what
+        // paging off the top of a session looked like.
+        let (mut app, request_rx, root, boundary) = attached_claude_app("history-top");
+        let top = boundary + 6;
+
+        app.scroll_history(true, 3);
+        let requested_offset = match receive_request(&request_rx) {
+            Request::Capture {
+                offset_from_bottom, ..
+            } => offset_from_bottom,
+            request => panic!("expected history capture, got {request:?}"),
+        };
+        let mut page = daemon_page(requested_offset, true);
+        page.history_size = top;
+        page.more_history = false;
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(page),
+        });
+        assert_eq!(app.history_offset, boundary + 3, "still short of the top");
+
+        app.scroll_history(true, 20);
+
+        assert_eq!(app.history_offset, top, "stopped on the oldest row");
+        assert!(
+            app.status_message.contains("oldest available history"),
+            "said so: {}",
+            app.status_message
+        );
+        assert!(app.history.text.contains("daemon-line"), "still showing it");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "no capture for missing rows"
+        );
+
+        // And it stays there, however long the key is held.
+        app.scroll_history(true, 20);
+        assert_eq!(app.history_offset, top);
+        assert!(
+            request_rx.try_recv().is_err(),
+            "no capture for missing rows"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1217,8 +1217,14 @@ impl Runtime {
                 rendered: history.rendered,
                 // A rendered page is replayed only as deep as it was asked to
                 // go, so reaching the offset that was asked for says nothing
-                // about the log ending there; falling short of it does.
-                more_history: history.rendered && history.offset_from_bottom >= offset_from_bottom,
+                // about the log ending there; falling short of it does. Neither
+                // does reading the log from the beginning leave anything above,
+                // however far the page was asked to reach — without that the
+                // size a page reports is never a boundary and the view scrolls
+                // off the top of a session that has already been read whole.
+                more_history: history.rendered
+                    && !history.reached_start
+                    && history.offset_from_bottom >= offset_from_bottom,
             });
         }
         // Derive capture coordinates from the pane's actual height. History

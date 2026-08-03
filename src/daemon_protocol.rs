@@ -320,6 +320,12 @@ pub enum DaemonResponse {
         /// the two apart.
         #[serde(default)]
         rendered: bool,
+        /// Whether the read started at the beginning of the log, which is what
+        /// makes `total_lines` the whole history rather than the reach of this
+        /// one page. Absent from daemons that predate it, where it defaults to
+        /// false and a page is read as possibly having older rows above it.
+        #[serde(default)]
+        reached_start: bool,
     },
     HistoryMatches {
         matches: Vec<DaemonHistoryMatch>,
