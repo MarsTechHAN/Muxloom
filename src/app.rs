@@ -2313,8 +2313,21 @@ impl App {
                     {
                         self.set_selected_target(target_index);
                     }
-                    self.focus = Focus::Agents;
+                    // The point of starting an agent is to talk to it, so open
+                    // the terminal and take input rather than stopping on the
+                    // list beside it. Until now the session has been elsewhere:
+                    // the launch form, a machine pane, an archived entry being
+                    // resumed -- and every one of them left the first keystroke
+                    // going somewhere other than the agent that was just asked
+                    // for.
+                    self.focus = Focus::Recap;
                     self.select_session(session_id);
+                    // A session that is already gone is left alone: opening one
+                    // of those means resuming it, and answering a launch with
+                    // another launch is not what was asked for.
+                    if self.selected_session().is_some_and(|session| !session.dead) {
+                        self.activate_terminal();
+                    }
                     self.pending_launch_selection = None;
                 } else {
                     self.ensure_session_selection();
@@ -2450,8 +2463,11 @@ impl App {
                             .insert(target_id.clone(), session_id.clone());
                         self.pending_launch_selection =
                             Some((target_id.clone(), session_id.clone(), 0));
-                        // Land on the new agent in the Agents pane rather than
-                        // leaving focus on the machine/folder sidebar.
+                        // Wait on the agent list rather than the sidebar the
+                        // launch came from. The session is not in it yet, so
+                        // focusing the terminal here would aim input at
+                        // whichever agent was open before; the refresh that
+                        // finds the new one steps into its terminal.
                         self.focus = Focus::Agents;
                         self.status_message = if legacy_tmux {
                             let detail = notice.unwrap_or_else(|| {
@@ -9705,7 +9721,7 @@ mod tests {
     }
 
     #[test]
-    fn launching_focuses_the_agents_pane() {
+    fn launching_lands_in_the_new_agents_terminal() {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
         let worker = Worker {
@@ -9773,7 +9789,20 @@ mod tests {
             Some("muxloomd-codex-1-2-0")
         );
         assert!(app.pending_launch_selection.is_none());
-        assert_eq!(app.focus, Focus::Agents);
+        assert_eq!(
+            app.focus,
+            Focus::Recap,
+            "a launched agent is opened, not merely highlighted"
+        );
+        let attach = app
+            .pending_attach
+            .as_ref()
+            .expect("the new agent's terminal must be connecting");
+        assert_eq!(attach.session_id, "muxloomd-codex-1-2-0");
+        assert!(
+            attach.take_input,
+            "the first keystroke belongs to the agent that was just launched"
+        );
     }
 
     #[test]
