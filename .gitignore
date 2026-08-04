@@ -20,3 +20,7 @@ target
 # Local editor and operating-system files
 *.swp
 .DS_Store
+
+# Debug logs and state files left in the working tree by local runs and tests
+*.log
+unused-state.json
