@@ -53,11 +53,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .filter(|size| size.width > 0 && size.height > 0)
         .map(|size| (size.width, size.height));
     let portrait = portrait_layout(area, pixels);
-    let compact = if portrait {
-        area.width < 48 || area.height < 28
-    } else {
-        area.width < 72 || area.height < 16
-    };
+    let was_compact = app
+        .layout_debug_signature
+        .is_some_and(|(_, _, _, _, _, compact)| compact);
+    let compact = compact_layout(was_compact, area, portrait);
     let (pixel_width, pixel_height) = pixels.unwrap_or_default();
     let signature = (
         area.width,
@@ -92,6 +91,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some(modal) = app.modal.as_mut() {
         draw_modal(frame, modal, area);
+    }
+}
+
+/// Whether the window has to fall back to showing one pane at a time.
+fn compact_layout(was_compact: bool, area: Rect, portrait: bool) -> bool {
+    // Leaving the compact layout takes a few more cells than falling into it,
+    // so dragging a window across the threshold does not flip the whole screen
+    // back and forth a cell at a time.
+    let slack = if was_compact { 4 } else { 0 };
+    if portrait {
+        area.width < 48 + slack || area.height < 28 + slack
+    } else {
+        // Height on its own never forces it. A 200x15 window has room for all
+        // three columns; stacking them would throw that width away and leave
+        // the machine list reachable only by hiding the terminal.
+        area.width < 72 + slack
     }
 }
 
@@ -4141,7 +4156,20 @@ mod tests {
     }
 
     #[test]
-    fn focused_sidebars_expand() {
+    fn a_wide_but_short_window_keeps_all_three_panes() {
+        // 200x15 used to collapse to a single pane because one flag covered
+        // both axes, hiding the machine list on a screen with room to spare.
+        assert!(!compact_layout(false, Rect::new(0, 0, 200, 15), false));
+        assert!(compact_layout(false, Rect::new(0, 0, 60, 40), false));
+        // Hysteresis: a window already compact holds that layout for a few
+        // more columns rather than flipping on every cell of a resize.
+        assert!(compact_layout(true, Rect::new(0, 0, 74, 40), false));
+        assert!(!compact_layout(false, Rect::new(0, 0, 74, 40), false));
+        assert!(!compact_layout(true, Rect::new(0, 0, 76, 40), false));
+    }
+
+    #[test]
+    fn moving_focus_leaves_every_pane_where_it_was() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
         let mut state = State::default();
