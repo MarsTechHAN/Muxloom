@@ -1029,7 +1029,10 @@ fi
 if [ -n "$candidate" ]; then
     fingerprint=$("$candidate" binary-sha256 2>/dev/null || true)
     case "$fingerprint" in ''|*[!0-9a-fA-F]*) fingerprint=legacy ;; esac
-    printf '{marker} HAVE %s %s %s\n' "$os" "$arch" "$fingerprint"
+    version=$("$candidate" --version 2>/dev/null || true)
+    version=${{version##* }}
+    case "$version" in ''|*[!0-9A-Za-z.+-]*) version=unknown ;; esac
+    printf '{marker} HAVE %s %s %s %s\n' "$os" "$arch" "$fingerprint" "$version"
 else
     printf '{marker} NEED %s %s\n' "$os" "$arch"
 fi
@@ -1104,7 +1107,7 @@ fn negotiate_remote_companion(
     let fields: Vec<_> = status.split_whitespace().collect();
     match fields.as_slice() {
         [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
-        [marker, "HAVE", os, arch, fingerprint] if *marker == BOOTSTRAP_MARKER => {
+        [marker, "HAVE", os, arch, fingerprint, version] if *marker == BOOTSTRAP_MARKER => {
             let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
                 Err(error) => {
@@ -1122,17 +1125,37 @@ fn negotiate_remote_companion(
                 }
             };
             let expected = sha256_file(&asset)?;
-            if fingerprint.eq_ignore_ascii_case(&expected) {
+            if !fingerprint.eq_ignore_ascii_case(&expected) {
+                return deploy_remote_companion(
+                    alias, &asset, &notice, os, arch, reader, writer, progress,
+                );
+            }
+            writeln!(writer, "USE")?;
+            writer.flush()?;
+            // The remote already runs exactly this asset, which makes it
+            // current only if the asset is this generation. A companion left
+            // behind by an older build matches itself forever, so without the
+            // version the remote stays pinned to it and every capability
+            // added since goes silently missing.
+            if *version == env!("CARGO_PKG_VERSION") {
                 debug::log(
                     "bridge",
                     format!("target={alias} remote companion fingerprint is current"),
                 );
-                writeln!(writer, "USE")?;
-                writer.flush()?;
-                Ok(None)
-            } else {
-                deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer, progress)
+                return Ok(None);
             }
+            debug::log(
+                "bridge",
+                format!(
+                    "target={alias} companion asset {} is muxloomd {version}, not {}; the remote cannot be updated from it",
+                    asset.display(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+            Ok(Some(format!(
+                "remote muxloomd {version} is older than this client and the {} companion asset is the same build, so it cannot be updated; rebuild or replace that asset",
+                companion_target_triple(os, arch).unwrap_or_else(|_| format!("{os}/{arch}"))
+            )))
         }
         [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
             let (asset, notice) = resolve_companion_asset(options, os, arch, progress)?;
@@ -2010,7 +2033,11 @@ mod tests {
         assert!(script.contains(BOOTSTRAP_MARKER));
         assert!(script.contains("uname -s"));
         assert!(script.contains("binary-sha256"));
-        assert!(script.contains("HAVE %s %s %s"));
+        assert!(script.contains("HAVE %s %s %s %s"));
+        // The reported version is what keeps a companion left behind by an
+        // older build from matching its own fingerprint forever.
+        assert!(script.contains("--version"));
+        assert!(script.contains("version=${version##* }"));
         assert!(script.contains("INSTALL "));
         assert!(script.contains("head -c \"$muxloom_size\""));
         assert!(script.contains("mv -f \"$temporary\" \"$installed\""));
