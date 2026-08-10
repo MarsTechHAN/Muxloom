@@ -185,6 +185,10 @@ pub enum Event {
     Searched {
         query: String,
         results: Vec<SearchResult>,
+        /// Machines whose history could not be read for this query. Without
+        /// them an empty result list cannot tell "nothing matched" apart from
+        /// "nothing could be looked at".
+        unreachable: Vec<String>,
     },
     DirectoryListed {
         target_id: String,
@@ -535,6 +539,7 @@ impl Worker {
                         }
                         // Multiplex a bounded number of SSH/tmux searches at once. This keeps
                         // large fleets responsive without opening an unbounded connection burst.
+                        let mut unreachable: Vec<String> = Vec::new();
                         for jobs in history_jobs.chunks(8) {
                             let batch = thread::scope(|scope| {
                                 let mut handles = Vec::new();
@@ -549,10 +554,20 @@ impl Worker {
                                 }
                                 handles
                                     .into_iter()
-                                    .filter_map(|handle| handle.join().ok().flatten())
+                                    .filter_map(|handle| handle.join().ok())
                                     .collect::<Vec<_>>()
                             });
-                            results.extend(batch);
+                            for outcome in batch {
+                                match outcome {
+                                    Ok(Some(hit)) => results.push(hit),
+                                    Ok(None) => {}
+                                    Err(target_id) => {
+                                        if !unreachable.contains(&target_id) {
+                                            unreachable.push(target_id);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         results.sort_by(|left, right| {
                             right
@@ -570,7 +585,11 @@ impl Worker {
                             "search",
                             format!("query completed results={}", results.len()),
                         );
-                        let _ = events.send(Event::Searched { query, results });
+                        let _ = events.send(Event::Searched {
+                            query,
+                            results,
+                            unreachable,
+                        });
                     }
                     Request::ListDirectory { target, path } => {
                         let target_id = target.id.clone();
@@ -953,12 +972,14 @@ fn best_recap_match(session: &AgentSession, query: &str) -> Option<(usize, Strin
     search_match_score(recap, query).map(|score| (score, recap.to_string()))
 }
 
+/// Searches one session's history. `Err` carries the machine id, so a search
+/// that could not reach a host can say so instead of reporting no matches.
 fn search_session_history(
     runtime: &Runtime,
     target: Target,
     session: AgentSession,
     query: &str,
-) -> Option<(SearchResult, usize)> {
+) -> Result<Option<(SearchResult, usize)>, String> {
     let matches = match runtime.search_history(&target, &session.id, query, 12) {
         Ok(matches) => matches,
         Err(error) => {
@@ -966,16 +987,18 @@ fn search_session_history(
                 "search",
                 format!("history search failed session={}: {error}", session.id),
             );
-            return None;
+            return Err(target.id);
         }
     };
-    let (item, score) = best_history_match(&matches, query)?;
+    let Some((item, score)) = best_history_match(&matches, query) else {
+        return Ok(None);
+    };
     let match_kind = if item.recap {
         SearchMatchKind::Recap
     } else {
         SearchMatchKind::History
     };
-    Some((
+    Ok(Some((
         search_result(
             &session,
             match_kind,
@@ -983,7 +1006,7 @@ fn search_session_history(
             Some(item.line_number),
         ),
         score,
-    ))
+    )))
 }
 
 fn search_result(

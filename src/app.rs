@@ -2830,7 +2830,11 @@ impl App {
                     }
                 }
             }
-            Event::Searched { query, results } => {
+            Event::Searched {
+                query,
+                results,
+                unreachable,
+            } => {
                 if let Some(Modal::Search(form)) = self.modal.as_mut()
                     && form.submitted_query == query
                 {
@@ -2838,10 +2842,21 @@ impl App {
                     form.results = results;
                     form.result_rows.clear();
                     form.selected = 0;
-                    form.error = if form.results.is_empty() {
-                        Some("No matching agent name, recap, or history".into())
-                    } else {
-                        None
+                    // A machine that could not be reached is not a machine that
+                    // holds no match, and saying otherwise sends the user
+                    // looking for a session that is really still there.
+                    let skipped = match unreachable.as_slice() {
+                        [] => None,
+                        [one] => Some(format!("{one} could not be searched")),
+                        many => Some(format!("{} machines could not be searched", many.len())),
+                    };
+                    form.error = match (form.results.is_empty(), skipped) {
+                        (true, Some(skipped)) => Some(format!("No matches so far; {skipped}")),
+                        (true, None) => Some("No matching agent name, recap, or history".into()),
+                        (false, Some(skipped)) => {
+                            Some(format!("{} matches; {skipped}", form.results.len()))
+                        }
+                        (false, None) => None,
                     };
                 }
             }
