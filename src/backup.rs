@@ -279,6 +279,55 @@ impl BackupStore {
         decode_frames(&bytes).with_context(|| format!("failed to zstd-decode {}", path.display()))
     }
 
+    /// Read at most `max_bytes` of the *newest* decompressed output of a blob,
+    /// leaving everything older compressed on disk. Returns the bytes and
+    /// whether older output was left behind.
+    ///
+    /// A capture blob holds every row a session ever printed — tens of
+    /// megabytes decompressed — while a pane shows a few hundred rows, so
+    /// reading the whole thing to display the end of it is pure cost. Frames
+    /// are walked back-to-front and only the ones the budget needs are
+    /// decompressed; the result is then cut to `max_bytes` at a line boundary.
+    pub fn read_blob_tail(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool)> {
+        let path = self.session_dir(target_id, session_id).join(name);
+        if !path.exists() {
+            return Ok((Vec::new(), false));
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let frames = frame_spans(&bytes);
+        let mut first = frames.len();
+        let mut raw = 0usize;
+        while first > 0 && raw < max_bytes {
+            first -= 1;
+            raw = raw.saturating_add(frames[first].2);
+        }
+        let mut out = Vec::with_capacity(raw.min(max_bytes.saturating_mul(2)));
+        for (start, end, _) in &frames[first..] {
+            out.extend_from_slice(
+                &decode_frames(&bytes[*start..*end])
+                    .with_context(|| format!("failed to zstd-decode {}", path.display()))?,
+            );
+        }
+        let mut clipped = first > 0;
+        if out.len() > max_bytes {
+            let mut cut = out.len() - max_bytes;
+            // Land on a line boundary so the first row shown is a whole row.
+            if let Some(offset) = out[cut..].iter().position(|byte| *byte == b'\n') {
+                cut += offset + 1;
+            }
+            out.drain(..cut);
+            clipped = true;
+        }
+        Ok((out, clipped))
+    }
+
     /// Compressed on-disk size of a session blob (0 if absent).
     pub fn blob_len(&self, target_id: &str, session_id: &str, name: &str) -> u64 {
         let path = self.session_dir(target_id, session_id).join(name);
@@ -313,23 +362,11 @@ impl BackupStore {
             return Ok(());
         }
         let bytes = fs::read(&path)?;
-        // Collect the byte span of each whole frame.
-        let mut frames: Vec<(usize, usize)> = Vec::new();
-        let mut pos = 0usize;
-        while pos + FRAME_HEADER_LEN <= bytes.len() {
-            let comp_len =
-                u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
-            let end = pos + FRAME_HEADER_LEN + comp_len;
-            if end > bytes.len() {
-                break;
-            }
-            frames.push((pos, end));
-            pos = end;
-        }
-        let mut total: usize = frames.iter().map(|(start, end)| end - start).sum();
+        let frames = frame_spans(&bytes);
+        let mut total: usize = frames.iter().map(|(start, end, _)| end - start).sum();
         let mut drop_to = 0usize;
         while total > max_bytes as usize && drop_to + 1 < frames.len() {
-            let (start, end) = frames[drop_to];
+            let (start, end, _) = frames[drop_to];
             total -= end - start;
             drop_to += 1;
         }
@@ -357,6 +394,25 @@ fn encode_frame(chunk: &[u8]) -> Result<Vec<u8>> {
     frame.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
     frame.extend_from_slice(&compressed);
     Ok(frame)
+}
+
+/// The `(start, end, raw_len)` of each whole frame in a blob, read from the
+/// headers alone — nothing is decompressed. A short trailing write is ignored,
+/// same as [`decode_frames`].
+fn frame_spans(bytes: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    while pos + FRAME_HEADER_LEN <= bytes.len() {
+        let raw_len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+        let comp_len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
+        let end = pos + FRAME_HEADER_LEN + comp_len;
+        if end > bytes.len() {
+            break;
+        }
+        frames.push((pos, end, raw_len));
+        pos = end;
+    }
+    frames
 }
 
 fn decode_frames(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -1379,6 +1435,63 @@ mod tests {
             .unwrap();
         let out = store.read_blob("local", "s1", CAPTURE_BLOB).unwrap();
         assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn reading_the_tail_stops_at_the_newest_output_it_was_asked_for() {
+        let store = temp_store();
+        for index in 0..40u32 {
+            store
+                .append_frame(
+                    "local",
+                    "s1",
+                    CAPTURE_BLOB,
+                    format!("line {index:02}\n").as_bytes(),
+                )
+                .unwrap();
+        }
+        let whole = store.read_blob("local", "s1", CAPTURE_BLOB).unwrap();
+        assert_eq!(whole.len(), 40 * "line 00\n".len());
+
+        // A budget smaller than the blob returns its end, cut to whole lines,
+        // and says so.
+        let (tail, clipped) = store
+            .read_blob_tail("local", "s1", CAPTURE_BLOB, 30)
+            .unwrap();
+        assert!(clipped);
+        assert!(
+            tail.len() <= 30,
+            "read {} bytes for a 30 budget",
+            tail.len()
+        );
+        let text = String::from_utf8(tail).unwrap();
+        assert!(text.starts_with("line "), "cut mid-line: {text:?}");
+        assert!(text.ends_with("line 39\n"));
+
+        // A budget past the end returns everything, unclipped.
+        let (all, clipped) = store
+            .read_blob_tail("local", "s1", CAPTURE_BLOB, 10_000)
+            .unwrap();
+        assert!(!clipped);
+        assert_eq!(all, whole);
+
+        // One huge frame is cut too, not returned whole because it is one piece.
+        store
+            .write_blob("local", "s2", CAPTURE_BLOB, &vec![b'x'; 5_000])
+            .unwrap();
+        let (tail, clipped) = store
+            .read_blob_tail("local", "s2", CAPTURE_BLOB, 100)
+            .unwrap();
+        assert!(clipped);
+        assert_eq!(tail.len(), 100);
+
+        // A missing blob is empty, not an error.
+        assert_eq!(
+            store
+                .read_blob_tail("local", "gone", CAPTURE_BLOB, 100)
+                .unwrap(),
+            (Vec::new(), false)
+        );
     }
 
     #[test]

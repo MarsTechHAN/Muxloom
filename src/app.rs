@@ -342,6 +342,10 @@ const FILE_MONITOR_TIMEOUT: Duration = Duration::from_secs(20);
 /// whole file, so following a bigger one would mean hauling it across the link
 /// every time it changes; those wait for an explicit refresh.
 const AUTO_REFRESH_LIMIT: u64 = 4 * 1024 * 1024;
+/// How much of a backed-up capture is read to build one page of history. The
+/// blob holds every row the session ever printed, which for a long-running
+/// agent is tens of megabytes; a page is then cut from the tail of this.
+const RECOVERED_HISTORY_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -3441,8 +3445,14 @@ impl App {
             Some(info) => info.machine_key.clone(),
             None => return,
         };
-        let capture = backup_session_capture(&self.backup_root, &machine, &session.id);
-        let text = if capture.trim().is_empty() {
+        let (capture, mut clipped) = backup_session_capture(
+            &self.backup_root,
+            &machine,
+            &session.id,
+            RECOVERED_HISTORY_BYTES,
+        );
+        let mut text = if capture.trim().is_empty() {
+            clipped = false;
             let transcript = backup_session_transcript(&machine, &session.id, 200_000);
             if transcript.trim().is_empty() {
                 String::new()
@@ -3458,6 +3468,19 @@ impl App {
                 "This session is only in the local backup, and nothing readable came with it."
                     .into();
             return;
+        }
+        // Only the newest rows go on the page. Every redraw re-parses whatever
+        // sits in `history.text`, and a whole capture is orders of magnitude
+        // more than a pane can show: a live page is bounded the same way, by
+        // the daemon, so bound this one here.
+        let viewport_lines = self.agent_viewport_height.max(1) as usize;
+        let chunk_lines = self.config.history_chunk_lines.max(viewport_lines + 50);
+        if let Some(cut) = cut_to_last_lines(&text, chunk_lines) {
+            text.drain(..cut);
+            clipped = true;
+        }
+        if clipped {
+            text.insert_str(0, "--- older output stays in the local backup ---\n\n");
         }
         self.history_message.clear();
         let lines = text.lines().count();
@@ -7335,20 +7358,48 @@ fn recoverable_backup_records(
 /// The raw terminal capture kept for a backed-up session, ready to be rendered
 /// as read-only history. Empty when only messages were captured.
 #[cfg(feature = "controller")]
-fn backup_session_capture(root: &Path, target_id: &str, session_id: &str) -> String {
+fn backup_session_capture(
+    root: &Path,
+    target_id: &str,
+    session_id: &str,
+    max_bytes: usize,
+) -> (String, bool) {
     let store = crate::backup::BackupStore::new(root.to_path_buf());
-    match store.read_blob(target_id, session_id, crate::backup::CAPTURE_BLOB) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    match store.read_blob_tail(
+        target_id,
+        session_id,
+        crate::backup::CAPTURE_BLOB,
+        max_bytes,
+    ) {
+        Ok((bytes, clipped)) => (String::from_utf8_lossy(&bytes).into_owned(), clipped),
         Err(error) => {
             debug::log("backup", format!("capture unreadable: {error:#}"));
-            String::new()
+            (String::new(), false)
         }
     }
 }
 
 #[cfg(not(feature = "controller"))]
-fn backup_session_capture(_root: &Path, _target_id: &str, _session_id: &str) -> String {
-    String::new()
+fn backup_session_capture(
+    _root: &Path,
+    _target_id: &str,
+    _session_id: &str,
+    _max_bytes: usize,
+) -> (String, bool) {
+    (String::new(), false)
+}
+
+/// Byte offset that leaves the last `max_lines` lines of `text`, or None when
+/// it already fits. Cutting there keeps whole lines.
+fn cut_to_last_lines(text: &str, max_lines: usize) -> Option<usize> {
+    let mut seen = 0usize;
+    for (offset, _) in text.rmatch_indices('\n') {
+        seen += 1;
+        if seen > max_lines {
+            return Some(offset + 1);
+        }
+    }
+    None
 }
 
 /// Canonicalise an ssh alias to its stable backup machine key, so "same
@@ -11501,6 +11552,109 @@ mod tests {
                 .unwrap()
                 .position("local", "muxloomd-codex-lost")
                 .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A capture blob holds every row a session ever printed, and the terminal
+    /// panel re-parses whatever is on the page on every redraw, so a page built
+    /// from the backup has to be bounded exactly like a live one.
+    #[test]
+    #[cfg(feature = "controller")]
+    fn a_page_built_from_the_backup_is_no_bigger_than_a_live_one() {
+        use crate::{
+            backup::{BackupIndex, BackupRecord, BackupStore, CAPTURE_BLOB},
+            model::Probe,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-app-bigpage-{nonce}"));
+        let store = BackupStore::new(root.clone());
+        // Far more output than any pane shows, in the frames a real sync leaves.
+        let mut written = 0usize;
+        for frame in 0..40u32 {
+            let chunk: String = (0..2_000)
+                .map(|line| format!("frame {frame} line {line} of terminal output\n"))
+                .collect();
+            written += chunk.len();
+            store
+                .append_frame(
+                    "local",
+                    "muxloomd-claude-huge",
+                    CAPTURE_BLOB,
+                    chunk.as_bytes(),
+                )
+                .unwrap();
+        }
+        assert!(written > 2_000_000, "wrote only {written} bytes");
+        let mut index = BackupIndex::default();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-huge".into(),
+            kind: "claude".into(),
+            cwd: "/work/project".into(),
+            created_at: 7,
+            dead: true,
+            message_count: 1,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let config = Config::default();
+        let chunk_lines = config.history_chunk_lines;
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.backup_root = root.clone();
+        app.targets[0].probe.claude = true;
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((Probe::default(), Vec::new())),
+        });
+
+        let start = std::time::Instant::now();
+        app.select_session("muxloomd-claude-huge".into());
+        let elapsed = start.elapsed();
+        let lines = app.history.text.lines().count();
+        assert!(
+            lines <= chunk_lines + 2,
+            "page carries {lines} lines for a {chunk_lines}-line chunk"
+        );
+        assert!(
+            app.history.text.len() < 1_000_000,
+            "page carries {} bytes",
+            app.history.text.len()
+        );
+        assert!(
+            app.history
+                .text
+                .contains("older output stays in the local backup"),
+            "a clipped page has to say so"
+        );
+        assert!(
+            app.history.text.contains("frame 39 line 1999"),
+            "the newest output has to be the output shown"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "building the page took {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
