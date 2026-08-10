@@ -6,28 +6,31 @@ use muxloom::{
     runtime::Runtime,
 };
 
+fn remote_runtime(alias: &str) -> Runtime {
+    let mut hosts = BTreeMap::new();
+    hosts.insert(
+        alias.to_string(),
+        HostConfig {
+            companion_command: Some(
+                std::env::var("MUXLOOM_REMOTE_COMPANION_COMMAND")
+                    .unwrap_or_else(|_| "definitely-missing-muxloomd".into()),
+            ),
+            companion_binary: std::env::var("MUXLOOM_REMOTE_COMPANION_ASSET").ok(),
+            ..HostConfig::default()
+        },
+    );
+    Runtime::new(&Config {
+        hosts,
+        ..Config::default()
+    })
+}
+
 #[test]
 #[ignore = "requires MUXLOOM_REMOTE_TEST_ALIAS and a target-native muxloomd"]
 fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
     let alias = std::env::var("MUXLOOM_REMOTE_TEST_ALIAS")
         .expect("MUXLOOM_REMOTE_TEST_ALIAS must name an SSH config host");
-    let command = std::env::var("MUXLOOM_REMOTE_COMPANION_COMMAND")
-        .unwrap_or_else(|_| "definitely-missing-muxloomd".into());
-    let companion_binary = std::env::var("MUXLOOM_REMOTE_COMPANION_ASSET").ok();
-    let mut hosts = BTreeMap::new();
-    hosts.insert(
-        alias.clone(),
-        HostConfig {
-            companion_command: Some(command),
-            companion_binary,
-            ..HostConfig::default()
-        },
-    );
-    let config = Config {
-        hosts,
-        ..Config::default()
-    };
-    let runtime = Runtime::new(&config);
+    let runtime = remote_runtime(&alias);
     let target = Target::ssh(&alias);
     let marker = format!("muxloom-remote-smoke-{}", std::process::id());
     let request = LaunchRequest {
@@ -101,4 +104,59 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         working_seen,
         "remote daemon never reported a working session"
     );
+}
+
+/// Forwarding has to work against whatever daemon the machine happens to be
+/// running, including one that live sessions pin to a generation older than
+/// the capability: the bridge serves it there, so the client never sees it
+/// missing. Reads a banner from a port the far end listens on — 22 by
+/// default, since a machine reached over SSH is listening on it.
+#[test]
+#[ignore = "requires MUXLOOM_REMOTE_TEST_ALIAS and a target-native muxloomd"]
+fn tcp_forwarding_reaches_a_remote_listener_over_one_bridge() {
+    let alias = std::env::var("MUXLOOM_REMOTE_TEST_ALIAS")
+        .expect("MUXLOOM_REMOTE_TEST_ALIAS must name an SSH config host");
+    let port: u16 = std::env::var("MUXLOOM_REMOTE_TEST_TCP_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(22);
+    let runtime = remote_runtime(&alias);
+    let target = Target::ssh(&alias);
+
+    runtime
+        .bridge_pool()
+        .ensure_tcp_forward(&target)
+        .unwrap_or_else(|error| {
+            panic!(
+                "forwarding was unavailable: {error:#} notice={:?}",
+                runtime.take_bridge_notice(&alias)
+            )
+        });
+    // Privileged ports are left out of this report, so the port the banner is
+    // read from need not appear in it.
+    let ports = runtime.tcp_listener_ports(&target).unwrap();
+    assert!(
+        ports.iter().all(|port| *port >= 1024),
+        "privileged ports were reported as forwardable: {ports:?}"
+    );
+
+    let mut stream = runtime
+        .bridge_pool()
+        .open_tcp(&target, "127.0.0.1".into(), port)
+        .unwrap();
+    let mut banner = Vec::new();
+    for _ in 0..100 {
+        while let Some(bytes) = stream.try_read_result().unwrap() {
+            banner.extend_from_slice(&bytes);
+        }
+        if !banner.is_empty() || stream.is_closed() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !banner.is_empty(),
+        "nothing came back from 127.0.0.1:{port}"
+    );
+    assert_eq!(runtime.bridge_pool().connected_targets(), 1);
 }

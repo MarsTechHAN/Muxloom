@@ -781,8 +781,11 @@ impl BridgeConnection {
         {
             Ok(())
         } else {
+            // Reached only when the companion binary itself predates the
+            // capability: a current companion serves forwarding from the
+            // bridge process even when the daemon it talks to is older.
             bail!(
-                "active muxloomd generation does not support {capability}; keep running agents active and retry after its deferred upgrade"
+                "the muxloomd companion on this machine predates {capability}; update it to this client's generation"
             )
         }
     }
@@ -1869,7 +1872,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tcp_streams_are_not_sent_to_an_older_daemon_generation() {
+    fn tcp_streams_are_not_sent_to_an_older_companion_generation() {
         let (client, server) = UnixStream::pair().unwrap();
         let reader = client.try_clone().unwrap();
         let connection = BridgeConnection::from_parts("old-daemon".into(), reader, client, None);
@@ -1877,11 +1880,7 @@ mod tests {
             .open_tcp("127.0.0.1".into(), 3000)
             .err()
             .expect("missing capability must reject the stream");
-        assert!(
-            error
-                .to_string()
-                .contains("does not support tcp-forward-v1")
-        );
+        assert!(error.to_string().contains("predates tcp-forward-v1"));
         connection.state.shutdown();
         drop(server);
     }

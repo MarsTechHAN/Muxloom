@@ -15,7 +15,7 @@ mod platform {
         process::{Command, Stdio},
         sync::{
             Arc, Condvar, Mutex, OnceLock,
-            atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -55,6 +55,11 @@ mod platform {
     /// roughly two seconds here, and an attach waits for it.
     const SCROLLBACK_SEED_BYTES_MAX: u64 = 128 * 1024 * 1024;
     static METADATA_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// Opening a TCP stream to a host the far end can reach. Served by the
+    /// daemon, or by the bridge when it talks to a daemon too old to have it.
+    const FORWARD_CAPABILITY: &str = "tcp-forward-v1";
+    /// Reporting which TCP ports the far end is listening on.
+    const LISTENERS_CAPABILITY: &str = "tcp-listeners-v1";
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -880,8 +885,8 @@ mod platform {
         result
     }
 
-    fn write_stream_opened(
-        writer: &Arc<Mutex<UnixStream>>,
+    fn write_stream_opened<W: Write>(
+        writer: &Arc<Mutex<W>>,
         frame: &Frame,
         total_bytes: Option<u64>,
     ) -> Result<()> {
@@ -899,8 +904,8 @@ mod platform {
         )
     }
 
-    fn write_stream_error(
-        writer: &Arc<Mutex<UnixStream>>,
+    fn write_stream_error<W: Write>(
+        writer: &Arc<Mutex<W>>,
         frame: &Frame,
         message: String,
     ) -> Result<()> {
@@ -975,8 +980,8 @@ mod platform {
         )
     }
 
-    fn stream_tcp(
-        writer: &Arc<Mutex<UnixStream>>,
+    fn stream_tcp<W: Write>(
+        writer: &Arc<Mutex<W>>,
         flow: &StreamFlow,
         stream_id: u32,
         mut socket: TcpStream,
@@ -1094,8 +1099,8 @@ mod platform {
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
-                            "tcp-forward-v1".into(),
-                            "tcp-listeners-v1".into(),
+                            FORWARD_CAPABILITY.into(),
+                            LISTENERS_CAPABILITY.into(),
                             "handover-drain-v1".into(),
                         ],
                     },
@@ -2487,8 +2492,8 @@ mod platform {
         }
     }
 
-    fn write_response(
-        writer: &Arc<Mutex<UnixStream>>,
+    fn write_response<W: Write>(
+        writer: &Arc<Mutex<W>>,
         request_id: u64,
         response: &DaemonResponse,
     ) -> Result<()> {
@@ -2498,7 +2503,7 @@ mod platform {
         )
     }
 
-    fn write_frame(writer: &Arc<Mutex<UnixStream>>, frame: &Frame) -> Result<()> {
+    fn write_frame<W: Write>(writer: &Arc<Mutex<W>>, frame: &Frame) -> Result<()> {
         frame.write_to(
             &mut *writer
                 .lock()
@@ -2507,25 +2512,318 @@ mod platform {
     }
 
     pub fn bridge(paths: &DaemonPaths) -> Result<()> {
-        let mut stream = connect_or_start(paths)?;
-        let mut outbound = stream.try_clone()?;
-        let input = thread::spawn(move || -> io::Result<()> {
-            io::copy(&mut io::stdin().lock(), &mut outbound)?;
-            outbound.shutdown(std::net::Shutdown::Write)
-        });
-        let mut stdout = io::stdout().lock();
+        let mut daemon = connect_or_start(paths)?;
+        let mut outbound = daemon.try_clone()?;
+        let forwarding = Arc::new(BridgeForwarding::default());
+        // Both the daemon pump and every forwarded socket write here, so the
+        // handle is shared and only ever written a whole frame at a time.
+        let client = Arc::new(Mutex::new(io::stdout()));
+        let input = {
+            let forwarding = Arc::clone(&forwarding);
+            let client = Arc::clone(&client);
+            thread::spawn(move || -> Result<()> {
+                let mut inbound = io::stdin().lock();
+                let result = pump_client_frames(&mut inbound, &mut outbound, &forwarding, &client);
+                // Release any forwarded socket still waiting on stream credit
+                // the client will now never send.
+                forwarding.flow.disconnect();
+                let _ = outbound.shutdown(Shutdown::Write);
+                result
+            })
+        };
         let mut buffer = vec![0; DATA_CHUNK_SIZE];
-        loop {
-            let read = stream.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let result = (|| -> Result<()> {
+            loop {
+                // A daemon that serves forwarding itself needs nothing from
+                // this process but bytes, and staying out of the frames keeps
+                // the bridge forward compatible with frames it predates.
+                if forwarding.mode() == BridgeMode::Passthrough {
+                    let read = daemon.read(&mut buffer)?;
+                    if read == 0 {
+                        return Ok(());
+                    }
+                    let mut client = client
+                        .lock()
+                        .map_err(|_| anyhow!("muxloomd bridge output is poisoned"))?;
+                    client.write_all(&buffer[..read])?;
+                    client.flush()?;
+                    continue;
+                }
+                let Some(frame) = Frame::read_from(&mut daemon)? else {
+                    return Ok(());
+                };
+                let frame = if frame.kind == FrameKind::Response
+                    && forwarding.mode() == BridgeMode::Negotiating
+                {
+                    negotiate_bridge_capabilities(frame, &forwarding)
+                } else {
+                    frame
+                };
+                write_frame(&client, &frame)?;
             }
-            stdout.write_all(&buffer[..read])?;
-            stdout.flush()?;
+        })();
+        forwarding.flow.disconnect();
+        if result.is_ok() {
+            input
+                .join()
+                .map_err(|_| anyhow!("muxloomd bridge input thread panicked"))??;
         }
-        input
-            .join()
-            .map_err(|_| anyhow!("muxloomd bridge input thread panicked"))??;
+        result
+    }
+
+    /// Which of the frames crossing this bridge it has to understand.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BridgeMode {
+        /// The daemon has not answered the client's `Hello` yet, so whether it
+        /// serves forwarding is still unknown.
+        Negotiating,
+        /// The daemon serves forwarding, so frames pass through as raw bytes.
+        Passthrough,
+        /// The daemon predates forwarding and this bridge serves it instead.
+        Forwarding,
+    }
+
+    /// TCP forwarding served by the bridge process rather than by the daemon.
+    ///
+    /// Forwarding wants a socket and a byte pump, never any session state, so
+    /// the bridge can serve it alone. Sometimes it must: a daemon that live
+    /// sessions pin to an older generation never gains the capability, because
+    /// the handover that would replace it stays deferred for exactly as long
+    /// as those sessions run. Answering here keeps forwarding available
+    /// against a daemon the client can neither use for it nor replace, and
+    /// costs the running agents nothing.
+    #[derive(Default)]
+    struct BridgeForwarding {
+        mode: AtomicU8,
+        flow: StreamFlow,
+        sockets: Mutex<HashMap<u32, TcpStream>>,
+    }
+
+    impl BridgeForwarding {
+        fn mode(&self) -> BridgeMode {
+            match self.mode.load(Ordering::Acquire) {
+                1 => BridgeMode::Passthrough,
+                2 => BridgeMode::Forwarding,
+                _ => BridgeMode::Negotiating,
+            }
+        }
+
+        /// Settle the mode before the `Hello` that decides it reaches the
+        /// client, so the frames the client sends in reply are read in the
+        /// mode its capabilities promised.
+        fn settle(&self, mode: BridgeMode) {
+            self.mode.store(
+                match mode {
+                    BridgeMode::Negotiating => 0,
+                    BridgeMode::Passthrough => 1,
+                    BridgeMode::Forwarding => 2,
+                },
+                Ordering::Release,
+            );
+        }
+
+        fn owns(&self, stream_id: u32) -> bool {
+            self.sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&stream_id)
+        }
+
+        fn close(&self, stream_id: u32) {
+            let socket = self
+                .sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&stream_id);
+            if let Some(socket) = socket {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+            self.flow.close(stream_id);
+        }
+    }
+
+    /// Pass the daemon's `Hello` on to the client, claiming the forwarding
+    /// capabilities this bridge serves when the daemon does not serve them.
+    fn negotiate_bridge_capabilities(frame: Frame, forwarding: &BridgeForwarding) -> Frame {
+        let Ok(DaemonResponse::Hello {
+            daemon_version,
+            protocol_version,
+            pid,
+            mut capabilities,
+        }) = frame.decode_json::<DaemonResponse>()
+        else {
+            return frame;
+        };
+        if capabilities.iter().any(|it| it == FORWARD_CAPABILITY) {
+            forwarding.settle(BridgeMode::Passthrough);
+            return frame;
+        }
+        capabilities.push(FORWARD_CAPABILITY.into());
+        if !capabilities.iter().any(|it| it == LISTENERS_CAPABILITY) {
+            capabilities.push(LISTENERS_CAPABILITY.into());
+        }
+        let supplemented = Frame::json(
+            FrameKind::Response,
+            frame.stream_id,
+            frame.request_id,
+            &DaemonResponse::Hello {
+                daemon_version: daemon_version.clone(),
+                protocol_version,
+                pid,
+                capabilities,
+            },
+        );
+        match supplemented {
+            Ok(supplemented) => {
+                forwarding.settle(BridgeMode::Forwarding);
+                eprintln!(
+                    "muxloomd bridge serves TCP forwarding for daemon {daemon_version}, which predates it"
+                );
+                supplemented
+            }
+            // Nothing here is worth failing the whole connection over: without
+            // the capability the client simply reports forwarding unavailable,
+            // exactly as it did before.
+            Err(error) => {
+                eprintln!("muxloomd bridge could not offer TCP forwarding: {error:#}");
+                frame
+            }
+        }
+    }
+
+    fn pump_client_frames<R: Read, D: Write, W: Write + Send + 'static>(
+        inbound: &mut R,
+        daemon: &mut D,
+        forwarding: &Arc<BridgeForwarding>,
+        client: &Arc<Mutex<W>>,
+    ) -> Result<()> {
+        loop {
+            if forwarding.mode() == BridgeMode::Passthrough {
+                io::copy(inbound, daemon)?;
+                return Ok(());
+            }
+            let Some(frame) = Frame::read_from(inbound)? else {
+                return Ok(());
+            };
+            if !serve_bridge_frame(&frame, forwarding, client)? {
+                frame.write_to(daemon)?;
+            }
+        }
+    }
+
+    /// Serve a client frame that belongs to forwarding this bridge took on,
+    /// reporting whether it was answered here instead of at the daemon.
+    fn serve_bridge_frame<W: Write + Send + 'static>(
+        frame: &Frame,
+        forwarding: &Arc<BridgeForwarding>,
+        client: &Arc<Mutex<W>>,
+    ) -> Result<bool> {
+        if forwarding.mode() != BridgeMode::Forwarding {
+            return Ok(false);
+        }
+        match frame.kind {
+            FrameKind::OpenStream => {
+                let Ok(OpenStream::Tcp { host, port }) = frame.decode_json::<OpenStream>() else {
+                    return Ok(false);
+                };
+                open_bridge_tcp(frame, forwarding, client, &host, port)?;
+                Ok(true)
+            }
+            FrameKind::Request => {
+                if !matches!(
+                    frame.decode_json::<DaemonRequest>(),
+                    Ok(DaemonRequest::ListTcpListeners)
+                ) {
+                    return Ok(false);
+                }
+                let response = match tcp_listener_ports() {
+                    Ok(ports) => DaemonResponse::TcpListeners { ports },
+                    Err(error) => DaemonResponse::Error {
+                        message: error.to_string(),
+                    },
+                };
+                write_response(client, frame.request_id, &response)?;
+                Ok(true)
+            }
+            FrameKind::Data => {
+                if !forwarding.owns(frame.stream_id) {
+                    return Ok(false);
+                }
+                let payload = frame.decoded_payload()?;
+                let written = {
+                    let mut sockets = forwarding
+                        .sockets
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match sockets.get_mut(&frame.stream_id) {
+                        Some(socket) => socket.write_all(&payload).is_ok(),
+                        None => return Ok(false),
+                    }
+                };
+                // One forwarded connection going away must not take the bridge
+                // — and with it every session on this machine — down with it.
+                if !written {
+                    forwarding.close(frame.stream_id);
+                    write_frame(
+                        client,
+                        &Frame::new(FrameKind::CloseStream, frame.stream_id, 0, vec![]),
+                    )?;
+                }
+                Ok(true)
+            }
+            FrameKind::WindowUpdate => {
+                if !forwarding.owns(frame.stream_id) {
+                    return Ok(false);
+                }
+                forwarding.flow.add(frame.stream_id, frame.window_credit()?);
+                Ok(true)
+            }
+            FrameKind::CloseStream => {
+                if !forwarding.owns(frame.stream_id) {
+                    return Ok(false);
+                }
+                forwarding.close(frame.stream_id);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn open_bridge_tcp<W: Write + Send + 'static>(
+        frame: &Frame,
+        forwarding: &Arc<BridgeForwarding>,
+        client: &Arc<Mutex<W>>,
+        host: &str,
+        port: u16,
+    ) -> Result<()> {
+        let socket = match TcpStream::connect((host, port)) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return write_stream_error(
+                    client,
+                    frame,
+                    format!("cannot connect to {host}:{port}: {error}"),
+                );
+            }
+        };
+        socket.set_nodelay(true)?;
+        let reader = socket.try_clone()?;
+        forwarding
+            .sockets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(frame.stream_id, socket);
+        write_stream_opened(client, frame, None)?;
+        forwarding.flow.open(frame.stream_id);
+        let client = Arc::clone(client);
+        let forwarding = Arc::clone(forwarding);
+        let stream_id = frame.stream_id;
+        thread::spawn(move || {
+            if let Err(error) = stream_tcp(&client, &forwarding.flow, stream_id, reader) {
+                eprintln!("muxloomd bridge TCP stream {stream_id} failed: {error:#}");
+            }
+            forwarding.close(stream_id);
+        });
         Ok(())
     }
 
@@ -3622,6 +3920,137 @@ mod platform {
             drop(client);
             daemon_handle.join().unwrap().unwrap();
             fs::remove_dir_all(root).unwrap();
+        }
+
+        fn hello_frame(capabilities: &[&str]) -> Frame {
+            Frame::json(
+                FrameKind::Response,
+                0,
+                1,
+                &DaemonResponse::Hello {
+                    daemon_version: "0.3.0".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    pid: 4321,
+                    capabilities: capabilities.iter().map(|it| (*it).to_string()).collect(),
+                },
+            )
+            .unwrap()
+        }
+
+        fn hello_capabilities(frame: &Frame) -> Vec<String> {
+            match frame.decode_json::<DaemonResponse>().unwrap() {
+                DaemonResponse::Hello { capabilities, .. } => capabilities,
+                other => panic!("expected a hello, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_bridge_claims_forwarding_only_for_a_daemon_that_lacks_it() {
+            // A daemon old enough to predate forwarding: the bridge adds the
+            // capabilities it will serve itself, so the client stops reporting
+            // forwarding unavailable against a daemon it cannot replace.
+            let forwarding = BridgeForwarding::default();
+            assert_eq!(forwarding.mode(), BridgeMode::Negotiating);
+            let supplemented =
+                negotiate_bridge_capabilities(hello_frame(&["files-v1"]), &forwarding);
+            assert_eq!(forwarding.mode(), BridgeMode::Forwarding);
+            assert_eq!(
+                hello_capabilities(&supplemented),
+                ["files-v1", FORWARD_CAPABILITY, LISTENERS_CAPABILITY]
+            );
+
+            // A daemon that serves forwarding itself is left entirely alone,
+            // and the bridge goes back to pumping bytes it never inspects.
+            let forwarding = BridgeForwarding::default();
+            let original = hello_frame(&["files-v1", FORWARD_CAPABILITY, LISTENERS_CAPABILITY]);
+            let passed = negotiate_bridge_capabilities(original.clone(), &forwarding);
+            assert_eq!(forwarding.mode(), BridgeMode::Passthrough);
+            assert_eq!(passed.payload, original.payload);
+        }
+
+        #[test]
+        fn a_bridge_serves_the_tcp_forwarding_its_daemon_predates() {
+            use std::net::TcpListener;
+
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let upstream_handle = thread::spawn(move || {
+                let (mut socket, _) = upstream.accept().unwrap();
+                let mut request = [0_u8; 4];
+                socket.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"ping");
+                socket.write_all(b"pong").unwrap();
+            });
+
+            let forwarding = Arc::new(BridgeForwarding::default());
+            negotiate_bridge_capabilities(hello_frame(&["files-v1"]), &forwarding);
+            let client = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let stream_id = stream::MEDIA_BASE + 11;
+            let mut inbound = Vec::new();
+            Frame::json(
+                FrameKind::OpenStream,
+                stream_id,
+                0,
+                &OpenStream::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                },
+            )
+            .unwrap()
+            .write_to(&mut inbound)
+            .unwrap();
+            Frame::data(stream_id, 0, b"ping", false)
+                .write_to(&mut inbound)
+                .unwrap();
+            Frame::json(FrameKind::Request, 0, 41, &DaemonRequest::ListTcpListeners)
+                .unwrap()
+                .write_to(&mut inbound)
+                .unwrap();
+            // Everything forwarding does not own still belongs to the daemon.
+            Frame::json(FrameKind::Request, 0, 42, &DaemonRequest::Ping)
+                .unwrap()
+                .write_to(&mut inbound)
+                .unwrap();
+
+            let mut daemon = Vec::new();
+            pump_client_frames(&mut inbound.as_slice(), &mut daemon, &forwarding, &client).unwrap();
+
+            let mut daemon = daemon.as_slice();
+            let passed = Frame::read_from(&mut daemon).unwrap().unwrap();
+            assert_eq!(passed.request_id, 42);
+            assert!(Frame::read_from(&mut daemon).unwrap().is_none());
+
+            // The upstream reply arrives on the socket thread, so the frames
+            // the bridge wrote are read back until the echo shows up.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut opened = false;
+            let mut listeners = false;
+            let mut echoed = Vec::new();
+            while echoed != b"pong" {
+                assert!(Instant::now() < deadline, "the bridge never echoed");
+                let written = client
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let mut written = written.as_slice();
+                opened = false;
+                listeners = false;
+                echoed.clear();
+                while let Some(frame) = Frame::read_from(&mut written).unwrap() {
+                    match frame.kind {
+                        FrameKind::OpenStream if frame.stream_id == stream_id => opened = true,
+                        FrameKind::Response if frame.request_id == 41 => listeners = true,
+                        FrameKind::Data if frame.stream_id == stream_id => {
+                            echoed.extend_from_slice(&frame.decoded_payload().unwrap());
+                        }
+                        _ => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(opened, "the forwarded stream was never acknowledged");
+            assert!(listeners, "the listener request was left for the daemon");
+            upstream_handle.join().unwrap();
         }
 
         #[cfg(target_os = "linux")]
