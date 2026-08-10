@@ -1172,10 +1172,34 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let help = if app.interactive {
+    let help = if let Some(form) = app.file_manager.as_ref() {
+        // The browser swallows every key while it is open, so the footer has to
+        // advertise its own bindings rather than the pane ones underneath.
+        if form.preview_path.is_some() {
+            if area.width < 88 {
+                "  Esc close  j/k scroll  d download  r reload"
+            } else {
+                "  Esc/Enter close  j/k scroll  g/G top/end  d download  c copy path  r reload"
+            }
+        } else if !form.query.is_empty() {
+            if area.width < 88 {
+                "  Esc clear filter  Enter open  Ctrl-f close"
+            } else {
+                "  type to filter  Esc clear filter  Enter open  ↑↓ move  Ctrl-f close"
+            }
+        } else if area.width < 88 {
+            "  Enter open  ← up  Ctrl-d download  Ctrl-f close"
+        } else {
+            "  Enter open  ← up  type to filter  / find  Ctrl-d download  Ctrl-y copy path  Ctrl-f close"
+        }
+    } else if app.interactive {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
-        "  n new  t temporal  p ports  Enter open  / search  q quit"
+        match app.focus {
+            Focus::Machines => "  Space toggle  n new  / search  q quit",
+            Focus::Agents => "  Enter open  n new  t temporal  p ports  / search  q quit",
+            Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit",
+        }
     } else {
         match app.focus {
             Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
@@ -2749,8 +2773,9 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row("Arrows / Enter", "Select, move to parent, or open an entry"),
         help_row("/pattern", "Search subfolder filenames with * or **"),
-        help_row("d", "Download the selected file to Downloads"),
-        help_row("c", "Copy the selected target path to the clipboard"),
+        help_row("Type text", "Filter the entries in the browsed directory"),
+        help_row("Ctrl-d", "Download the selected file to Downloads"),
+        help_row("Ctrl-y", "Copy the selected target path to the clipboard"),
         help_row("Drop local files", "Upload them into the visible directory"),
         Line::raw(""),
         help_header("View And Configuration"),

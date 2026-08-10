@@ -323,7 +323,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 55;
+pub const HELP_CONTENT_ROWS: usize = 57;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1072,8 +1072,35 @@ impl App {
         self.last_file_click = None;
         if key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
         {
+            self.file_manager = Some(form);
+            return true;
+        }
+        // Plain letters type into the filter, so the browser's actions live on
+        // control chords instead. They work the same in the list and in a
+        // preview, and every other chord is swallowed to keep the browser modal
+        // over the pane underneath it.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => self.download_selected_file(&form),
+                KeyCode::Char('y') => {
+                    if let Some(entry) = form.entries.get(form.selected) {
+                        self.clipboard_request = Some(entry.path.clone());
+                        self.status_message = format!("Copied path: {}", entry.path);
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if let Some(path) = form.preview_path.clone() {
+                        self.request_preview_refresh(&mut form, path);
+                        self.status_message = "Re-reading the open file".into();
+                    } else {
+                        self.request_file_listing(form);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
             self.file_manager = Some(form);
             return true;
         }
@@ -1139,17 +1166,7 @@ impl App {
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
-            KeyCode::Char('k') if form.query.is_empty() => {
-                Self::move_file_selection(&mut form, -1);
-                self.queue_file_preloads(&mut form);
-                self.file_manager = Some(form);
-            }
             KeyCode::Down => {
-                Self::move_file_selection(&mut form, 1);
-                self.queue_file_preloads(&mut form);
-                self.file_manager = Some(form);
-            }
-            KeyCode::Char('j') if form.query.is_empty() => {
                 Self::move_file_selection(&mut form, 1);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
@@ -1185,29 +1202,17 @@ impl App {
             }
             KeyCode::Right | KeyCode::Enter => self.open_file_entry(form),
             KeyCode::PageUp => {
-                let page = form.preview_page_rows.max(1) as isize;
+                let page = Self::file_list_page(&form);
                 Self::move_file_selection(&mut form, -page);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
             KeyCode::PageDown => {
-                let page = form.preview_page_rows.max(1) as isize;
+                let page = Self::file_list_page(&form);
                 Self::move_file_selection(&mut form, page);
                 self.queue_file_preloads(&mut form);
                 self.file_manager = Some(form);
             }
-            KeyCode::Char('d') if form.query.is_empty() => {
-                self.download_selected_file(&form);
-                self.file_manager = Some(form);
-            }
-            KeyCode::Char('c') if form.query.is_empty() => {
-                if let Some(entry) = form.entries.get(form.selected) {
-                    self.clipboard_request = Some(entry.path.clone());
-                    self.status_message = format!("Copied path: {}", entry.path);
-                }
-                self.file_manager = Some(form);
-            }
-            KeyCode::Char('r') if form.query.is_empty() => self.request_file_listing(form),
             KeyCode::F(5) => self.request_file_listing(form),
             KeyCode::Backspace => {
                 let was_recursive = form.query.starts_with('/');
@@ -9271,17 +9276,28 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work/project".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work/project".into(),
                 entries: vec![FileEntry {
                     name: "README.md".into(),
                     path: "/work/project/README.md".into(),
                     kind: FileEntryKind::File,
+                    symlink: false,
                     size: 42,
                     mtime: 0,
                 }],
             }),
         });
+        // Plain letters filter the listing; downloads live on Ctrl-d so that
+        // typing a name starting with "d" is not intercepted.
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager.as_ref().map(|form| form.query.as_str()),
+            Some("d")
+        );
+        assert!(request_rx.try_recv().is_err());
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(
             receive_request(&request_rx),
             Request::DownloadFile { total_size: 42, .. }

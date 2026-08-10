@@ -182,8 +182,8 @@ Files over 4 MiB are not re-read on their own — press `r` or `F5` to pull the
 current bytes.
 
 **Keys** — `Ctrl-f` open/close · type to match · `Enter`/`Right` open · `Left`
-up · `d` download · `c` copy path · drag preview text to copy · drag local files
-in to upload.
+up · `Ctrl-d` download · `Ctrl-y` copy path · drag preview text to copy · drag
+local files in to upload.
 
 ### 🔍 Search, recap, and archive
 
@@ -328,18 +328,19 @@ first and last item, and each mouse-wheel event moves exactly one item.
 
 | Key or gesture | Action |
 | --- | --- |
-| `Up` / `Down`, `j` / `k` | Select an entry |
+| `Up` / `Down` | Select an entry |
 | Type text | Match entries in the current directory |
 | `/pattern` | Search filenames recursively below the current directory; supports `*` and `**` |
 | `Right`, `Enter`, double-click | Enter a directory or toggle Preview |
 | `Left`, right-click | Go to the parent directory |
 | Arrows, `PageUp` / `PageDown` | Page an opened preview, stopping at its start and end |
 | `g` / `G`, `Home` / `End` | Jump to preview start or end; the end follows the file as it grows |
-| `c` | Copy the selected target-side full path |
+| `Ctrl-y` | Copy the selected target-side full path |
 | Drag over preview text | Copy the selected preview text on release |
-| `d` | Download the selected file to `~/Downloads` |
+| `Ctrl-d` | Download the selected file to `~/Downloads` |
 | Drag local files in | Upload them to the browsed directory |
-| `r`, `F5` | Re-read the open preview, or refresh the current directory |
+| `Ctrl-r`, `F5` | Re-read the open preview, or refresh the current directory |
+| `j` / `k`, `c`, `d`, `r` | Same as above, inside an open preview where typing does not filter |
 | `Esc` | Close Preview, then clear a query, then close Files |
 
 Clicking a pane focuses it; machine and session rows, Archive, Back, and the
