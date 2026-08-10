@@ -155,6 +155,12 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
+    } else if let Some(version) = &app.available_update {
+        first_spans.push(Span::raw("  "));
+        first_spans.push(Span::styled(
+            format!("↑ v{version} available — muxloom update"),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     let first = Line::from(first_spans);
     let second = Line::from(vec![

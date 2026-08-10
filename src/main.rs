@@ -110,14 +110,18 @@ fn spawn_update_check(slot: muxloom::app::UpdateSlot, environment: Vec<(String, 
                     result.latest
                 )),
                 staged_version: Some(result.latest),
+                available_version: None,
             }
         } else if result.update_available {
+            // Nothing was downloaded on this path, so the header must not
+            // offer a restart: the user still has to run the update.
             muxloom::app::UpdateNote {
                 message: Some(format!(
                     "muxloom {} available — run `muxloom update`",
                     result.latest
                 )),
-                staged_version: Some(result.latest),
+                staged_version: None,
+                available_version: Some(result.latest),
             }
         } else {
             return;

@@ -125,7 +125,11 @@ pub struct UpdateNote {
     /// Footer message to show, if any.
     pub message: Option<String>,
     /// The newer version that is now staged / available, if any.
+    /// Set only when a new build was downloaded and is waiting on a restart.
     pub staged_version: Option<String>,
+    /// Set when a newer release exists but nothing was downloaded, so the
+    /// header asks for `muxloom update` rather than promising a restart.
+    pub available_version: Option<String>,
 }
 
 /// A slot the startup update thread writes once; the UI drains it on the next tick.
