@@ -1115,6 +1115,12 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         ""
     };
+    // A failure reads differently from the progress lines it sits among.
+    let status_style = if app.status_is_error() {
+        Style::default().fg(Color::LightRed)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
     if let Some((target_id, progress)) = app.visible_task_progress() {
         let gauge_width = area.width.min(52);
         let areas = Layout::default()
@@ -1127,7 +1133,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 " {}{busy}",
                 truncate(&app.status_message, status_width)
             ))
-            .style(Style::default().fg(Color::Gray)),
+            .style(status_style),
             areas[0],
         );
         let ratio = progress
@@ -1187,7 +1193,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!(" {}{busy}", truncate(&app.status_message, status_width)),
-                Style::default().fg(Color::Gray),
+                status_style,
             ),
             Span::styled(help, Style::default().fg(MUTED)),
         ])),

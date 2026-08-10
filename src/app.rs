@@ -512,6 +512,12 @@ pub struct App {
     /// reopening the browser for an agent returns to where you left off.
     file_dirs: HashMap<String, String>,
     pub status_message: String,
+    /// The last message written through `set_error`, with the moment it was
+    /// written. The footer colours the line while `status_message` still holds
+    /// that text, and background chatter refuses to replace a recent one — an
+    /// error the user has not had time to read must not be scrolled away by an
+    /// auto-reconnect they never asked for.
+    pub status_error: Option<(String, Instant)>,
     pub busy_operations: usize,
     pub pane_layout: PaneLayout,
     pub attention_banner: Option<Rect>,
@@ -1533,7 +1539,7 @@ impl App {
                 resize_error = Some(error.to_string());
             }
             if let Some(error) = resize_error {
-                self.status_message = format!("Terminal resize failed: {}", short_error(&error));
+                self.set_error(format!("Terminal resize failed: {}", short_error(&error)));
             }
         }
     }
@@ -1788,7 +1794,7 @@ impl App {
             return;
         }
         let Some(target) = self.target(&session.target_id).cloned() else {
-            self.status_message = "Archived session machine is no longer available".into();
+            self.set_error("Archived session machine is no longer available");
             return;
         };
         self.close_terminal();
@@ -1806,7 +1812,7 @@ impl App {
             path: session.path,
         };
         if self.worker.requests.send(request).is_err() {
-            self.status_message = "Resume scanner is unavailable".into();
+            self.set_error("Resume scanner is unavailable");
             return;
         }
         debug::log(
@@ -1917,7 +1923,10 @@ impl App {
                 let _ = sender.send(result);
             });
         if let Err(error) = spawned {
-            self.status_message = format!("Attach failed: {}", short_error(&error.to_string()));
+            self.set_error(format!(
+                "Attach failed: {}",
+                short_error(&error.to_string())
+            ));
             self.defer_terminal_retry();
             return;
         }
@@ -1932,7 +1941,7 @@ impl App {
             self.status_message =
                 "Terminal is connecting; input activates with its first frame".into();
         } else {
-            self.status_message = "Switching terminal in background".into();
+            self.set_background_status("Switching terminal in background");
         }
     }
 
@@ -1972,7 +1981,7 @@ impl App {
                 self.sync_terminal_size();
             }
             Err(error) => {
-                self.status_message = format!("Attach failed: {error}");
+                self.set_error(format!("Attach failed: {error}"));
                 self.defer_terminal_retry();
             }
         }
@@ -2091,7 +2100,7 @@ impl App {
             resize_error = Some(error.to_string());
         }
         if let Some(error) = resize_error {
-            self.status_message = format!("Terminal resize failed: {}", short_error(&error));
+            self.set_error(format!("Terminal resize failed: {}", short_error(&error)));
         }
     }
 
@@ -2179,11 +2188,12 @@ impl App {
                     self.terminal_session_id.as_deref().unwrap_or("unknown")
                 ),
             );
-            self.status_message = if take_input {
-                "Agent terminal input active; Left returns to agent list".into()
+            if take_input {
+                self.status_message =
+                    "Agent terminal input active; Left returns to agent list".into();
             } else {
-                "Live terminal connected in background".into()
-            };
+                self.set_background_status("Live terminal connected in background");
+            }
         }
     }
 
@@ -2588,9 +2598,7 @@ impl App {
                         }
                         self.refresh_target(&target_id);
                     }
-                    Err(error) => {
-                        self.status_message = format!("Launch failed: {}", short_error(&error))
-                    }
+                    Err(error) => self.set_error(format!("Launch failed: {}", short_error(&error))),
                 }
             }
             Event::Installed {
@@ -2618,7 +2626,7 @@ impl App {
                     }
                     Err(error) => {
                         self.pending_install_launch = None;
-                        self.status_message = format!("Install failed: {}", short_error(&error));
+                        self.set_error(format!("Install failed: {}", short_error(&error)));
                     }
                 }
             }
@@ -2636,9 +2644,7 @@ impl App {
                         self.selected_session_id = None;
                         self.refresh_target(&target_id);
                     }
-                    Err(error) => {
-                        self.status_message = format!("Close failed: {}", short_error(&error))
-                    }
+                    Err(error) => self.set_error(format!("Close failed: {}", short_error(&error))),
                 }
             }
             Event::Archived {
@@ -2661,7 +2667,7 @@ impl App {
                         self.refresh_target(&target_id);
                     }
                     Err(error) => {
-                        self.status_message = format!("Archive failed: {}", short_error(&error));
+                        self.set_error(format!("Archive failed: {}", short_error(&error)));
                     }
                 }
             }
@@ -2805,10 +2811,10 @@ impl App {
                         }
                         Err(error) => {
                             self.request_history();
-                            self.status_message = format!(
+                            self.set_error(format!(
                                 "Could not find resumable {kind} history: {}",
                                 short_error(&error)
-                            );
+                            ));
                         }
                     }
                 }
@@ -3066,7 +3072,7 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        self.status_message = format!("Upload failed: {}", short_error(&error));
+                        self.set_error(format!("Upload failed: {}", short_error(&error)));
                     }
                 }
             }
@@ -3142,7 +3148,7 @@ impl App {
                             "backup",
                             format!("restore of {session_id} to {target_id} failed: {error}"),
                         );
-                        self.status_message = format!("Restore failed: {error}");
+                        self.set_error(format!("Restore failed: {error}"));
                     }
                 }
             }
@@ -3294,7 +3300,7 @@ impl App {
             return;
         }
         let Some(target) = self.target(&session.target_id).cloned() else {
-            self.status_message = "That machine is no longer configured".into();
+            self.set_error("That machine is no longer configured");
             return;
         };
         if !self
@@ -3325,7 +3331,7 @@ impl App {
         {
             self.restoring
                 .remove(&(session.target_id.clone(), session.id.clone()));
-            self.status_message = "Restore worker is unavailable".into();
+            self.set_error("Restore worker is unavailable");
             return;
         }
         self.busy_operations = self.busy_operations.saturating_add(1);
@@ -3908,7 +3914,7 @@ impl App {
             self.history = HistoryPage::default();
             self.history_loading = false;
             self.pending_capture = None;
-            self.status_message = "Temporal Chat does not retain history".into();
+            self.set_error("Temporal Chat does not retain history");
             return;
         }
         if self.is_recoverable(&session.target_id, &session.id) {
@@ -4381,7 +4387,7 @@ impl App {
             return;
         };
         let Some(target) = self.target(&session.target_id).cloned() else {
-            self.status_message = "The selected agent's machine is unavailable".into();
+            self.set_error("The selected agent's machine is unavailable");
             return;
         };
         let visible = if self.attached_terminal_for_selected() {
@@ -5399,7 +5405,7 @@ impl App {
             .iter()
             .position(|target| target.target.id == result.target_id)
         else {
-            self.status_message = "Search result machine is no longer available".into();
+            self.set_error("Search result machine is no longer available");
             return;
         };
         if !self
@@ -5407,7 +5413,7 @@ impl App {
             .iter()
             .any(|session| session.id == result.session_id)
         {
-            self.status_message = "Search result session is no longer available".into();
+            self.set_error("Search result session is no longer available");
             return;
         }
         self.set_selected_target(target_index);
