@@ -19,7 +19,7 @@ use crate::{
         FileListing, FilePreview, FilePreviewKind, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
-    port_forward::{PortForwardManager, PortForwardSummary},
+    port_forward::{PortForwardManager, PortForwardState, PortForwardSummary},
     recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
     ssh_config,
@@ -736,6 +736,86 @@ impl App {
             if note.staged_version.is_some() {
                 self.staged_update = note.staged_version;
             }
+            if note.available_version.is_some() {
+                self.available_update = note.available_version;
+            }
+        }
+    }
+
+    /// Show `message` as a failure: it is coloured in the footer and, for a
+    /// few seconds, protected from being overwritten by background chatter.
+    fn set_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status_error = Some((message.clone(), Instant::now()));
+        self.status_message = message;
+    }
+
+    /// Show `message` unless it would bury a failure the user has not had time
+    /// to read. For lines nobody asked for: auto-reconnects, background
+    /// attaches, and other tick-driven progress.
+    fn set_background_status(&mut self, message: impl Into<String>) {
+        const ERROR_GRACE: Duration = Duration::from_secs(6);
+        if self
+            .status_error
+            .as_ref()
+            .is_some_and(|(text, at)| *text == self.status_message && at.elapsed() < ERROR_GRACE)
+        {
+            return;
+        }
+        self.status_message = message.into();
+    }
+
+    /// True while `status_message` still holds the last failure, so the footer
+    /// can colour it differently from an ordinary progress line.
+    pub fn status_is_error(&self) -> bool {
+        self.status_error
+            .as_ref()
+            .is_some_and(|(text, _)| *text == self.status_message)
+    }
+
+    /// Forwards come up on a background thread, so the modal is not the only
+    /// place their outcome matters: a tunnel that fails after the modal closes
+    /// would otherwise leave the footer claiming it is forwarding. Report every
+    /// state transition here, and keep the modal rows fresh while it is open.
+    fn poll_port_forwards(&mut self) {
+        let summaries = self.port_forwards.summaries();
+        self.port_forward_states
+            .retain(|id, _| summaries.iter().any(|summary| summary.id == *id));
+        for summary in &summaries {
+            let previous = self
+                .port_forward_states
+                .insert(summary.id, summary.state.clone());
+            if previous.as_ref() == Some(&summary.state) {
+                continue;
+            }
+            match &summary.state {
+                PortForwardState::Starting => {}
+                PortForwardState::Active => {
+                    self.status_message = format!(
+                        "Forwarding 127.0.0.1:{} to {}:{} on {}",
+                        summary.local_port,
+                        summary.remote_host,
+                        summary.remote_port,
+                        summary.target_id
+                    );
+                }
+                PortForwardState::Error(error) => {
+                    self.status_message = format!(
+                        "Forward 127.0.0.1:{} to {}:{} failed: {}",
+                        summary.local_port,
+                        summary.remote_host,
+                        summary.remote_port,
+                        short_error(error)
+                    );
+                }
+            }
+        }
+        if let Some(Modal::PortForward(form)) = self.modal.as_mut() {
+            form.active = summaries
+                .into_iter()
+                .filter(|summary| summary.target_id == form.target.id)
+                .collect();
+            form.selected = form.selected.min(form.row_count().saturating_sub(1));
         }
     }
 
@@ -746,10 +826,7 @@ impl App {
         self.animation_frame =
             (self.animation_epoch.elapsed().as_millis() / ANIMATION_FRAME_MS) as u64;
         self.drain_worker();
-        if let Some(Modal::PortForward(form)) = self.modal.as_mut() {
-            form.active = self.port_forwards.summaries_for(&form.target.id);
-            form.selected = form.selected.min(form.row_count().saturating_sub(1));
-        }
+        self.poll_port_forwards();
         self.drain_update_slot();
         self.poll_media();
         self.poll_attach();
@@ -4467,8 +4544,10 @@ impl App {
             Ok(forward) => {
                 form.error = None;
                 form.active = self.port_forwards.summaries_for(&form.target.id);
+                // The tunnel is still opening on a worker thread; poll_port_forwards
+                // reports whether it reached Active or failed.
                 self.status_message = format!(
-                    "Forwarding 127.0.0.1:{} to {}:{} on {}",
+                    "Starting forward 127.0.0.1:{} to {}:{} on {}...",
                     forward.local_port, forward.remote_host, forward.remote_port, forward.target_id
                 );
             }
@@ -5877,7 +5956,8 @@ impl App {
                 _ => self.modal = Some(Modal::Temporal(form)),
             },
             Modal::PortForward(mut form) => match key.code {
-                KeyCode::Esc | KeyCode::Char('p') => {}
+                KeyCode::Esc => {}
+                KeyCode::Char('p') if form.selected >= PortForwardForm::FIELD_COUNT => {}
                 KeyCode::Tab | KeyCode::Down => {
                     form.selected = clamped_index(form.selected, form.row_count(), 1);
                     form.error = None;

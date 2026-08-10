@@ -169,12 +169,12 @@ impl PortForwardManager {
         }
     }
 
-    pub fn summaries_for(&self, target_id: &str) -> Vec<PortForwardSummary> {
+    /// Every live forward, with the state its worker thread last published.
+    pub fn summaries(&self) -> Vec<PortForwardSummary> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .filter(|entry| entry.summary.target_id == target_id)
             .map(|entry| {
                 let mut summary = entry.summary.clone();
                 summary.state = entry
@@ -184,6 +184,13 @@ impl PortForwardManager {
                     .clone();
                 summary
             })
+            .collect()
+    }
+
+    pub fn summaries_for(&self, target_id: &str) -> Vec<PortForwardSummary> {
+        self.summaries()
+            .into_iter()
+            .filter(|summary| summary.target_id == target_id)
             .collect()
     }
 }
