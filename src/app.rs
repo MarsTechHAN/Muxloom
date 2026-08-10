@@ -4062,6 +4062,9 @@ impl App {
         }
         self.history_offset = 0;
         self.history = HistoryPage::default();
+        // The pane falls back to this text until the new session's capture
+        // lands, and the last session's failure must not be read as this one's.
+        self.history_message.clear();
         if self.selected_session().is_some_and(|session| session.dead) {
             self.request_history();
         } else {
