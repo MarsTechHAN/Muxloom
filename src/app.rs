@@ -600,7 +600,13 @@ pub struct App {
     pub(crate) task_progress: Vec<(String, TaskKind, TaskProgress)>,
     /// A newer version staged (or available) by the background update check;
     /// shown in the header. `None` until the check reports something newer.
+    /// Sessions whose current prompt has already been announced, and machines
+    /// that have answered at least one scan in this run. Both outlive
+    /// `sessions`, which is emptied when a machine is disabled.
+    notified_attention: HashSet<String>,
+    scanned_targets: HashSet<String>,
     pub staged_update: Option<String>,
+    pub available_update: Option<String>,
 }
 
 impl App {
@@ -707,7 +713,10 @@ impl App {
             next_file_search_id: 0,
             update_slot: Arc::new(Mutex::new(None)),
             task_progress: Vec::new(),
+            notified_attention: HashSet::new(),
+            scanned_targets: HashSet::new(),
             staged_update: None,
+            available_update: None,
         }
     }
 
@@ -2386,12 +2395,6 @@ impl App {
                 let scan_succeeded = result.is_ok();
                 self.clear_task_progress(&target_id, TaskKind::Connect);
                 self.pending_scans.remove(&target_id);
-                let previous_attention: HashSet<_> = self
-                    .sessions
-                    .iter()
-                    .filter(|session| session.target_id == target_id && session.needs_attention)
-                    .map(|session| session.id.clone())
-                    .collect();
                 let engaged = self
                     .terminal_session_id
                     .clone()
@@ -2407,16 +2410,35 @@ impl App {
                             target.probe = probe;
                             target.error = None;
                             target.consecutive_failures = 0;
-                            for session in sessions.iter().filter(|session| {
-                                session.needs_attention && !previous_attention.contains(&session.id)
-                            }) {
+                            // Alerts follow the prompt, not this list: reading
+                            // "already alerted" out of `self.sessions` made a
+                            // fresh start -- or re-enabling a machine, which
+                            // empties it -- ring the bell for every prompt that
+                            // had been waiting there all along.
+                            let here: HashSet<&str> =
+                                sessions.iter().map(|session| session.id.as_str()).collect();
+                            let asking: HashSet<&str> = sessions
+                                .iter()
+                                .filter(|session| session.needs_attention)
+                                .map(|session| session.id.as_str())
+                                .collect();
+                            self.notified_attention.retain(|id| {
+                                !here.contains(id.as_str()) || asking.contains(id.as_str())
+                            });
+                            let first_scan = self.scanned_targets.insert(target_id.clone());
+                            for session in sessions.iter().filter(|session| session.needs_attention)
+                            {
+                                if !self.notified_attention.insert(session.id.clone()) {
+                                    continue;
+                                }
                                 let reason = session
                                     .attention_reason
                                     .as_deref()
                                     .unwrap_or("input required");
                                 // No toast for the session the user is already
-                                // typing into.
-                                if engaged.as_deref() != Some(session.id.as_str()) {
+                                // typing into, nor for prompts that were already
+                                // waiting when this machine first answered.
+                                if !first_scan && engaged.as_deref() != Some(session.id.as_str()) {
                                     self.notifications.push(format!(
                                         "{} / {} needs input ({reason})",
                                         session.target_id,
@@ -2426,7 +2448,7 @@ impl App {
                                 debug::log(
                                     "attention",
                                     format!(
-                                        "new prompt target={} session={} reason={reason}",
+                                        "new prompt target={} session={} reason={reason} first_scan={first_scan}",
                                         session.target_id, session.id
                                     ),
                                 );
@@ -10296,6 +10318,67 @@ mod tests {
             single_line_paste("first\nsecond\tthird"),
             "first second third"
         );
+    }
+
+    fn waiting_session(id: &str, reason: &str) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work".into(),
+            label: id.into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: true,
+            attention_reason: Some(reason.into()),
+            recap: None,
+        }
+    }
+
+    /// Prompts that were already waiting when muxloom started -- or when a
+    /// machine came back -- are shown, not announced. Only prompts that appear
+    /// while the user is watching ring the bell.
+    #[test]
+    fn a_prompt_that_was_already_waiting_does_not_raise_a_notification() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let scan = |sessions: Vec<AgentSession>| Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((crate::model::Probe::default(), sessions)),
+        };
+
+        app.handle_worker_event(scan(vec![waiting_session("one", "approve?")]));
+        assert!(app.take_notifications().is_empty());
+
+        // A second prompt, found while the app is up, is news.
+        app.handle_worker_event(scan(vec![
+            waiting_session("one", "approve?"),
+            waiting_session("two", "approve?"),
+        ]));
+        let raised = app.take_notifications();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert!(raised[0].contains("two"), "{raised:?}");
+
+        // Disabling a machine drops its sessions; getting them back is not news.
+        app.sessions.retain(|session| session.target_id != "local");
+        app.handle_worker_event(scan(vec![
+            waiting_session("one", "approve?"),
+            waiting_session("two", "approve?"),
+        ]));
+        assert!(app.take_notifications().is_empty());
+
+        // A session that stops asking and asks again is news again.
+        let mut answered = waiting_session("two", "approve?");
+        answered.needs_attention = false;
+        answered.attention_reason = None;
+        app.handle_worker_event(scan(vec![waiting_session("one", "approve?"), answered]));
+        assert!(app.take_notifications().is_empty());
+        app.handle_worker_event(scan(vec![
+            waiting_session("one", "approve?"),
+            waiting_session("two", "approve?"),
+        ]));
+        assert_eq!(app.take_notifications().len(), 1);
     }
 
     fn ux_test_app(targets: Vec<Target>) -> App {
