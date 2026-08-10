@@ -6789,7 +6789,6 @@ impl App {
             cursor: point,
             dragging: true,
         });
-        self.status_message = "Selecting terminal text...".into();
         true
     }
 
@@ -6799,6 +6798,11 @@ impl App {
         };
         if let Some(selection) = self.terminal_selection.as_mut() {
             selection.cursor = point;
+            // Announced here rather than on button-down: a plain click selects
+            // nothing, and the note used to sit in the footer for good.
+            if selection.anchor != point {
+                self.status_message = "Selecting terminal text...".into();
+            }
         }
     }
 
@@ -6808,6 +6812,9 @@ impl App {
         }
         if self.copy_terminal_selection() {
             return;
+        }
+        if self.status_message == "Selecting terminal text..." {
+            self.status_message = "Nothing selected".into();
         }
 
         self.terminal_selection = None;
