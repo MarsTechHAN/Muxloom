@@ -253,6 +253,9 @@ pub struct FileManagerForm {
     pub query: String,
     pub search_request_id: Option<u64>,
     pub searching: bool,
+    /// Set when the last recursive search hit its own budget, so the footer can
+    /// say the list is a slice of the matches rather than all of them.
+    pub search_truncated: bool,
     pub search_edited_at: Option<Instant>,
     pub preview_cache: HashMap<String, FilePreview>,
     pub preload_pending: HashSet<String>,
@@ -2942,7 +2945,7 @@ impl App {
                     form.loading = false;
                     self.file_monitor_in_flight = false;
                     match result {
-                        Ok(FileListing { path, entries }) => {
+                        Ok(FileListing { path, entries, .. }) => {
                             form.directory_cache.insert(path.clone(), entries.clone());
                             form.path = path;
                             // Every listing doubles as a freshness check for the
@@ -4830,6 +4833,7 @@ impl App {
             query: String::new(),
             search_request_id: None,
             searching: false,
+            search_truncated: false,
             search_edited_at: None,
             preview_cache: HashMap::new(),
             preload_pending: HashSet::new(),
@@ -5043,12 +5047,14 @@ impl App {
         form.search_edited_at = None;
         match result {
             Ok(listing) => {
+                form.search_truncated = listing.truncated;
                 form.entries = listing.entries;
                 form.selected = 0;
                 form.return_path = None;
                 form.error = None;
             }
             Err(error) => {
+                form.search_truncated = false;
                 form.entries.clear();
                 form.selected = 0;
                 form.error = Some(short_error(&error));
@@ -9352,6 +9358,7 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: Vec::new(),
             }),
@@ -9369,6 +9376,7 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work/project".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work/project".into(),
                 entries: Vec::new(),
             }),
@@ -9495,11 +9503,13 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work/project".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work/project".into(),
                 entries: vec![FileEntry {
                     name: "src".into(),
                     path: "/work/project/src".into(),
                     kind: FileEntryKind::Directory,
+                    symlink: false,
                     size: 0,
                     mtime: 0,
                 }],
@@ -9620,12 +9630,14 @@ mod tests {
             target_id: "local".into(),
             requested_path: ".".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![
                     FileEntry {
                         name: "alpha.txt".into(),
                         path: "/work/alpha.txt".into(),
                         kind: FileEntryKind::File,
+                        symlink: false,
                         size: 5,
                         mtime: 0,
                     },
@@ -9633,6 +9645,7 @@ mod tests {
                         name: "beta.rs".into(),
                         path: "/work/beta.rs".into(),
                         kind: FileEntryKind::File,
+                        symlink: false,
                         size: 12,
                         mtime: 0,
                     },
@@ -9640,6 +9653,7 @@ mod tests {
                         name: "src".into(),
                         path: "/work/src".into(),
                         kind: FileEntryKind::Directory,
+                        symlink: false,
                         size: 0,
                         mtime: 0,
                     },
@@ -9710,6 +9724,7 @@ mod tests {
             name: "notes.log".into(),
             path: "/work/notes.log".into(),
             kind: FileEntryKind::File,
+            symlink: false,
             size,
             mtime,
         };
@@ -9738,6 +9753,7 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![entry],
             }),
@@ -9784,6 +9800,7 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![FileEntry {
                     size: AUTO_REFRESH_LIMIT + 4_096,
@@ -9816,6 +9833,7 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![FileEntry {
                     size: 12,
@@ -9936,12 +9954,14 @@ mod tests {
             target_id: "local".into(),
             requested_path: ".".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![
                     FileEntry {
                         name: "README.md".into(),
                         path: "/work/README.md".into(),
                         kind: FileEntryKind::File,
+                        symlink: false,
                         size: 300_000,
                         mtime: 0,
                     },
@@ -9949,6 +9969,7 @@ mod tests {
                         name: "src".into(),
                         path: "/work/src".into(),
                         kind: FileEntryKind::Directory,
+                        symlink: false,
                         size: 0,
                         mtime: 0,
                     },
@@ -10043,6 +10064,7 @@ mod tests {
                 name: "old".into(),
                 path: "/work/old".into(),
                 kind: FileEntryKind::Directory,
+                symlink: false,
                 size: 0,
                 mtime: 0,
             },
@@ -10050,6 +10072,7 @@ mod tests {
                 name: "new".into(),
                 path: "/work/new".into(),
                 kind: FileEntryKind::Directory,
+                symlink: false,
                 size: 0,
                 mtime: 0,
             },
@@ -10063,12 +10086,14 @@ mod tests {
             target_id: "local".into(),
             requested_path: "/work".into(),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![
                     FileEntry {
                         name: "old".into(),
                         path: "/work/old".into(),
                         kind: FileEntryKind::Directory,
+                        symlink: false,
                         size: 0,
                         mtime: 0,
                     },
@@ -10076,6 +10101,7 @@ mod tests {
                         name: "new".into(),
                         path: "/work/new".into(),
                         kind: FileEntryKind::Directory,
+                        symlink: false,
                         size: 0,
                         mtime: 0,
                     },
@@ -10432,6 +10458,7 @@ mod tests {
             query: String::new(),
             search_request_id: None,
             searching: false,
+            search_truncated: false,
             search_edited_at: None,
             preview_cache: HashMap::new(),
             preload_pending: HashSet::new(),
@@ -11012,6 +11039,7 @@ mod tests {
             name: "README.md".into(),
             path: "/work/README.md".into(),
             kind: FileEntryKind::File,
+            symlink: false,
             size: 10,
             mtime: 0,
         };
@@ -11052,11 +11080,13 @@ mod tests {
             pattern: pattern.clone(),
             request_id: request_id.saturating_sub(1),
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![FileEntry {
                     name: "stale.rs".into(),
                     path: "/work/stale.rs".into(),
                     kind: FileEntryKind::File,
+                    symlink: false,
                     size: 1,
                     mtime: 0,
                 }],
@@ -11071,6 +11101,7 @@ mod tests {
             name: "src/job.rs".into(),
             path: "/work/src/job.rs".into(),
             kind: FileEntryKind::File,
+            symlink: false,
             size: 20,
             mtime: 0,
         };
@@ -11078,6 +11109,7 @@ mod tests {
             name: "tests/job.rs".into(),
             path: "/work/tests/job.rs".into(),
             kind: FileEntryKind::File,
+            symlink: false,
             size: 30,
             mtime: 0,
         };
@@ -11087,6 +11119,7 @@ mod tests {
             pattern,
             request_id,
             result: Ok(FileListing {
+                truncated: false,
                 path: "/work".into(),
                 entries: vec![found.clone(), second.clone()],
             }),

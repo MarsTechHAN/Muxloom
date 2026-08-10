@@ -1472,9 +1472,12 @@ END {
         }
         // Size and modification time come from a single stat so the browser can
         // tell that an open file changed without paying a second call per entry.
+        // Link entries report what they resolve to (test follows links), with the
+        // kind letter upper-cased so the browser can still mark them as links:
+        // d/D directory, f/F regular file, o/O anything else or a broken link.
         let collect = r#"for entry do
-            if [ -L "$entry" ]; then kind=l; size=0; mtime=0;
-            elif [ -d "$entry" ]; then kind=d; size=0; mtime=0;
+            if [ -L "$entry" ]; then link=1; else link=0; fi
+            if [ -d "$entry" ]; then kind=d; size=0; mtime=0;
             elif [ -f "$entry" ]; then
                 kind=f
                 meta=$(stat -c '%s %Y' -- "$entry" 2>/dev/null || stat -f '%z %m' "$entry" 2>/dev/null)
@@ -1483,6 +1486,9 @@ END {
                     *) size=$(wc -c < "$entry" | tr -d '[:space:]'); mtime=0 ;;
                 esac
             else kind=o; size=0; mtime=0; fi
+            if [ "$link" = 1 ]; then
+                case "$kind" in d) kind=D ;; f) kind=F ;; *) kind=O ;; esac
+            fi
             name=${entry#./}
             printf '%s\0%s\0%s\0%s\0' "$kind" "$size" "$mtime" "$name"
         done"#;
@@ -1520,6 +1526,10 @@ END {
         let mut listing = Some(root_listing);
         let mut results = Vec::new();
         let mut visited = 0usize;
+        // The walk gives up on huge trees rather than running forever, and the
+        // caller has to be able to say so instead of showing a partial answer
+        // as if it were the whole one.
+        let mut truncated = false;
 
         loop {
             let current = if let Some(listing) = listing.take() {
@@ -1542,11 +1552,14 @@ END {
             for mut entry in current.entries {
                 visited += 1;
                 if visited > MAX_VISITED || results.len() >= MAX_RESULTS {
+                    truncated = true;
                     break;
                 }
                 match entry.kind {
-                    FileEntryKind::Directory => directories.push_back(entry.path),
-                    FileEntryKind::File | FileEntryKind::Symlink
+                    // Links are not descended into: a link back up the tree
+                    // would make the walk loop until the visit budget runs out.
+                    FileEntryKind::Directory if !entry.symlink => directories.push_back(entry.path),
+                    FileEntryKind::File | FileEntryKind::Symlink | FileEntryKind::Other
                         if filename_matches_pattern(&entry.name, pattern) =>
                     {
                         entry.name = relative_search_path(&canonical_root, &entry.path);
@@ -1556,11 +1569,13 @@ END {
                 }
             }
             if visited > MAX_VISITED || results.len() >= MAX_RESULTS {
+                truncated = true;
                 break;
             }
         }
         results.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(FileListing {
+            truncated,
             path: canonical_root,
             entries: results,
         })
@@ -2680,11 +2695,14 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
     }
     let mut entries = Vec::new();
     for fields in values.chunks_exact(4) {
-        let kind = match fields[0] {
-            b"d" => FileEntryKind::Directory,
-            b"f" => FileEntryKind::File,
-            b"l" => FileEntryKind::Symlink,
-            _ => FileEntryKind::Other,
+        let (kind, symlink) = match fields[0] {
+            b"d" => (FileEntryKind::Directory, false),
+            b"f" => (FileEntryKind::File, false),
+            b"D" => (FileEntryKind::Directory, true),
+            b"F" => (FileEntryKind::File, true),
+            // "l" is what older targets emit for any link, resolved or not.
+            b"O" | b"l" => (FileEntryKind::Other, true),
+            _ => (FileEntryKind::Other, false),
         };
         let size = String::from_utf8_lossy(fields[1]).parse().unwrap_or(0);
         let mtime = String::from_utf8_lossy(fields[2]).parse().unwrap_or(0);
@@ -2696,6 +2714,7 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
             path: remote_child_path(&path, &name),
             name,
             kind,
+            symlink,
             size,
             mtime,
         });
@@ -2706,7 +2725,11 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             .then_with(|| left.name.cmp(&right.name))
     });
-    Ok(FileListing { path, entries })
+    Ok(FileListing {
+        path,
+        entries,
+        truncated: false,
+    })
 }
 
 fn parse_file_preview(output: &[u8]) -> Result<FilePreview> {

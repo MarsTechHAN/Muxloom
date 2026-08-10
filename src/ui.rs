@@ -1480,11 +1480,14 @@ fn draw_file_browser(
         form.entries
             .iter()
             .map(|entry| {
-                let (icon, color) = match entry.kind {
-                    FileEntryKind::Directory => ("▸", ACCENT),
-                    FileEntryKind::File => ("·", Color::White),
-                    FileEntryKind::Symlink => ("↗", Color::Cyan),
-                    FileEntryKind::Other => ("?", MUTED),
+                // A link shows where it points (a directory arrow still opens
+                // like a directory) but keeps its own colour so it reads as one.
+                let (icon, color) = match (entry.kind, entry.symlink) {
+                    (_, true) => ("↗", Color::Cyan),
+                    (FileEntryKind::Directory, false) => ("▸", ACCENT),
+                    (FileEntryKind::File, false) => ("·", Color::White),
+                    (FileEntryKind::Symlink, false) => ("↗", Color::Cyan),
+                    (FileEntryKind::Other, false) => ("?", MUTED),
                 };
                 let size = if entry.kind == FileEntryKind::File {
                     format_bytes(entry.size)
@@ -1534,17 +1537,31 @@ fn draw_file_browser(
             .collect()
     };
 
-    let footer = if form.preview_path.is_some() {
+    // A listing that failed while cached rows are still on screen has nowhere
+    // else to say so: the rows look current and only the title carries a tag.
+    let footer = if let Some(error) = form.error.as_deref().filter(|_| !form.entries.is_empty()) {
+        error
+    } else if form.preview_path.is_some() {
         "Double-click/Enter close  Scroll or arrows page  Right-click parent"
     } else if form.loading || form.searching {
         "Click select  Double-click open  Right-click parent  loading"
     } else if form.query.starts_with('/') {
-        "Recursive filename search  * and ** wildcards  Esc clears"
+        if form.search_truncated {
+            "Too many to list — these are some of the matches; narrow the pattern"
+        } else {
+            "Recursive filename search  * and ** wildcards  Esc clears"
+        }
     } else {
-        "Type / to search subfolders  Double-click open  c copy  d download"
+        "Type / to search subfolders  Double-click open  Ctrl-y copy  Ctrl-d download"
+    };
+    let footer_color = if form.error.is_some() && !form.entries.is_empty() {
+        Color::Red
+    } else {
+        MUTED
     };
     frame.render_widget(
-        Paragraph::new(truncate(footer, rows[1].width as usize)).style(Style::default().fg(MUTED)),
+        Paragraph::new(truncate(footer, rows[1].width as usize))
+            .style(Style::default().fg(footer_color)),
         rows[1],
     );
 }
@@ -4328,6 +4345,7 @@ mod tests {
                 name: "README.md".into(),
                 path: "/work/README.md".into(),
                 kind: crate::model::FileEntryKind::File,
+                symlink: false,
                 size: 42,
                 mtime: 0,
             }],
@@ -4357,6 +4375,7 @@ mod tests {
             query: String::new(),
             search_request_id: None,
             searching: false,
+            search_truncated: false,
             search_edited_at: None,
             preview_cache: std::collections::HashMap::new(),
             preload_pending: std::collections::HashSet::new(),
@@ -4463,6 +4482,7 @@ mod tests {
                 name: "notes.log".into(),
                 path: "/work/notes.log".into(),
                 kind: crate::model::FileEntryKind::File,
+                symlink: false,
                 size: 42,
                 mtime: 1,
             }],
@@ -4485,6 +4505,7 @@ mod tests {
             query: String::new(),
             search_request_id: None,
             searching: false,
+            search_truncated: false,
             search_edited_at: None,
             preview_cache: std::collections::HashMap::new(),
             preload_pending: std::collections::HashSet::new(),

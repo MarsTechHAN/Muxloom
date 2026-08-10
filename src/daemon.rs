@@ -1690,21 +1690,39 @@ mod platform {
         for entry in fs::read_dir(&path)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
-            let kind = if file_type.is_symlink() {
-                FileEntryKind::Symlink
+            let symlink = file_type.is_symlink();
+            // Classify a link by what it points at: a link to a directory has to
+            // be enterable, and a link to a file has to be previewable. A broken
+            // link resolves to nothing and stays Other.
+            let resolved = if symlink {
+                fs::metadata(entry.path()).ok().map(|metadata| {
+                    if metadata.is_dir() {
+                        FileEntryKind::Directory
+                    } else if metadata.is_file() {
+                        FileEntryKind::File
+                    } else {
+                        FileEntryKind::Other
+                    }
+                })
             } else if file_type.is_dir() {
-                FileEntryKind::Directory
+                Some(FileEntryKind::Directory)
             } else if file_type.is_file() {
-                FileEntryKind::File
+                Some(FileEntryKind::File)
             } else {
-                FileEntryKind::Other
+                Some(FileEntryKind::Other)
             };
-            let metadata = entry.metadata().ok();
+            let kind = resolved.unwrap_or(FileEntryKind::Other);
+            let metadata = if symlink {
+                fs::metadata(entry.path()).ok()
+            } else {
+                entry.metadata().ok()
+            };
             entries.push(FileEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().to_string_lossy().into_owned(),
                 kind,
-                size: if file_type.is_file() {
+                symlink,
+                size: if kind == FileEntryKind::File {
                     metadata.as_ref().map_or(0, |metadata| metadata.len())
                 } else {
                     0
@@ -1722,6 +1740,7 @@ mod platform {
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
         Ok(FileListing {
+            truncated: false,
             path: path.to_string_lossy().into_owned(),
             entries,
         })
@@ -3210,6 +3229,54 @@ mod platform {
             );
             // A bare name with no PATH to search is likewise refused.
             assert_eq!(resolve_executable_on_path("claude", None), None);
+        }
+
+        #[test]
+        fn a_listing_classifies_a_symlink_by_what_it_points_at() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloomd-symlinks-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(root.join("releases")).unwrap();
+            fs::write(root.join("notes.txt"), b"hello").unwrap();
+            std::os::unix::fs::symlink(root.join("releases"), root.join("current")).unwrap();
+            std::os::unix::fs::symlink(root.join("notes.txt"), root.join("latest.txt")).unwrap();
+            std::os::unix::fs::symlink(root.join("gone"), root.join("broken")).unwrap();
+
+            let listing = native_list_files(root.to_str().unwrap()).unwrap();
+            let entry = |name: &str| {
+                listing
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing from listing"))
+                    .clone()
+            };
+
+            // A link to a directory has to open like a directory, or a deploy
+            // tree laid out as current -> releases/vN is a dead end.
+            let current = entry("current");
+            assert_eq!(current.kind, FileEntryKind::Directory);
+            assert!(current.symlink);
+            // A link to a file previews, and reports the target's size.
+            let latest = entry("latest.txt");
+            assert_eq!(latest.kind, FileEntryKind::File);
+            assert!(latest.symlink);
+            assert_eq!(latest.size, 5);
+            // A link that resolves to nothing stays unopenable.
+            let broken = entry("broken");
+            assert_eq!(broken.kind, FileEntryKind::Other);
+            assert!(broken.symlink);
+            // Plain entries are unchanged and never flagged as links.
+            assert_eq!(entry("releases").kind, FileEntryKind::Directory);
+            assert!(!entry("releases").symlink);
+            assert!(!entry("notes.txt").symlink);
+
+            fs::remove_dir_all(&root).ok();
         }
 
         fn test_state(name: &str) -> Arc<DaemonState> {

@@ -270,12 +270,21 @@ pub struct FileEntry {
     /// change stamp the browser polls to notice edits to an open file.
     #[serde(default)]
     pub mtime: u64,
+    /// True when the entry is a symbolic link. `kind` describes what the link
+    /// resolves to, so a link to a directory can be opened like any other
+    /// directory; this flag only keeps the listing able to say it is a link.
+    #[serde(default)]
+    pub symlink: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileListing {
     pub path: String,
     pub entries: Vec<FileEntry>,
+    /// True when the walk stopped at its own budget rather than at the end of
+    /// the tree, so the caller can say the list is a slice rather than the set.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
