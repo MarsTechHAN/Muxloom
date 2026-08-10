@@ -1163,6 +1163,10 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 if form.query.is_empty() {
+                    // Ctrl-f remembers where the user was; Esc has to as well,
+                    // or closing one way loses the directory and the other does
+                    // not.
+                    self.remember_file_dir(&form);
                     self.status_message = "File browser closed".into();
                 } else {
                     form.query.clear();
