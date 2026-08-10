@@ -4281,6 +4281,18 @@ impl App {
         self.scroll_history(older, page);
     }
 
+    /// Drop a finished selection when the view scrolls out from under it, but
+    /// leave a drag in progress alone: the button is still down, and rolling
+    /// the wheel mid-drag is how a selection is carried past the pane's edge.
+    fn release_selection_for_scroll(&mut self) {
+        if !self
+            .terminal_selection
+            .is_some_and(|selection| selection.dragging)
+        {
+            self.terminal_selection = None;
+        }
+    }
+
     fn scroll_history(&mut self, older: bool, lines: usize) {
         if self.attached_terminal_for_selected() {
             self.scroll_attached_terminal(older, lines);
@@ -4313,7 +4325,7 @@ impl App {
         } else {
             self.history_offset = self.history_offset.saturating_sub(lines.max(1));
         }
-        self.terminal_selection = None;
+        self.release_selection_for_scroll();
         if self.history_offset == 0 && self.selected_session().is_some_and(|session| !session.dead)
         {
             self.history_loading = false;
