@@ -7363,17 +7363,36 @@ fn sanitize_terminal_text(output: &str) -> String {
             match characters.peek().copied() {
                 Some('[') => {
                     characters.next();
-                    let mut sequence = String::from("\x1b[");
+                    let mut parameters = String::new();
                     let mut final_byte = None;
                     for next in characters.by_ref() {
-                        sequence.push(next);
                         if ('@'..='~').contains(&next) {
                             final_byte = Some(next);
                             break;
                         }
+                        parameters.push(next);
                     }
-                    if final_byte == Some('m') {
-                        sanitized.push_str(&sequence);
+                    match final_byte {
+                        Some('m') => {
+                            sanitized.push('\x1b');
+                            sanitized.push('[');
+                            sanitized.push_str(&parameters);
+                            sanitized.push('m');
+                        }
+                        // A rendered row crosses cells it never wrote by moving
+                        // the cursor rather than by spacing over them, so a
+                        // transcript laid out in columns -- every panel an
+                        // agent draws -- arrives with its gaps as escapes.
+                        // Nothing downstream moves a cursor, so spend them as
+                        // spaces and the columns survive the trip.
+                        Some('C') => {
+                            let columns = parameters
+                                .parse::<usize>()
+                                .unwrap_or(1)
+                                .clamp(1, MAXIMUM_CURSOR_ADVANCE);
+                            sanitized.extend(std::iter::repeat_n(' ', columns));
+                        }
+                        _ => {}
                     }
                 }
                 Some(']') => {
@@ -7393,12 +7412,23 @@ fn sanitize_terminal_text(output: &str) -> String {
                 }
                 None => {}
             }
+        } else if character == '\x08' {
+            // A row that wraps a wide glyph is written as space-backspace-erase.
+            // Taking the space back leaves the line the width it renders at.
+            if !sanitized.ends_with('\n') {
+                sanitized.pop();
+            }
         } else if character == '\n' || character == '\t' || !character.is_control() {
             sanitized.push(character);
         }
     }
     sanitized
 }
+
+/// How far one cursor-forward escape is allowed to space a line out. Rendered
+/// rows never advance past their own width; this only stops a malformed count
+/// in raw output from inflating a page.
+const MAXIMUM_CURSOR_ADVANCE: usize = 1_000;
 
 fn strip_terminal_styles(output: &str) -> String {
     let mut plain = String::with_capacity(output.len());
@@ -7777,6 +7807,25 @@ mod tests {
         );
         assert_eq!(styled, "\x1b[31;1mred\x1b[0m\nlink");
         assert_eq!(strip_terminal_styles(&styled), "red\nlink");
+    }
+
+    #[test]
+    fn rendered_history_rows_keep_the_columns_they_were_drawn_in() {
+        // The daemon renders history through an emulator, and an emulator
+        // crosses cells nobody wrote by moving the cursor. Dropping those moves
+        // pulled every column of an agent's panels back against the left
+        // margin, and took the copy-a-selection column maths with it.
+        let log = b"\x1b[1;1Hname\x1b[1;12Hstatus\r\n\x1b[2;3Hclaude\x1b[2;12Hworking\r\n";
+        let (page, _total, _offset) =
+            crate::terminal_session::render_history_rows(&log[..], 24, 4, 0, 6).expect("render");
+        let page = String::from_utf8(page).expect("utf-8 rows");
+
+        let text = sanitize_terminal_text(&page);
+        let plain = strip_terminal_styles(&text);
+        let mut lines = plain.lines();
+
+        assert_eq!(lines.next(), Some("name       status"));
+        assert_eq!(lines.next(), Some("  claude   working"));
     }
 
     #[test]

@@ -954,6 +954,10 @@ fn render_vt_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, area: Rect, s
     }
 }
 
+/// Dim and strikethrough are missing here on purpose: vt100 0.15 tracks them
+/// internally but `Cell` exposes no accessor for either, so a live screen
+/// cannot render what `ansi_history_text` shows for the same bytes in deep
+/// history. Add them here once the crate grows the accessors.
 fn vt_style(cell: &vt100::Cell) -> Style {
     let mut style = Style::default()
         .fg(vt_color(cell.fgcolor()))
