@@ -7521,6 +7521,16 @@ fn inside(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+/// A horizontal divider spans the whole window, so the row of slack a vertical
+/// divider gets on each side would cover the terminal's last line of output
+/// from edge to edge. Only the divider row and the border below it grab.
+fn near_horizontal_divider(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row <= area.y.saturating_add(area.height)
+}
+
 fn near_divider(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x.saturating_sub(1)
         && column <= area.x.saturating_add(area.width)
@@ -8316,6 +8326,23 @@ mod tests {
     }
 
     #[test]
+    fn the_terminal_row_above_a_horizontal_divider_is_not_a_drag_handle() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.pane_layout = PaneLayout {
+            recap: Some(Rect::new(0, 0, 80, 20)),
+            agents: Some(Rect::new(0, 20, 80, 10)),
+            portrait_terminal_divider: Some(Rect::new(0, 19, 80, 1)),
+            ..PaneLayout::default()
+        };
+        // The last row of terminal output belongs to the terminal.
+        assert!(!app.on_divider(40, 18));
+        assert!(app.dragging.is_none());
+        assert!(app.on_divider(40, 19));
+        app.dragging = None;
+        assert!(app.on_divider(40, 20));
+    }
+
+    #[test]
     fn mouse_drag_changes_sidebar_width() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
@@ -8349,14 +8376,19 @@ mod tests {
             row: 10,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.state.machine_width, 33);
+        // The divider lands under the pointer, at column 40.
+        assert_eq!(app.state.machine_width, 41);
 
         app.open_file_manager();
         app.focus = Focus::Agents;
         app.dragging = Some(DragDivider::Agents);
         app.drag_divider(80, 10);
-        assert_eq!(app.state.file_width, 39);
+        assert_eq!(app.state.file_width, 49);
         assert_eq!(app.state.agents_width, 40);
+        // ...and stays there whichever pane happens to be focused.
+        app.focus = Focus::Recap;
+        app.drag_divider(80, 10);
+        assert_eq!(app.state.file_width, 49);
     }
 
     #[test]
