@@ -332,6 +332,20 @@ impl ResumeCandidate {
     }
 }
 
+/// Where a backed-up transcript landed after being restored onto a machine that
+/// had lost it. Plain fields so the daemon build, which has no backup store,
+/// still compiles the worker protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredTranscript {
+    /// The agent-native id to resume with (`claude --resume <id>`,
+    /// `codex resume <id>`).
+    pub resume_id: String,
+    /// Absolute path the transcript now occupies on the target.
+    pub path: String,
+    /// Uncompressed transcript size, for the status line.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub text: String,

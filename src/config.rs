@@ -62,7 +62,9 @@ impl Default for Config {
 
 /// Settings for the local history backup that mirrors every session (running and
 /// archived) from all machines into `<state>/backup/` as zstd blobs + a JSON
-/// index. Local only — nothing leaves the machine.
+/// index. The mirror is pull-only: the copy is made here and nothing is sent
+/// anywhere, except when a machine that lost a session is explicitly asked to
+/// take its transcript back, which copies out and leaves the local record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackupConfig {
@@ -430,7 +432,8 @@ auto_update = true
 
 # Local backup of every session's conversation history (running + archived)
 # from all machines into ~/.local/state/muxloom/backup/ as compressed blobs.
-# Local only; nothing leaves the machine.
+# Nothing is pushed anywhere on its own; a machine that lost a session can be
+# asked to take the transcript back, and the local copy is kept either way.
 [backup]
 enabled = true
 interval_secs = 300

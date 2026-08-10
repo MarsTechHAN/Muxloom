@@ -25,6 +25,7 @@
 //! delta; [`BackupStore::read_blob`] stitches the frames back into one stream.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -37,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    model::{AgentKind, LOCAL_TARGET_ID, Target, Transport},
+    model::{AgentKind, LOCAL_TARGET_ID, RestoredTranscript, Target, Transport},
     runtime::{Runtime, is_temporary_session_id},
 };
 
@@ -1049,6 +1050,155 @@ fn truncate_title(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Restore: push a backed-up conversation back onto the machine it came from.
+// ---------------------------------------------------------------------------
+
+/// The backed-up sessions of one machine that the machine itself no longer
+/// knows about — what a wiped, reimaged or recycled box lost. `alias` is the
+/// target id as configured locally; records are partitioned by stable machine
+/// key, so it is de-aliased first. Newest first.
+///
+/// A record is only worth listing if something readable came back with it: a
+/// structured transcript (restorable) or a terminal capture (readable). Live
+/// sessions are filtered out by the caller's `live_session_ids`, so the result
+/// is exactly the history that would otherwise have vanished with the machine.
+///
+/// Records are collapsed to one per agent-native transcript, newest kept:
+/// several muxloom sessions resuming the same conversation share a transcript,
+/// and once one of them is live again — which is what a restore leads to — the
+/// whole conversation stops being lost and drops off the list.
+pub fn recoverable_records(
+    store: &BackupStore,
+    alias: &str,
+    live_session_ids: &HashSet<String>,
+) -> Vec<BackupRecord> {
+    let index = match store.load_index() {
+        Ok(index) => index,
+        Err(error) => {
+            crate::debug::log("backup", format!("index unreadable: {error:#}"));
+            return Vec::new();
+        }
+    };
+    let machine = index.machine_key_for_alias(alias);
+    let mine: Vec<BackupRecord> = index
+        .records
+        .into_iter()
+        .filter(|record| record.target_id == machine)
+        .filter(|record| record.kind != AgentKind::Terminal.as_str())
+        .collect();
+    // Conversations that still have a session on the machine are not lost, no
+    // matter which of their records the machine happens to still know about.
+    let present: HashSet<&str> = mine
+        .iter()
+        .filter(|record| live_session_ids.contains(&record.session_id))
+        .map(|record| record.native_id.as_str())
+        .filter(|native_id| !native_id.is_empty())
+        .collect();
+    let mut records: Vec<BackupRecord> = mine
+        .iter()
+        .filter(|record| !live_session_ids.contains(&record.session_id))
+        .filter(|record| !present.contains(record.native_id.as_str()))
+        .filter(|record| {
+            record.message_count > 0
+                || store.blob_len(&record.target_id, &record.session_id, CAPTURE_BLOB) > 0
+        })
+        .cloned()
+        .collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+    let mut seen: HashSet<String> = HashSet::new();
+    records.retain(|record| record.native_id.is_empty() || seen.insert(record.native_id.clone()));
+    records
+}
+
+/// Whether a record carries the structured transcript a restore needs. Records
+/// with only a terminal capture are readable but cannot be resumed.
+pub fn is_restorable(record: &BackupRecord) -> bool {
+    !record.native_id.is_empty()
+        && native_relative_path(&record.native_path).is_some()
+        && record.jsonl_bytes_synced > 0
+}
+
+/// Restore one session of one machine from the default store, looked up by the
+/// key the UI carries. See [`restore_transcript`].
+pub fn restore_session(
+    runtime: &Runtime,
+    target: &Target,
+    machine_key: &str,
+    session_id: &str,
+) -> Result<RestoredTranscript> {
+    let store = BackupStore::new(BackupStore::default_root());
+    let index = store.load_index()?;
+    let record = index
+        .position(machine_key, session_id)
+        .map(|position| index.records[position].clone())
+        .with_context(|| format!("{session_id} is not in the backup of {machine_key}"))?;
+    restore_transcript(runtime, &store, target, &record)
+}
+
+/// Write a backed-up transcript back onto `target` at the agent-native location
+/// so the agent's own resume can find it again, and return the id to resume
+/// with. The local blob is left untouched — this copies out, it does not move.
+pub fn restore_transcript(
+    runtime: &Runtime,
+    store: &BackupStore,
+    target: &Target,
+    record: &BackupRecord,
+) -> Result<RestoredTranscript> {
+    if record.native_id.is_empty() {
+        bail!("only this session's terminal output was backed up, not a resumable transcript");
+    }
+    let relative = native_relative_path(&record.native_path).with_context(|| {
+        format!(
+            "cannot place a transcript from an unrecognised path: {}",
+            record.native_path
+        )
+    })?;
+    let data = store.read_blob(&record.target_id, &record.session_id, TRANSCRIPT_BLOB)?;
+    if data.is_empty() {
+        bail!("the backed-up transcript is empty");
+    }
+    // The path is rebuilt from the target's own HOME rather than replayed
+    // verbatim: the same machine can come back with a different home, and a
+    // record may be restored onto a box that is not the one it came from.
+    let destination = runtime.home_relative_path(target, &relative)?;
+    let temp = std::env::temp_dir().join(format!(
+        "muxloom-restore-{}-{}.jsonl",
+        sanitize(&record.target_id),
+        sanitize(&record.session_id)
+    ));
+    fs::write(&temp, &data)
+        .with_context(|| format!("failed to stage restore in {}", temp.display()))?;
+    let placed = runtime.place_file(target, &temp, &destination);
+    let _ = fs::remove_file(&temp);
+    placed.with_context(|| format!("failed to restore transcript to {destination}"))?;
+    crate::debug::log(
+        "backup",
+        format!(
+            "restored {} bytes of {} to {}:{destination}",
+            data.len(),
+            record.session_id,
+            target.id
+        ),
+    );
+    Ok(RestoredTranscript {
+        resume_id: record.native_id.clone(),
+        path: destination,
+        bytes: data.len() as u64,
+    })
+}
+
+/// The `$HOME`-relative tail of an agent-native transcript path
+/// (`.claude/projects/…` or `.codex/sessions/…`), or None if the path is not
+/// one an agent would look in.
+fn native_relative_path(native_path: &str) -> Option<String> {
+    [".claude/", ".codex/"].into_iter().find_map(|marker| {
+        native_path
+            .find(marker)
+            .map(|position| native_path[position..].to_string())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Search: query the aggregated backup across all machines.
 // ---------------------------------------------------------------------------
 
@@ -1560,5 +1710,144 @@ mod tests {
         assert_eq!(index.machine_key_for_alias("h20-alt"), "h20");
         // Unknown alias falls back to itself.
         assert_eq!(index.machine_key_for_alias("other"), "other");
+    }
+
+    #[test]
+    fn recoverable_records_are_the_history_the_machine_no_longer_has() {
+        let store = temp_store();
+        let mut index = BackupIndex::default();
+        index.machines.push(MachineIdentity {
+            key: "h20".into(),
+            aliases: vec!["h20".into(), "h20-alt".into()],
+            ..Default::default()
+        });
+        let mut add = |session: &str, native: &str, created: u64, kind: &str| {
+            index.upsert(BackupRecord {
+                target_id: "h20".into(),
+                session_id: session.into(),
+                kind: kind.into(),
+                created_at: created,
+                native_id: native.into(),
+                native_path: format!("/home/me/.codex/sessions/2026/08/09/rollout-{native}.jsonl"),
+                jsonl_bytes_synced: 10,
+                message_count: 2,
+                ..Default::default()
+            });
+        };
+        add("muxloomd-codex-live", "native-live", 100, "codex");
+        add("muxloomd-codex-old", "native-live", 90, "codex");
+        add("muxloomd-codex-lost", "native-lost", 80, "codex");
+        add("muxloomd-codex-dupe", "native-lost", 70, "codex");
+        add("muxloomd-term", "native-term", 60, "terminal");
+        // Backed up, but nothing readable came with it.
+        index.upsert(BackupRecord {
+            target_id: "h20".into(),
+            session_id: "muxloomd-codex-empty".into(),
+            kind: "codex".into(),
+            created_at: 50,
+            ..Default::default()
+        });
+        // Another machine's history must never appear under this one.
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-elsewhere".into(),
+            kind: "codex".into(),
+            created_at: 40,
+            native_id: "native-elsewhere".into(),
+            native_path: "/home/me/.codex/sessions/x.jsonl".into(),
+            jsonl_bytes_synced: 10,
+            message_count: 1,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let live = HashSet::from(["muxloomd-codex-live".to_string()]);
+        // Asked by the alias the machine is reachable under today, not the key
+        // its records were partitioned under.
+        let found = recoverable_records(&store, "h20-alt", &live);
+        let ids: Vec<&str> = found
+            .iter()
+            .map(|record| record.session_id.as_str())
+            .collect();
+        // `-old` shares its transcript with the live session, so that
+        // conversation is not lost; `-dupe` collapses into the newer `-lost`;
+        // the terminal and the empty record carry nothing to show.
+        assert_eq!(ids, ["muxloomd-codex-lost"]);
+        assert!(is_restorable(&found[0]));
+
+        // A machine that reports nothing at all has every conversation listed.
+        let all = recoverable_records(&store, "h20", &HashSet::new());
+        let ids: Vec<&str> = all
+            .iter()
+            .map(|record| record.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["muxloomd-codex-live", "muxloomd-codex-lost"]);
+    }
+
+    #[test]
+    fn a_capture_only_record_is_listed_but_not_restorable() {
+        let store = temp_store();
+        store
+            .append_frame("h20", "muxloomd-claude-capture", CAPTURE_BLOB, b"screen")
+            .unwrap();
+        let mut index = BackupIndex::default();
+        index.upsert(BackupRecord {
+            target_id: "h20".into(),
+            session_id: "muxloomd-claude-capture".into(),
+            kind: "claude".into(),
+            created_at: 10,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let found = recoverable_records(&store, "h20", &HashSet::new());
+        assert_eq!(found.len(), 1, "a capture alone is still worth showing");
+        assert!(!is_restorable(&found[0]));
+
+        // And restoring it says so rather than writing an unusable file.
+        let runtime = Runtime::new(&crate::config::Config::default());
+        let error = restore_transcript(&runtime, &store, &Target::local(), &found[0])
+            .expect_err("a capture cannot be resumed");
+        assert!(
+            error.to_string().contains("terminal output"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn native_paths_are_rebuilt_relative_to_the_target_home() {
+        assert_eq!(
+            native_relative_path("/Users/me/.claude/projects/slug/abc.jsonl").as_deref(),
+            Some(".claude/projects/slug/abc.jsonl")
+        );
+        assert_eq!(
+            native_relative_path("/home/other/.codex/sessions/2026/08/09/rollout-x.jsonl")
+                .as_deref(),
+            Some(".codex/sessions/2026/08/09/rollout-x.jsonl")
+        );
+        // Anything outside a known agent directory is not placed by guesswork.
+        assert_eq!(native_relative_path("/var/tmp/notes.jsonl"), None);
+        assert_eq!(native_relative_path(""), None);
+    }
+
+    #[test]
+    fn restoring_an_unrecognised_path_refuses_rather_than_guessing() {
+        let store = temp_store();
+        let runtime = Runtime::new(&crate::config::Config::default());
+        let record = BackupRecord {
+            target_id: "h20".into(),
+            session_id: "muxloomd-codex-odd".into(),
+            kind: "codex".into(),
+            native_id: "native-odd".into(),
+            native_path: "/var/tmp/rollout-native-odd.jsonl".into(),
+            jsonl_bytes_synced: 10,
+            ..Default::default()
+        };
+        let error = restore_transcript(&runtime, &store, &Target::local(), &record)
+            .expect_err("an unknown location must not be invented");
+        assert!(
+            error.to_string().contains("unrecognised path"),
+            "unexpected error: {error}"
+        );
     }
 }

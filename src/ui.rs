@@ -623,7 +623,14 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             selected_row = Some(row);
         }
         let (icon, runtime_name, _) = agent_visual(session.kind);
-        let state = if session.dead {
+        let recoverable = session.dead && app.is_recoverable(&session.target_id, &session.id);
+        let state = if app.is_restoring(&session.target_id, &session.id) {
+            "restoring to machine..."
+        } else if recoverable && app.is_restorable(&session.target_id, &session.id) {
+            "local backup only - Enter to restore"
+        } else if recoverable {
+            "local backup only - read-only"
+        } else if session.dead {
             "archived - Enter to resume"
         } else if session.needs_attention {
             "waiting for input"
@@ -805,7 +812,23 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.history_offset,
         )
     } else if let Some(session) = &selected {
-        if session.dead {
+        if app.is_restoring(&session.target_id, &session.id) {
+            format!(
+                " {} / {} / restoring history to the machine... ",
+                session.kind, session.target_id
+            )
+        } else if app.is_recoverable(&session.target_id, &session.id) {
+            format!(
+                " {} / {} / local backup only - {} ",
+                session.kind,
+                session.target_id,
+                if app.is_restorable(&session.target_id, &session.id) {
+                    "Enter restores it to the machine"
+                } else {
+                    "terminal output only"
+                }
+            )
+        } else if session.dead {
             format!(
                 " {} / {} / archived - Enter to resume{loading} ",
                 session.kind, session.target_id
@@ -2606,7 +2629,7 @@ fn is_markdown_rule(value: &str) -> bool {
             .all(|character| character == compact.chars().next().unwrap())
 }
 
-fn format_bytes(size: u64) -> String {
+pub(crate) fn format_bytes(size: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = size as f64;
     let mut unit = 0;

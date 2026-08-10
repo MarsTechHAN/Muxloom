@@ -7,8 +7,8 @@ use crate::{
     media::{MediaPlayback, MediaUpdate, decode_image_stream, decode_video_stream},
     model::{
         AgentKind, AgentSession, DirectoryListing, FileListing, FilePreview, FilePreviewKind,
-        HistoryMatch, HistoryPage, LaunchRequest, Probe, ResumeCandidate, SearchMatchKind,
-        SearchResult, Target, TaskProgress,
+        HistoryMatch, HistoryPage, LaunchRequest, Probe, RestoredTranscript, ResumeCandidate,
+        SearchMatchKind, SearchResult, Target, TaskProgress,
     },
     runtime::{Runtime, is_temporary_session_id},
 };
@@ -121,6 +121,15 @@ pub enum Request {
         targets: Vec<Target>,
         include_ansi: bool,
         ansi_max_bytes: u64,
+    },
+    /// Push one backed-up transcript from the local store back onto a machine
+    /// that lost it, so the agent's own resume can find it again. The record
+    /// itself is read from the store on the worker thread, so only its key
+    /// travels: the stable machine partition plus the session id.
+    BackupRestore {
+        target: Target,
+        machine_key: String,
+        session_id: String,
     },
 }
 
@@ -237,6 +246,13 @@ pub enum Event {
     /// One backup pass finished; the payload is a human-readable summary.
     BackupSynced {
         result: Result<String, String>,
+    },
+    /// A backed-up transcript finished transferring back onto a machine. On
+    /// success the payload carries the agent-native id to resume with.
+    BackupRestored {
+        target_id: String,
+        session_id: String,
+        result: Result<RestoredTranscript, String>,
     },
 }
 
@@ -796,6 +812,38 @@ impl Worker {
                         #[cfg(not(feature = "controller"))]
                         {
                             let _ = (targets, include_ansi, ansi_max_bytes);
+                        }
+                    }
+                    Request::BackupRestore {
+                        target,
+                        machine_key,
+                        session_id,
+                    } => {
+                        let target_id = target.id.clone();
+                        #[cfg(feature = "controller")]
+                        {
+                            let result = crate::backup::restore_session(
+                                &runtime,
+                                &target,
+                                &machine_key,
+                                &session_id,
+                            )
+                            .map_err(|error| format!("{error:#}"));
+                            if let Err(error) = &result {
+                                debug::log(
+                                    "worker",
+                                    format!("backup restore {session_id} failed: {error}"),
+                                );
+                            }
+                            let _ = events.send(Event::BackupRestored {
+                                target_id,
+                                session_id,
+                                result,
+                            });
+                        }
+                        #[cfg(not(feature = "controller"))]
+                        {
+                            let _ = (machine_key, target_id, session_id);
                         }
                     }
                 });

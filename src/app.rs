@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -184,6 +184,32 @@ pub struct CrossMachineHit {
     pub title: String,
     pub snippet: String,
     pub created_at: u64,
+}
+
+/// A conversation the local backup still holds for a machine that has since
+/// forgotten it. Plain fields only, for the same reason as `CrossMachineHit`.
+#[derive(Debug, Clone)]
+struct RecoverableSession {
+    session_id: String,
+    kind: String,
+    label: String,
+    cwd: String,
+    title: String,
+    recap: String,
+    created_at: u64,
+    machine_key: String,
+    restorable: bool,
+}
+
+/// What the local store knows about a listed session its machine has lost.
+#[derive(Debug, Clone)]
+struct RecoveryInfo {
+    /// Backup partition holding the record. Not always the target id: a machine
+    /// keeps the key it was first seen under, across later alias churn.
+    machine_key: String,
+    /// Whether a resumable agent transcript came with the record, or only the
+    /// terminal output it printed.
+    restorable: bool,
 }
 
 #[derive(Debug)]
@@ -521,6 +547,20 @@ pub struct App {
     last_activity_refresh: Instant,
     last_backup_sync: Option<Instant>,
     backup_in_flight: bool,
+    /// The aggregated history store, beside the state file. Restoring reads it;
+    /// listing a machine's lost sessions reads its index.
+    backup_root: PathBuf,
+    /// `(target id, session id)` of every listed session that exists only in the
+    /// local backup — the machine it ran on no longer has it. These are read
+    /// from the store instead of the daemon, and pushed back onto it on demand.
+    recoverable: HashMap<(String, String), RecoveryInfo>,
+    /// Sessions whose transcript is being transferred back to their machine.
+    restoring: HashSet<(String, String)>,
+    /// Sessions already put back this run. Their transcript is on the machine
+    /// now, so they are no longer listed from the backup — the machine's own
+    /// archived-resume path can find them, and the next sync links the record to
+    /// whatever session resumed it.
+    restored: HashSet<(String, String)>,
     top_up_count: u8,
     last_top_up: Option<Instant>,
     notifications: Vec<String>,
@@ -559,10 +599,12 @@ impl App {
         targets: Vec<Target>,
         worker: Worker,
     ) -> Self {
-        let history_cache_dir = state_path
+        let state_dir = state_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("history");
+            .to_path_buf();
+        let history_cache_dir = state_dir.join("history");
+        let backup_root = state_dir.join("backup");
         let statuses = targets
             .into_iter()
             .map(|target| {
@@ -626,6 +668,10 @@ impl App {
             last_activity_refresh: Instant::now(),
             last_backup_sync: None,
             backup_in_flight: false,
+            backup_root,
+            recoverable: HashMap::new(),
+            restoring: HashSet::new(),
+            restored: HashSet::new(),
             top_up_count: 0,
             last_top_up: None,
             notifications: Vec::new(),
@@ -1706,7 +1752,11 @@ impl App {
         // Opening the session is how the user answers the prompt, so stop
         // reminding them about it the moment they step in.
         self.acknowledge_attention(&session.id);
-        if session.dead {
+        if self.is_recoverable(&session.target_id, &session.id) {
+            // Nothing on the machine to resume from yet; put the transcript back
+            // first and let the restore finish the launch.
+            self.restore_recoverable_session(&session);
+        } else if session.dead {
             self.resume_archived_session(session);
         } else {
             self.pending_archived_resume = None;
@@ -2294,6 +2344,14 @@ impl App {
                             ));
                         }
                     }
+                }
+                if scan_succeeded {
+                    // A machine that comes back without its sessions has not lost
+                    // the conversations themselves: whatever the local store still
+                    // holds for it is listed alongside, so the history stays
+                    // readable and can be put back.
+                    self.merge_recoverable_sessions(&target_id);
+                    self.apply_session_labels();
                 }
                 let launched = self
                     .pending_launch_selection
@@ -2984,7 +3042,260 @@ impl App {
                     }
                 }
             }
+            Event::BackupRestored {
+                target_id,
+                session_id,
+                result,
+            } => {
+                self.busy_operations = self.busy_operations.saturating_sub(1);
+                let key = (target_id.clone(), session_id.clone());
+                self.restoring.remove(&key);
+                match result {
+                    Ok(restored) => {
+                        debug::log(
+                            "backup",
+                            format!(
+                                "restored {session_id} to {target_id} at {} ({} bytes)",
+                                restored.path, restored.bytes
+                            ),
+                        );
+                        let session = self
+                            .sessions
+                            .iter()
+                            .find(|session| {
+                                session.target_id == target_id && session.id == session_id
+                            })
+                            .cloned();
+                        // The transcript is on the machine now, so the entry stops
+                        // being a backup-only ghost whatever happens next.
+                        self.restored.insert(key.clone());
+                        self.recoverable.remove(&key);
+                        self.sessions.retain(|session| {
+                            session.target_id != target_id || session.id != session_id
+                        });
+                        let launch = session.as_ref().and_then(|session| {
+                            self.target(&target_id).cloned().map(|target| LaunchForm {
+                                target,
+                                kind: session.kind,
+                                path: session.path.clone(),
+                                label: session.label.clone(),
+                                temporary: false,
+                                field: LaunchField::Kind,
+                            })
+                        });
+                        match launch {
+                            Some(launch) => {
+                                let kind = launch.kind;
+                                self.submit_launch(launch, Some(restored.resume_id), None, None);
+                                self.status_message = format!(
+                                    "Restored {} of history to {target_id} - resuming {kind}...",
+                                    crate::ui::format_bytes(restored.bytes)
+                                );
+                            }
+                            None => {
+                                self.status_message = format!(
+                                    "Restored {} of history to {target_id}",
+                                    crate::ui::format_bytes(restored.bytes)
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        debug::log(
+                            "backup",
+                            format!("restore of {session_id} to {target_id} failed: {error}"),
+                        );
+                        self.status_message = format!("Restore failed: {error}");
+                    }
+                }
+            }
         }
+    }
+
+    /// Whether a listed session exists only in the local backup, because the
+    /// machine it ran on no longer knows about it.
+    pub fn is_recoverable(&self, target_id: &str, session_id: &str) -> bool {
+        self.recoverable
+            .contains_key(&(target_id.to_string(), session_id.to_string()))
+    }
+
+    /// Whether a recoverable session came with a transcript its agent can resume
+    /// from, as opposed to only the terminal output it printed.
+    pub fn is_restorable(&self, target_id: &str, session_id: &str) -> bool {
+        self.recovery_info(target_id, session_id)
+            .is_some_and(|info| info.restorable)
+    }
+
+    fn recovery_info(&self, target_id: &str, session_id: &str) -> Option<&RecoveryInfo> {
+        self.recoverable
+            .get(&(target_id.to_string(), session_id.to_string()))
+    }
+
+    /// Whether a recoverable session's transcript is being pushed back to its
+    /// machine right now.
+    pub fn is_restoring(&self, target_id: &str, session_id: &str) -> bool {
+        self.restoring
+            .contains(&(target_id.to_string(), session_id.to_string()))
+    }
+
+    /// Add a machine's backed-up sessions that the machine itself no longer has
+    /// to the session list. A box that was reimaged, recycled or simply had its
+    /// state directory cleared comes back reporting nothing, and until now that
+    /// silently emptied the list even though every conversation was still in the
+    /// local store. Listing them keeps history reachable and gives the restore
+    /// something to act on.
+    fn merge_recoverable_sessions(&mut self, target_id: &str) {
+        self.recoverable
+            .retain(|(target, _), _| target != target_id);
+        if !self.config.backup.enabled {
+            return;
+        }
+        let live: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter(|session| session.target_id == target_id)
+            .map(|session| session.id.clone())
+            .collect();
+        for record in recoverable_backup_records(&self.backup_root, target_id, &live) {
+            let Ok(kind) = record.kind.parse::<AgentKind>() else {
+                continue;
+            };
+            if self
+                .restored
+                .contains(&(target_id.to_string(), record.session_id.clone()))
+            {
+                continue;
+            }
+            self.recoverable.insert(
+                (target_id.to_string(), record.session_id.clone()),
+                RecoveryInfo {
+                    machine_key: record.machine_key,
+                    restorable: record.restorable,
+                },
+            );
+            let recap = [record.recap, record.title]
+                .into_iter()
+                .find(|text| !text.trim().is_empty());
+            self.sessions.push(AgentSession {
+                id: record.session_id,
+                target_id: target_id.to_string(),
+                kind,
+                path: record.cwd,
+                label: record.label,
+                created_at: record.created_at,
+                // Nothing is running, so it belongs with the archived entries:
+                // read-only until it is put back on the machine.
+                dead: true,
+                pid: None,
+                working: false,
+                needs_attention: false,
+                attention_reason: None,
+                recap,
+            });
+        }
+    }
+
+    /// Show a recoverable session's history out of the local backup: the machine
+    /// cannot be asked for it, and the raw capture is the same terminal stream a
+    /// live daemon would have replayed.
+    fn show_recoverable_history(&mut self, session: &AgentSession) {
+        self.pending_capture = None;
+        self.history_loading = false;
+        let machine = match self.recovery_info(&session.target_id, &session.id) {
+            Some(info) => info.machine_key.clone(),
+            None => return,
+        };
+        let capture = backup_session_capture(&self.backup_root, &machine, &session.id);
+        let text = if capture.trim().is_empty() {
+            let transcript = backup_session_transcript(&machine, &session.id, 200_000);
+            if transcript.trim().is_empty() {
+                String::new()
+            } else {
+                format!("--- backed-up conversation ---\n\n{transcript}")
+            }
+        } else {
+            capture
+        };
+        if text.is_empty() {
+            self.history = HistoryPage::default();
+            self.history_message =
+                "This session is only in the local backup, and nothing readable came with it."
+                    .into();
+            return;
+        }
+        self.history_message.clear();
+        let lines = text.lines().count();
+        self.history = HistoryPage {
+            text: sanitize_terminal_text(&text),
+            history_size: lines,
+            pane_height: 0,
+            pane_width: self.agent_viewport_width as usize,
+            offset_from_bottom: 0,
+            rendered: false,
+            more_history: false,
+        };
+        self.history_offset = 0;
+        self.status_message = format!(
+            "{} is only in the local backup - Enter restores it to {}",
+            session.display_label(),
+            session.target_id
+        );
+    }
+
+    /// Push a recoverable session's transcript back onto its machine in the
+    /// background, then resume it there. The local copy stays where it is.
+    fn restore_recoverable_session(&mut self, session: &AgentSession) {
+        let Some(info) = self.recovery_info(&session.target_id, &session.id) else {
+            return;
+        };
+        let machine_key = info.machine_key.clone();
+        if !info.restorable {
+            self.status_message = format!(
+                "Only the terminal output of {} was backed up - it can be read here, but not resumed",
+                session.display_label()
+            );
+            return;
+        }
+        let Some(target) = self.target(&session.target_id).cloned() else {
+            self.status_message = "That machine is no longer configured".into();
+            return;
+        };
+        if !self
+            .targets
+            .iter()
+            .any(|status| status.target.id == session.target_id && status.enabled)
+        {
+            self.status_message = format!(
+                "Enable {} before restoring history to it",
+                session.target_id
+            );
+            return;
+        }
+        let key = (session.target_id.clone(), session.id.clone());
+        if !self.restoring.insert(key) {
+            self.status_message = "That history is already being transferred".into();
+            return;
+        }
+        if self
+            .worker
+            .requests
+            .send(Request::BackupRestore {
+                target,
+                machine_key,
+                session_id: session.id.clone(),
+            })
+            .is_err()
+        {
+            self.restoring
+                .remove(&(session.target_id.clone(), session.id.clone()));
+            self.status_message = "Restore worker is unavailable".into();
+            return;
+        }
+        self.busy_operations = self.busy_operations.saturating_add(1);
+        self.status_message = format!(
+            "Sending {} history back to {}...",
+            session.kind, session.target_id
+        );
     }
 
     /// Enqueue a backup pass over the enabled targets when one is due and none
@@ -3561,6 +3872,12 @@ impl App {
             self.history_loading = false;
             self.pending_capture = None;
             self.status_message = "Temporal Chat does not retain history".into();
+            return;
+        }
+        if self.is_recoverable(&session.target_id, &session.id) {
+            // Its machine has no record of it, so there is nobody to ask for a
+            // page: the local store is the only copy.
+            self.show_recoverable_history(&session);
             return;
         }
         let desired_offset = self.history_offset;
@@ -4933,6 +5250,9 @@ impl App {
         let sessions: Vec<_> = self
             .sessions
             .iter()
+            // Backup-only entries have no history on their machine to grep; the
+            // same text is reachable through the cross-machine hits below.
+            .filter(|session| !self.is_recoverable(&session.target_id, &session.id))
             .filter_map(|session| {
                 self.target(&session.target_id)
                     .cloned()
@@ -5904,6 +6224,10 @@ impl App {
         else {
             return;
         };
+        if self.is_recoverable(&session.target_id, session_id) {
+            self.status_message = "That history is already only in the local backup".into();
+            return;
+        }
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
@@ -5929,6 +6253,14 @@ impl App {
         else {
             return;
         };
+        if self.is_recoverable(&session.target_id, session_id) {
+            // The machine has nothing to close, and the backup is the last copy
+            // of this conversation: it is not something a keystroke should drop.
+            self.status_message =
+                "Kept: this history exists only in the local backup, so it is not deleted here"
+                    .into();
+            return;
+        }
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
@@ -6696,6 +7028,59 @@ fn backup_session_transcript(target_id: &str, session_id: &str, max_chars: usize
 
 #[cfg(not(feature = "controller"))]
 fn backup_session_transcript(_target_id: &str, _session_id: &str, _max_chars: usize) -> String {
+    String::new()
+}
+
+/// The conversations the local store holds for `alias` that the machine itself
+/// no longer reports. `live` is the set of session ids it did report.
+#[cfg(feature = "controller")]
+fn recoverable_backup_records(
+    root: &Path,
+    alias: &str,
+    live: &HashSet<String>,
+) -> Vec<RecoverableSession> {
+    let store = crate::backup::BackupStore::new(root.to_path_buf());
+    crate::backup::recoverable_records(&store, alias, live)
+        .into_iter()
+        .map(|record| RecoverableSession {
+            restorable: crate::backup::is_restorable(&record),
+            machine_key: record.target_id,
+            session_id: record.session_id,
+            kind: record.kind,
+            label: record.label,
+            cwd: record.cwd,
+            title: record.title,
+            recap: record.recap,
+            created_at: record.created_at,
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "controller"))]
+fn recoverable_backup_records(
+    _root: &Path,
+    _alias: &str,
+    _live: &HashSet<String>,
+) -> Vec<RecoverableSession> {
+    Vec::new()
+}
+
+/// The raw terminal capture kept for a backed-up session, ready to be rendered
+/// as read-only history. Empty when only messages were captured.
+#[cfg(feature = "controller")]
+fn backup_session_capture(root: &Path, target_id: &str, session_id: &str) -> String {
+    let store = crate::backup::BackupStore::new(root.to_path_buf());
+    match store.read_blob(target_id, session_id, crate::backup::CAPTURE_BLOB) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => {
+            debug::log("backup", format!("capture unreadable: {error:#}"));
+            String::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "controller"))]
+fn backup_session_capture(_root: &Path, _target_id: &str, _session_id: &str) -> String {
     String::new()
 }
 
@@ -10369,5 +10754,153 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.file_manager.as_ref().unwrap().entries, [original]);
+    }
+
+    /// A machine that came back empty still shows what the local backup holds
+    /// for it, reads that history out of the local store, and pushes it back on
+    /// demand without giving up the local copy.
+    #[test]
+    #[cfg(feature = "controller")]
+    fn a_machine_that_lost_its_history_lists_it_from_the_backup_and_can_take_it_back() {
+        use crate::{
+            backup::{BackupIndex, BackupRecord, BackupStore, CAPTURE_BLOB},
+            model::{Probe, RestoredTranscript},
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-app-restore-{nonce}"));
+        let store = BackupStore::new(root.clone());
+        store
+            .append_frame(
+                "local",
+                "muxloomd-codex-lost",
+                CAPTURE_BLOB,
+                b"$ cargo test\nall green\n",
+            )
+            .unwrap();
+        let mut index = BackupIndex::default();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-lost".into(),
+            kind: "codex".into(),
+            cwd: "/work/project".into(),
+            created_at: 42,
+            label: "lost work".into(),
+            recap: "was fixing the pager".into(),
+            dead: true,
+            native_id: "native-lost".into(),
+            native_path: "/home/me/.codex/sessions/2026/08/09/rollout-native-lost.jsonl".into(),
+            jsonl_bytes_synced: 128,
+            message_count: 4,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.backup_root = root.clone();
+        app.targets[0].probe.codex = true;
+
+        // The machine answers the scan with nothing at all.
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((Probe::default(), Vec::new())),
+        });
+        assert_eq!(app.sessions.len(), 1, "backed-up history must be listed");
+        let listed = app.sessions[0].clone();
+        assert_eq!(listed.id, "muxloomd-codex-lost");
+        assert_eq!(listed.path, "/work/project");
+        assert!(listed.dead, "nothing is running, so it reads as archived");
+        assert_eq!(listed.recap.as_deref(), Some("was fixing the pager"));
+        assert!(app.is_recoverable("local", "muxloomd-codex-lost"));
+        assert!(app.is_restorable("local", "muxloomd-codex-lost"));
+
+        // Selecting it renders the capture from the local store instead of
+        // asking the machine, which has nothing to give.
+        app.select_session("muxloomd-codex-lost".into());
+        assert!(app.history.text.contains("all green"));
+        assert!(
+            app.pending_capture.is_none(),
+            "no capture should be requested from a machine that lost the session"
+        );
+
+        // Deleting must not be how history leaves the local store.
+        app.delete_session("muxloomd-codex-lost");
+        assert!(app.status_message.contains("Kept"));
+        assert!(app.sessions.iter().any(|s| s.id == "muxloomd-codex-lost"));
+
+        // Enter transfers it back in the background.
+        app.activate_terminal();
+        assert!(app.is_restoring("local", "muxloomd-codex-lost"));
+        match receive_request(&request_rx) {
+            Request::BackupRestore {
+                target,
+                machine_key,
+                session_id,
+            } => {
+                assert_eq!(target.id, "local");
+                assert_eq!(machine_key, "local");
+                assert_eq!(session_id, "muxloomd-codex-lost");
+            }
+            request => panic!("expected a restore, got {request:?}"),
+        }
+
+        // Once it lands, the agent resumes from the id that came back.
+        app.handle_worker_event(Event::BackupRestored {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-lost".into(),
+            result: Ok(RestoredTranscript {
+                resume_id: "native-lost".into(),
+                path: "/home/me/.codex/sessions/2026/08/09/rollout-native-lost.jsonl".into(),
+                bytes: 128,
+            }),
+        });
+        assert!(!app.is_restoring("local", "muxloomd-codex-lost"));
+        assert!(
+            !app.is_recoverable("local", "muxloomd-codex-lost"),
+            "the machine has the transcript now"
+        );
+        match receive_request(&request_rx) {
+            Request::Launch { request, .. } => {
+                assert_eq!(request.kind, AgentKind::Codex);
+                assert_eq!(request.path, "/work/project");
+                assert_eq!(request.resume_id.as_deref(), Some("native-lost"));
+            }
+            request => panic!("expected a resume launch, got {request:?}"),
+        }
+        // A later scan does not resurrect the entry now that it is on the box.
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((Probe::default(), Vec::new())),
+        });
+        assert!(app.sessions.is_empty());
+        // And the local copy is still there: this copies out, it never moves.
+        assert!(store.blob_len("local", "muxloomd-codex-lost", CAPTURE_BLOB) > 0);
+        assert!(
+            store
+                .load_index()
+                .unwrap()
+                .position("local", "muxloomd-codex-lost")
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

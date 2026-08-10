@@ -1113,7 +1113,7 @@ impl Runtime {
         Ok(synced)
     }
 
-    fn remote_home(&self, target: &Target) -> Result<String> {
+    pub fn remote_home(&self, target: &Target) -> Result<String> {
         let output = self.run_shell(target, "printf '%s\\n' \"$HOME\"", false)?;
         ensure_success(&output, "resolve remote home")?;
         let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1816,6 +1816,84 @@ END {
             uploaded += 1;
         }
         Ok(uploaded)
+    }
+
+    /// Resolve a `$HOME`-relative path against the target's own home directory.
+    pub fn home_relative_path(&self, target: &Target, relative: &str) -> Result<String> {
+        let home = match target.transport {
+            Transport::Local => std::env::var("HOME")
+                .context("HOME is unavailable while resolving a target path")?,
+            Transport::Ssh { .. } => self.remote_home(target)?,
+        };
+        Ok(format!(
+            "{}/{}",
+            home.trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        ))
+    }
+
+    /// Copy a local file onto a target at one exact absolute path, creating the
+    /// parent directory first and keeping whatever was already there as a dated
+    /// sibling. Unlike [`Runtime::upload_files`] the destination name is chosen
+    /// by the caller, which is what restoring an agent transcript needs: the
+    /// agent only finds its own history under the name it wrote it as.
+    pub fn place_file(&self, target: &Target, local_path: &Path, remote_path: &str) -> Result<()> {
+        let parent = Path::new(remote_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .context("destination path has no parent directory")?
+            .to_path_buf();
+        match &target.transport {
+            Transport::Local => {
+                // No shell for a machine we are already on: the same three steps
+                // as the remote script, done directly.
+                let destination = PathBuf::from(remote_path);
+                fs::create_dir_all(&parent).with_context(|| {
+                    format!("failed to create {} for a restore", parent.display())
+                })?;
+                if fs::canonicalize(&destination).ok().as_deref()
+                    == fs::canonicalize(local_path).ok().as_deref()
+                {
+                    return Ok(());
+                }
+                if destination.is_file() {
+                    let kept = format!("{remote_path}.muxloom-replaced-{}", unix_seconds());
+                    fs::copy(&destination, &kept)
+                        .with_context(|| format!("failed to keep the file already at {kept}"))?;
+                }
+                fs::copy(local_path, &destination)
+                    .with_context(|| format!("failed to copy into {}", destination.display()))?;
+            }
+            Transport::Ssh { alias } => {
+                let prepare = format!(
+                    "mkdir -p {} && if [ -f {} ]; then cp -p {} {}.muxloom-replaced-$(date +%Y%m%d-%H%M%S); fi",
+                    shell_quote(&parent.to_string_lossy()),
+                    shell_quote(remote_path),
+                    shell_quote(remote_path),
+                    shell_quote(remote_path),
+                );
+                let output = self.run_shell(target, &prepare, false)?;
+                ensure_success(&output, "prepare destination directory")?;
+                // muxloomd writes through a temp file in the destination
+                // directory and renames, so a half-transferred transcript never
+                // becomes visible to the agent. scp is the fallback when the
+                // daemon is not reachable.
+                if let Err(error) =
+                    self.bridges
+                        .upload_file(target, local_path, remote_path.to_string())
+                {
+                    debug::log(
+                        "runtime",
+                        format!(
+                            "place_file target={} muxloomd upload failed: {error:#}; using scp",
+                            target.id
+                        ),
+                    );
+                    self.scp_to(alias, local_path, remote_path)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn scan_resumes(
@@ -3242,6 +3320,14 @@ pub fn shell_join(values: &[&str]) -> String {
         .join(" ")
 }
 
+/// Whole seconds since the epoch, for naming the copy a placement keeps.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -3672,6 +3758,49 @@ mod tests {
         assert!(is_temporary_session_id("muxloomd-temporal-codex-1"));
         assert!(is_temporary_session_id("muxloom-temporal-codex-1"));
         assert!(!is_temporary_session_id("muxloomd-codex-1"));
+    }
+
+    /// Placing a file creates the directories the agent expects and never
+    /// silently overwrites: whatever was there is kept beside the new copy.
+    #[test]
+    fn placing_a_file_creates_its_directory_and_keeps_what_it_replaces() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-place-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("restored.jsonl");
+        fs::write(&source, b"{\"role\":\"user\"}\n").unwrap();
+        let destination = root.join("home/.codex/sessions/2026/08/09/rollout-x.jsonl");
+
+        let runtime = Runtime::new(&crate::config::Config::default());
+        let target = Target::local();
+        let path = destination.to_string_lossy().to_string();
+        runtime.place_file(&target, &source, &path).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"{\"role\":\"user\"}\n");
+
+        // A second placement of different content keeps the first alongside.
+        fs::write(&source, b"{\"role\":\"assistant\"}\n").unwrap();
+        runtime.place_file(&target, &source, &path).unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"{\"role\":\"assistant\"}\n"
+        );
+        let kept = fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".muxloom-replaced-")
+            });
+        assert!(
+            kept,
+            "the replaced transcript must be kept beside the new one"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
