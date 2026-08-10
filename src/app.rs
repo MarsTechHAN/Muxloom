@@ -1624,12 +1624,27 @@ impl App {
             }
             return;
         }
-        if self.interactive
-            && let Some(terminal) = self.terminal.as_mut()
-            && let Err(error) = terminal.write_paste(&text)
-        {
-            self.status_message = format!("Paste failed: {}", short_error(&error.to_string()));
+        // Nothing below here can deliver the text, so say where it went rather
+        // than swallow a paste the user watched themselves make.
+        if !self.interactive {
+            self.status_message = if self.selected_session().is_some_and(|session| session.dead) {
+                "This session is archived and read-only, so there is nowhere to paste".into()
+            } else {
+                "Press Enter or click the terminal to take input, then paste again".into()
+            };
+            return;
         }
+        let Some(terminal) = self.terminal.as_mut() else {
+            self.status_message = "Terminal is still connecting; paste again in a moment".into();
+            return;
+        };
+        // A paste is input like any keystroke, so return to the live tail the
+        // way handle_interactive_key does: pasting into a scrolled-back view
+        // otherwise lands the text somewhere off screen.
+        if let Err(error) = terminal.write_paste(&text) {
+            self.set_error(format!("Paste failed: {}", short_error(&error.to_string())));
+        }
+        self.history_offset = 0;
     }
 
     pub fn resize_agent_viewport(&mut self, width: u16, height: u16) {
