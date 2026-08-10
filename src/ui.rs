@@ -76,11 +76,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
         app.layout_debug_signature = Some(signature);
     }
+    // The solver honours `Min` before a trailing `Length`, so a content minimum
+    // of 5 used to eat the whole footer below nine rows -- and the footer is the
+    // only place the keys are written down. Give the content one row and shrink
+    // the header instead: the counts matter more than the tagline at this size.
+    let header_height = match area.height {
+        height if height < 9 => 1,
+        height if height < 12 => 2,
+        _ => 3,
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Length(header_height),
+            Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(area);
@@ -156,12 +165,16 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             format!("v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(MUTED),
         ),
-        Span::raw("  "),
-        Span::styled(
+    ];
+    // The tagline is the first thing a narrow terminal can do without; the
+    // version and the staged-update notice next to it are not.
+    if area.width >= 72 {
+        first_spans.push(Span::raw("  "));
+        first_spans.push(Span::styled(
             "persistent multi-machine agent sessions",
             Style::default().fg(Color::Gray),
-        ),
-    ];
+        ));
+    }
     if let Some(version) = &app.staged_update {
         first_spans.push(Span::raw("  "));
         first_spans.push(Span::styled(
@@ -216,7 +229,6 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .collect();
     app.attention_ids = attention.iter().map(|(id, _, _)| id.clone()).collect();
     let third = if let Some((_, target, label)) = attention.first() {
-        app.attention_banner = Some(Rect::new(area.x, area.y + 2, area.width, 1));
         Line::from(vec![
             Span::styled(
                 format!(" INPUT REQUIRED {} ", attention.len()),
@@ -231,10 +243,21 @@ fn draw_header(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ),
         ])
     } else {
-        app.attention_banner = None;
         Line::raw("")
     };
-    frame.render_widget(Paragraph::new(vec![first, second, third]), area);
+    // A squeezed header drops the tagline first and keeps the alert last, and
+    // the banner is only clickable on the row it was actually drawn on.
+    let (lines, banner_row) = match (area.height, attention.is_empty()) {
+        (0, _) => (Vec::new(), None),
+        (1, false) => (vec![third], Some(0)),
+        (1, true) => (vec![second], None),
+        (2, false) => (vec![second, third], Some(1)),
+        (2, true) => (vec![first, second], None),
+        (_, empty) => (vec![first, second, third], (!empty).then_some(2)),
+    };
+    app.attention_banner =
+        banner_row.map(|offset| Rect::new(area.x, area.y + offset, area.width, 1));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, portrait: bool, compact: bool) {
@@ -2814,6 +2837,9 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
     let block = panel(&title, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
     let content = Rect::new(
         inner.x,
         inner.y,
@@ -2868,19 +2894,26 @@ fn draw_path_picker(frame: &mut Frame<'_>, form: &PathPickerForm, outer: Rect) {
     let block = panel(&title, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(truncate(&form.path, inner.width as usize))
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new(truncate(&form.path, inner.width as usize))
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            row,
+        );
+    }
     let query_prefix = "Match: ";
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(query_prefix, Style::default().fg(ACCENT)),
-            Span::styled(form.query.as_str(), Style::default().fg(Color::White)),
-        ])),
-        Rect::new(inner.x, inner.y + 1, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 1) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(query_prefix, Style::default().fg(ACCENT)),
+                Span::styled(form.query.as_str(), Style::default().fg(Color::White)),
+            ])),
+            row,
+        );
+    }
     let matches = form.matches();
     let status = if form.loading {
         "Loading folders..."
@@ -2893,16 +2926,18 @@ fn draw_path_picker(frame: &mut Frame<'_>, form: &PathPickerForm, outer: Rect) {
     } else {
         ""
     };
-    frame.render_widget(
-        Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(
-            if form.error.is_some() {
-                Color::Red
-            } else {
-                MUTED
-            },
-        )),
-        Rect::new(inner.x, inner.y + 2, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 2) {
+        frame.render_widget(
+            Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(
+                if form.error.is_some() {
+                    Color::Red
+                } else {
+                    MUTED
+                },
+            )),
+            row,
+        );
+    }
     let available = inner.height.saturating_sub(5) as usize;
     let start = if form.selected >= available && available > 0 {
         form.selected + 1 - available
@@ -2916,6 +2951,9 @@ fn draw_path_picker(frame: &mut Frame<'_>, form: &PathPickerForm, outer: Rect) {
         .take(available)
         .enumerate()
     {
+        let Some(row) = modal_row(inner, 3 + visible as u16) else {
+            break;
+        };
         let selected = index == form.selected;
         let row_text = format!("{} {directory}/", if selected { ">" } else { " " });
         frame.render_widget(
@@ -2924,22 +2962,20 @@ fn draw_path_picker(frame: &mut Frame<'_>, form: &PathPickerForm, outer: Rect) {
             } else {
                 Style::default().fg(Color::Gray)
             }),
-            Rect::new(inner.x, inner.y + 3 + visible as u16, inner.width, 1),
+            row,
         );
     }
-    frame.render_widget(
-        Paragraph::new(
-            "Type to match  Backspace/Ctrl-u edit  Arrows navigate  Enter use  Esc back",
-        )
-        .style(Style::default().fg(MUTED)),
-        Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        ),
-    );
-    if !form.loading {
+    if let Some(row) = modal_row(inner, inner.height.saturating_sub(1)) {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                "Type to match  Backspace/Ctrl-u edit  Arrows navigate  Enter use  Esc back",
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    if !form.loading && inner.height > 1 {
         let cursor_x = inner
             .x
             .saturating_add(query_prefix.len() as u16)
@@ -2960,6 +2996,9 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     let block = panel(&title, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let footer_y = inner.y + inner.height.saturating_sub(1);
     // Second-to-last row hosts the cross-machine search box; the list above it
@@ -2978,22 +3017,24 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     }
 
     let new_selected = form.selected == 0;
-    frame.render_widget(
-        Paragraph::new(if new_selected {
-            "> New session"
-        } else {
-            "  New session"
-        })
-        .style(if new_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        }),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new(if new_selected {
+                "> New session"
+            } else {
+                "  New session"
+            })
+            .style(if new_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            }),
+            row,
+        );
+    }
     let status = if form.loading {
         "Scanning Codex and Claude history... Enter starts New immediately"
     } else if let Some(error) = &form.error {
@@ -3003,16 +3044,18 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
     } else {
         "Resume matching history or reference the other agent's history"
     };
-    frame.render_widget(
-        Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(
-            if form.error.is_some() {
-                Color::Yellow
-            } else {
-                MUTED
-            },
-        )),
-        Rect::new(inner.x, inner.y + 1, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 1) {
+        frame.render_widget(
+            Paragraph::new(truncate(status, inner.width as usize)).style(Style::default().fg(
+                if form.error.is_some() {
+                    Color::Yellow
+                } else {
+                    MUTED
+                },
+            )),
+            row,
+        );
+    }
 
     let available = inner.height.saturating_sub(4) as usize;
     let selected_candidate = form.selected.saturating_sub(1);
@@ -3189,6 +3232,9 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
     let block = panel(" Search all agent history ", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let query_prefix = "Search: ";
     frame.render_widget(
@@ -3317,6 +3363,9 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     let block = panel(&title, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
     let label_width = 27u16.min(inner.width / 2);
     let value_width = inner.width.saturating_sub(label_width + 1) as usize;
     let visible_fields = inner.height.saturating_sub(3) as usize;
@@ -3386,6 +3435,76 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     }
 }
 
+/// The runtime row, with the hint that Left/Right change it.
+fn launch_kind_line(form: &LaunchForm) -> Line<'static> {
+    Line::from(vec![
+        segment(" CODEX ", form.kind == AgentKind::Codex, CODEX),
+        Span::raw("  "),
+        segment(" CLAUDE ", form.kind == AgentKind::Claude, CLAUDE),
+        Span::raw("  "),
+        segment(" TERMINAL ", form.kind == AgentKind::Terminal, TERMINAL),
+        Span::styled("  Left/Right", Style::default().fg(MUTED)),
+    ])
+}
+
+/// The launch form as one row per field, for a terminal too short to hold the
+/// captioned layout. Without this the captions win the row budget and the path
+/// and label the user is typing into simply stop being drawn.
+fn draw_launch_modal_compact(frame: &mut Frame<'_>, form: &LaunchForm, content: Rect) {
+    const FIELDS: usize = 3;
+    let focused = match form.field {
+        LaunchField::Kind => 0usize,
+        LaunchField::Path => 1,
+        LaunchField::Label => 2,
+    };
+    let visible = usize::from(content.height).min(FIELDS);
+    // Scroll just enough to keep the field being edited on screen.
+    let start = focused
+        .saturating_sub(visible.saturating_sub(1))
+        .min(FIELDS - visible);
+    let mut cursor = None;
+    for (offset, index) in (start..start + visible).enumerate() {
+        let row = Rect::new(content.x, content.y + offset as u16, content.width, 1);
+        let (prefix, value, focused_field) = match index {
+            0 => {
+                frame.render_widget(
+                    Paragraph::new(launch_kind_line(form))
+                        .style(field_style(form.field == LaunchField::Kind)),
+                    row,
+                );
+                continue;
+            }
+            1 => ("Dir ", form.path.as_str(), LaunchField::Path),
+            _ => ("Label ", form.label.as_str(), LaunchField::Label),
+        };
+        let is_focused = form.field == focused_field;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate(
+                        value,
+                        usize::from(content.width).saturating_sub(prefix.len()),
+                    ),
+                    field_style(is_focused),
+                ),
+            ])),
+            row,
+        );
+        if is_focused {
+            let used = prefix.len() + UnicodeWidthStr::width(value);
+            cursor = Some((
+                row.x
+                    .saturating_add(used.min(row.width.saturating_sub(1) as usize) as u16),
+                row.y,
+            ));
+        }
+    }
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+}
+
 fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
     let area = centered_rect(70, 13, outer);
     frame.render_widget(Clear, area);
@@ -3395,6 +3514,15 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
         .border_style(Style::default().fg(ACCENT));
     let content = inner.inner(area);
     frame.render_widget(inner, area);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    // The captioned layout below needs its ten rows; anything less and the
+    // later constraints resolve to nothing and the fields vanish silently.
+    if content.height < 10 {
+        draw_launch_modal_compact(frame, form, content);
+        return;
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3409,16 +3537,8 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
         ])
         .split(content);
     frame.render_widget(Paragraph::new("Agent runtime"), rows[0]);
-    let kinds = Line::from(vec![
-        segment(" CODEX ", form.kind == AgentKind::Codex, CODEX),
-        Span::raw("  "),
-        segment(" CLAUDE ", form.kind == AgentKind::Claude, CLAUDE),
-        Span::raw("  "),
-        segment(" TERMINAL ", form.kind == AgentKind::Terminal, TERMINAL),
-        Span::styled("  Left/Right", Style::default().fg(MUTED)),
-    ]);
     frame.render_widget(
-        Paragraph::new(kinds).style(field_style(form.field == LaunchField::Kind)),
+        Paragraph::new(launch_kind_line(form)).style(field_style(form.field == LaunchField::Kind)),
         rows[1],
     );
     frame.render_widget(
@@ -3461,6 +3581,9 @@ fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, o
     let block = panel(" Temporal Chat ", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3501,12 +3624,18 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
     let block = panel(&title, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let labels = ["Remote host", "Remote port", "Local port"];
     let values = [&form.remote_host, &form.remote_port, &form.local_port];
     let label_width = 15;
     for (index, (label, value)) in labels.iter().zip(values).enumerate() {
         let active = form.selected == index;
+        let Some(row) = modal_row(inner, index as u16) else {
+            continue;
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -3522,7 +3651,7 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
                     },
                 ),
             ])),
-            Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+            row,
         );
     }
 
@@ -3540,23 +3669,32 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
                 .join("  ")
         )
     };
-    frame.render_widget(
-        Paragraph::new(truncate(&detected, inner.width as usize)).style(Style::default().fg(MUTED)),
-        Rect::new(inner.x, inner.y + 4, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 4) {
+        frame.render_widget(
+            Paragraph::new(truncate(&detected, inner.width as usize))
+                .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
 
-    frame.render_widget(
-        Paragraph::new("Active forwards").style(Style::default().fg(Color::Gray).bold()),
-        Rect::new(inner.x, inner.y + 6, inner.width, 1),
-    );
+    if let Some(row) = modal_row(inner, 6) {
+        frame.render_widget(
+            Paragraph::new("Active forwards").style(Style::default().fg(Color::Gray).bold()),
+            row,
+        );
+    }
     let selected_active = form.active_index();
+    // Two trailing rows are reserved for the error line and the key hints.
+    let active_rows = usize::from(inner.height.saturating_sub(9)).min(6);
     let active_start = selected_active
-        .map(|index| index.saturating_add(1).saturating_sub(6))
+        .map(|index| index.saturating_add(1).saturating_sub(active_rows.max(1)))
         .unwrap_or(0);
-    if form.active.is_empty() {
+    if form.active.is_empty()
+        && let Some(row) = modal_row(inner, 7)
+    {
         frame.render_widget(
             Paragraph::new("None").style(Style::default().fg(MUTED)),
-            Rect::new(inner.x, inner.y + 7, inner.width, 1),
+            row,
         );
     }
     for (visible, (index, forward)) in form
@@ -3564,7 +3702,7 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
         .iter()
         .enumerate()
         .skip(active_start)
-        .take(6)
+        .take(active_rows)
         .enumerate()
     {
         let (status, color) = match &forward.state {
@@ -3573,6 +3711,9 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
             PortForwardState::Error(error) => {
                 (format!("error: {}", truncate(error, 28)), Color::Red)
             }
+        };
+        let Some(row) = modal_row(inner, 7 + visible as u16) else {
+            break;
         };
         let selected = selected_active == Some(index);
         let folder = forward
@@ -3594,7 +3735,7 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
                     Color::Reset
                 }),
             ),
-            Rect::new(inner.x, inner.y + 7 + visible as u16, inner.width, 1),
+            row,
         );
     }
 
@@ -3604,28 +3745,23 @@ fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer:
         .or(form.detection_error.as_ref())
         .map(|error| truncate(error, inner.width as usize))
         .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(message).style(Style::default().fg(Color::Red)),
-        Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(2),
-            inner.width,
-            1,
-        ),
-    );
-    frame.render_widget(
-        Paragraph::new(
-            "Tab field/forward   Left/Right detected port   Enter start   d stop   Esc close",
-        )
-        .style(Style::default().fg(MUTED)),
-        Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        ),
-    );
-    if form.selected < PortForwardForm::FIELD_COUNT {
+    if let Some(row) = modal_row(inner, inner.height.saturating_sub(2)) {
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(Color::Red)),
+            row,
+        );
+    }
+    if let Some(row) = modal_row(inner, inner.height.saturating_sub(1)) {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                "Tab field/forward   Left/Right detected port   Enter start   d stop   Esc close",
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    if form.selected < PortForwardForm::FIELD_COUNT && (form.selected as u16) < inner.height {
         let value = values[form.selected];
         let cursor = inner
             .x
@@ -3718,6 +3854,16 @@ fn field_style(active: bool) -> Style {
     } else {
         Style::default().fg(Color::Gray)
     }
+}
+
+/// A single full-width row at a fixed offset inside a modal body.
+///
+/// Modal bodies are laid out at constant offsets, but `centered_rect` shrinks
+/// the modal to fit a short terminal. Rendering a widget outside the frame
+/// buffer panics, so rows that fall past the bottom are dropped instead.
+fn modal_row(inner: Rect, offset: u16) -> Option<Rect> {
+    (offset < inner.height && inner.width > 0)
+        .then(|| Rect::new(inner.x, inner.y + offset, inner.width, 1))
 }
 
 fn centered_rect(width: u16, height: u16, outer: Rect) -> Rect {
