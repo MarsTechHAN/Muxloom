@@ -17,9 +17,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, FileManagerForm, FileManagerOrigin, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
-        LaunchForm, Modal, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
-        SettingsForm, SettingsScope,
+        App, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal,
+        PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm, SettingsForm,
+        SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
@@ -258,11 +258,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect, portrait: bool
 }
 
 fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneLayout {
-    if app
-        .file_manager
-        .as_ref()
-        .is_some_and(|form| form.origin == FileManagerOrigin::TerminalPane)
-    {
+    if app.file_manager_fills_the_terminal_pane() {
         let maximum = area.width.saturating_sub(24).max(12);
         let file_width = app.state.file_width.clamp(12, maximum);
         let split = Layout::default()
@@ -323,13 +319,7 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
                 ..PaneLayout::default()
             };
         }
-        let base_machine_percent = app.state.portrait_machine_percent.clamp(25, 75);
-        let machine_percent = match app.focus {
-            Focus::Machines => base_machine_percent.saturating_add(10),
-            Focus::Agents => base_machine_percent.saturating_sub(10),
-            Focus::Recap => base_machine_percent,
-        }
-        .clamp(20, 80);
+        let machine_percent = app.state.portrait_machine_percent.clamp(25, 75);
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -353,8 +343,7 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
         } else {
             app.state.agents_width.clamp(24, 72)
         };
-        let mut agents_width = base_width + if app.focus == Focus::Agents { 10 } else { 0 };
-        agents_width = agents_width.min(area.width.saturating_sub(28));
+        let agents_width = base_width.min(area.width.saturating_sub(28));
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(agents_width), Constraint::Min(28)])
@@ -367,14 +356,15 @@ fn compute_layout(app: &App, area: Rect, portrait: bool, compact: bool) -> PaneL
         };
     }
 
-    let mut machine_width =
-        app.state.machine_width.clamp(16, 52) + if app.focus == Focus::Machines { 8 } else { 0 };
-    let base_agents_width = if app.file_manager.is_some() {
+    // No focus bump on any of these widths: a focused pane is already marked by
+    // its border and highlight, and widening it moved both dividers and sent a
+    // SIGWINCH to the attached PTY every time the user switched panes.
+    let mut machine_width = app.state.machine_width.clamp(16, 52);
+    let mut agents_width = if app.file_manager.is_some() {
         app.state.file_width.clamp(22, 72)
     } else {
         app.state.agents_width.clamp(24, 72)
     };
-    let mut agents_width = base_agents_width + if app.focus == Focus::Agents { 10 } else { 0 };
     let available = area.width.saturating_sub(28);
     while machine_width + agents_width > available && agents_width > 24 {
         agents_width -= 1;
@@ -3812,7 +3802,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::App,
+        app::{App, FileManagerOrigin},
         config::{Config, State},
         model::{AgentKind, AgentSession, Target, TaskProgress},
         runtime::Runtime,
@@ -4182,13 +4172,22 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        let area = Rect::new(0, 0, 160, 30);
-        app.focus = Focus::Machines;
-        let machine_focused = compute_layout(&app, area, false, false);
-        app.focus = Focus::Agents;
-        let agents_focused = compute_layout(&app, area, false, false);
-        assert!(machine_focused.machines.unwrap().width > agents_focused.machines.unwrap().width);
-        assert!(agents_focused.agents.unwrap().width > machine_focused.agents.unwrap().width);
+        // The focused pane used to grow by 8-10 columns, which moved both
+        // dividers and resized the attached PTY on every pane switch.
+        for (area, portrait) in [
+            (Rect::new(0, 0, 160, 30), false),
+            (Rect::new(0, 0, 60, 100), true),
+        ] {
+            app.focus = Focus::Recap;
+            let unfocused = compute_layout(&app, area, portrait, false);
+            for focus in [Focus::Machines, Focus::Agents] {
+                app.focus = focus;
+                let layout = compute_layout(&app, area, portrait, false);
+                assert_eq!(layout.machines, unfocused.machines, "{focus:?} {portrait}");
+                assert_eq!(layout.agents, unfocused.agents, "{focus:?} {portrait}");
+                assert_eq!(layout.recap, unfocused.recap, "{focus:?} {portrait}");
+            }
+        }
     }
 
     #[test]

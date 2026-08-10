@@ -6561,7 +6561,7 @@ impl App {
         if self
             .pane_layout
             .portrait_terminal_divider
-            .is_some_and(|area| near_divider(area, column, row))
+            .is_some_and(|area| near_horizontal_divider(area, column, row))
         {
             self.dragging = Some(DragDivider::PortraitTerminal);
             return true;
@@ -6593,33 +6593,42 @@ impl App {
         false
     }
 
+    /// True when the file browser has taken over the terminal pane, which is
+    /// the one layout that sizes the browser against the whole window.
+    pub(crate) fn file_manager_fills_the_terminal_pane(&self) -> bool {
+        self.file_manager
+            .as_ref()
+            .is_some_and(|form| form.origin == FileManagerOrigin::TerminalPane)
+    }
+
     fn drag_divider(&mut self, column: u16, row: u16) {
         match self.dragging {
             Some(DragDivider::Machines) => {
                 let Some(area) = self.pane_layout.machines else {
                     return;
                 };
-                let focused_bonus = u16::from(self.focus == Focus::Machines) * 8;
                 self.state.machine_width = column
                     .saturating_sub(area.x)
                     .saturating_add(1)
-                    .saturating_sub(focused_bonus)
                     .clamp(16, 52);
             }
             Some(DragDivider::Agents) => {
                 let Some(area) = self.pane_layout.agents else {
                     return;
                 };
-                let focused_bonus = u16::from(self.focus == Focus::Agents) * 10;
-                let width = column
-                    .saturating_sub(area.x)
-                    .saturating_add(1)
-                    .saturating_sub(focused_bonus)
-                    .clamp(24, 72);
-                if self.file_manager.is_some() {
-                    self.state.file_width = width;
+                let width = column.saturating_sub(area.x).saturating_add(1);
+                // Each layout clamps this width differently, and a drag that
+                // clamps to a range the layout does not use leaves the divider
+                // stuck somewhere the pointer never was.
+                if self.file_manager_fills_the_terminal_pane() {
+                    let row = area
+                        .width
+                        .saturating_add(self.pane_layout.recap.map_or(0, |recap| recap.width));
+                    self.state.file_width = width.clamp(12, row.saturating_sub(24).max(12));
+                } else if self.file_manager.is_some() {
+                    self.state.file_width = width.clamp(22, 72);
                 } else {
-                    self.state.agents_width = width;
+                    self.state.agents_width = width.clamp(24, 72);
                 }
             }
             Some(DragDivider::PortraitMachines) => {
@@ -6634,14 +6643,7 @@ impl App {
                     .saturating_add(1)
                     .saturating_mul(100)
                     / total;
-                let focus_adjustment: i16 = match self.focus {
-                    Focus::Machines => 10,
-                    Focus::Agents => -10,
-                    Focus::Recap => 0,
-                };
-                self.state.portrait_machine_percent =
-                    (i16::try_from(display_percent).unwrap_or(i16::MAX) - focus_adjustment)
-                        .clamp(25, 75) as u16;
+                self.state.portrait_machine_percent = display_percent.clamp(25, 75);
             }
             Some(DragDivider::PortraitTerminal) => {
                 let Some(recap) = self.pane_layout.recap else {
