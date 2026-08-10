@@ -6948,10 +6948,10 @@ impl App {
             .recap
             .is_some_and(|area| inside(area, column, row))
         {
+            // Scrolling is a read gesture: it moves focus but never attaches.
+            // Attaching here would silently route the next keystroke into the
+            // agent, and on an archived session it would start a resume.
             self.focus = Focus::Recap;
-            if self.history_offset == 0 {
-                self.activate_terminal();
-            }
             self.scroll_history(up, 1);
             return;
         }
