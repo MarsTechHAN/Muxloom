@@ -402,54 +402,15 @@ impl TerminalSession {
     }
 
     pub fn write_mouse(&mut self, event: MouseEvent, column: u16, row: u16) -> Result<bool> {
-        use vt100::{MouseProtocolEncoding, MouseProtocolMode};
-
         let screen = self.parser.screen();
-        let mode = screen.mouse_protocol_mode();
-        if mode == MouseProtocolMode::None {
+        let Some(bytes) = mouse_report(
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            event,
+            column,
+            row,
+        ) else {
             return Ok(false);
-        }
-        let (button, release) = match event.kind {
-            MouseEventKind::Down(button) => (mouse_button(button), false),
-            MouseEventKind::Up(button) if mode != MouseProtocolMode::Press => {
-                (mouse_button(button), true)
-            }
-            MouseEventKind::Drag(button)
-                if matches!(
-                    mode,
-                    MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
-                ) =>
-            {
-                (mouse_button(button) + 32, false)
-            }
-            MouseEventKind::Moved if mode == MouseProtocolMode::AnyMotion => (35, false),
-            _ => return Ok(false),
-        };
-        let mut code = button + mouse_modifier(event.modifiers);
-        if release && screen.mouse_protocol_encoding() != MouseProtocolEncoding::Sgr {
-            code = 3 + mouse_modifier(event.modifiers);
-        }
-        let x = column.saturating_add(1);
-        let y = row.saturating_add(1);
-        let bytes = match screen.mouse_protocol_encoding() {
-            MouseProtocolEncoding::Sgr => {
-                format!("\x1b[<{};{x};{y}{}", code, if release { 'm' } else { 'M' }).into_bytes()
-            }
-            MouseProtocolEncoding::Default => vec![
-                0x1b,
-                b'[',
-                b'M',
-                code.saturating_add(32),
-                x.min(223) as u8 + 32,
-                y.min(223) as u8 + 32,
-            ],
-            MouseProtocolEncoding::Utf8 => {
-                let mut bytes = b"\x1b[M".to_vec();
-                push_utf8_codepoint(&mut bytes, u32::from(code) + 32);
-                push_utf8_codepoint(&mut bytes, u32::from(x) + 32);
-                push_utf8_codepoint(&mut bytes, u32::from(y) + 32);
-                bytes
-            }
         };
         self.write(&bytes)?;
         Ok(true)
@@ -1049,6 +1010,71 @@ fn cursor_sequence(final_byte: char, modifier: u8, application_cursor: bool) -> 
     }
 }
 
+/// The bytes an application expects for `event`, or None when it did not ask to
+/// hear about that kind of event.
+fn mouse_report(
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+    event: MouseEvent,
+    column: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+    let (button, release) = match event.kind {
+        MouseEventKind::Down(button) => (mouse_button(button), false),
+        MouseEventKind::Up(button) if mode != MouseProtocolMode::Press => {
+            (mouse_button(button), true)
+        }
+        MouseEventKind::Drag(button)
+            if matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ) =>
+        {
+            (mouse_button(button) + 32, false)
+        }
+        MouseEventKind::Moved if mode == MouseProtocolMode::AnyMotion => (35, false),
+        // Wheel events are reported as buttons 64-67 and are never released.
+        // Without them a pager or editor inside the pane cannot scroll at all,
+        // because the wheel would only move Muxloom's own scrollback over it.
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        _ => return None,
+    };
+    let mut code = button + mouse_modifier(event.modifiers);
+    if release && encoding != MouseProtocolEncoding::Sgr {
+        code = 3 + mouse_modifier(event.modifiers);
+    }
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    Some(match encoding {
+        MouseProtocolEncoding::Sgr => {
+            format!("\x1b[<{};{x};{y}{}", code, if release { 'm' } else { 'M' }).into_bytes()
+        }
+        MouseProtocolEncoding::Default => vec![
+            0x1b,
+            b'[',
+            b'M',
+            code.saturating_add(32),
+            x.min(223) as u8 + 32,
+            y.min(223) as u8 + 32,
+        ],
+        MouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            push_utf8_codepoint(&mut bytes, u32::from(code) + 32);
+            push_utf8_codepoint(&mut bytes, u32::from(x) + 32);
+            push_utf8_codepoint(&mut bytes, u32::from(y) + 32);
+            bytes
+        }
+    })
+}
+
 fn mouse_button(button: MouseButton) -> u8 {
     match button {
         MouseButton::Left => 0,
@@ -1126,6 +1152,63 @@ mod tests {
 
         activity.process(b"\x1b]0;project\x1b\\");
         assert_eq!(activity.working(), Some(false));
+    }
+
+    #[test]
+    fn a_wheel_event_is_reported_to_an_application_that_asked_for_the_mouse() {
+        use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Buttons 64 and 65 in SGR, at the one-based cell the wheel is over.
+        assert_eq!(
+            mouse_report(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+                wheel(MouseEventKind::ScrollUp),
+                4,
+                9,
+            ),
+            Some(b"\x1b[<64;5;10M".to_vec())
+        );
+        assert_eq!(
+            mouse_report(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+                wheel(MouseEventKind::ScrollDown),
+                4,
+                9,
+            ),
+            Some(b"\x1b[<65;5;10M".to_vec())
+        );
+        // The default encoding offsets every field by 32.
+        assert_eq!(
+            mouse_report(
+                MouseProtocolMode::Press,
+                MouseProtocolEncoding::Default,
+                wheel(MouseEventKind::ScrollUp),
+                0,
+                0,
+            ),
+            Some(vec![0x1b, b'[', b'M', 96, 33, 33])
+        );
+        // An application that never asked for the mouse leaves the wheel to
+        // Muxloom's own scrollback.
+        assert_eq!(
+            mouse_report(
+                MouseProtocolMode::None,
+                MouseProtocolEncoding::Sgr,
+                wheel(MouseEventKind::ScrollUp),
+                0,
+                0,
+            ),
+            None
+        );
     }
 
     #[test]

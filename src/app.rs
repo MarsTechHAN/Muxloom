@@ -1405,12 +1405,25 @@ impl App {
                     self.forward_terminal_mouse(mouse);
                 }
             }
-            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, true),
-            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, false),
+            // An application that asked for mouse reporting owns the wheel, the
+            // way it does in any terminal emulator; otherwise the wheel moves
+            // Muxloom's scrollback. PageUp reaches the history either way.
+            MouseEventKind::ScrollUp => {
+                if !self.forward_terminal_mouse(mouse) {
+                    self.scroll_at(mouse.column, mouse.row, true);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if !self.forward_terminal_mouse(mouse) {
+                    self.scroll_at(mouse.column, mouse.row, false);
+                }
+            }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                self.forward_terminal_mouse(mouse);
+            }
             MouseEventKind::Moved => {
                 self.forward_terminal_mouse(mouse);
             }
-            _ => {}
         }
         Action::Continue
     }
