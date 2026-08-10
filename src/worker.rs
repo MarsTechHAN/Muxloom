@@ -200,6 +200,9 @@ pub enum Event {
         kind: AgentKind,
         path: String,
         result: Result<Vec<ResumeCandidate>, String>,
+        /// Set when one runtime's history could be read and the other's could
+        /// not, so an empty list is not reported as a definite "nothing here".
+        warning: Option<String>,
     },
     FilesListed {
         target_id: String,
@@ -611,6 +614,7 @@ impl Worker {
                         let claude = runtime
                             .scan_resumes(&target, AgentKind::Claude, &path)
                             .map_err(|error| error.to_string());
+                        let mut warning = None;
                         let result = match (codex, claude) {
                             (Ok(mut codex), Ok(claude)) => {
                                 codex.extend(claude);
@@ -623,6 +627,8 @@ impl Worker {
                                         "Claude history scan failed target={target_id}: {error}"
                                     ),
                                 );
+                                warning =
+                                    Some(format!("Could not scan claude history: {error}"));
                                 Ok(candidates)
                             }
                             (Err(error), Ok(candidates)) => {
@@ -632,6 +638,7 @@ impl Worker {
                                         "Codex history scan failed target={target_id}: {error}"
                                     ),
                                 );
+                                warning = Some(format!("Could not scan codex history: {error}"));
                                 Ok(candidates)
                             }
                             (Err(codex), Err(claude)) => Err(format!(
@@ -649,6 +656,7 @@ impl Worker {
                             kind,
                             path,
                             result,
+                            warning,
                         });
                     }
                     Request::ListFiles { target, path } => {

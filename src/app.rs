@@ -2888,7 +2888,17 @@ impl App {
                 kind,
                 path,
                 result,
+                warning,
             } => {
+                // One runtime's history can fail while the other's succeeds. The
+                // candidates that were found are still worth showing, but an
+                // empty list must not be reported as a settled "nothing here".
+                let unread = warning.filter(|warning| {
+                    warning.contains(match kind {
+                        AgentKind::Claude => "claude",
+                        _ => "codex",
+                    })
+                });
                 if let Some(Modal::Resume(form)) = self.modal.as_mut()
                     && form.launch.target.id == target_id
                     && form.launch.kind == kind
@@ -2899,7 +2909,7 @@ impl App {
                         Ok(candidates) => {
                             form.candidates = candidates.clone();
                             form.selected = 0;
-                            form.error = None;
+                            form.error = unread.clone();
                         }
                         Err(error) => {
                             form.error = Some(short_error(error));
@@ -2941,6 +2951,9 @@ impl App {
                                     resume_id: candidate.id.clone(),
                                     remove_archive: self.state.remove_archive_after_resume,
                                 });
+                            } else if let Some(unread) = unread {
+                                self.request_history();
+                                self.set_error(unread);
                             } else {
                                 self.request_history();
                                 self.status_message = format!(
@@ -8975,6 +8988,7 @@ mod tests {
             target_id: "local".into(),
             kind: AgentKind::Codex,
             path: "/work/project".into(),
+            warning: None,
             result: Ok(vec![ResumeCandidate {
                 id: "thread-id".into(),
                 kind: AgentKind::Codex,
