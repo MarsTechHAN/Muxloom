@@ -3187,8 +3187,11 @@ impl App {
             } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 match result {
-                    Ok(count) => {
-                        self.status_message = format!("Uploaded {count} file(s)");
+                    Ok(names) => {
+                        self.status_message = match names.as_slice() {
+                            [name] => format!("Uploaded {name}"),
+                            names => format!("Uploaded {} files", names.len()),
+                        };
                         let refresh = matches!(self.file_manager.as_ref(), Some(form)
                             if form.target.id == target_id && form.path == remote_directory);
                         if refresh && let Some(form) = self.file_manager.take() {

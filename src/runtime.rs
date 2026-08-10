@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -1776,28 +1776,60 @@ END {
         target: &Target,
         local_paths: &[PathBuf],
         remote_directory: &str,
-    ) -> Result<usize> {
+    ) -> Result<Vec<String>> {
+        self.upload_files_with_progress(target, local_paths, remote_directory, |_, _, _| {})
+    }
+
+    /// Upload while reporting `(name, transferred, size)` as each file goes
+    /// across. Only the daemon's own stream can say how far along it is; an scp
+    /// or a local copy reports the file once it has landed, so a drop of many
+    /// files still moves rather than sits there.
+    pub fn upload_files_with_progress(
+        &self,
+        target: &Target,
+        local_paths: &[PathBuf],
+        remote_directory: &str,
+        mut progress: impl FnMut(&str, u64, u64),
+    ) -> Result<Vec<String>> {
         if local_paths.is_empty() {
             bail!("no local files were provided");
         }
+        // An upload never replaces what is already there: a dropped file that
+        // collides with an existing name lands beside it as "name (1).ext", the
+        // same way a download does locally.
+        let mut taken: HashSet<String> = HashSet::new();
         let daemon_upload = if matches!(target.transport, Transport::Ssh { .. }) {
             match self.bridges.list_files(target, remote_directory.into()) {
-                Ok(_) => true,
+                Ok(listing) => {
+                    taken.extend(listing.entries.into_iter().map(|entry| entry.name));
+                    true
+                }
                 Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
                 Err(_) => {
                     let check = format!("test -d {}", shell_quote(remote_directory));
                     let output = self.run_shell(target, &check, false)?;
                     ensure_success(&output, "validate upload directory")?;
+                    if let Ok(listing) = self.list_files(target, remote_directory) {
+                        taken.extend(listing.entries.into_iter().map(|entry| entry.name));
+                    }
                     false
                 }
             }
         } else {
-            if !Path::new(remote_directory).is_dir() {
+            let directory = Path::new(remote_directory);
+            if !directory.is_dir() {
                 bail!("upload directory does not exist: {remote_directory}");
+            }
+            if let Ok(entries) = fs::read_dir(directory) {
+                taken.extend(
+                    entries
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned()),
+                );
             }
             false
         };
-        let mut uploaded = 0;
+        let mut uploaded = Vec::new();
         for local_path in local_paths {
             if !local_path.is_file() {
                 bail!(
@@ -1809,26 +1841,47 @@ END {
                 .file_name()
                 .filter(|name| !name.is_empty())
                 .context("upload source has no filename")?
-                .to_string_lossy();
-            let destination = remote_child_path(remote_directory, &name);
+                .to_string_lossy()
+                .into_owned();
+            // Dropping a file back onto the directory it already lives in is a
+            // no-op, not a reason to make a second copy of it.
+            let in_place = matches!(target.transport, Transport::Local)
+                && fs::canonicalize(local_path).ok()
+                    == fs::canonicalize(remote_child_path(remote_directory, &name)).ok();
+            let stored = if in_place {
+                name.clone()
+            } else {
+                unique_upload_name(&mut taken, &name)
+            };
+            let destination = remote_child_path(remote_directory, &stored);
+            let size = local_path.metadata().map(|data| data.len()).unwrap_or(0);
             match &target.transport {
                 Transport::Local => {
                     let source = fs::canonicalize(local_path).with_context(|| {
                         format!("failed to resolve upload source {}", local_path.display())
                     })?;
                     let destination_path = PathBuf::from(&destination);
-                    if fs::canonicalize(&destination_path).ok().as_ref() != Some(&source) {
+                    if !in_place {
                         fs::copy(&source, &destination_path).with_context(|| {
                             format!("failed to upload to {}", destination_path.display())
                         })?;
                     }
+                    progress(&stored, size, size);
                 }
                 Transport::Ssh { .. } if daemon_upload => {
-                    self.bridges.upload_file(target, local_path, destination)?;
+                    self.bridges.upload_file(
+                        target,
+                        local_path,
+                        destination,
+                        |transferred, size| progress(&stored, transferred, size),
+                    )?;
                 }
-                Transport::Ssh { alias } => self.scp_to(alias, local_path, &destination)?,
+                Transport::Ssh { alias } => {
+                    self.scp_to(alias, local_path, &destination)?;
+                    progress(&stored, size, size);
+                }
             }
-            uploaded += 1;
+            uploaded.push(stored);
         }
         Ok(uploaded)
     }
@@ -2823,6 +2876,32 @@ fn filename_matches_pattern(filename: &str, pattern: &str) -> bool {
         previous_was_star = token == '*';
     }
     previous[text.len()]
+}
+
+/// The name an upload should take in a directory that already holds `taken`.
+///
+/// Names chosen here are recorded, so a batch of drops that collide with each
+/// other still lands as separate files rather than overwriting one another.
+fn unique_upload_name(taken: &mut HashSet<String>, name: &str) -> String {
+    let chosen = if taken.contains(name) {
+        let path = Path::new(name);
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_string());
+        let extension = path.extension().map(|value| value.to_string_lossy());
+        (1..10_000)
+            .map(|index| match &extension {
+                Some(extension) => format!("{stem} ({index}).{extension}"),
+                None => format!("{stem} ({index})"),
+            })
+            .find(|candidate| !taken.contains(candidate))
+            .unwrap_or_else(|| format!("{stem}-{}", std::process::id()))
+    } else {
+        name.to_string()
+    };
+    taken.insert(chosen.clone());
+    chosen
 }
 
 fn unique_destination(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {

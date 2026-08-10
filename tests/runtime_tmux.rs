@@ -432,10 +432,30 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
                 &root.display().to_string()
             )
             .unwrap(),
-        1
+        vec!["upload.txt".to_string()]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("upload.txt")).unwrap(),
+        "uploaded"
+    );
+    // A second drop of the same name lands beside the first instead of
+    // silently replacing it.
+    assert_eq!(
+        runtime
+            .upload_files(
+                &target,
+                std::slice::from_ref(&upload),
+                &root.display().to_string()
+            )
+            .unwrap(),
+        vec!["upload (1).txt".to_string()]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("upload.txt")).unwrap(),
+        "uploaded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("upload (1).txt")).unwrap(),
         "uploaded"
     );
     let downloaded = runtime
