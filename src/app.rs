@@ -1065,6 +1065,15 @@ impl App {
         }
     }
 
+    /// How far PageUp/PageDown moves through the listing. This used to read
+    /// `preview_page_rows`, which is only set while a preview is on screen and
+    /// is reset to 1 when it closes, so paging the list moved a single row.
+    fn file_list_page(form: &FileManagerForm) -> isize {
+        form.list_area
+            .map_or(10, |area| area.height as isize - 1)
+            .max(1)
+    }
+
     fn handle_file_key(&mut self, key: KeyEvent) -> bool {
         let Some(mut form) = self.file_manager.take() else {
             return false;
