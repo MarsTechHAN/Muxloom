@@ -1728,6 +1728,19 @@ impl App {
         self.clipboard_request.take()
     }
 
+    /// Temper the "copied" message when nothing confirmed the copy. Without a
+    /// clipboard tool the text goes out as an OSC 52 request, and a terminal
+    /// that quietly drops those left the user holding a receipt for nothing.
+    pub fn note_clipboard_delivery(&mut self, confirmed: bool) {
+        if confirmed || self.status_message.is_empty() {
+            return;
+        }
+        self.status_message = format!(
+            "{} - asked the terminal to take it",
+            self.status_message.trim_end()
+        );
+    }
+
     pub fn selected_session(&self) -> Option<&AgentSession> {
         let id = self.selected_session_id.as_deref()?;
         self.sessions.iter().find(|session| session.id == id)

@@ -185,10 +185,11 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
         for notification in app.take_notifications() {
             emit_terminal_notification(terminal, &notification)?;
         }
-        if let Some(text) = app.take_clipboard_request()
-            && let Err(error) = emit_clipboard_copy(terminal, &text)
-        {
-            app.status_message = format!("Clipboard copy failed: {error}");
+        if let Some(text) = app.take_clipboard_request() {
+            match emit_clipboard_copy(terminal, &text) {
+                Ok(confirmed) => app.note_clipboard_delivery(confirmed),
+                Err(error) => app.status_message = format!("Clipboard copy failed: {error}"),
+            }
         }
         if !event::poll(Duration::from_millis(33))? {
             continue;
@@ -327,7 +328,12 @@ fn emit_terminal_notification(terminal: &mut Tui, message: &str) -> Result<()> {
     Ok(())
 }
 
-fn emit_clipboard_copy(terminal: &mut Tui, text: &str) -> Result<()> {
+/// Put `text` on the clipboard, reporting whether anything confirmed it landed.
+///
+/// A clipboard tool that exits cleanly has taken the text. OSC 52 is a request
+/// the terminal is free to ignore — many refuse it by default — so it goes out
+/// as well but cannot be counted as an answer.
+fn emit_clipboard_copy(terminal: &mut Tui, text: &str) -> Result<bool> {
     let native = copy_native_clipboard(text);
     let encoded = base64_encode(text.as_bytes());
     write!(terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
@@ -339,7 +345,7 @@ fn emit_clipboard_copy(terminal: &mut Tui, text: &str) -> Result<()> {
             text.chars().count()
         ),
     );
-    Ok(())
+    Ok(native)
 }
 
 #[cfg(target_os = "macos")]
@@ -352,12 +358,26 @@ fn copy_native_clipboard(text: &str) -> bool {
     write_clipboard_command("clip.exe", &[], text)
 }
 
+/// Wayland and X11 both hand the clipboard to a helper program. Try the one
+/// that matches the session first, then the other two, and let the OSC 52
+/// fallback carry the copy on a machine that has none of them.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn copy_native_clipboard(_text: &str) -> bool {
-    false
+fn copy_native_clipboard(text: &str) -> bool {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut tools: Vec<(&str, &[&str])> = vec![
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    if wayland {
+        tools.insert(0, ("wl-copy", &[]));
+    } else {
+        tools.push(("wl-copy", &[]));
+    }
+    tools
+        .into_iter()
+        .any(|(program, arguments)| write_clipboard_command(program, arguments, text))
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn write_clipboard_command(program: &str, arguments: &[&str], text: &str) -> bool {
     use std::process::{Command, Stdio};
 
