@@ -238,10 +238,18 @@ pub enum Event {
     FileDownloaded {
         result: Result<PathBuf, String>,
     },
+    FileUploadProgress {
+        name: String,
+        transferred: u64,
+        total_size: u64,
+        bytes_per_second: f64,
+    },
     FilesUploaded {
         target_id: String,
         remote_directory: String,
-        result: Result<usize, String>,
+        /// The names the files were stored under, which differ from the ones
+        /// dropped when an upload had to step around an existing file.
+        result: Result<Vec<String>, String>,
     },
     /// One backup pass finished; the payload is a human-readable summary.
     BackupSynced {
@@ -780,8 +788,36 @@ impl Worker {
                         remote_directory,
                     } => {
                         let target_id = target.id.clone();
+                        let progress_events = events.clone();
+                        let mut last_update = Instant::now();
+                        let mut last_bytes = 0u64;
                         let result = runtime
-                            .upload_files(&target, &local_paths, &remote_directory)
+                            .upload_files_with_progress(
+                                &target,
+                                &local_paths,
+                                &remote_directory,
+                                |name, transferred, total_size| {
+                                    if last_update.elapsed().as_millis() < 100
+                                        && transferred < total_size
+                                    {
+                                        return;
+                                    }
+                                    let elapsed = last_update.elapsed().as_secs_f64().max(0.001);
+                                    let bytes_per_second =
+                                        transferred.saturating_sub(last_bytes) as f64 / elapsed;
+                                    let _ = progress_events.send(Event::FileUploadProgress {
+                                        name: name.to_string(),
+                                        transferred,
+                                        total_size,
+                                        bytes_per_second,
+                                    });
+                                    last_update = Instant::now();
+                                    // Each file starts its own count, so the
+                                    // rate does not read as a huge negative
+                                    // jump when the next one begins at zero.
+                                    last_bytes = transferred;
+                                },
+                            )
                             .map_err(|error| error.to_string());
                         let _ = events.send(Event::FilesUploaded {
                             target_id,

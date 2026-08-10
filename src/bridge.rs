@@ -838,7 +838,12 @@ impl BridgeConnection {
         })
     }
 
-    pub fn upload_file(&self, local_path: &std::path::Path, remote_path: String) -> Result<()> {
+    pub fn upload_file(
+        &self,
+        local_path: &std::path::Path,
+        remote_path: String,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<()> {
         let parent = std::path::Path::new(&remote_path)
             .parent()
             .context("remote upload path has no parent")?
@@ -852,12 +857,16 @@ impl BridgeConnection {
             size,
         })?;
         let mut buffer = vec![0; crate::daemon_protocol::DATA_CHUNK_SIZE];
+        let mut sent = 0u64;
+        progress(0, size);
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             stream.write_data(&buffer[..read], true)?;
+            sent = sent.saturating_add(read as u64);
+            progress(sent, size);
         }
         drop(stream);
         self.list_files(parent)?;
@@ -1737,9 +1746,10 @@ impl BridgePool {
         target: &Target,
         local_path: &std::path::Path,
         remote_path: String,
+        progress: impl FnMut(u64, u64),
     ) -> Result<()> {
         self.connection_for_target(target)?
-            .upload_file(local_path, remote_path)
+            .upload_file(local_path, remote_path, progress)
     }
 
     fn connection_for_target(&self, target: &Target) -> Result<Arc<BridgeConnection>> {

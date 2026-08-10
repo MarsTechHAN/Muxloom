@@ -1948,7 +1948,7 @@ END {
                 // daemon is not reachable.
                 if let Err(error) =
                     self.bridges
-                        .upload_file(target, local_path, remote_path.to_string())
+                        .upload_file(target, local_path, remote_path.to_string(), |_, _| {})
                 {
                     debug::log(
                         "runtime",

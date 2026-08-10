@@ -3154,24 +3154,21 @@ impl App {
                     .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or(remote_path.as_str());
-                let percent = transferred
-                    .saturating_mul(100)
-                    .checked_div(total_size)
-                    .unwrap_or(0);
-                let progress = if total_size > 0 {
-                    format!(
-                        "{}%  {}/{}",
-                        percent,
-                        format_transfer_bytes(transferred),
-                        format_transfer_bytes(total_size)
-                    )
-                } else {
-                    format_transfer_bytes(transferred)
-                };
-                self.status_message = format!(
-                    "Downloading {name}  {progress}  {}/s",
-                    format_transfer_bytes(bytes_per_second as u64)
-                );
+                self.set_background_status(format!(
+                    "Downloading {name}  {}",
+                    transfer_progress(transferred, total_size, bytes_per_second)
+                ));
+            }
+            Event::FileUploadProgress {
+                name,
+                transferred,
+                total_size,
+                bytes_per_second,
+            } => {
+                self.set_background_status(format!(
+                    "Uploading {name}  {}",
+                    transfer_progress(transferred, total_size, bytes_per_second)
+                ));
             }
             Event::FileDownloaded { result } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
@@ -7605,6 +7602,27 @@ fn folder_match_rank(name: &str, query: &str) -> Option<(u8, usize, usize)> {
         cursor = position + 1;
     }
     Some((2, first.unwrap_or(0), gaps))
+}
+
+/// The shared tail of a transfer status line: how far along, and how fast.
+fn transfer_progress(transferred: u64, total_size: u64, bytes_per_second: f64) -> String {
+    let measured = if total_size > 0 {
+        let percent = transferred
+            .saturating_mul(100)
+            .checked_div(total_size)
+            .unwrap_or(0);
+        format!(
+            "{percent}%  {}/{}",
+            format_transfer_bytes(transferred),
+            format_transfer_bytes(total_size)
+        )
+    } else {
+        format_transfer_bytes(transferred)
+    };
+    format!(
+        "{measured}  {}/s",
+        format_transfer_bytes(bytes_per_second as u64)
+    )
 }
 
 fn format_transfer_bytes(bytes: u64) -> String {
