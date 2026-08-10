@@ -2752,6 +2752,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Mouse drag",
             "Select and copy terminal text; Alt-drag forwards",
         ),
+        help_row(
+            "Cmd-c / Ctrl-Shift-c",
+            "Copy the selection; plain Ctrl-c goes to the agent",
+        ),
         help_row("x", "Archive live agents; directly destroy a Temporal Chat"),
         help_row("a", "Expand or collapse Archived sessions"),
         help_row("e", "Rename the selected agent's display name"),

@@ -158,7 +158,8 @@ still deep to page through after the controller is relaunched. Drag to select
 and copy — while scrolled back, and while the file browser is open.
 
 **Keys** — `Enter` attach · `PageUp`/`PageDown` or wheel scroll · drag to select
-· `Cmd`/`Ctrl+C` copy · `Shift`/`Option+Enter` newline.
+· `Cmd+C`/`Ctrl+Shift+C` copy (plain `Ctrl-c` goes to the agent) ·
+`Shift`/`Option+Enter` newline.
 
 ### 📁 File browser and previews
 
