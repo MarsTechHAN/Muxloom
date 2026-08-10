@@ -48,6 +48,12 @@ const CODEX_LATEST: &str = "https://github.com/openai/codex/releases/latest";
 const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
 const CODEX_NO_HISTORY_CONFIG: &str = "history.persistence=\"none\"";
 
+/// The most of a text file a preview will pull across. A preview is something
+/// to glance through, and reading a log of any size whole — over SSH, into
+/// memory, behind a spinner that cannot say how long it will take — is not that.
+/// Past this the reader is told the preview stops short.
+const PREVIEW_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 struct TargetPlatform {
     os: String,
@@ -1586,6 +1592,7 @@ END {
         // and is completed over the chunked file stream, so a preview shows the
         // whole file while no single frame carries more than this.
         const FIRST_READ: u64 = 1024 * 1024;
+        let limit = PREVIEW_BYTE_LIMIT;
         if !self.bridge_recently_failed(&target.id) {
             match self
                 .bridges
@@ -1626,10 +1633,19 @@ END {
                 kind=text
                 [ -n "$mime" ] || mime=text/plain
             fi
+            limit={limit}
             truncated=0
+            case "$kind" in
+                text|markdown) [ "${{size:-0}}" -gt "$limit" ] 2>/dev/null && truncated=1 ;;
+            esac
             printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
             case "$kind" in
-                text|markdown) cat -- "$path" ;;
+                text|markdown)
+                    if head -c 1 </dev/null >/dev/null 2>&1; then
+                        head -c "$limit" < "$path"
+                    else
+                        cat -- "$path"
+                    fi ;;
                 audio|video)
                     if command -v ffprobe >/dev/null 2>&1; then
                         ffprobe -v error -show_entries format=format_name,duration,size,bit_rate:stream=index,codec_name,codec_type,width,height,sample_rate,channels -of default=noprint_wrappers=1 -- "$path" 2>&1 | head -n 160
@@ -1665,10 +1681,13 @@ END {
         {
             return preview;
         }
-        match self.bridges.read_file(target, path.into()) {
+        match self
+            .bridges
+            .read_file(target, path.into(), PREVIEW_BYTE_LIMIT)
+        {
             Ok(bytes) => {
+                preview.truncated = bytes.len() as u64 >= PREVIEW_BYTE_LIMIT;
                 preview.content = String::from_utf8_lossy(&bytes).into_owned();
-                preview.truncated = false;
             }
             Err(error) => debug::log(
                 "runtime",

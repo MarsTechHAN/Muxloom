@@ -1682,10 +1682,7 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Rect::new(inner.x, inner.y, inner.width, pinned_rows),
         );
     }
-    form.preview_max_scroll = render
-        .height()
-        .saturating_sub(body_area.height as usize)
-        .min(u16::MAX as usize) as u16;
+    form.preview_max_scroll = render.height().saturating_sub(body_area.height as usize);
     form.preview_page_rows = body_area.height.max(1);
     // A reader parked at the end of the file stays there as it grows: the
     // monitor swaps in longer content and the view follows to the new tail.
@@ -1699,7 +1696,7 @@ fn draw_file_preview_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // lines in JSON/JSONL session dumps and, once scrolled, leaves stray glyphs
     // on otherwise-empty rows. Emitting exactly the visible rows keeps scroll
     // bounds accurate and drops control characters that would shift columns.
-    let window = render.window(form.preview_scroll as usize, body_area.height as usize);
+    let window = render.window(form.preview_scroll, body_area.height as usize);
     // Remember the plain text of the visible rows so a mouse selection over the
     // preview can be copied, mirroring terminal selection.
     form.preview_text_area = Some(body_area);
@@ -2065,7 +2062,11 @@ fn file_preview_render(preview: &crate::model::FilePreview) -> PreviewRender {
     let mut pinned = vec![file_preview_metadata(preview)];
     if preview.truncated {
         pinned.push(Line::styled(
-            "Only part of this file could be read",
+            format!(
+                "Showing the first {} of {} — download it to read the rest",
+                format_bytes(preview.content.len() as u64),
+                format_bytes(preview.size)
+            ),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -2207,8 +2208,10 @@ fn text_preview_render(
         .to_ascii_lowercase();
     let rich = preview.content.len() <= RICH_RENDER_LIMIT;
     match extension.as_str() {
-        "csv" => delimited_render(pinned, &preview.content, b','),
-        "tsv" => delimited_render(pinned, &preview.content, b'\t'),
+        // Building the table parses every record and measures every cell, all
+        // on the render thread, so a big file gets the plain reader instead.
+        "csv" if rich => delimited_render(pinned, &preview.content, b','),
+        "tsv" if rich => delimited_render(pinned, &preview.content, b'\t'),
         "json" if rich => PreviewRender::lines(
             pinned,
             parsed_json_lines(&preview.content)

@@ -235,8 +235,8 @@ pub struct FileManagerForm {
     pub preview_requested_path: Option<String>,
     pub preview_loading: bool,
     pub preview_error: Option<String>,
-    pub preview_scroll: u16,
-    pub preview_max_scroll: u16,
+    pub preview_scroll: usize,
+    pub preview_max_scroll: usize,
     pub preview_page_rows: u16,
     /// True while the view sits at the bottom of the preview. A refresh that
     /// makes the file longer then follows the new tail instead of leaving the
@@ -5244,7 +5244,7 @@ impl App {
     }
 
     fn page_file_preview(form: &mut FileManagerForm, forward: bool) {
-        let step = form.preview_page_rows.max(1);
+        let step = usize::from(form.preview_page_rows.max(1));
         if form.preview_max_scroll == 0 {
             form.preview_scroll = 0;
         } else if forward {

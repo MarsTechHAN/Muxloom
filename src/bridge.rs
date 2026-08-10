@@ -1715,18 +1715,21 @@ impl BridgePool {
         Ok(())
     }
 
-    /// Read a whole remote file over the chunked, flow-controlled file stream.
-    /// Used to finish a preview whose body does not fit in one response frame,
-    /// so the transfer stays bounded per frame no matter how big the file is.
-    pub fn read_file(&self, target: &Target, path: String) -> Result<Vec<u8>> {
+    /// Read up to `limit` bytes of a remote file over the chunked,
+    /// flow-controlled file stream. Used to finish a preview whose body does
+    /// not fit in one response frame, so the transfer stays bounded per frame
+    /// no matter how big the file is — and bounded overall, because a preview
+    /// nobody can scroll to the end of is not worth the wait or the memory.
+    pub fn read_file(&self, target: &Target, path: String, limit: u64) -> Result<Vec<u8>> {
         let connection = self.connection_for_target(target)?;
-        let mut stream = connection.open_file(path, 0, None, false)?;
+        let mut stream = connection.open_file(path, 0, Some(limit), false)?;
         let mut bytes = Vec::new();
         while !stream.is_closed() {
             if let Some(chunk) = stream.read_timeout(REQUEST_TIMEOUT)? {
                 bytes.extend_from_slice(&chunk);
             }
         }
+        bytes.truncate(limit as usize);
         Ok(bytes)
     }
 
