@@ -493,9 +493,16 @@ pub struct App {
     pub history_message: String,
     pub history_loading: bool,
     pub history_offset: usize,
+    /// The scrollback offset last exchanged with the attached emulator, so
+    /// `sync_terminal_scrollback` can tell an app-driven move from the drift
+    /// the emulator applies itself as new output arrives.
+    terminal_scrollback_pin: usize,
     pub interactive: bool,
     pub modal: Option<Modal>,
     port_forwards: PortForwardManager,
+    /// The last state reported for each live forward, so `poll_port_forwards`
+    /// only announces transitions instead of repeating itself every tick.
+    port_forward_states: HashMap<u64, PortForwardState>,
     pub file_manager: Option<FileManagerForm>,
     /// File browsers stashed while another machine is selected, keyed by target
     /// id. The active machine's browser lives in `file_manager`; switching
@@ -627,13 +634,16 @@ impl App {
             history_message: "Select an agent to load its terminal history.".into(),
             history_loading: false,
             history_offset: 0,
+            terminal_scrollback_pin: 0,
             interactive: false,
             modal: None,
             port_forwards: PortForwardManager::default(),
+            port_forward_states: HashMap::new(),
             file_manager: None,
             stashed_file_managers: HashMap::new(),
             file_dirs: HashMap::new(),
             status_message: "Space enables a machine; n starts an agent".into(),
+            status_error: None,
             busy_operations: 0,
             pane_layout: PaneLayout::default(),
             attention_banner: None,
@@ -2025,6 +2035,33 @@ impl App {
 
     /// True when the selected history position is still represented by the
     /// attached emulator. Older positions are rendered from daemon history.
+    /// Settle the attached emulator on the row the app asked for, and report
+    /// where it ended up.
+    ///
+    /// The emulator anchors a scrolled-back view to its content: every line the
+    /// session prints lifts its own offset by one so the same rows stay on
+    /// screen. Handing it `history_offset` again on every frame would undo
+    /// that, sliding the page down a line for each line of output. So write
+    /// only when the app moved the view itself, and otherwise take the
+    /// emulator's answer as the truth.
+    pub(crate) fn sync_terminal_scrollback(&mut self) -> usize {
+        if !self.attached_terminal_for_selected() {
+            return self.history_offset;
+        }
+        let desired = self.history_offset;
+        let pinned = self.terminal_scrollback_pin;
+        let Some(terminal) = self.terminal.as_mut() else {
+            return desired;
+        };
+        if desired != pinned {
+            terminal.set_scrollback(desired);
+        }
+        let settled = terminal.scrollback();
+        self.history_offset = settled;
+        self.terminal_scrollback_pin = settled;
+        settled
+    }
+
     pub(crate) fn attached_history_is_buffered(&mut self) -> bool {
         if !self.attached_terminal_for_selected() {
             return false;
@@ -4174,12 +4211,13 @@ impl App {
             terminal.set_scrollback(desired.min(boundary));
             if desired <= boundary {
                 self.history_offset = terminal.scrollback();
+                self.terminal_scrollback_pin = self.history_offset;
                 buffered = true;
             } else {
                 self.history_offset = desired;
             }
         }
-        self.terminal_selection = None;
+        self.release_selection_for_scroll();
         if buffered {
             self.history_loading = false;
             self.history_message.clear();
@@ -8373,6 +8411,138 @@ mod tests {
             rendered,
             more_history: rendered,
         }
+    }
+
+    #[test]
+    fn a_scrolled_back_view_stays_on_its_rows_while_the_session_prints() {
+        // The emulator lifts its own offset for every line that arrives so the
+        // page keeps the same rows. Handing it the app's older count back on
+        // each frame slid the view down a line per line of output, which read
+        // as the transcript crawling away under the reader.
+        let (mut app, _request_rx, _root, _boundary) = attached_claude_app("scroll-drift");
+        app.terminal
+            .as_mut()
+            .expect("terminal attached")
+            .set_scrollback(0);
+        app.history_offset = 0;
+        app.terminal_scrollback_pin = 0;
+        app.scroll_history(true, 2);
+        assert_eq!(app.history_offset, 2, "two rows up");
+        let before = app
+            .terminal
+            .as_ref()
+            .expect("terminal attached")
+            .screen()
+            .contents();
+
+        app.terminal
+            .as_mut()
+            .expect("terminal attached")
+            .process_output_for_test(b"fresh-1\r\n");
+        let offset = app.sync_terminal_scrollback();
+
+        assert_eq!(offset, 3, "counted from the new bottom");
+        assert_eq!(app.history_offset, offset, "and the app agrees");
+        assert_eq!(
+            app.terminal
+                .as_ref()
+                .expect("terminal attached")
+                .screen()
+                .contents(),
+            before,
+            "same rows on screen"
+        );
+    }
+
+    #[test]
+    fn scrolling_mid_drag_keeps_the_selection_being_made() {
+        // Dragging a selection past the top of the pane scrolls the view; if
+        // that scroll dropped the selection, the drag could never reach a row
+        // that was off screen when it started.
+        let (mut app, _request_rx, _root, _boundary) = attached_claude_app("drag-scroll");
+        let dragging = TerminalSelection {
+            anchor: TerminalPoint { row: 3, column: 0 },
+            cursor: TerminalPoint { row: 0, column: 4 },
+            dragging: true,
+        };
+        app.terminal_selection = Some(dragging);
+
+        app.scroll_history(true, 1);
+        assert_eq!(app.terminal_selection, Some(dragging), "drag survives");
+
+        app.terminal_selection = Some(TerminalSelection {
+            dragging: false,
+            ..dragging
+        });
+        app.scroll_history(true, 1);
+
+        assert_eq!(
+            app.terminal_selection, None,
+            "a finished selection still clears"
+        );
+    }
+
+    #[test]
+    fn an_upload_reports_how_far_along_it_is() {
+        // A drop of a large file used to sit on "Uploading dropped files..."
+        // until it finished, with no way to tell a slow link from a stuck one.
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+
+        app.handle_worker_event(Event::FileUploadProgress {
+            name: "notes.md".into(),
+            transferred: 512,
+            total_size: 2048,
+            bytes_per_second: 1024.0,
+        });
+
+        assert!(
+            app.status_message.contains("Uploading notes.md"),
+            "named the file: {}",
+            app.status_message
+        );
+        assert!(app.status_message.contains("25%"), "{}", app.status_message);
+        assert!(
+            app.status_message.contains("1.0 KiB/s"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn pasting_without_input_says_where_the_text_went() {
+        let (mut app, _request_rx, _root, boundary) = attached_claude_app("paste");
+        app.interactive = false;
+
+        app.handle_paste("cargo test\n".into());
+
+        assert!(
+            app.status_message.contains("take input"),
+            "explained itself: {}",
+            app.status_message
+        );
+        assert_eq!(app.history_offset, boundary, "and left the view alone");
+    }
+
+    #[test]
+    fn pasting_into_a_scrolled_back_terminal_returns_to_the_live_tail() {
+        // The text lands at the prompt on the bottom row, so the view has to
+        // follow it there the way a keystroke does.
+        let (mut app, _request_rx, _root, boundary) = attached_claude_app("paste-scrolled");
+        app.interactive = true;
+        assert_eq!(app.history_offset, boundary, "starts scrolled back");
+
+        app.handle_paste("cargo test\n".into());
+
+        assert_eq!(app.history_offset, 0, "back on the live rows");
     }
 
     /// An app attached to a Claude session that has scrolled a screenful of

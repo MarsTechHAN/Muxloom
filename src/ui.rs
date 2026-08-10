@@ -786,6 +786,9 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_file_preview_panel(frame, app, area);
         return;
     }
+    // Take the emulator's own scrollback position before anything reads
+    // `history_offset`, so the title and the rows agree on where the view sits.
+    app.sync_terminal_scrollback();
     let selected = app.selected_session().cloned();
     let current_matches = app.terminal_session_id.as_deref() == app.selected_session_id.as_deref();
     let pending_matches =
@@ -872,7 +875,6 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let show_cursor = app.interactive && offset == 0;
         let selection = app.terminal_selection;
         if let Some(terminal) = app.terminal.as_mut() {
-            terminal.set_scrollback(offset);
             render_vt_screen(frame, terminal.screen(), inner, show_cursor);
         }
         highlight_terminal_selection(frame, inner, selection);
