@@ -1281,10 +1281,23 @@ impl Runtime {
         self.bridges.tcp_listener_ports(target)
     }
 
+    /// The newest `lines` rows the session actually drew.
+    ///
+    /// A page is anchored to the bottom of the emulator's screen, so asking for
+    /// fewer rows than the pane is tall lands entirely among the rows below a
+    /// short session's output — a recap of a command that printed one line came
+    /// back as a screen's worth of blanks. Reach past the pane once that has
+    /// happened and keep the rows something was drawn on.
     pub fn capture(&self, target: &Target, session_id: &str, lines: usize) -> Result<String> {
-        Ok(self
-            .capture_page(target, session_id, 0, lines, 80, 24)?
-            .text)
+        let lines = lines.max(1);
+        let page = self.capture_page(target, session_id, 0, lines, 80, 24)?;
+        let deep = lines.saturating_add(page.pane_height);
+        let page = if deep > lines && drawn_rows(&page.text).len() < lines {
+            self.capture_page(target, session_id, 0, deep, 80, 24)?
+        } else {
+            page
+        };
+        Ok(newest_drawn_rows(&page.text, lines))
     }
 
     pub fn detect_attention(
@@ -3408,6 +3421,69 @@ fn ensure_success(output: &Output, action: &str) -> Result<()> {
     ))
 }
 
+/// The newest `wanted` rows of a page that hold something to read.
+fn newest_drawn_rows(page: &str, wanted: usize) -> String {
+    let rows = drawn_rows(page);
+    rows[rows.len().saturating_sub(wanted)..].join("\n")
+}
+
+/// The rows of a page up to the last one anything was drawn on. Rows below it
+/// carry only the attributes the renderer resets each row with, and standing in
+/// for output that a caller asked to see is the one thing they must not do.
+fn drawn_rows(page: &str) -> Vec<&str> {
+    let mut rows: Vec<&str> = page.lines().collect();
+    while rows.last().is_some_and(|row| !row_has_content(row)) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Whether a rendered row shows anything, looking past the escape sequences
+/// that carry its colours rather than counting them as content.
+fn row_has_content(row: &str) -> bool {
+    let bytes = row.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b => index = escape_end(bytes, index),
+            byte if byte < 0x20 || byte == 0x7f || byte == b' ' => index += 1,
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Where the escape sequence starting at `start` ends, so a scan can step over
+/// it without mistaking its parameters for text.
+fn escape_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    match bytes.get(index) {
+        Some(b'[') => {
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| (0x20..0x40).contains(byte))
+            {
+                index += 1;
+            }
+            index + 1
+        }
+        // A string sequence runs until BEL or ST rather than a final byte.
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+            index += 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    0x07 => return index + 1,
+                    0x1b if bytes.get(index + 1) == Some(&b'\\') => return index + 2,
+                    _ => index += 1,
+                }
+            }
+            index
+        }
+        _ => index + 1,
+    }
+}
+
 fn validate_session_id(session_id: &str) -> Result<()> {
     if is_managed_session_id(session_id) {
         Ok(())
@@ -3649,6 +3725,46 @@ mod tests {
         assert_eq!(page.offset_from_bottom, 120);
         assert_eq!(page.text, "line one\nline two");
         assert!(!page.has_older());
+    }
+
+    #[test]
+    fn a_recap_shows_what_a_short_session_printed_rather_than_the_blank_rows_under_it() {
+        // What a page of a barely-used screen looks like: one printed row, then
+        // rows the renderer only resets the attributes on.
+        let mut page = String::from("muxloom-smoke\u{1b}[m");
+        for _ in 0..19 {
+            page.push_str("\n\u{1b}[m");
+        }
+        assert_eq!(newest_drawn_rows(&page, 20), "muxloom-smoke\u{1b}[m");
+    }
+
+    #[test]
+    fn a_recap_keeps_the_newest_rows_and_the_blank_ones_between_them() {
+        let page = (0..30)
+            .map(|row| {
+                if row == 27 {
+                    "\u{1b}[m".to_string()
+                } else {
+                    format!("row {row}\u{1b}[m")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            newest_drawn_rows(&page, 4),
+            "row 26\u{1b}[m\n\u{1b}[m\nrow 28\u{1b}[m\nrow 29\u{1b}[m"
+        );
+        assert_eq!(newest_drawn_rows("\u{1b}[m\n\u{1b}[m", 20), "");
+    }
+
+    #[test]
+    fn styling_and_titles_do_not_count_as_terminal_output() {
+        assert!(!row_has_content("\u{1b}[m"));
+        assert!(!row_has_content("\u{1b}[K\u{1b}[38;5;24m   \u{1b}[m"));
+        assert!(!row_has_content("\u{1b}]0;muxloom\u{7}"));
+        assert!(!row_has_content("\u{1b}]8;;https://example.com\u{1b}\\"));
+        assert!(row_has_content("\u{1b}[1mdone\u{1b}[m"));
+        assert!(row_has_content("\u{1b}[m你好"));
     }
 
     #[test]
