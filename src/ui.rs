@@ -463,18 +463,6 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut rows = Vec::new();
     for target_index in &visible {
         let status = &app.targets[*target_index];
-        let codex_working = app.sessions.iter().any(|session| {
-            session.target_id == status.target.id
-                && session.kind == AgentKind::Codex
-                && session.working
-                && !session.dead
-        });
-        let claude_working = app.sessions.iter().any(|session| {
-            session.target_id == status.target.id
-                && session.kind == AgentKind::Claude
-                && session.working
-                && !session.dead
-        });
         let (marker, marker_color) = match status.state {
             ConnectionState::Disabled => (" ", MUTED),
             ConnectionState::Scanning => ("~", Color::Yellow),
@@ -515,19 +503,9 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else if status.enabled {
             let mut spans = vec![
                 Span::raw("    "),
-                runtime_capability(
-                    AgentKind::Codex,
-                    status.probe.codex,
-                    codex_working,
-                    app.animation_frame,
-                ),
+                runtime_capability(AgentKind::Codex, status.probe.codex),
                 Span::raw(" "),
-                runtime_capability(
-                    AgentKind::Claude,
-                    status.probe.claude,
-                    claude_working,
-                    app.animation_frame,
-                ),
+                runtime_capability(AgentKind::Claude, status.probe.claude),
             ];
             if let Some(version) = app.daemon_lag_version(&status.target.id) {
                 spans.push(Span::styled(
@@ -578,9 +556,11 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let sessions: Vec<_> = app.visible_sessions().into_iter().cloned().collect();
-    let mut working_by_group = HashMap::<String, (bool, bool)>::new();
+    // Group rows carry their children's state as a steady row colour:
+    // attention outranks working. Animation stays on the agent rows alone.
+    let mut state_by_group = HashMap::<String, (bool, bool)>::new();
     for session in &sessions {
-        if session.dead || !session.working {
+        if session.dead || !(session.working || session.needs_attention) {
             continue;
         }
         let folder = if is_temporary_session_id(&session.id) {
@@ -593,11 +573,12 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             folder.to_string()
         };
-        let active = working_by_group.entry(group).or_default();
-        match session.kind {
-            AgentKind::Codex => active.0 = true,
-            AgentKind::Claude => active.1 = true,
-            AgentKind::Terminal => {}
+        let state = state_by_group.entry(group).or_default();
+        if session.needs_attention {
+            state.0 = true;
+        }
+        if session.working {
+            state.1 = true;
         }
     }
     let archived_count = app.archived_count();
@@ -627,33 +608,18 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             folder.to_string()
         };
         if group != previous_group {
-            let active = working_by_group.get(&group).copied().unwrap_or_default();
-            let activity_width = usize::from(active.0) * 2 + usize::from(active.1) * 2;
-            let mut spans = vec![Span::styled(
-                truncate(
-                    &group,
-                    area.width
-                        .saturating_sub(4)
-                        .saturating_sub(activity_width as u16) as usize,
-                ),
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::BOLD),
+            let (attention, working) = state_by_group.get(&group).copied().unwrap_or_default();
+            let colour = if attention {
+                Color::Yellow
+            } else if working {
+                Color::Green
+            } else {
+                Color::Gray
+            };
+            let spans = vec![Span::styled(
+                truncate(&group, area.width.saturating_sub(4) as usize),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
             )];
-            if active.0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    running_agent_effect(AgentKind::Codex, app.animation_frame),
-                    Style::default().fg(CODEX).add_modifier(Modifier::BOLD),
-                ));
-            }
-            if active.1 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    running_agent_effect(AgentKind::Claude, app.animation_frame),
-                    Style::default().fg(CLAUDE).add_modifier(Modifier::BOLD),
-                ));
-            }
             items.push(ListItem::new(Line::from(spans)));
             row_ids.push((None, 1));
             previous_group = group;
@@ -1484,6 +1450,53 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                     .alignment(Alignment::Center)
                     .wrap(Wrap { trim: false })
                     .block(panel(" Update available ", true)),
+                area,
+            );
+        }
+        Modal::ConfirmForcedUpdate {
+            target,
+            working,
+            terminals,
+            resumable,
+        } => {
+            let area = centered_rect(72, 14, outer);
+            frame.render_widget(Clear, area);
+            let mut text = vec![
+                Line::raw(""),
+                Line::styled(
+                    format!("Force the daemon update on {}?", target.id),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Line::raw(""),
+                Line::raw(format!(
+                    "{resumable} agent(s) will be archived and resumed from their transcripts."
+                )),
+            ];
+            if !working.is_empty() {
+                text.push(Line::styled(
+                    format!("Interrupts work in progress: {}", working.join(", ")),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if !terminals.is_empty() {
+                text.push(Line::styled(
+                    format!(
+                        "Ends without resume (terminals/temporal): {}",
+                        terminals.join(", ")
+                    ),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            text.push(Line::raw(""));
+            text.push(Line::styled(
+                "Enter/y force update    Esc/n not now",
+                Style::default().fg(MUTED),
+            ));
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" Forced daemon update ", true)),
                 area,
             );
         }
@@ -3842,22 +3855,14 @@ fn list_highlight_style(focused: bool, bold: bool) -> Style {
     }
 }
 
-fn runtime_capability(
-    kind: AgentKind,
-    available: bool,
-    working: bool,
-    frame: u64,
-) -> Span<'static> {
+/// A machine row's static capability marker. Working state animates only on
+/// the agent row itself; here it is not shown at all.
+fn runtime_capability(kind: AgentKind, available: bool) -> Span<'static> {
     let (idle, _, color) = agent_visual(kind);
-    let label = if working {
-        running_agent_effect(kind, frame)
-    } else {
-        idle
-    };
     Span::styled(
-        label,
+        idle,
         Style::default()
-            .fg(if available || working { color } else { MUTED })
+            .fg(if available { color } else { MUTED })
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -4087,7 +4092,7 @@ mod tests {
     }
 
     #[test]
-    fn working_agent_animation_is_visible_in_machine_and_folder_panes() {
+    fn animation_stays_on_agent_rows_and_folder_rows_carry_state_as_colour() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
         let mut state = State::default();
@@ -4116,47 +4121,69 @@ mod tests {
                 recap: None,
             });
         }
+        app.targets[0].probe.codex = true;
+        app.targets[0].probe.claude = true;
 
+        // Each row as its text plus the colour at a given marker substring.
+        let rows = |terminal: &Terminal<TestBackend>| -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect()
+                })
+                .collect()
+        };
+        let colour_at = |terminal: &Terminal<TestBackend>, marker: &str| -> Option<Color> {
+            let buffer = terminal.backend().buffer();
+            for y in 0..buffer.area.height {
+                let text: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if let Some(column) = text.find(marker) {
+                    return buffer[(column as u16, y)].style().fg;
+                }
+            }
+            None
+        };
+
+        // The machine row shows static capability icons: no spinner frames.
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_machines(frame, &mut app, frame.area()))
             .unwrap();
-        let machines = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(machines.contains('⠋'));
-        assert!(machines.contains('✻'));
+        let machines: String = rows(&terminal).concat();
+        assert!(!machines.contains('⠋'), "machine rows must not animate");
+        assert!(machines.contains('◉') && machines.contains('✻'));
 
+        // The folder row does not animate either; it turns green while a
+        // child works, and the agent rows keep the only animation.
         terminal
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .unwrap();
-        let folders = terminal
-            .backend()
-            .buffer()
-            .content()
+        let agent_rows = rows(&terminal);
+        let folder = agent_rows
             .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(folders.contains("/work/project ⠋ ✻"));
+            .find(|text| text.contains("/work/project"))
+            .expect("folder row rendered");
+        assert!(!folder.contains('⠋'), "folder rows must not animate");
+        assert_eq!(colour_at(&terminal, "/work/project"), Some(Color::Green));
+        assert!(
+            agent_rows
+                .iter()
+                .any(|text| text.contains('⠋') && text.contains("codex task")),
+            "the agent row itself must animate"
+        );
 
-        app.animation_frame = 20;
+        // Attention outranks working in the folder colour.
+        app.sessions[1].needs_attention = true;
+        app.sessions[1].working = false;
         terminal
-            .draw(|frame| draw_machines(frame, &mut app, frame.area()))
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .unwrap();
-        let next_frame = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(next_frame.contains('⠼'));
-        assert!(next_frame.contains('✶'));
+        assert_eq!(colour_at(&terminal, "/work/project"), Some(Color::Yellow));
     }
 
     #[test]

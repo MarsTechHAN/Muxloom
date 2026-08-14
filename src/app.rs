@@ -143,6 +143,37 @@ pub struct UpdatePrompt {
     pub can_self_update: bool,
 }
 
+/// One machine's forced daemon update in flight: archive the sessions that
+/// hold the old generation, cycle the bridge so the handover completes, then
+/// resume every agent from the transcript its runtime recorded.
+#[derive(Debug)]
+struct ForcedUpdate {
+    target: Target,
+    phase: ForcedPhase,
+    /// Give up and report if a phase stalls past this.
+    deadline: Instant,
+    /// Agents to bring back once the new daemon serves, in archive order.
+    resumes: Vec<PendingResume>,
+    /// Sessions whose archive/kill acknowledgement is still pending.
+    pending_acks: usize,
+    terminals_archived: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForcedPhase {
+    Archiving,
+    Cycling,
+    Resuming,
+}
+
+#[derive(Debug)]
+struct PendingResume {
+    session_id: String,
+    kind: AgentKind,
+    path: String,
+    label: String,
+}
+
 /// A slot the startup update thread writes once; the UI drains it on the next tick.
 pub type UpdateSlot = Arc<Mutex<Option<UpdateNote>>>;
 
@@ -319,6 +350,13 @@ pub enum Modal {
         detail: String,
     },
     UpdatePrompt(UpdatePrompt),
+    /// A forced daemon update would interrupt what it lists; the user decides.
+    ConfirmForcedUpdate {
+        target: Target,
+        working: Vec<String>,
+        terminals: Vec<String>,
+        resumable: usize,
+    },
     Help(HelpForm),
     Settings(SettingsForm),
     Search(SearchForm),
@@ -342,6 +380,9 @@ pub const HELP_CONTENT_ROWS: usize = 57;
 /// constant regardless of how frequently the UI redraws.
 const ANIMATION_FRAME_MS: u128 = 180;
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
+/// How long one phase of a forced daemon update may take before the
+/// orchestration gives up and says so.
+const FORCED_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How often the browser re-lists the directory holding the open preview to
 /// notice that the file changed. Only runs while a preview is on screen, so an
@@ -385,7 +426,7 @@ pub struct SearchForm {
     pub edited_at: Instant,
 }
 
-pub const SETTING_LABELS: [&str; 20] = [
+pub const SETTING_LABELS: [&str; 21] = [
     "Refresh interval (ms)",
     "SSH timeout (sec)",
     "History limit",
@@ -406,6 +447,7 @@ pub const SETTING_LABELS: [&str; 20] = [
     "Terminal command",
     "Terminal args",
     "Attention patterns",
+    "Force daemon update (true/false)",
 ];
 
 pub const HOST_SETTING_LABELS: [&str; 15] = [
@@ -628,9 +670,16 @@ pub struct App {
     /// `sessions`, which is emptied when a machine is disabled.
     notified_attention: HashSet<String>,
     scanned_targets: HashSet<String>,
+    /// Machines whose current refresh the user asked for. Background retries
+    /// to a machine that already failed stay quiet — no scanning spinner, no
+    /// connect progress — because the steady red mark is the message.
+    user_refreshes: HashSet<String>,
     /// When each machine's daemon was last nudged toward the current
     /// generation, for the quiet retry backoff.
     daemon_refreshes: HashMap<String, Instant>,
+    /// Forced-update orchestrations in flight, one per machine: archive the
+    /// sessions holding the old daemon, cycle the bridge, resume the agents.
+    forced_updates: HashMap<String, ForcedUpdate>,
     pub staged_update: Option<String>,
     pub available_update: Option<String>,
 }
@@ -741,7 +790,9 @@ impl App {
             task_progress: Vec::new(),
             notified_attention: HashSet::new(),
             scanned_targets: HashSet::new(),
+            user_refreshes: HashSet::new(),
             daemon_refreshes: HashMap::new(),
+            forced_updates: HashMap::new(),
             staged_update: None,
             available_update: None,
         }
@@ -912,12 +963,15 @@ impl App {
     /// reconnect re-runs bootstrap, deploys the current companion, and the
     /// handover carries every session across on its keeper. One attempt per
     /// machine per backoff window — a handover deferred by pre-keeper sessions
-    /// stays deferred until they end — and never under an attached terminal,
-    /// whose PTY stream the cycle would cut.
+    /// stays deferred until they end (or `force_daemon_update` steps in) —
+    /// and never under an attached terminal, whose PTY stream the cycle would
+    /// cut.
     fn maybe_refresh_daemons(&mut self) {
         const DAEMON_REFRESH_BACKOFF: Duration = Duration::from_secs(30 * 60);
         for (target_id, _) in self.outdated_daemons() {
-            if Some(target_id.as_str()) == self.attached_target_id() {
+            if Some(target_id.as_str()) == self.attached_target_id()
+                || self.forced_updates.contains_key(&target_id)
+            {
                 continue;
             }
             if self
@@ -937,6 +991,284 @@ impl App {
             };
             self.daemon_refreshes.insert(target_id, Instant::now());
             let _ = self.worker.requests.send(Request::RefreshDaemon { target });
+        }
+    }
+
+    /// The quiet cycle could not advance a machine's daemon: pre-keeper
+    /// sessions hold it. With `force_daemon_update` on, offer (or start) the
+    /// forced path — archive, hand over, resume.
+    fn propose_forced_update(&mut self, target_id: &str) {
+        let Some(target) = self.target(target_id).cloned() else {
+            return;
+        };
+        let working: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.target_id == target_id
+                    && !session.dead
+                    && session.working
+                    && session.kind != AgentKind::Terminal
+            })
+            .map(|session| session.display_label().to_string())
+            .collect();
+        let terminals: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.target_id == target_id
+                    && !session.dead
+                    && (session.kind == AgentKind::Terminal || is_temporary_session_id(&session.id))
+            })
+            .map(|session| session.display_label().to_string())
+            .collect();
+        let resumable = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.target_id == target_id
+                    && !session.dead
+                    && session.kind != AgentKind::Terminal
+                    && !is_temporary_session_id(&session.id)
+            })
+            .count();
+        if working.is_empty() && terminals.is_empty() {
+            self.begin_forced_update(target);
+        } else if self.modal.is_none() {
+            // What the force would interrupt is the user's call to make.
+            self.modal = Some(Modal::ConfirmForcedUpdate {
+                target,
+                working,
+                terminals,
+                resumable,
+            });
+        }
+    }
+
+    /// Archive everything holding the old daemon. The acknowledgements drive
+    /// the next phase.
+    fn begin_forced_update(&mut self, target: Target) {
+        let target_id = target.id.clone();
+        if self.forced_updates.contains_key(&target_id) {
+            return;
+        }
+        let sessions: Vec<AgentSession> = self
+            .sessions
+            .iter()
+            .filter(|session| session.target_id == target_id && !session.dead)
+            .cloned()
+            .collect();
+        let mut resumes = Vec::new();
+        let mut pending_acks = 0usize;
+        let mut terminals_archived = 0usize;
+        for session in sessions {
+            let request = if is_temporary_session_id(&session.id) {
+                terminals_archived += 1;
+                Request::Kill {
+                    target: target.clone(),
+                    session_id: session.id.clone(),
+                }
+            } else {
+                if session.kind == AgentKind::Terminal {
+                    terminals_archived += 1;
+                } else {
+                    resumes.push(PendingResume {
+                        session_id: session.id.clone(),
+                        kind: session.kind,
+                        path: session.path.clone(),
+                        label: session.label.clone(),
+                    });
+                }
+                Request::Archive {
+                    target: target.clone(),
+                    session_id: session.id.clone(),
+                }
+            };
+            if self.worker.requests.send(request).is_ok() {
+                self.busy_operations += 1;
+                pending_acks += 1;
+            }
+        }
+        self.set_background_status(format!(
+            "{target_id}: forcing the daemon update — archiving {pending_acks} sessions"
+        ));
+        let mut update = ForcedUpdate {
+            target,
+            phase: ForcedPhase::Archiving,
+            deadline: Instant::now() + FORCED_PHASE_TIMEOUT,
+            resumes,
+            pending_acks,
+            terminals_archived,
+        };
+        if update.pending_acks == 0 {
+            update.phase = ForcedPhase::Cycling;
+            self.daemon_refreshes
+                .insert(target_id.clone(), Instant::now());
+            let _ = self.worker.requests.send(Request::RefreshDaemon {
+                target: update.target.clone(),
+            });
+        }
+        self.forced_updates.insert(target_id, update);
+    }
+
+    /// One of the sessions being archived for a forced update answered.
+    fn forced_update_ack(&mut self, target_id: &str) {
+        let Some(update) = self.forced_updates.get_mut(target_id) else {
+            return;
+        };
+        if update.phase != ForcedPhase::Archiving {
+            return;
+        }
+        update.pending_acks = update.pending_acks.saturating_sub(1);
+        if update.pending_acks == 0 {
+            update.phase = ForcedPhase::Cycling;
+            update.deadline = Instant::now() + FORCED_PHASE_TIMEOUT;
+            let target = update.target.clone();
+            self.daemon_refreshes
+                .insert(target_id.to_string(), Instant::now());
+            let _ = self.worker.requests.send(Request::RefreshDaemon { target });
+        }
+    }
+
+    /// The forced cycle reached the new generation: bring the agents back
+    /// from the transcripts their runtimes recorded.
+    fn forced_update_resume_phase(&mut self, target_id: &str) {
+        let Some(update) = self.forced_updates.get_mut(target_id) else {
+            return;
+        };
+        update.phase = ForcedPhase::Resuming;
+        update.deadline = Instant::now() + FORCED_PHASE_TIMEOUT;
+        let mut paths: Vec<String> = update
+            .resumes
+            .iter()
+            .map(|pending| pending.path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        update.pending_acks = paths.len();
+        if paths.is_empty() {
+            self.finish_forced_update(target_id);
+            return;
+        }
+        let target = update.target.clone();
+        for path in paths {
+            // The worker scans both runtimes' histories whatever kind says.
+            let _ = self.worker.requests.send(Request::ScanResumes {
+                target: target.clone(),
+                kind: AgentKind::Codex,
+                path,
+            });
+        }
+    }
+
+    /// Resume candidates for one folder arrived during a forced update.
+    /// Newest transcripts map onto the newest archived sessions of the same
+    /// kind; consumes the event when a forced update owns it.
+    fn forced_update_handle_resumes(
+        &mut self,
+        target_id: &str,
+        path: &str,
+        result: &Result<Vec<ResumeCandidate>, String>,
+    ) -> bool {
+        let Some(update) = self.forced_updates.get_mut(target_id) else {
+            return false;
+        };
+        if update.phase != ForcedPhase::Resuming {
+            return false;
+        }
+        update.pending_acks = update.pending_acks.saturating_sub(1);
+        let mut candidates: Vec<ResumeCandidate> = match result {
+            Ok(candidates) => candidates.clone(),
+            Err(_) => Vec::new(),
+        };
+        let mut launches = Vec::new();
+        let mut remaining = Vec::new();
+        for pending in std::mem::take(&mut update.resumes) {
+            if pending.path != path {
+                remaining.push(pending);
+                continue;
+            }
+            let Some(slot) = candidates
+                .iter()
+                .position(|candidate| candidate.kind == pending.kind)
+            else {
+                // No transcript to resume from; the session stays archived.
+                remaining.push(pending);
+                continue;
+            };
+            let candidate = candidates.remove(slot);
+            launches.push((pending, candidate.id));
+        }
+        update.resumes = remaining;
+        let target = update.target.clone();
+        let done = update.pending_acks == 0;
+        for (pending, resume_id) in launches {
+            let command = self.config.command_for(&target.id, pending.kind).clone();
+            let environment = self.config.environment_for(&target.id).unwrap_or_default();
+            let request = LaunchRequest {
+                target: target.clone(),
+                kind: pending.kind,
+                path: pending.path,
+                label: pending.label,
+                temporary: false,
+                resume_id: Some(resume_id),
+                initial_prompt: None,
+            };
+            let remove_archive_session_id = self
+                .state
+                .remove_archive_after_resume
+                .then_some(pending.session_id);
+            if self
+                .worker
+                .requests
+                .send(Request::Launch {
+                    request,
+                    command,
+                    environment,
+                    remove_archive_session_id,
+                })
+                .is_ok()
+            {
+                self.busy_operations += 1;
+            }
+        }
+        if done {
+            self.finish_forced_update(target_id);
+        }
+        true
+    }
+
+    fn finish_forced_update(&mut self, target_id: &str) {
+        let Some(update) = self.forced_updates.remove(target_id) else {
+            return;
+        };
+        let unresumed = update.resumes.len();
+        let mut summary = format!("{target_id}: daemon updated — sessions resumed");
+        if update.terminals_archived > 0 {
+            summary.push_str(&format!(
+                "; {} terminal(s) archived",
+                update.terminals_archived
+            ));
+        }
+        if unresumed > 0 {
+            summary.push_str(&format!(
+                "; {unresumed} agent(s) had no transcript and stay archived"
+            ));
+        }
+        self.set_background_status(summary);
+    }
+
+    /// Abandon forced updates whose current phase stalled.
+    fn sweep_forced_updates(&mut self) {
+        let expired: Vec<String> = self
+            .forced_updates
+            .iter()
+            .filter(|(_, update)| Instant::now() > update.deadline)
+            .map(|(target_id, _)| target_id.clone())
+            .collect();
+        for target_id in expired {
+            self.forced_updates.remove(&target_id);
+            self.set_error(format!("{target_id}: forced daemon update timed out"));
         }
     }
 
@@ -1006,6 +1338,7 @@ impl App {
             self.refresh_daemon_activity();
         }
         self.maybe_refresh_daemons();
+        self.sweep_forced_updates();
         self.maybe_backup_sync();
         if !self.has_terminal_for_selected()
             && self
@@ -1079,7 +1412,7 @@ impl App {
                     return Action::Continue;
                 }
                 KeyCode::Char('r') => {
-                    self.refresh_enabled();
+                    self.refresh_enabled_manual();
                     return Action::Continue;
                 }
                 KeyCode::Char('h') => {
@@ -1120,7 +1453,7 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char('r') => {
-                self.refresh_enabled();
+                self.refresh_enabled_manual();
                 Action::Continue
             }
             KeyCode::Char('a') if self.focus == Focus::Agents => {
@@ -2608,11 +2941,25 @@ impl App {
                 target_id,
                 operation,
                 progress,
-            } => self.set_task_progress(target_id, operation, progress),
+            } => {
+                // Background reconnects to a machine already marked offline
+                // stay out of the footer; the red mark is the message.
+                let quiet = operation == TaskKind::Connect
+                    && !self.user_refreshes.contains(&target_id)
+                    && self
+                        .targets
+                        .iter()
+                        .find(|target| target.target.id == target_id)
+                        .is_some_and(|target| target.consecutive_failures > 0);
+                if !quiet {
+                    self.set_task_progress(target_id, operation, progress);
+                }
+            }
             Event::Scanned { target_id, result } => {
                 let scan_succeeded = result.is_ok();
                 self.clear_task_progress(&target_id, TaskKind::Connect);
                 self.pending_scans.remove(&target_id);
+                self.user_refreshes.remove(&target_id);
                 let engaged = self
                     .terminal_session_id
                     .clone()
@@ -2791,23 +3138,54 @@ impl App {
                     self.apply_activity_refresh(&target_id, &sessions);
                 }
             }
-            Event::DaemonRefreshed { target_id, result } => match result {
-                Ok(Some(version)) if version == env!("CARGO_PKG_VERSION") => {
-                    self.set_background_status(format!(
-                        "{target_id} daemon updated to {version} — sessions kept running"
-                    ));
+            Event::DaemonRefreshed { target_id, result } => {
+                let forced_cycling = self
+                    .forced_updates
+                    .get(&target_id)
+                    .is_some_and(|update| update.phase == ForcedPhase::Cycling);
+                match result {
+                    Ok(Some(version)) if version == env!("CARGO_PKG_VERSION") => {
+                        if forced_cycling {
+                            self.forced_update_resume_phase(&target_id);
+                        } else {
+                            self.set_background_status(format!(
+                                "{target_id} daemon updated to {version} — sessions kept running"
+                            ));
+                        }
+                    }
+                    // Still lagging: an old generation kept serving because
+                    // it holds pre-keeper sessions, or the companion could
+                    // not be updated.
+                    Ok(other) => {
+                        if forced_cycling {
+                            let still = other.unwrap_or_else(|| "unknown".into());
+                            self.forced_updates.remove(&target_id);
+                            self.set_error(format!(
+                                "{target_id}: forced update failed — daemon still {still}"
+                            ));
+                        } else if self.config.force_daemon_update
+                            && Some(target_id.as_str()) != self.attached_target_id()
+                            && !self.forced_updates.contains_key(&target_id)
+                        {
+                            self.propose_forced_update(&target_id);
+                        }
+                    }
+                    Err(error) => {
+                        if forced_cycling {
+                            self.forced_updates.remove(&target_id);
+                            self.set_error(format!(
+                                "{target_id}: forced update failed — {}",
+                                short_error(&error)
+                            ));
+                        } else {
+                            debug::log(
+                                "app",
+                                format!("daemon refresh failed target={target_id}: {error}"),
+                            );
+                        }
+                    }
                 }
-                // Still lagging: an old generation kept serving because it
-                // holds pre-keeper sessions, or the companion could not be
-                // updated. The next backoff window tries again.
-                Ok(_) => {}
-                Err(error) => {
-                    debug::log(
-                        "app",
-                        format!("daemon refresh failed target={target_id}: {error}"),
-                    );
-                }
-            },
+            }
             Event::PortsDetected { target_id, result } => {
                 if let Some(Modal::PortForward(form)) = self.modal.as_mut()
                     && form.target.id == target_id
@@ -2966,6 +3344,7 @@ impl App {
             }
             Event::Killed { target_id, result } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
+                self.forced_update_ack(&target_id);
                 match result {
                     Ok(()) => {
                         self.status_message = "Agent session closed".into();
@@ -2987,6 +3366,7 @@ impl App {
                 result,
             } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
+                self.forced_update_ack(&target_id);
                 match result {
                     Ok(()) => {
                         if self.selected_session_id.as_deref() == Some(&session_id) {
@@ -3100,6 +3480,11 @@ impl App {
                 result,
                 warning,
             } => {
+                // A forced update in its resume phase owns these candidates;
+                // they never reach the resume modal.
+                if self.forced_update_handle_resumes(&target_id, &path, &result) {
+                    return;
+                }
                 // One runtime's history can fail while the other's succeeds. The
                 // candidates that were found are still worth showing, but an
                 // empty list must not be reported as a settled "nothing here".
@@ -3773,6 +4158,19 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
+    /// A refresh the user asked for: unlike the background timer, it shows
+    /// the scanning spinner and connect progress even for machines that are
+    /// already marked offline.
+    fn refresh_enabled_manual(&mut self) {
+        self.user_refreshes.extend(
+            self.targets
+                .iter()
+                .filter(|target| target.enabled)
+                .map(|target| target.target.id.clone()),
+        );
+        self.refresh_enabled();
+    }
+
     fn refresh_daemon_activity(&mut self) {
         let targets: Vec<_> = self
             .targets
@@ -3895,7 +4293,12 @@ impl App {
         if !status.enabled {
             return;
         }
-        if status.state != ConnectionState::Online {
+        // A machine that already failed keeps its steady offline mark through
+        // background retries; the scanning spinner is for first contact and
+        // for refreshes the user asked for.
+        if status.state != ConnectionState::Online
+            && (status.consecutive_failures == 0 || self.user_refreshes.contains(id))
+        {
             status.state = ConnectionState::Scanning;
         }
         let request = ScanRequest {
@@ -4974,6 +5377,7 @@ impl App {
                 self.config.agents.terminal.command.clone(),
                 format_shell_list(&self.config.agents.terminal.args),
                 format_shell_list(&self.config.attention_patterns),
+                self.config.force_daemon_update.to_string(),
             ],
             selected: 0,
             error: None,
@@ -6219,6 +6623,28 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::UpdatePrompt(prompt)),
             },
+            Modal::ConfirmForcedUpdate {
+                target,
+                working,
+                terminals,
+                resumable,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.begin_forced_update(target),
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.set_background_status(format!(
+                        "{}: forced daemon update declined; it will ask again later",
+                        target.id
+                    ));
+                }
+                _ => {
+                    self.modal = Some(Modal::ConfirmForcedUpdate {
+                        target,
+                        working,
+                        terminals,
+                        resumable,
+                    })
+                }
+            },
             Modal::Launch(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Tab | KeyCode::Down => {
@@ -6420,6 +6846,16 @@ impl App {
                         parse_shell_list(&form.values[18], SETTING_LABELS[18])?;
                     config.attention_patterns =
                         parse_shell_list(&form.values[19], SETTING_LABELS[19])?;
+                    config.force_daemon_update = match form.values[20].trim() {
+                        "true" | "yes" | "1" => true,
+                        "false" | "no" | "0" | "" => false,
+                        other => {
+                            return Err(format!(
+                                "{} must be true or false, not {other:?}",
+                                SETTING_LABELS[20]
+                            ));
+                        }
+                    };
                 }
                 SettingsScope::Host(target_id) => {
                     let codex = CommandConfig {
@@ -6553,7 +6989,7 @@ impl App {
             ),
         };
         debug::log("config", format!("saved {}", self.config_path.display()));
-        self.refresh_enabled();
+        self.refresh_enabled_manual();
     }
 
     fn submit_launch(
@@ -8207,6 +8643,176 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert!(app.status_message.contains("muxloom update"));
+    }
+
+    #[test]
+    fn a_forced_update_archives_cycles_and_resumes_in_order() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.config.force_daemon_update = true;
+        app.sessions = vec![
+            AgentSession {
+                id: "muxloomd-claude-old-1".into(),
+                target_id: "local".into(),
+                kind: AgentKind::Claude,
+                path: "/work/project".into(),
+                label: "big refactor".into(),
+                created_at: 1,
+                dead: false,
+                pid: Some(10),
+                working: false,
+                needs_attention: false,
+                attention_reason: None,
+                recap: None,
+            },
+            AgentSession {
+                id: "muxloomd-terminal-old-2".into(),
+                target_id: "local".into(),
+                kind: AgentKind::Terminal,
+                path: "/work/project".into(),
+                label: "dev server".into(),
+                created_at: 2,
+                dead: false,
+                pid: Some(11),
+                working: false,
+                needs_attention: false,
+                attention_reason: None,
+                recap: None,
+            },
+        ];
+
+        // The quiet cycle could not advance the daemon; the terminal makes
+        // the force a question rather than an action.
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        assert!(matches!(app.modal, Some(Modal::ConfirmForcedUpdate { .. })));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        {
+            let update = app.forced_updates.get("local").expect("orchestration");
+            assert_eq!(update.phase, ForcedPhase::Archiving);
+            assert_eq!(update.pending_acks, 2);
+            assert_eq!(update.resumes.len(), 1);
+            assert_eq!(update.terminals_archived, 1);
+        }
+
+        // Both archives acknowledge; the bridge cycle begins.
+        for session_id in ["muxloomd-claude-old-1", "muxloomd-terminal-old-2"] {
+            app.handle_worker_event(Event::Archived {
+                target_id: "local".into(),
+                session_id: session_id.into(),
+                result: Ok(()),
+            });
+        }
+        assert_eq!(
+            app.forced_updates.get("local").unwrap().phase,
+            ForcedPhase::Cycling
+        );
+
+        // The new generation answers; the resume scan goes out.
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some(env!("CARGO_PKG_VERSION").into())),
+        });
+        assert_eq!(
+            app.forced_updates.get("local").unwrap().phase,
+            ForcedPhase::Resuming
+        );
+
+        // Candidates land: the agent resumes, the terminal stays archived,
+        // and the orchestration reports and clears itself.
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work/project".into(),
+            result: Ok(vec![ResumeCandidate {
+                id: "claude-native-resume-id".into(),
+                kind: AgentKind::Claude,
+                source_path: "/home/user/.claude/projects/x.jsonl".into(),
+                recap: Some("big refactor".into()),
+                first_message: None,
+                last_message: None,
+                updated_at: "2026-08-14T00:00:00Z".into(),
+            }]),
+            warning: None,
+        });
+        assert!(app.forced_updates.is_empty());
+        assert!(
+            app.status_message.contains("daemon updated"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.status_message.contains("1 terminal(s) archived"));
+    }
+
+    #[test]
+    fn a_forced_update_with_no_blockers_starts_without_asking() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.config.force_daemon_update = true;
+        // No sessions at all: nothing to warn about, straight to cycling.
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.forced_updates.get("local").unwrap().phase,
+            ForcedPhase::Cycling
+        );
+        // Without the setting the failed cycle stays a quiet observation.
+        let mut plain = ux_test_app(vec![Target::local()]);
+        plain.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        assert!(plain.forced_updates.is_empty() && plain.modal.is_none());
+    }
+
+    #[test]
+    fn an_offline_machine_keeps_its_mark_through_quiet_retries() {
+        let mut app = ux_test_app(vec![Target::ssh("gpu")]);
+        app.state.enabled_hosts.insert("gpu".into());
+        app.targets[0].enabled = true;
+
+        // First contact shows the scanning spinner and the connect progress.
+        app.refresh_target("gpu");
+        assert_eq!(app.targets[0].state, ConnectionState::Scanning);
+        app.handle_worker_event(Event::Scanned {
+            target_id: "gpu".into(),
+            result: Err("no route to host".into()),
+        });
+        assert_eq!(app.targets[0].state, ConnectionState::Offline);
+
+        // A background retry neither flips the row back to scanning nor
+        // surfaces connect progress: the steady red mark is the message.
+        app.refresh_target("gpu");
+        assert_eq!(app.targets[0].state, ConnectionState::Offline);
+        app.handle_worker_event(Event::TaskProgress {
+            target_id: "gpu".into(),
+            operation: TaskKind::Connect,
+            progress: TaskProgress::pending("Connecting to gpu"),
+        });
+        assert!(app.visible_task_progress().is_none());
+        app.handle_worker_event(Event::Scanned {
+            target_id: "gpu".into(),
+            result: Err("no route to host".into()),
+        });
+        assert_eq!(app.targets[0].state, ConnectionState::Offline);
+
+        // A refresh the user asked for is loud again.
+        app.refresh_enabled_manual();
+        assert_eq!(app.targets[0].state, ConnectionState::Scanning);
+        app.handle_worker_event(Event::TaskProgress {
+            target_id: "gpu".into(),
+            operation: TaskKind::Connect,
+            progress: TaskProgress::pending("Connecting to gpu"),
+        });
+        assert!(app.visible_task_progress().is_some());
+        app.handle_worker_event(Event::Scanned {
+            target_id: "gpu".into(),
+            result: Err("still unreachable".into()),
+        });
+        assert_eq!(app.targets[0].state, ConnectionState::Offline);
     }
 
     #[test]
