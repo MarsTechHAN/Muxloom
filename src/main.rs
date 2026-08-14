@@ -83,6 +83,21 @@ fn real_main() -> Result<()> {
                 init_config(&options.config_path)
             }
         }
+        Command::Mcp => {
+            // The MCP transport owns stdout: no terminal setup, no update
+            // banner, nothing printed that is not a JSON-RPC message.
+            if let Some(log_path) = &options.debug_log {
+                debug::init(log_path)?;
+            }
+            let config = Config::load(&options.config_path)?;
+            let mut surface = muxloom::control::ControllerControl::new(config)?;
+            muxloom::mcp::serve(
+                &mut surface,
+                "muxloom",
+                io::stdin().lock(),
+                io::stdout().lock(),
+            )
+        }
         Command::Run => {
             if !options.config_explicit {
                 migrate_legacy_file(&legacy_config_path(), &options.config_path)?;
@@ -554,6 +569,7 @@ enum Command {
     Run,
     Init,
     Update,
+    Mcp,
     Help,
     Version,
 }
@@ -575,6 +591,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
         match args[index].as_str() {
             "init" => command = Command::Init,
             "update" => command = Command::Update,
+            "mcp" => command = Command::Mcp,
             "--help" | "-h" => command = Command::Help,
             "--version" | "-V" => command = Command::Version,
             "--debug" => debug_log = Some(default_debug_log_path()),
@@ -607,7 +624,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
 
 fn print_help() {
     println!(
-        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the latest release, if newer\n",
+        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update\n    muxloom mcp [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the latest release, if newer\n    mcp                  Serve muxloom's control surface over MCP stdio\n",
         env!("CARGO_PKG_VERSION")
     );
 }

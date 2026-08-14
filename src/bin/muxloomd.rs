@@ -22,6 +22,15 @@ fn run() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => serve(&paths),
         Some("bridge") => bridge(&paths),
+        Some("mcp") => {
+            let mut surface = muxloom::control::DaemonControl::new()?;
+            muxloom::mcp::serve(
+                &mut surface,
+                "muxloomd",
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )
+        }
         Some("status") => {
             match request_status(&paths)? {
                 DaemonResponse::Status {
@@ -57,7 +66,7 @@ fn run() -> Result<()> {
         }
         Some("--help" | "-h" | "help") | None => {
             println!(
-                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd status\n    muxloomd protocol-version\n    muxloomd binary-sha256",
+                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd mcp\n    muxloomd status\n    muxloomd protocol-version\n    muxloomd binary-sha256",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())

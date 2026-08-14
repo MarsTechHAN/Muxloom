@@ -3,11 +3,13 @@ pub mod app;
 pub mod backup;
 pub mod bridge;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod daemon_protocol;
 pub mod debug;
 #[cfg(feature = "controller")]
 pub mod http;
+pub mod mcp;
 pub mod media;
 pub mod model;
 pub mod port_forward;

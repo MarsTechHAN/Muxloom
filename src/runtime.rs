@@ -396,21 +396,7 @@ impl Runtime {
                 request.target.id, request.kind, request.path, command.command
             ),
         );
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let session_id = format!(
-            "{DAEMON_SESSION_PREFIX}{}{}-{now}-{}-{sequence}",
-            if request.temporary {
-                TEMPORARY_SESSION_MARKER
-            } else {
-                ""
-            },
-            request.kind.as_str(),
-            std::process::id()
-        );
+        let (session_id, now) = new_daemon_session_id(request.kind, request.temporary);
         let label = request.label.replace(['\t', '\n', '\r'], " ");
         let args = launch_arguments(
             command,
@@ -2141,7 +2127,12 @@ END {
         }
     }
 
-    fn run_shell(&self, target: &Target, script: &str, interactive: bool) -> Result<Output> {
+    pub(crate) fn run_shell(
+        &self,
+        target: &Target,
+        script: &str,
+        interactive: bool,
+    ) -> Result<Output> {
         if let Transport::Ssh { alias } = &target.transport
             && !interactive
             && !self.bridge_recently_failed(&target.id)
@@ -3241,7 +3232,29 @@ fn command_line(
     shell_join(&values)
 }
 
-fn launch_arguments(
+/// A fresh daemon session id and the launch timestamp it embeds. Shared with
+/// the control surface so a session launched over MCP is indistinguishable
+/// from one launched by the dashboard.
+pub(crate) fn new_daemon_session_id(kind: AgentKind, temporary: bool) -> (String, u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session_id = format!(
+        "{DAEMON_SESSION_PREFIX}{}{}-{now}-{}-{sequence}",
+        if temporary {
+            TEMPORARY_SESSION_MARKER
+        } else {
+            ""
+        },
+        kind.as_str(),
+        std::process::id()
+    );
+    (session_id, now)
+}
+
+pub(crate) fn launch_arguments(
     command: &CommandConfig,
     kind: AgentKind,
     temporary: bool,
