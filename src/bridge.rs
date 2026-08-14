@@ -45,6 +45,10 @@ pub struct BridgeOptions {
     pub reverse_tunnel: String,
     pub bootstrap_binary: String,
     pub download_environment: Vec<(String, String)>,
+    /// Attention patterns sunk into the daemon right after the handshake, so
+    /// waiting states surface at its refresh cadence rather than the
+    /// controller's full scans.
+    pub attention_patterns: Vec<String>,
 }
 
 impl Default for BridgeOptions {
@@ -55,6 +59,7 @@ impl Default for BridgeOptions {
             reverse_tunnel: String::new(),
             bootstrap_binary: String::new(),
             download_environment: Vec::new(),
+            attention_patterns: Vec::new(),
         }
     }
 }
@@ -726,6 +731,18 @@ impl BridgeConnection {
     pub fn send_input(&self, session_id: String, bytes: Vec<u8>) -> Result<()> {
         self.require_capability("send-input-v1")?;
         self.expect_ack(DaemonRequest::SendInput { session_id, bytes })
+    }
+
+    fn set_attention_patterns(&self, patterns: Vec<String>) -> Result<()> {
+        self.expect_ack(DaemonRequest::SetAttentionPatterns { patterns })
+    }
+
+    fn has_capability(&self, capability: &str) -> bool {
+        self.state
+            .capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(capability)
     }
 
     pub fn delete(&self, session_id: String) -> Result<()> {
@@ -1914,6 +1931,19 @@ impl BridgePool {
                 (BridgeConnection::connect_local(&options.command)?, None)
             }
         };
+        // Sink the machine's attention patterns into the daemon so its own
+        // snapshots classify waiting states without waiting on a full scan.
+        // Best-effort: an older daemon simply keeps using its built-ins.
+        if !options.attention_patterns.is_empty()
+            && connection.has_capability("attention-patterns-v1")
+            && let Err(error) =
+                connection.set_attention_patterns(options.attention_patterns.clone())
+        {
+            debug::log(
+                "bridge",
+                format!("target={target_id} could not sink attention patterns: {error:#}"),
+            );
+        }
         self.connections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

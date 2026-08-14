@@ -247,6 +247,12 @@ pub enum DaemonRequest {
         session_id: String,
         bytes: Vec<u8>,
     },
+    /// Attention patterns the daemon applies when classifying sessions, so
+    /// waiting states surface at the daemon's own refresh cadence instead of
+    /// the controller's slower full scans.
+    SetAttentionPatterns {
+        patterns: Vec<String>,
+    },
     ReadHistory {
         session_id: String,
         offset_from_bottom: usize,

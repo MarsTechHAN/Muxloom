@@ -140,6 +140,7 @@ impl Runtime {
             reverse_tunnel: config.reverse_tunnel.clone(),
             bootstrap_binary: config.companion_binary.clone(),
             download_environment: default_download_environment,
+            attention_patterns: config.attention_patterns_for(LOCAL_TARGET_ID).to_vec(),
         };
         let bridge_options = config
             .hosts
@@ -162,6 +163,7 @@ impl Runtime {
                             .clone()
                             .unwrap_or_else(|| config.companion_binary.clone()),
                         download_environment: Self::controller_environment_for_config(config, host),
+                        attention_patterns: config.attention_patterns_for(host).to_vec(),
                     },
                 )
             })
@@ -2644,7 +2646,12 @@ pub(crate) fn attention_reason(
         AgentKind::Codex => &[
             (
                 "command approval",
-                &["run this command", "run the following command"],
+                &[
+                    "run this command",
+                    "run the following command",
+                    "allow command",
+                    "wants to run",
+                ],
             ),
             (
                 "file change approval",
@@ -2658,9 +2665,21 @@ pub(crate) fn attention_reason(
         AgentKind::Claude => &[
             (
                 "permission request",
-                &["allow this", "allow command", "permission"],
+                &[
+                    "allow this",
+                    "allow command",
+                    "permission",
+                    "trust the files",
+                ],
             ),
-            ("confirmation", &["do you want to proceed", "esc to cancel"]),
+            (
+                "confirmation",
+                &[
+                    "do you want to proceed",
+                    "do you want to make this edit",
+                    "esc to cancel",
+                ],
+            ),
         ],
         AgentKind::Terminal => &[],
     };
@@ -2676,32 +2695,45 @@ pub(crate) fn attention_reason(
             "choose an option",
             "select an option",
             "permission",
+            "allow",
         ]
         .iter()
         .any(|marker| screen.contains(marker))
     {
         return Some("interactive choice".into());
     }
+    // A selection cursor parked on a numbered option is a question being
+    // asked even when no option says yes or no — the answers to a
+    // model-authored question rarely do. The interrupt marker rules out the
+    // working phase, whose panels can also draw pointed lists.
+    if !screen.contains("esc to interrupt") && screen.lines().any(selector_line) {
+        return Some("interactive choice".into());
+    }
     None
+}
+
+/// A line like `❯ 2. Fix the test` — a selection cursor on a numbered option.
+fn selector_line(line: &str) -> bool {
+    let value = line.trim_start();
+    let Some(rest) = value.strip_prefix('❯').or_else(|| value.strip_prefix('›')) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && matches!(rest.chars().nth(digits), Some('.') | Some(')') | Some(':'))
 }
 
 pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     if kind == AgentKind::Terminal {
         return false;
     }
-    let tail = attention_tail(screen).to_lowercase();
-    let interruptible = tail.contains("esc to interrupt");
-    match kind {
-        AgentKind::Codex => interruptible,
-        AgentKind::Claude => {
-            interruptible
-                && (tail.contains("running…")
-                    || tail.contains("running...")
-                    || tail.contains("tokens)")
-                    || tail.contains("tokens ·"))
-        }
-        AgentKind::Terminal => false,
-    }
+    // "esc to interrupt" is the one marker both CLIs keep on screen for the
+    // whole of an interruptible turn: the early phase before a token count
+    // appears, tool runs, and parallel subagent displays included. Anything
+    // stricter reads those phases as idle.
+    attention_tail(screen)
+        .to_lowercase()
+        .contains("esc to interrupt")
 }
 
 fn attention_tail(screen: &str) -> String {
@@ -3874,6 +3906,50 @@ mod tests {
             String::from("• Working (7s • esc to interrupt) · 1 background terminal running\n");
         codex.push_str(&"   \n".repeat(40));
         assert!(agent_is_working(AgentKind::Codex, &codex));
+    }
+
+    #[test]
+    fn every_interruptible_phase_counts_as_working() {
+        // The early phase, before any token count is drawn.
+        assert!(agent_is_working(
+            AgentKind::Claude,
+            "✳ Deliberating… (esc to interrupt)\n"
+        ));
+        // A tool run.
+        assert!(agent_is_working(
+            AgentKind::Claude,
+            "  Running… (esc to interrupt)\n"
+        ));
+        // A parallel subagent display.
+        assert!(agent_is_working(
+            AgentKind::Claude,
+            "✻ Task(explore the repo)\n✻ Task(review tests)\n2 agents running · esc to interrupt\n"
+        ));
+        // A finished turn is not working, whatever the transcript retains.
+        assert!(!agent_is_working(
+            AgentKind::Claude,
+            "✻ Worked for 27s · ↓ 24.0k tokens\n❯ \n? for shortcuts\n"
+        ));
+    }
+
+    #[test]
+    fn a_selection_cursor_on_a_numbered_option_asks_for_attention() {
+        let menu = "Which approach should we take?\n\
+                    ❯ 1. Refactor the parser\n  2. Patch the renderer\n  3. Other\n\
+                    esc to skip\n";
+        assert_eq!(
+            attention_reason(AgentKind::Claude, menu, &[]).as_deref(),
+            Some("interactive choice")
+        );
+        // The same pointed list while a turn is running is a progress panel,
+        // not a question.
+        let busy = format!("{menu}✻ Nucleating… (esc to interrupt)\n");
+        assert_eq!(attention_reason(AgentKind::Claude, &busy, &[]), None);
+        // A bare input caret is not a menu.
+        assert_eq!(
+            attention_reason(AgentKind::Claude, "❯ \n? for shortcuts\n", &[]),
+            None
+        );
     }
 
     #[test]

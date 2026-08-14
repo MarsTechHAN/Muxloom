@@ -44,6 +44,9 @@ mod platform {
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+    /// How recently the PTY must have produced output for a session to count
+    /// as working. Working CLIs repaint their spinners far more often.
+    const WORKING_OUTPUT_FRESHNESS_MS: u64 = 15_000;
     /// The least of a session's log to render when seeding a client's
     /// scrollback. Enough on its own for an agent that writes its transcript
     /// out plainly, and cheap enough to read whether or not it is.
@@ -125,6 +128,10 @@ mod platform {
         persisted_sessions: Mutex<HashMap<String, Arc<PersistedSession>>>,
         paths: DaemonPaths,
         keeper_mode: KeeperMode,
+        /// Extra attention patterns a controller sank down, applied alongside
+        /// the built-in classification on every snapshot. Shared with every
+        /// session so an update reaches sessions launched before it arrived.
+        attention_patterns: Arc<Mutex<Vec<String>>>,
     }
 
     /// How a launch obtains its keeper. Real daemons spawn the detached
@@ -155,6 +162,12 @@ mod platform {
         /// and the history append. The daemon is only this session's current
         /// client; it can disconnect — or die — without ending the session.
         keeper: Mutex<UnixStream>,
+        /// When the PTY last produced output (epoch ms). Both CLIs repaint
+        /// their spinner continuously while working, so a screen that still
+        /// says "working" over a quiet PTY is a leftover, not a state.
+        last_output: AtomicU64,
+        /// Shared with [`DaemonState::attention_patterns`].
+        attention_patterns: Arc<Mutex<Vec<String>>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
         codex_activity: Mutex<CodexActivity>,
@@ -263,6 +276,7 @@ mod platform {
                 persisted_sessions: Mutex::new(persisted_sessions),
                 paths,
                 keeper_mode,
+                attention_patterns: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1118,6 +1132,7 @@ mod platform {
                             "shell-compat-v1".into(),
                             "pty-v1".into(),
                             "send-input-v1".into(),
+                            "attention-patterns-v1".into(),
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
@@ -1256,6 +1271,13 @@ mod platform {
             }
             DaemonRequest::SendInput { session_id, bytes } => {
                 daemon_session(state, &session_id)?.write_input(&bytes)?;
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::SetAttentionPatterns { patterns } => {
+                *state
+                    .attention_patterns
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = patterns;
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::ReadHistory {
@@ -1586,6 +1608,8 @@ mod platform {
                     .try_clone()
                     .context("failed to clone keeper stream")?,
             ),
+            last_output: AtomicU64::new(now_ms()),
+            attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
@@ -1648,6 +1672,7 @@ mod platform {
             let exited = loop {
                 match keeper::read_frame(&mut stream) {
                     Ok(Some((keeper::frame::DATA, payload))) => {
+                        session.last_output.store(now_ms(), Ordering::Relaxed);
                         session.record_output(&payload);
                         session.broadcast(&payload);
                     }
@@ -1932,6 +1957,8 @@ mod platform {
                     .try_clone()
                     .context("failed to clone keeper stream")?,
             ),
+            last_output: AtomicU64::new(now_ms()),
+            attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
@@ -1964,6 +1991,14 @@ mod platform {
             .insert(id.to_string(), Arc::clone(&session));
         spawn_session_reader(state, session, stream);
         Ok(true)
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     fn daemon_session(state: &DaemonState, session_id: &str) -> Result<Arc<ManagedSession>> {
@@ -2332,14 +2367,25 @@ mod platform {
                     snapshot.needs_attention = false;
                     snapshot.attention_reason = None;
                 } else {
-                    snapshot.attention_reason = attention_reason(kind, &visible_screen, &[]);
+                    let patterns = self
+                        .attention_patterns
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    snapshot.attention_reason = attention_reason(kind, &visible_screen, &patterns);
                     snapshot.needs_attention = snapshot.attention_reason.is_some();
+                    // Both CLIs repaint their spinner continuously while
+                    // working; a screen still claiming so over a PTY that has
+                    // gone quiet is a leftover of an ended or wedged turn.
+                    let fresh = now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
+                        < WORKING_OUTPUT_FRESHNESS_MS;
                     let working_hint = self
                         .codex_activity
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .working();
                     snapshot.working = !snapshot.needs_attention
+                        && fresh
                         && if kind == AgentKind::Codex {
                             working_hint.unwrap_or_else(|| agent_is_working(kind, &visible_screen))
                         } else {
@@ -3950,6 +3996,57 @@ mod platform {
             assert!(archived.archived && archived.dead);
             assert!(!archived.working);
             assert!(!archived.needs_attention);
+        }
+
+        #[test]
+        fn a_quiet_pty_stops_counting_as_working_and_sunk_patterns_classify_waiting() {
+            let state = test_state("freshness");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-codex-freshness".into(),
+                "codex".into(),
+                "/tmp".into(),
+                "freshness".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+            session.record_output("\x1b[2J\x1b[H• Working (2s • esc to interrupt)".as_bytes());
+            assert!(session.snapshot().working);
+
+            // A screen still claiming work over a PTY that has gone quiet is a
+            // leftover of an ended turn, not a state.
+            session.last_output.store(
+                now_ms().saturating_sub(WORKING_OUTPUT_FRESHNESS_MS + 1),
+                Ordering::Relaxed,
+            );
+            assert!(!session.snapshot().working);
+            session.last_output.store(now_ms(), Ordering::Relaxed);
+            assert!(session.snapshot().working);
+
+            // Patterns a controller sank down classify waiting on the
+            // daemon's own snapshots, custom wording included.
+            session.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            *state
+                .attention_patterns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                vec!["gpu quota approval".into()];
+            let snapshot = session.snapshot();
+            assert!(snapshot.needs_attention);
+            assert_eq!(
+                snapshot.attention_reason.as_deref(),
+                Some("gpu quota approval")
+            );
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
