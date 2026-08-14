@@ -513,7 +513,7 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Red),
             )
         } else if status.enabled {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::raw("    "),
                 runtime_capability(
                     AgentKind::Codex,
@@ -528,7 +528,14 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     claude_working,
                     app.animation_frame,
                 ),
-            ])
+            ];
+            if let Some(version) = app.daemon_lag_version(&status.target.id) {
+                spans.push(Span::styled(
+                    format!("  ⟳{version}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Line::from(spans)
         } else {
             Line::styled("    disabled", Style::default().fg(MUTED))
         };
@@ -1249,8 +1256,19 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
         }
     };
+    // Machines whose running daemon lags this build get a bottom-right chip;
+    // narrow footers keep the keybindings instead.
+    let lagging = app.outdated_daemons();
+    let chip = if lagging.is_empty() || area.width < 72 {
+        String::new()
+    } else if let [(target_id, version)] = lagging.as_slice() {
+        format!(" ⟳ {target_id} daemon {version} ")
+    } else {
+        format!(" ⟳ {} daemons outdated ", lagging.len())
+    };
     let help_width = UnicodeWidthStr::width(help);
-    let status_width = (area.width as usize).saturating_sub(help_width + busy.len() + 2);
+    let chip_width = UnicodeWidthStr::width(chip.as_str());
+    let status_width = (area.width as usize).saturating_sub(help_width + chip_width + busy.len() + 2);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1258,6 +1276,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 status_style,
             ),
             Span::styled(help, Style::default().fg(MUTED)),
+            Span::styled(chip, Style::default().fg(Color::Yellow)),
         ])),
         area,
     );

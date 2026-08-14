@@ -793,6 +793,27 @@ impl App {
             .is_some_and(|(text, _)| *text == self.status_message)
     }
 
+    /// The running daemon version behind a machine's live bridge, when it is
+    /// older than this controller build. `None` while no bridge is connected,
+    /// so a machine only reads as outdated when that is actually observable.
+    pub fn daemon_lag_version(&self, target_id: &str) -> Option<String> {
+        let version = self.worker.bridges.daemon_version(target_id)?;
+        crate::model::version_is_newer(env!("CARGO_PKG_VERSION"), &version).then_some(version)
+    }
+
+    /// Ids and running versions of every enabled machine whose daemon lags
+    /// this controller build, for the footer indicator.
+    pub fn outdated_daemons(&self) -> Vec<(String, String)> {
+        self.targets
+            .iter()
+            .filter(|status| status.enabled && status.state == ConnectionState::Online)
+            .filter_map(|status| {
+                self.daemon_lag_version(&status.target.id)
+                    .map(|version| (status.target.id.clone(), version))
+            })
+            .collect()
+    }
+
     /// Forwards come up on a background thread, so the modal is not the only
     /// place their outcome matters: a tunnel that fails after the modal closes
     /// would otherwise leave the footer claiming it is forwarding. Report every

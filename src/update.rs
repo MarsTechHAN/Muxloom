@@ -24,7 +24,10 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
-use crate::http;
+use crate::{
+    http,
+    model::{parse_version, version_is_newer as is_newer},
+};
 
 const REPO_LATEST: &str = "https://github.com/MarsTechHAN/Muxloom/releases/latest";
 const DOWNLOAD_BASE: &str = "https://github.com/MarsTechHAN/Muxloom/releases/download";
@@ -54,25 +57,6 @@ fn target_triple() -> Option<&'static str> {
         ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
-    }
-}
-
-/// Parse a semantic version into comparable numbers, ignoring any pre-release or
-/// build suffix (`0.4.3-rc1` -> `(0, 4, 3)`). `None` if it does not look like one.
-fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
-    let core = text.trim().trim_start_matches('v');
-    let core = core.split(['-', '+']).next().unwrap_or(core);
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
-}
-
-fn is_newer(latest: &str, current: &str) -> bool {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(latest), Some(current)) => latest > current,
-        _ => false,
     }
 }
 

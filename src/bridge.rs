@@ -101,6 +101,8 @@ struct ConnectionState {
     next_stream: AtomicU64,
     alive: AtomicBool,
     capabilities: Mutex<HashSet<String>>,
+    /// The running daemon's version from its Hello, for the update indicator.
+    daemon_version: Mutex<Option<String>>,
 }
 
 /// Outbound side of one bridge connection. Frames are queued here and written
@@ -455,6 +457,7 @@ impl BridgeConnection {
                     DaemonResponse::Hello {
                         protocol_version,
                         capabilities,
+                        daemon_version,
                         ..
                     },
                 ..
@@ -465,6 +468,11 @@ impl BridgeConnection {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     capabilities.into_iter().collect();
+                *connection
+                    .state
+                    .daemon_version
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(daemon_version);
                 debug::log(
                     "bridge",
                     format!("connected target={target} via one persistent bridge"),
@@ -498,6 +506,7 @@ impl BridgeConnection {
             next_stream: AtomicU64::new(u64::from(stream::PTY_BASE)),
             alive: AtomicBool::new(true),
             capabilities: Mutex::new(HashSet::new()),
+            daemon_version: Mutex::new(None),
         });
         spawn_writer(frames, Arc::downgrade(&state), writer);
         spawn_reader(Arc::clone(&state), reader);
@@ -1884,6 +1893,17 @@ impl BridgePool {
         self.live_connection(target_id).is_some()
     }
 
+    /// The version of the daemon the target's live bridge talks to. `None`
+    /// means no live bridge rather than "current"; safe on the render loop.
+    pub fn daemon_version(&self, target_id: &str) -> Option<String> {
+        self.live_connection(target_id)?
+            .state
+            .daemon_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// The target's established bridge, if it has one. Unlike
     /// [`Self::connection_for_target`] this never connects and never waits on
     /// the per-target connect lock, so callers on the render loop stay
@@ -1929,6 +1949,44 @@ mod tests {
         assert!(error.to_string().contains("predates tcp-forward-v1"));
         connection.state.shutdown();
         drop(server);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_records_the_running_daemon_version_for_the_update_indicator() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = client.try_clone().unwrap();
+        let connection = BridgeConnection::from_parts("test".into(), reader, client, None);
+        let server_thread = thread::spawn(move || {
+            let hello = Frame::read_from(&mut server).unwrap().unwrap();
+            Frame::json(
+                FrameKind::Response,
+                0,
+                hello.request_id,
+                &DaemonResponse::Hello {
+                    daemon_version: "0.3.0".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    pid: 1,
+                    capabilities: vec!["pty-v1".into()],
+                },
+            )
+            .unwrap()
+            .write_to(&mut server)
+            .unwrap();
+            server
+        });
+        let connection = BridgeConnection::handshake(connection, "test").unwrap();
+        assert_eq!(
+            connection
+                .state
+                .daemon_version
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("0.3.0")
+        );
+        connection.state.shutdown();
+        drop(server_thread.join().unwrap());
     }
 
     #[cfg(unix)]

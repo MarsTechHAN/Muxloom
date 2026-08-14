@@ -4,6 +4,26 @@ use serde::{Deserialize, Serialize};
 
 pub const LOCAL_TARGET_ID: &str = "local";
 
+/// Parse a semantic version into comparable numbers, ignoring any pre-release
+/// or build suffix (`0.4.3-rc1` -> `(0, 4, 3)`). `None` if it does not look
+/// like one.
+pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
