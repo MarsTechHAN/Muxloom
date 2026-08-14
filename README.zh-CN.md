@@ -29,6 +29,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 - [界面与布局](#zh-interface)
 - [操作](#zh-controls)
 - [配置](#zh-configuration)
+- [MCP](#zh-mcp)
 - [会话、历史与提醒](#zh-sessions)
 - [文件管理与预览](#zh-files)
 - [实现架构](#zh-architecture)
@@ -103,6 +104,7 @@ cargo build --release
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
 muxloom update [--config PATH]
+muxloom mcp [--config PATH]
 ```
 
 `--config` 指定 TOML；`--debug` 写入默认 Debug Log；`--debug-log PATH` 指定日志路径。
@@ -247,6 +249,50 @@ binary，否则由 Controller 下载并校验目标平台产物，再传到目�
 目标机器访问外网。Controller 无法准备时才执行该机器配置的用户态安装命令，此时默认
 Installer 需要目标直连或通过 Reverse Tunnel 访问网络。`sync_files` 会复制到目标用户 Home
 下相同的相对路径，已有文件先备份，历史目录不会作为配置同步。
+
+<a id="zh-mcp"></a>
+
+### MCP
+
+两个 binary 都能通过 Model Context Protocol（stdio 传输）把整个工作台交给 AI Agent 操作：
+
+- **`muxloom mcp`** —— Controller 面，headless 运行。读取与 Dashboard 相同的配置和状态，
+  可触达所有**已启用**的机器：列出机器与会话（含实时 working / needs_attention 状态与
+  Recap）、启动与恢复会话、向会话输入、读取渲染后的屏幕与回滚、全文搜索历史、浏览与预览
+  文件、归档或删除会话、执行 Shell 脚本。TUI 不需要在运行。
+- **`muxloomd mcp`** —— 同样的工具形态，但只作用于本机 daemon，适合运行在目标机器上的
+  Agent。每次调用都用一条短连接访问本机 `muxloomd` socket（daemon 未运行时会自动拉起），
+  因此挂着的 MCP 客户端不会推迟 daemon 升级。
+
+在 Claude Code 中注册：
+
+```bash
+claude mcp add muxloom -- muxloom mcp
+# 或在承载会话的机器上使用 daemon 面：
+claude mcp add muxloomd -- muxloomd mcp
+```
+
+Codex（`~/.codex/config.toml`）：
+
+```toml
+[mcp_servers.muxloom]
+command = "muxloom"
+args = ["mcp"]
+```
+
+Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）→ `send_input` 带
+`submit: true` 提交 Prompt → 轮询 `list_sessions` 等 `working` 结束（`needs_attention`
+会带上命中的审批提示）→ `read_screen` 读取结果。
+
+通过 MCP 启动的会话就是普通托管会话：会出现在 Dashboard 中、在 MCP 客户端退出后继续运
+行，也要像其他会话一样归档或删除。未启用的机器不会被触碰——指向它的调用会被拒绝。
+
+工具面本身与传输无关（`src/control.rs`）；MCP stdio 是它的第一个适配器，同一接缝将来
+可以接 TCP 或串口适配器，让硬件状态面板读取 Agent 状态。
+
+> [!WARNING]
+> `run_shell` 与 `send_input` 允许连接的 MCP 客户端在启用机器上以你的用户身份执行任意
+> 命令，请据此决定向哪些客户端开放。
 
 <a id="zh-sessions"></a>
 
@@ -409,6 +455,8 @@ Debug Log 可能包含少量当前 Agent 可见文本，应按敏感信息处理
 - Attention 是启发式检测，每台机器的 Pattern 应尽量具体；
 - 启用机器意味着允许周期性 BatchMode SSH 和 companion 管理；
 - 目标 History、Debug Snippet 和搜索结果都可能包含敏感内容；
+- 连接 `muxloom mcp` / `muxloomd mcp` 的 MCP 客户端可以读取历史、向会话输入并以你的用户
+  身份在启用机器上执行 Shell 脚本；
 - Muxloom 默认不添加跳过 Agent 权限检查的参数，用户配置的 Runtime Args 仍具有对应风险。
 
 ---

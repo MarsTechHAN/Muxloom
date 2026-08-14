@@ -35,6 +35,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 - [Quick start](#quick-start)
 - [Controls](#controls)
 - [Configuration](#configuration)
+- [MCP](#mcp)
 - [How it works](#how-it-works)
 - [Platform support](#platform-support)
 - [Troubleshooting](#troubleshooting)
@@ -81,6 +82,9 @@ messages, PTY traffic, history pages, file operations, and encoded media.
   the bell, and desktop notifications.
 - 🧭 **Responsive layout** — landscape, portrait, and compact modes that follow
   the rendered geometry, with independently persisted split ratios.
+- 🤖 **MCP** — `muxloom mcp` and `muxloomd mcp` serve the whole workspace to AI
+  agents over the Model Context Protocol: session status, launch/resume,
+  typed input, screen reads, search, and files.
 
 ## Feature tour
 
@@ -249,6 +253,7 @@ cargo build --release
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
 muxloom update [--config PATH]
+muxloom mcp [--config PATH]
 ```
 
 | Option | Purpose |
@@ -422,6 +427,58 @@ args = ["--full-auto"]
 - Edit these live: `,` for the selected machine, `Ctrl-,` for global defaults.
   Settings fields use shell-word syntax rather than JSON.
 
+## MCP
+
+Both binaries serve the workspace to AI agents over the Model Context
+Protocol's stdio transport:
+
+- **`muxloom mcp`** — the controller surface, headless. It reads the same
+  configuration and state as the dashboard and reaches every **enabled**
+  machine: list machines and sessions with fresh working/attention status,
+  launch and resume sessions, type into a session, read rendered screens and
+  scrollback pages, search histories, browse and preview files, archive or
+  delete sessions, and run shell scripts. The TUI does not need to be
+  running.
+- **`muxloomd mcp`** — the same tool shapes scoped to the daemon on this
+  machine, for an agent that runs on the target itself. Every call opens a
+  short-lived connection to the local `muxloomd` socket (starting the daemon
+  if needed), so a connected MCP client never delays daemon upgrades.
+
+Register with Claude Code:
+
+```bash
+claude mcp add muxloom -- muxloom mcp
+# or, for the machine-local daemon surface:
+claude mcp add muxloomd -- muxloomd mcp
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.muxloom]
+command = "muxloom"
+args = ["mcp"]
+```
+
+Typical loop for an agent driving another agent: `list_sessions` (or
+`launch_session`), `send_input` with `submit: true` to hand it a prompt, then
+poll `list_sessions` until `working` clears — `needs_attention` carries the
+matched approval prompt — and `read_screen` to read the outcome.
+
+Sessions launched over MCP are ordinary managed sessions: they appear in the
+dashboard, survive the MCP client exiting, and are archived or deleted like
+any other. A machine that is not enabled stays untouched — calls addressing
+it are refused.
+
+The tool surface itself is transport-agnostic (`src/control.rs`); MCP stdio
+is its first adapter, and the same seam is intended to carry a TCP or serial
+adapter so hardware status panels can read agent state.
+
+> [!WARNING]
+> `run_shell` and `send_input` let a connected MCP client execute arbitrary
+> commands as your user on enabled machines. Grant access to these servers
+> with that in mind.
+
 ## How it works
 
 ```mermaid
@@ -476,6 +533,8 @@ old frame visible until the new stream produces its first frame.
 | `src/app.rs` | State machine, focus, forms, retries, input routing |
 | `src/ui.rs` | Responsive layouts, widgets, VT cells, preview rendering |
 | `src/worker.rs` | Background typed request/event execution |
+| `src/control.rs` | Transport-agnostic control surface behind MCP and future adapters |
+| `src/mcp.rs` | Minimal MCP server over line-based JSON-RPC |
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |
@@ -538,6 +597,9 @@ muxloom --debug-log /tmp/muxloom-debug.log
   sensitive content.
 - Muxloom adds no permission-bypass arguments by default; configured runtime
   flags keep the security consequences of that runtime.
+- An MCP client connected to `muxloom mcp` or `muxloomd mcp` can read
+  histories, type into sessions, and run shell scripts as your user on
+  enabled machines.
 
 ## Contributing
 

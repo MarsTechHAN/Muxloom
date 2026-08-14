@@ -58,6 +58,22 @@ preserve.
 - Upgrade regressions must cover both an active session, where handover is
   deferred, and an idle daemon, where the new generation starts without tmux.
 
+## Control surfaces
+
+- External adapters (MCP today, hardware bridges tomorrow) reach muxloom only
+  through the `ControlSurface` trait in `src/control.rs`. New capabilities are
+  added to the surface, not to an individual transport.
+- Typed input from an adapter must use the `SendInput` request. Opening a PTY
+  stream resizes the session under an attached terminal and must never be used
+  just to write bytes.
+- An adapter client of the local daemon must use short-lived connections per
+  call: a resident client holds the client count up and defers generation
+  handover indefinitely.
+- A machine the user has not enabled must be unreachable from every adapter,
+  by name or otherwise.
+- MCP transports own stdout. Nothing but protocol messages may be printed
+  while a surface is being served; diagnostics go to the debug log.
+
 ## Terminal correctness
 
 - Bound every embedded terminal parser and resize operation to the actual pane
