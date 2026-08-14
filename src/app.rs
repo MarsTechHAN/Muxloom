@@ -616,6 +616,9 @@ pub struct App {
     /// `sessions`, which is emptied when a machine is disabled.
     notified_attention: HashSet<String>,
     scanned_targets: HashSet<String>,
+    /// When each machine's daemon was last nudged toward the current
+    /// generation, for the quiet retry backoff.
+    daemon_refreshes: HashMap<String, Instant>,
     pub staged_update: Option<String>,
     pub available_update: Option<String>,
 }
@@ -726,6 +729,7 @@ impl App {
             task_progress: Vec::new(),
             notified_attention: HashSet::new(),
             scanned_targets: HashSet::new(),
+            daemon_refreshes: HashMap::new(),
             staged_update: None,
             available_update: None,
         }
@@ -814,6 +818,47 @@ impl App {
             .collect()
     }
 
+    /// The machine the attached terminal lives on, while one is attached.
+    fn attached_target_id(&self) -> Option<&str> {
+        let session_id = self.terminal_session_id.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.target_id.as_str())
+    }
+
+    /// Quietly cycle the bridge of a machine whose daemon lags this build: the
+    /// reconnect re-runs bootstrap, deploys the current companion, and the
+    /// handover carries every session across on its keeper. One attempt per
+    /// machine per backoff window — a handover deferred by pre-keeper sessions
+    /// stays deferred until they end — and never under an attached terminal,
+    /// whose PTY stream the cycle would cut.
+    fn maybe_refresh_daemons(&mut self) {
+        const DAEMON_REFRESH_BACKOFF: Duration = Duration::from_secs(30 * 60);
+        for (target_id, _) in self.outdated_daemons() {
+            if Some(target_id.as_str()) == self.attached_target_id() {
+                continue;
+            }
+            if self
+                .daemon_refreshes
+                .get(&target_id)
+                .is_some_and(|last| last.elapsed() < DAEMON_REFRESH_BACKOFF)
+            {
+                continue;
+            }
+            let Some(target) = self
+                .targets
+                .iter()
+                .find(|status| status.target.id == target_id)
+                .map(|status| status.target.clone())
+            else {
+                continue;
+            };
+            self.daemon_refreshes.insert(target_id, Instant::now());
+            let _ = self.worker.requests.send(Request::RefreshDaemon { target });
+        }
+    }
+
     /// Forwards come up on a background thread, so the modal is not the only
     /// place their outcome matters: a tunnel that fails after the modal closes
     /// would otherwise leave the footer claiming it is forwarding. Report every
@@ -879,6 +924,7 @@ impl App {
         if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
             self.refresh_daemon_activity();
         }
+        self.maybe_refresh_daemons();
         self.maybe_backup_sync();
         if !self.has_terminal_for_selected()
             && self
@@ -2664,6 +2710,23 @@ impl App {
                     self.apply_activity_refresh(&target_id, &sessions);
                 }
             }
+            Event::DaemonRefreshed { target_id, result } => match result {
+                Ok(Some(version)) if version == env!("CARGO_PKG_VERSION") => {
+                    self.set_background_status(format!(
+                        "{target_id} daemon updated to {version} — sessions kept running"
+                    ));
+                }
+                // Still lagging: an old generation kept serving because it
+                // holds pre-keeper sessions, or the companion could not be
+                // updated. The next backoff window tries again.
+                Ok(_) => {}
+                Err(error) => {
+                    debug::log(
+                        "app",
+                        format!("daemon refresh failed target={target_id}: {error}"),
+                    );
+                }
+            },
             Event::PortsDetected { target_id, result } => {
                 if let Some(Modal::PortForward(form)) = self.modal.as_mut()
                     && form.target.id == target_id
@@ -8011,6 +8074,34 @@ mod tests {
             Some(false),
         );
         assert!(!app.sessions[0].working);
+    }
+
+    #[test]
+    fn a_daemon_refresh_reports_success_and_stays_quiet_when_still_lagging() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some(env!("CARGO_PKG_VERSION").into())),
+        });
+        assert!(
+            app.status_message.contains("sessions kept running"),
+            "{}",
+            app.status_message
+        );
+
+        // A refresh that could not advance the daemon stays quiet: the old
+        // generation is still serving and the backoff window will retry.
+        let mut app = ux_test_app(vec![Target::local()]);
+        let before = app.status_message.clone();
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Err("unreachable".into()),
+        });
+        assert_eq!(app.status_message, before);
     }
 
     #[test]

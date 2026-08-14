@@ -28,6 +28,12 @@ pub enum Request {
     RefreshActivity {
         target: Target,
     },
+    /// Cycle the target's bridge so the reconnect deploys the current
+    /// companion and, with keepers carrying the sessions, hands the daemon
+    /// over to the new generation.
+    RefreshDaemon {
+        target: Target,
+    },
     DetectPorts {
         target: Target,
     },
@@ -147,6 +153,12 @@ pub enum Event {
     ActivityRefreshed {
         target_id: String,
         result: Result<Vec<AgentSession>, String>,
+    },
+    /// The daemon version now serving the target after a bridge cycle, when
+    /// the reconnect could read one.
+    DaemonRefreshed {
+        target_id: String,
+        result: Result<Option<String>, String>,
     },
     PortsDetected {
         target_id: String,
@@ -363,6 +375,22 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::ActivityRefreshed { target_id, result });
+                    }
+                    Request::RefreshDaemon { target } => {
+                        let target_id = target.id.clone();
+                        let bridges = runtime.bridge_pool();
+                        bridges.disconnect(&target.id);
+                        let result = bridges
+                            .list_sessions(&target)
+                            .map(|_| bridges.daemon_version(&target.id))
+                            .map_err(|error| error.to_string());
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("daemon refresh failed target={target_id}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::DaemonRefreshed { target_id, result });
                     }
                     Request::DetectPorts { target } => {
                         let target_id = target.id.clone();

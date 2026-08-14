@@ -1893,6 +1893,19 @@ impl BridgePool {
         self.live_connection(target_id).is_some()
     }
 
+    /// Drop the target's bridge so the next operation reconnects, re-running
+    /// bootstrap — and with it the companion update and generation handover.
+    pub fn disconnect(&self, target_id: &str) {
+        let removed = self
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(target_id);
+        if let Some(connection) = removed {
+            connection.state.shutdown();
+        }
+    }
+
     /// The version of the daemon the target's live bridge talks to. `None`
     /// means no live bridge rather than "current"; safe on the render loop.
     pub fn daemon_version(&self, target_id: &str) -> Option<String> {
@@ -1977,12 +1990,7 @@ mod tests {
         });
         let connection = BridgeConnection::handshake(connection, "test").unwrap();
         assert_eq!(
-            connection
-                .state
-                .daemon_version
-                .lock()
-                .unwrap()
-                .as_deref(),
+            connection.state.daemon_version.lock().unwrap().as_deref(),
             Some("0.3.0")
         );
         connection.state.shutdown();
