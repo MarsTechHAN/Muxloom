@@ -592,6 +592,13 @@ impl BridgeConnection {
         }
     }
 
+    pub fn daemon_status(&self) -> Result<(u32, usize)> {
+        match self.request(DaemonRequest::Status)?.response {
+            DaemonResponse::Status { pid, clients, .. } => Ok((pid, clients)),
+            response => bail!("unexpected status response: {response:?}"),
+        }
+    }
+
     pub fn read_history(
         &self,
         session_id: String,
@@ -1307,14 +1314,28 @@ fn resolve_companion_asset(
         );
     }
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
-        debug::log(
-            "bridge",
-            format!("using bundled {triple} companion asset {}", path.display()),
-        );
-        return Ok((
-            path,
-            format!("deployed bundled {triple} muxloomd companion"),
-        ));
+        // A bundle ships companions built together with the controller; a
+        // source tree can hold a cross-build from weeks ago that would pin
+        // every remote to that stale generation. Trust a found asset only
+        // when it is not clearly older than the controller itself.
+        if bundled_asset_is_stale(&path, &current) {
+            debug::log(
+                "bridge",
+                format!(
+                    "ignoring stale {triple} companion asset {}; falling back to the release download/cache",
+                    path.display()
+                ),
+            );
+        } else {
+            debug::log(
+                "bridge",
+                format!("using bundled {triple} companion asset {}", path.display()),
+            );
+            return Ok((
+                path,
+                format!("deployed bundled {triple} muxloomd companion"),
+            ));
+        }
     }
     debug::log(
         "bridge",
@@ -1357,6 +1378,24 @@ impl CompanionSource {
                  it may be stale"
             }
         }
+    }
+}
+
+/// Whether a companion asset found beside (or below) the controller is
+/// clearly older than the controller executable itself. Bundles unpack with
+/// their build-time stamps, so genuine siblings land within the slack; a
+/// leftover cross-build from an earlier week does not.
+fn bundled_asset_is_stale(asset: &Path, controller: &Path) -> bool {
+    const SLACK: Duration = Duration::from_secs(60 * 60);
+    let (Ok(asset_meta), Ok(controller_meta)) = (fs::metadata(asset), fs::metadata(controller))
+    else {
+        return false;
+    };
+    match (asset_meta.modified(), controller_meta.modified()) {
+        (Ok(asset_time), Ok(controller_time)) => controller_time
+            .duration_since(asset_time)
+            .is_ok_and(|behind| behind > SLACK),
+        _ => false,
     }
 }
 
@@ -1756,6 +1795,11 @@ impl BridgePool {
             .send_input(session_id, bytes)
     }
 
+    /// The serving daemon's pid and client count.
+    pub fn daemon_status(&self, target: &Target) -> Result<(u32, usize)> {
+        self.connection_for_target(target)?.daemon_status()
+    }
+
     pub fn delete(&self, target: &Target, session_id: String) -> Result<()> {
         self.connection_for_target(target)?.delete(session_id)
     }
@@ -2073,6 +2117,37 @@ mod tests {
         assert!(error.to_string().contains("predates tcp-forward-v1"));
         connection.state.shutdown();
         drop(server);
+    }
+
+    /// A cross-build left in the workspace weeks ago must not pin every
+    /// remote to its stale generation: it only counts as a sibling of the
+    /// controller when their build stamps roughly agree.
+    #[test]
+    fn a_stale_workspace_companion_is_ignored_in_favour_of_the_release() {
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-stale-asset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let controller = root.join("muxloom");
+        let asset = root.join("muxloomd-cross");
+        fs::write(&controller, b"controller").unwrap();
+        fs::write(&asset, b"asset").unwrap();
+
+        // Same build round: trusted.
+        assert!(!bundled_asset_is_stale(&asset, &controller));
+
+        // An asset from a much earlier build round: ignored.
+        let old = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        let file = fs::File::options().write(true).open(&asset).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        assert!(bundled_asset_is_stale(&asset, &controller));
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// GitHub being unreachable must degrade to the previously verified cache

@@ -1,4 +1,9 @@
-use std::{path::PathBuf, sync::mpsc, thread, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     bridge::BridgePool,
@@ -32,6 +37,13 @@ pub enum Request {
     /// companion and, with keepers carrying the sessions, hands the daemon
     /// over to the new generation.
     RefreshDaemon {
+        target: Target,
+    },
+    /// Last resort of a forced update whose negotiated handover keeps being
+    /// deferred (a drifted client count on an old daemon can defer it
+    /// forever): with every session verified dead or archived, stop the old
+    /// daemon outright and reconnect so the new generation starts.
+    ForceDaemonRestart {
         target: Target,
     },
     DetectPorts {
@@ -289,6 +301,47 @@ pub enum TaskKind {
     Install,
 }
 
+/// Stop a daemon whose negotiated handover cannot succeed, then reconnect so
+/// the current generation starts. Refuses while any session is live: the old
+/// daemon's in-process PTYs die with it, so this is only safe after a forced
+/// update archived everything.
+fn force_daemon_restart(runtime: &Runtime, target: &Target) -> Result<Option<String>, String> {
+    let bridges = runtime.bridge_pool();
+    let sessions = bridges
+        .list_sessions(target)
+        .map_err(|error| format!("could not verify the sessions are stopped: {error:#}"))?;
+    if let Some(live) = sessions
+        .iter()
+        .find(|session| !session.dead && !session.archived)
+    {
+        return Err(format!(
+            "session {} is still live; refusing to stop its daemon",
+            live.id
+        ));
+    }
+    let (pid, _clients) = bridges
+        .daemon_status(target)
+        .map_err(|error| format!("could not read the daemon pid: {error:#}"))?;
+    // Schedule the stop from a detached shell so the acknowledgement gets
+    // out before the daemon goes down, and clear the socket the way an
+    // orderly exit would.
+    let script = format!(
+        "nohup sh -c 'sleep 1; kill {pid} 2>/dev/null; sleep 2; kill -9 {pid} 2>/dev/null; \
+         state=\"${{MUXLOOMD_STATE_DIR:-${{XDG_STATE_HOME:-$HOME/.local/state}}/muxloom}}\"; \
+         rm -f \"$state/muxloomd.sock\" \"$state/muxloomd.pid\"' >/dev/null 2>&1 & echo scheduled"
+    );
+    runtime
+        .run_shell(target, &script, false)
+        .map_err(|error| format!("could not schedule the daemon stop: {error:#}"))?;
+    thread::sleep(Duration::from_secs(5));
+    bridges.disconnect(&target.id);
+    thread::sleep(Duration::from_millis(1_500));
+    bridges
+        .list_sessions(target)
+        .map(|_| bridges.daemon_version(&target.id))
+        .map_err(|error| format!("daemon did not come back after the restart: {error:#}"))
+}
+
 pub struct Worker {
     pub requests: mpsc::Sender<Request>,
     pub events: mpsc::Receiver<Event>,
@@ -380,6 +433,10 @@ impl Worker {
                         let target_id = target.id.clone();
                         let bridges = runtime.bridge_pool();
                         bridges.disconnect(&target.id);
+                        // The dropped bridge's remote half needs a moment to
+                        // hang up; reconnecting under it leaves the daemon
+                        // counting two clients and deferring the handover.
+                        thread::sleep(Duration::from_millis(1_500));
                         let result = bridges
                             .list_sessions(&target)
                             .map(|_| bridges.daemon_version(&target.id))
@@ -391,6 +448,20 @@ impl Worker {
                             );
                         }
                         let _ = events.send(Event::DaemonRefreshed { target_id, result });
+                    }
+                    Request::ForceDaemonRestart { target } => {
+                        let target_id = target.id.clone();
+                        let result = force_daemon_restart(&runtime, &target);
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("forced daemon restart failed target={target_id}: {error}"),
+                            );
+                        }
+                        let _ = events.send(Event::DaemonRefreshed {
+                            target_id,
+                            result: result.map_err(|error| error.to_string()),
+                        });
                     }
                     Request::DetectPorts { target } => {
                         let target_id = target.id.clone();

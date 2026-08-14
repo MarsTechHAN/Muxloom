@@ -157,6 +157,9 @@ struct ForcedUpdate {
     /// Sessions whose archive/kill acknowledgement is still pending.
     pending_acks: usize,
     terminals_archived: usize,
+    /// Whether the negotiated handover already failed once and the outright
+    /// daemon restart was ordered. One escalation, then give up loudly.
+    escalated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,8 +384,10 @@ pub const HELP_CONTENT_ROWS: usize = 58;
 const ANIMATION_FRAME_MS: u128 = 180;
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
 /// How long one phase of a forced daemon update may take before the
-/// orchestration gives up and says so.
-const FORCED_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// orchestration gives up and says so. Generous: the cycle can carry a
+/// companion upload over a slow link, and the escalation waits out a
+/// deliberate daemon stop.
+const FORCED_PHASE_TIMEOUT: Duration = Duration::from_secs(180);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How often the browser re-lists the directory holding the open preview to
 /// notice that the file changed. Only runs while a preview is on screen, so an
@@ -1126,6 +1131,7 @@ impl App {
             resumes,
             pending_acks,
             terminals_archived,
+            escalated: false,
         };
         if update.pending_acks == 0 {
             update.phase = ForcedPhase::Cycling;
@@ -3191,10 +3197,34 @@ impl App {
                     Ok(other) => {
                         if forced_cycling {
                             let still = other.unwrap_or_else(|| "unknown".into());
-                            self.forced_updates.remove(&target_id);
-                            self.set_error(format!(
-                                "{target_id}: forced update failed — daemon still {still}"
-                            ));
+                            let escalate = self
+                                .forced_updates
+                                .get_mut(&target_id)
+                                .filter(|update| !update.escalated)
+                                .map(|update| {
+                                    // The polite handover keeps being
+                                    // deferred — a drifted client count on an
+                                    // old daemon defers it forever. Every
+                                    // session is already archived, so stop
+                                    // the daemon outright.
+                                    update.escalated = true;
+                                    update.deadline = Instant::now() + FORCED_PHASE_TIMEOUT;
+                                    update.target.clone()
+                                });
+                            if let Some(target) = escalate {
+                                self.set_background_status(format!(
+                                    "{target_id}: handover deferred (daemon still {still}); restarting the daemon outright"
+                                ));
+                                let _ = self
+                                    .worker
+                                    .requests
+                                    .send(Request::ForceDaemonRestart { target });
+                            } else {
+                                self.forced_updates.remove(&target_id);
+                                self.set_error(format!(
+                                    "{target_id}: forced update failed — daemon still {still}"
+                                ));
+                            }
                         }
                     }
                     Err(error) => {
@@ -8686,6 +8716,35 @@ mod tests {
             app.status_message
         );
         assert!(app.status_message.contains("1 terminal(s) archived"));
+    }
+
+    #[test]
+    fn a_deferred_forced_handover_escalates_to_a_restart_once_then_fails() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.propose_forced_update("local");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.forced_updates.get("local").unwrap().phase,
+            ForcedPhase::Cycling
+        );
+
+        // The polite cycle came back with the old daemon still serving: the
+        // orchestration escalates to an outright restart exactly once.
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        let update = app.forced_updates.get("local").expect("still in flight");
+        assert!(update.escalated);
+        assert_eq!(update.phase, ForcedPhase::Cycling);
+
+        // A second failure gives up loudly.
+        app.handle_worker_event(Event::DaemonRefreshed {
+            target_id: "local".into(),
+            result: Ok(Some("0.3.0".into())),
+        });
+        assert!(app.forced_updates.is_empty());
+        assert!(app.status_message.contains("forced update failed"));
     }
 
     #[test]
