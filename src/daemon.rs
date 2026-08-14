@@ -1096,6 +1096,7 @@ mod platform {
                             "compression-lz4-v1".into(),
                             "shell-compat-v1".into(),
                             "pty-v1".into(),
+                            "send-input-v1".into(),
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
@@ -1230,6 +1231,10 @@ mod platform {
                 rows,
             } => {
                 daemon_session(state, &session_id)?.resize(columns, rows)?;
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::SendInput { session_id, bytes } => {
+                daemon_session(state, &session_id)?.write_input(&bytes)?;
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::ReadHistory {
@@ -3341,6 +3346,138 @@ mod platform {
             assert_eq!(exit, Some(7));
             drop(client);
             handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn send_input_types_into_the_pty_without_attaching_a_stream() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let state = test_state("send-input");
+            let root = state.paths.root.clone();
+            let server_state = Arc::clone(&state);
+            let handle = thread::spawn(move || serve_client(server, server_state));
+
+            let session = launch_session(
+                &state,
+                "muxloomd-terminal-send-input".into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "send input".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+            let before = session.snapshot();
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                20,
+                &DaemonRequest::Hello {
+                    client_version: env!("CARGO_PKG_VERSION").into(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 20 {
+                    match frame.decode_json::<DaemonResponse>().unwrap() {
+                        DaemonResponse::Hello { capabilities, .. } => {
+                            assert!(capabilities.iter().any(|it| it == "send-input-v1"));
+                        }
+                        response => panic!("unexpected hello response {response:?}"),
+                    }
+                    break;
+                }
+            }
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                21,
+                &DaemonRequest::SendInput {
+                    session_id: "muxloomd-terminal-send-input".into(),
+                    bytes: b"send-input-probe\r".to_vec(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 21 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+
+            let probe = b"send-input-probe";
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut output = Vec::new();
+            while Instant::now() < deadline {
+                output = session
+                    .recent_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if output.windows(probe.len()).any(|window| window == probe) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                output.windows(probe.len()).any(|window| window == probe),
+                "typed bytes must reach the PTY output"
+            );
+            // Typing must not resize the session the way an attach would.
+            let after = session.snapshot();
+            assert_eq!(
+                (before.pid, session.columns.load(Ordering::Relaxed)),
+                (after.pid, 80)
+            );
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                22,
+                &DaemonRequest::SendInput {
+                    session_id: "muxloomd-terminal-send-input-missing".into(),
+                    bytes: b"x".to_vec(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 22 {
+                    match frame.decode_json::<DaemonResponse>().unwrap() {
+                        DaemonResponse::Error { message } => {
+                            assert!(message.contains("unknown daemon session"));
+                        }
+                        response => panic!("unexpected response {response:?}"),
+                    }
+                    break;
+                }
+            }
+
+            session.archive().unwrap();
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(root).unwrap();
         }
 
         #[test]

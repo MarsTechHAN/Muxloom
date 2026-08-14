@@ -714,6 +714,11 @@ impl BridgeConnection {
         self.expect_ack(DaemonRequest::Archive { session_id })
     }
 
+    pub fn send_input(&self, session_id: String, bytes: Vec<u8>) -> Result<()> {
+        self.require_capability("send-input-v1")?;
+        self.expect_ack(DaemonRequest::SendInput { session_id, bytes })
+    }
+
     pub fn delete(&self, session_id: String) -> Result<()> {
         self.expect_ack(DaemonRequest::Delete { session_id })
     }
@@ -1637,6 +1642,11 @@ impl BridgePool {
 
     pub fn archive(&self, target: &Target, session_id: String) -> Result<()> {
         self.connection_for_target(target)?.archive(session_id)
+    }
+
+    pub fn send_input(&self, target: &Target, session_id: String, bytes: Vec<u8>) -> Result<()> {
+        self.connection_for_target(target)?
+            .send_input(session_id, bytes)
     }
 
     pub fn delete(&self, target: &Target, session_id: String) -> Result<()> {

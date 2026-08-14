@@ -2044,6 +2044,34 @@ END {
         ensure_success(&output, "delete agent session")
     }
 
+    /// Type bytes into a session without attaching a PTY stream, which would
+    /// resize the session under any attached terminal.
+    pub fn send_input(&self, target: &Target, session_id: &str, bytes: &[u8]) -> Result<()> {
+        debug::log(
+            "runtime",
+            format!(
+                "send_input target={} session={session_id} bytes={}",
+                target.id,
+                bytes.len()
+            ),
+        );
+        validate_session_id(session_id)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if session_id.starts_with(DAEMON_SESSION_PREFIX) {
+            return self
+                .bridges
+                .send_input(target, session_id.into(), bytes.to_vec());
+        }
+        let hex: Vec<String> = bytes.iter().map(|byte| format!("0x{byte:02x}")).collect();
+        let mut command = vec!["tmux", "send-keys", "-t", session_id, "-H"];
+        command.extend(hex.iter().map(String::as_str));
+        let script = shell_join(&command);
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "send input to agent session")
+    }
+
     pub fn archive(&self, target: &Target, session_id: &str) -> Result<()> {
         debug::log(
             "runtime",

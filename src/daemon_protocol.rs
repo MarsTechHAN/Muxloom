@@ -240,6 +240,13 @@ pub enum DaemonRequest {
         columns: u16,
         rows: u16,
     },
+    /// Write bytes to the session's PTY without attaching a stream. An attach
+    /// resizes the PTY to the subscriber's geometry, so a client that only
+    /// wants to type — the MCP surface driving an agent — must not open one.
+    SendInput {
+        session_id: String,
+        bytes: Vec<u8>,
+    },
     ReadHistory {
         session_id: String,
         offset_from_bottom: usize,
