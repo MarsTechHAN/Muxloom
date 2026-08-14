@@ -50,7 +50,9 @@ const SHELL_OUTPUT_LIMIT: usize = 128 * 1024;
 enum Flavor {
     /// Every enabled machine, addressed by a `machine` argument.
     Controller,
-    /// The one local daemon.
+    /// The one local daemon. Constructed by the unix-only daemon surface, so
+    /// a Windows lib build sees no non-test constructor.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Daemon,
 }
 
