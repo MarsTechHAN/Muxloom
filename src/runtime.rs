@@ -2695,21 +2695,51 @@ pub(crate) fn attention_reason(
             "choose an option",
             "select an option",
             "permission",
-            "allow",
         ]
         .iter()
         .any(|marker| screen.contains(marker))
     {
         return Some("interactive choice".into());
     }
-    // A selection cursor parked on a numbered option is a question being
+    // A selection menu open at the bottom of the screen is a question being
     // asked even when no option says yes or no — the answers to a
-    // model-authored question rarely do. The interrupt marker rules out the
-    // working phase, whose panels can also draw pointed lists.
-    if !screen.contains("esc to interrupt") && screen.lines().any(selector_line) {
+    // model-authored question rarely do. Menus the model merely printed in
+    // its reply scroll away above the input line, so only the bottom rows
+    // count, and a real menu shows several numbered options, exactly one
+    // cursor, and a key hint. The interrupt marker rules out the working
+    // phase, whose panels can also draw pointed lists.
+    if !screen.contains("esc to interrupt") && bottom_menu_is_open(&screen) {
         return Some("interactive choice".into());
     }
     None
+}
+
+fn bottom_menu_is_open(tail: &str) -> bool {
+    let lines: Vec<&str> = tail
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let window = &lines[lines.len().saturating_sub(10)..];
+    let numbered = window
+        .iter()
+        .filter(|line| numbered_option_line(line))
+        .count();
+    let cursors = window.iter().filter(|line| selector_line(line)).count();
+    let hint = window.iter().any(|line| {
+        let line = line.trim();
+        line.chars().count() <= 80 && (line.contains("enter") || line.contains("esc"))
+    });
+    numbered >= 2 && cursors == 1 && hint
+}
+
+/// A numbered option row, with or without the selection cursor.
+fn numbered_option_line(line: &str) -> bool {
+    let value = line
+        .trim_start()
+        .trim_start_matches(['❯', '›'])
+        .trim_start();
+    let digits = value.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && matches!(value.chars().nth(digits), Some('.') | Some(')') | Some(':'))
 }
 
 /// A line like `❯ 2. Fix the test` — a selection cursor on a numbered option.
@@ -3948,6 +3978,25 @@ mod tests {
         // A bare input caret is not a menu.
         assert_eq!(
             attention_reason(AgentKind::Claude, "❯ \n? for shortcuts\n", &[]),
+            None
+        );
+        // A numbered list the model merely printed in its reply must not
+        // trigger: no cursor and no key hint...
+        let quoted = "Here are the options I considered:\n\
+                      1. Refactor the parser\n  2. Patch the renderer\n\
+                      Let me know which you prefer.\n";
+        assert_eq!(attention_reason(AgentKind::Claude, quoted, &[]), None);
+        // ...and even a cursor-looking quote scrolled above the input line
+        // sits outside the bottom window once the reply continues.
+        let scrolled = format!("{menu}{}", "output line\n".repeat(12));
+        assert_eq!(attention_reason(AgentKind::Claude, &scrolled, &[]), None);
+        // A single numbered line with a stray cursor is not a menu either.
+        assert_eq!(
+            attention_reason(
+                AgentKind::Claude,
+                "❯ 1. the only line\npress esc maybe\n",
+                &[]
+            ),
             None
         );
     }

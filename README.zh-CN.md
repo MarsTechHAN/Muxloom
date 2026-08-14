@@ -113,7 +113,10 @@ muxloom mcp [--config PATH]
 更新；配置 `auto_update = false` 可以关闭。默认情况下（`update_prompt = "ask"`）发现
 新版本会先弹窗询问：安装包构建可原地更新，源码构建则把远端机器要用的 muxloomd
 companion 拉进本地缓存；`"auto"` 恢复静默自动更新，`"never"` 跳过启动检查。GitHub
-不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。
+不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。设置面板
+（`,` 机器级 / `Ctrl-,` 全局）按分组只展示常用项——刷新间隔、环境变量、各 agent 命令、
+更新提示；隧道、companion 覆盖、安装命令、sync files、attention patterns 等低频项仅在
+config.toml 中配置。
 
 <a id="zh-first-run"></a>
 
@@ -413,9 +416,9 @@ SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标�
 搜索与元数据。daemon 升级不再等待空闲：换代时会话由各自的 keeper 原地带过去，新
 daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
 运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
-终端未 attach 时自动重连完成升级。pre-keeper 旧会话会无限期推迟接管；开启
-`force_daemon_update = true` 后 Controller 会归档它们、完成接管、再从各 agent 自身的
-转录自动 resume——若会打断工作中的 agent 或终结无法恢复的终端，会先弹窗确认。History
+终端未 attach 时自动重连完成升级。pre-keeper 旧会话会无限期推迟接管；在 Machines 面板
+选中该机按 `u` 可一次性强制更新——先弹窗列出将被打断的 working agent 与将被终结的终端
+（终端无法恢复），确认后归档、完成接管、再从各 agent 自身的转录自动 resume。History
 和 Metadata 始终保留在状态目录。
 
 Terminal 字节由 `vt100::Parser` 维护 Alternate Screen、光标、颜色、样式、Mouse Mode、

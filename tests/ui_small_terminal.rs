@@ -170,9 +170,12 @@ fn search_modal_never_panics() {
 fn settings_modal_never_panics() {
     for (w, h) in SIZES {
         for selected in [0usize, 5, 9] {
-            let values: Vec<String> = muxloom::app::SETTING_LABELS
+            let values: Vec<String> = muxloom::app::GLOBAL_SETTINGS
                 .iter()
-                .map(|label| format!("{label} value"))
+                .filter_map(|row| match row {
+                    muxloom::app::SettingsRow::Field(label) => Some(format!("{label} value")),
+                    muxloom::app::SettingsRow::Section(_) => None,
+                })
                 .collect();
             let form = SettingsForm {
                 scope: muxloom::app::SettingsScope::Global,

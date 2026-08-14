@@ -321,6 +321,7 @@ the full categorized help inside the TUI.
 | `f` | Toggle grouped and flat session views |
 | `v`, `Ctrl-h` | Hide disabled machines or show all |
 | `r`, `Ctrl-r` | Refresh enabled targets |
+| `u` in Machines | Force a `⟳`-marked daemon update: archive, hand over, resume |
 | `?` / `q` | Open help / exit without stopping managed sessions |
 
 Focus shortcuts follow the rendered geometry; unmodified arrows stay available
@@ -398,9 +399,6 @@ auto_update = true
 # What the startup check does with a newer release: "ask" (prompt), "auto"
 # (apply silently), or "never".
 update_prompt = "ask"
-# Archive-and-resume sessions that block a daemon handover. Asks on screen
-# first whenever working agents or terminals would be interrupted.
-force_daemon_update = false
 
 [agents.codex]
 command = "codex"
@@ -440,7 +438,11 @@ args = ["--full-auto"]
 - `sync_files` are copied from the controller user's home to the same relative
   target paths, backing up existing files. Histories are never synced.
 - Edit these live: `,` for the selected machine, `Ctrl-,` for global defaults.
-  Settings fields use shell-word syntax rather than JSON.
+  Settings fields use shell-word syntax rather than JSON. The in-app form
+  covers the common fields — refresh, environment, agent commands, the update
+  prompt — grouped under headings; everything else (tunnels, companion
+  overrides, install commands, sync files, attention patterns, history
+  bounds) lives in this file only.
 
 ## MCP
 
@@ -541,10 +543,10 @@ the next daemon adopts them with the same processes and transcripts. The
 footer shows a `⟳` chip while any machine's running daemon lags this build,
 and the controller quietly cycles such a machine's bridge (never while its
 terminal is attached) to complete the update. Pre-keeper sessions defer that
-handover indefinitely; with `force_daemon_update` enabled the controller
-archives them, completes the handover, and resumes every agent from its own
-transcript — asking on screen first when it would interrupt a working agent
-or end a terminal, which cannot resume.
+handover indefinitely; pressing `u` on the marked machine forces it once —
+after an on-screen summary of what will happen, the controller archives the
+blocking sessions, completes the handover, and resumes every agent from its
+own transcript. Terminals cannot resume and are archived.
 
 **Terminal rendering.** `vt100::Parser` maintains alternate-screen state,
 cursor, colors, styles, mouse mode, application cursor keys, bracketed paste,

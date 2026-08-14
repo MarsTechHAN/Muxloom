@@ -11,7 +11,7 @@ use ratatui::{layout::Rect, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    config::{CommandConfig, Config, HostConfig, State},
+    config::{Config, State},
     debug,
     media::{MediaFrame, MediaPlayback, MediaUpdate},
     model::{
@@ -373,7 +373,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 57;
+pub const HELP_CONTENT_ROWS: usize = 58;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -426,54 +426,66 @@ pub struct SearchForm {
     pub edited_at: Instant,
 }
 
-pub const SETTING_LABELS: [&str; 21] = [
-    "Refresh interval (ms)",
-    "SSH timeout (sec)",
-    "History limit",
-    "History chunk lines",
-    "SSH config path",
-    "Environment (A=x B=y)",
-    "Tunnel RPORT:LHOST:LPORT",
-    "Companion command",
-    "Companion binary (local)",
-    "Codex command",
-    "Codex args",
-    "Codex install command",
-    "Codex sync files",
-    "Claude command",
-    "Claude args",
-    "Claude install command",
-    "Claude sync files",
-    "Terminal command",
-    "Terminal args",
-    "Attention patterns",
-    "Force daemon update (true/false)",
+/// One row of the settings form: a section heading, or the label of the
+/// next editable field. `values` in [`SettingsForm`] aligns with the fields
+/// in row order; sections are display-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    Section(&'static str),
+    Field(&'static str),
+}
+
+/// The settings the dashboard edits. Everything else — tunnels, companion
+/// overrides, install commands, sync files, attention patterns, history
+/// bounds — stays in `config.toml`, where the rare edit belongs.
+pub const GLOBAL_SETTINGS: [SettingsRow; 15] = [
+    SettingsRow::Section("General"),
+    SettingsRow::Field("Refresh interval (ms)"),
+    SettingsRow::Field("SSH config path"),
+    SettingsRow::Section("Environment"),
+    SettingsRow::Field("Environment (A=x B=y)"),
+    SettingsRow::Section("Codex"),
+    SettingsRow::Field("Command"),
+    SettingsRow::Field("Args"),
+    SettingsRow::Section("Claude"),
+    SettingsRow::Field("Command"),
+    SettingsRow::Field("Args"),
+    SettingsRow::Section("Terminal"),
+    SettingsRow::Field("Command"),
+    SettingsRow::Section("Updates"),
+    SettingsRow::Field("Update prompt (ask/auto/never)"),
 ];
 
-pub const HOST_SETTING_LABELS: [&str; 15] = [
-    "Environment (A=x B=y)",
-    "Tunnel RPORT:LHOST:LPORT",
-    "Companion command",
-    "Companion binary (local)",
-    "Codex command",
-    "Codex args",
-    "Codex install command",
-    "Codex sync files",
-    "Claude command",
-    "Claude args",
-    "Claude install command",
-    "Claude sync files",
-    "Terminal command",
-    "Terminal args",
-    "Attention patterns",
+pub const HOST_SETTINGS: [SettingsRow; 10] = [
+    SettingsRow::Section("Environment"),
+    SettingsRow::Field("Environment (A=x B=y)"),
+    SettingsRow::Section("Codex"),
+    SettingsRow::Field("Command"),
+    SettingsRow::Field("Args"),
+    SettingsRow::Section("Claude"),
+    SettingsRow::Field("Command"),
+    SettingsRow::Field("Args"),
+    SettingsRow::Section("Terminal"),
+    SettingsRow::Field("Command"),
 ];
 
 impl SettingsForm {
-    pub fn labels(&self) -> &[&str] {
+    pub fn rows(&self) -> &'static [SettingsRow] {
         match &self.scope {
-            SettingsScope::Global => &SETTING_LABELS,
-            SettingsScope::Host(_) => &HOST_SETTING_LABELS,
+            SettingsScope::Global => &GLOBAL_SETTINGS,
+            SettingsScope::Host(_) => &HOST_SETTINGS,
         }
+    }
+
+    /// The editable field labels in `values` order.
+    pub fn field_labels(&self) -> Vec<&'static str> {
+        self.rows()
+            .iter()
+            .filter_map(|row| match row {
+                SettingsRow::Field(label) => Some(*label),
+                SettingsRow::Section(_) => None,
+            })
+            .collect()
     }
 }
 
@@ -994,9 +1006,28 @@ impl App {
         }
     }
 
-    /// The quiet cycle could not advance a machine's daemon: pre-keeper
-    /// sessions hold it. With `force_daemon_update` on, offer (or start) the
-    /// forced path — archive, hand over, resume.
+    /// `u` on a machine whose daemon lags: show what the forced update would
+    /// do — archive, hand over, resume — and let the user pull the trigger.
+    fn force_update_selected_machine(&mut self) {
+        let Some(status) = self.targets.get(self.selected_target) else {
+            return;
+        };
+        let target_id = status.target.id.clone();
+        if self.forced_updates.contains_key(&target_id) {
+            self.set_background_status(format!("{target_id}: forced update already running"));
+            return;
+        }
+        if self.daemon_lag_version(&target_id).is_none() {
+            self.set_background_status(format!(
+                "{target_id}: daemon is already current (or not connected)"
+            ));
+            return;
+        }
+        self.propose_forced_update(&target_id);
+    }
+
+    /// Open the confirmation for a one-shot forced update: archive the
+    /// sessions holding the old daemon, hand over, resume the agents.
     fn propose_forced_update(&mut self, target_id: &str) {
         let Some(target) = self.target(target_id).cloned() else {
             return;
@@ -1032,17 +1063,13 @@ impl App {
                     && !is_temporary_session_id(&session.id)
             })
             .count();
-        if working.is_empty() && terminals.is_empty() {
-            self.begin_forced_update(target);
-        } else if self.modal.is_none() {
-            // What the force would interrupt is the user's call to make.
-            self.modal = Some(Modal::ConfirmForcedUpdate {
-                target,
-                working,
-                terminals,
-                resumable,
-            });
-        }
+        // A one-shot action always shows its plan before pulling the trigger.
+        self.modal = Some(Modal::ConfirmForcedUpdate {
+            target,
+            working,
+            terminals,
+            resumable,
+        });
     }
 
     /// Archive everything holding the old daemon. The acknowledgements drive
@@ -1487,6 +1514,10 @@ impl App {
             }
             KeyCode::Char(' ') if self.focus == Focus::Machines => {
                 self.toggle_target(self.selected_target);
+                Action::Continue
+            }
+            KeyCode::Char('u') if self.focus == Focus::Machines => {
+                self.force_update_selected_machine();
                 Action::Continue
             }
             KeyCode::Up => {
@@ -3155,7 +3186,8 @@ impl App {
                     }
                     // Still lagging: an old generation kept serving because
                     // it holds pre-keeper sessions, or the companion could
-                    // not be updated.
+                    // not be updated. The `⟳` marker stays up; `u` on the
+                    // machine forces the update when the user decides to.
                     Ok(other) => {
                         if forced_cycling {
                             let still = other.unwrap_or_else(|| "unknown".into());
@@ -3163,11 +3195,6 @@ impl App {
                             self.set_error(format!(
                                 "{target_id}: forced update failed — daemon still {still}"
                             ));
-                        } else if self.config.force_daemon_update
-                            && Some(target_id.as_str()) != self.attached_target_id()
-                            && !self.forced_updates.contains_key(&target_id)
-                        {
-                            self.propose_forced_update(&target_id);
                         }
                     }
                     Err(error) => {
@@ -5358,26 +5385,14 @@ impl App {
             scope: SettingsScope::Global,
             values: vec![
                 self.config.refresh_interval_ms.to_string(),
-                self.config.ssh_connect_timeout_secs.to_string(),
-                self.config.history_limit.to_string(),
-                self.config.history_chunk_lines.to_string(),
                 self.config.ssh_config.clone(),
                 self.config.environment.clone(),
-                self.config.reverse_tunnel.clone(),
-                self.config.companion_command.clone(),
-                self.config.companion_binary.clone(),
                 self.config.agents.codex.command.clone(),
                 format_shell_list(&self.config.agents.codex.args),
-                self.config.agents.codex.install.clone(),
-                format_shell_list(&self.config.agents.codex.sync_files),
                 self.config.agents.claude.command.clone(),
                 format_shell_list(&self.config.agents.claude.args),
-                self.config.agents.claude.install.clone(),
-                format_shell_list(&self.config.agents.claude.sync_files),
                 self.config.agents.terminal.command.clone(),
-                format_shell_list(&self.config.agents.terminal.args),
-                format_shell_list(&self.config.attention_patterns),
-                self.config.force_daemon_update.to_string(),
+                self.config.update_prompt.clone(),
             ],
             selected: 0,
             error: None,
@@ -5417,32 +5432,11 @@ impl App {
                     .get(&target_id)
                     .and_then(|host| host.environment.clone())
                     .unwrap_or_else(|| self.config.environment.clone()),
-                self.config
-                    .hosts
-                    .get(&target_id)
-                    .and_then(|host| host.reverse_tunnel.clone())
-                    .unwrap_or_else(|| self.config.reverse_tunnel.clone()),
-                self.config
-                    .hosts
-                    .get(&target_id)
-                    .and_then(|host| host.companion_command.clone())
-                    .unwrap_or_else(|| self.config.companion_command.clone()),
-                self.config
-                    .hosts
-                    .get(&target_id)
-                    .and_then(|host| host.companion_binary.clone())
-                    .unwrap_or_else(|| self.config.companion_binary.clone()),
                 codex.command,
                 format_shell_list(&codex.args),
-                codex.install,
-                format_shell_list(&codex.sync_files),
                 claude.command,
                 format_shell_list(&claude.args),
-                claude.install,
-                format_shell_list(&claude.sync_files),
                 terminal.command,
-                format_shell_list(&terminal.args),
-                format_shell_list(self.config.attention_patterns_for(&target_id)),
             ],
             selected: 0,
             error: None,
@@ -6808,88 +6802,41 @@ impl App {
             let mut config = self.config.clone();
             match &form.scope {
                 SettingsScope::Global => {
-                    config.refresh_interval_ms = parse_setting(&form.values[0], SETTING_LABELS[0])?;
-                    config.ssh_connect_timeout_secs =
-                        parse_setting(&form.values[1], SETTING_LABELS[1])?;
-                    config.history_limit = parse_setting(&form.values[2], SETTING_LABELS[2])?;
-                    config.history_chunk_lines = parse_setting(&form.values[3], SETTING_LABELS[3])?;
+                    config.refresh_interval_ms =
+                        parse_setting(&form.values[0], "Refresh interval (ms)")?;
                     if config.refresh_interval_ms < 500 {
                         return Err("Refresh interval must be at least 500 ms".into());
                     }
-                    if config.ssh_connect_timeout_secs == 0 {
-                        return Err("SSH timeout must be greater than zero".into());
-                    }
-                    if config.history_limit < 2_000 || config.history_chunk_lines == 0 {
-                        return Err(
-                            "History limit must be >= 2000 and chunk lines must be > 0".into()
-                        );
-                    }
-                    config.ssh_config = form.values[4].clone();
-                    config.environment = form.values[5].clone();
-                    config.reverse_tunnel = form.values[6].clone();
-                    config.companion_command = form.values[7].clone();
-                    config.companion_binary = form.values[8].clone();
-                    config.agents.codex.command = form.values[9].clone();
-                    config.agents.codex.args =
-                        parse_shell_list(&form.values[10], SETTING_LABELS[10])?;
-                    config.agents.codex.install = form.values[11].clone();
-                    config.agents.codex.sync_files =
-                        parse_shell_list(&form.values[12], SETTING_LABELS[12])?;
-                    config.agents.claude.command = form.values[13].clone();
-                    config.agents.claude.args =
-                        parse_shell_list(&form.values[14], SETTING_LABELS[14])?;
-                    config.agents.claude.install = form.values[15].clone();
-                    config.agents.claude.sync_files =
-                        parse_shell_list(&form.values[16], SETTING_LABELS[16])?;
-                    config.agents.terminal.command = form.values[17].clone();
-                    config.agents.terminal.args =
-                        parse_shell_list(&form.values[18], SETTING_LABELS[18])?;
-                    config.attention_patterns =
-                        parse_shell_list(&form.values[19], SETTING_LABELS[19])?;
-                    config.force_daemon_update = match form.values[20].trim() {
-                        "true" | "yes" | "1" => true,
-                        "false" | "no" | "0" | "" => false,
-                        other => {
-                            return Err(format!(
-                                "{} must be true or false, not {other:?}",
-                                SETTING_LABELS[20]
-                            ));
-                        }
-                    };
+                    config.ssh_config = form.values[1].clone();
+                    config.environment = form.values[2].clone();
+                    config.agents.codex.command = form.values[3].clone();
+                    config.agents.codex.args = parse_shell_list(&form.values[4], "Codex args")?;
+                    config.agents.claude.command = form.values[5].clone();
+                    config.agents.claude.args = parse_shell_list(&form.values[6], "Claude args")?;
+                    config.agents.terminal.command = form.values[7].clone();
+                    config.update_prompt = form.values[8].trim().to_string();
                 }
                 SettingsScope::Host(target_id) => {
-                    let codex = CommandConfig {
-                        command: form.values[4].clone(),
-                        args: parse_shell_list(&form.values[5], HOST_SETTING_LABELS[5])?,
-                        install: form.values[6].clone(),
-                        sync_files: parse_shell_list(&form.values[7], HOST_SETTING_LABELS[7])?,
-                    };
-                    let claude = CommandConfig {
-                        command: form.values[8].clone(),
-                        args: parse_shell_list(&form.values[9], HOST_SETTING_LABELS[9])?,
-                        install: form.values[10].clone(),
-                        sync_files: parse_shell_list(&form.values[11], HOST_SETTING_LABELS[11])?,
-                    };
-                    let terminal = CommandConfig {
-                        command: form.values[12].clone(),
-                        args: parse_shell_list(&form.values[13], HOST_SETTING_LABELS[13])?,
-                        ..CommandConfig::default()
-                    };
-                    let attention_patterns =
-                        parse_shell_list(&form.values[14], HOST_SETTING_LABELS[14])?;
-                    config.hosts.insert(
-                        target_id.clone(),
-                        HostConfig {
-                            codex: Some(codex),
-                            claude: Some(claude),
-                            terminal: Some(terminal),
-                            environment: Some(form.values[0].clone()),
-                            reverse_tunnel: Some(form.values[1].clone()),
-                            companion_command: Some(form.values[2].clone()),
-                            companion_binary: Some(form.values[3].clone()),
-                            attention_patterns: Some(attention_patterns),
-                        },
-                    );
+                    // The form edits the common fields; everything it no
+                    // longer shows — tunnels, companion overrides, installs,
+                    // sync files, attention patterns — keeps whatever the
+                    // config file says for this host. Command overrides are
+                    // seeded from the effective config so those hidden parts
+                    // ride along unchanged.
+                    let mut host = config.hosts.get(target_id).cloned().unwrap_or_default();
+                    host.environment = Some(form.values[0].clone());
+                    let mut codex = config.command_for(target_id, AgentKind::Codex).clone();
+                    codex.command = form.values[1].clone();
+                    codex.args = parse_shell_list(&form.values[2], "Codex args")?;
+                    host.codex = Some(codex);
+                    let mut claude = config.command_for(target_id, AgentKind::Claude).clone();
+                    claude.command = form.values[3].clone();
+                    claude.args = parse_shell_list(&form.values[4], "Claude args")?;
+                    host.claude = Some(claude);
+                    let mut terminal = config.command_for(target_id, AgentKind::Terminal).clone();
+                    terminal.command = form.values[5].clone();
+                    host.terminal = Some(terminal);
+                    config.hosts.insert(target_id.clone(), host);
                 }
             }
             config
@@ -8648,7 +8595,6 @@ mod tests {
     #[test]
     fn a_forced_update_archives_cycles_and_resumes_in_order() {
         let mut app = ux_test_app(vec![Target::local()]);
-        app.config.force_daemon_update = true;
         app.sessions = vec![
             AgentSession {
                 id: "muxloomd-claude-old-1".into(),
@@ -8680,12 +8626,9 @@ mod tests {
             },
         ];
 
-        // The quiet cycle could not advance the daemon; the terminal makes
-        // the force a question rather than an action.
-        app.handle_worker_event(Event::DaemonRefreshed {
-            target_id: "local".into(),
-            result: Ok(Some("0.3.0".into())),
-        });
+        // The one-shot action always shows its plan first; the terminal in
+        // the list is what makes the confirmation matter.
+        app.propose_forced_update("local");
         assert!(matches!(app.modal, Some(Modal::ConfirmForcedUpdate { .. })));
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         {
@@ -8746,26 +8689,25 @@ mod tests {
     }
 
     #[test]
-    fn a_forced_update_with_no_blockers_starts_without_asking() {
+    fn a_forced_update_is_a_one_shot_action_never_an_ambient_state() {
+        // A lagging cycle result on its own opens nothing and starts
+        // nothing: the marker stays up and `u` is the only trigger.
         let mut app = ux_test_app(vec![Target::local()]);
-        app.config.force_daemon_update = true;
-        // No sessions at all: nothing to warn about, straight to cycling.
         app.handle_worker_event(Event::DaemonRefreshed {
             target_id: "local".into(),
             result: Ok(Some("0.3.0".into())),
         });
-        assert!(app.modal.is_none());
+        assert!(app.forced_updates.is_empty() && app.modal.is_none());
+
+        // With nothing to interrupt the confirmation still shows its plan,
+        // and confirming goes straight to the bridge cycle.
+        app.propose_forced_update("local");
+        assert!(matches!(app.modal, Some(Modal::ConfirmForcedUpdate { .. })));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(
             app.forced_updates.get("local").unwrap().phase,
             ForcedPhase::Cycling
         );
-        // Without the setting the failed cycle stays a quiet observation.
-        let mut plain = ux_test_app(vec![Target::local()]);
-        plain.handle_worker_event(Event::DaemonRefreshed {
-            target_id: "local".into(),
-            result: Ok(Some("0.3.0".into())),
-        });
-        assert!(plain.forced_updates.is_empty() && plain.modal.is_none());
     }
 
     #[test]
@@ -9896,7 +9838,7 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        form.values[17] = "/bin/zsh".into();
+        form.values[7] = "/bin/zsh".into();
         app.apply_settings(form);
 
         assert_eq!(app.config.refresh_interval_ms, 1500);
@@ -11299,10 +11241,21 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let ssh_path = root.join("ssh-config");
         std::fs::write(&ssh_path, "Host gpu\n").unwrap();
-        let config = Config {
+        let mut config = Config {
             ssh_config: ssh_path.display().to_string(),
             ..Config::default()
         };
+        // Overrides the trimmed-down form no longer shows must survive a
+        // save untouched.
+        config.hosts.insert(
+            "gpu".into(),
+            crate::config::HostConfig {
+                reverse_tunnel: Some("18118:127.0.0.1:8080".into()),
+                companion_binary: Some("~/Downloads/muxloomd-linux".into()),
+                attention_patterns: Some(vec!["gpu approval".into()]),
+                ..Default::default()
+            },
+        );
         let worker = Worker::start(Runtime::new(&config));
         let mut state = State::default();
         state.enabled_hosts.insert("local".into());
@@ -11322,12 +11275,8 @@ mod tests {
         };
         assert_eq!(form.scope, SettingsScope::Host("gpu".into()));
         form.values[0] = "HTTP_PROXY=http://proxy:8080".into();
-        form.values[1] = "18118:127.0.0.1:8080".into();
-        form.values[2] = "~/.local/bin/muxloomd".into();
-        form.values[3] = "~/Downloads/muxloomd-linux".into();
-        form.values[4] = "/opt/codex".into();
-        form.values[5] = "--full-auto".into();
-        form.values[14] = "'gpu approval'".into();
+        form.values[1] = "/opt/codex".into();
+        form.values[2] = "--full-auto".into();
         app.apply_settings(form);
 
         let reloaded = Config::load(&config_path).unwrap();

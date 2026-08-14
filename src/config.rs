@@ -30,12 +30,6 @@ pub struct Config {
     /// "auto" applies silently (the pre-0.5 behavior), "never" skips the
     /// check. Ignored when `auto_update` is off.
     pub update_prompt: String,
-    /// When a machine's daemon lags this build and cannot hand over on its
-    /// own — pre-keeper sessions hold it — archive its sessions, complete the
-    /// handover, and resume every agent from its own transcript. Sessions
-    /// that are working, and terminals (which cannot resume), are only
-    /// touched after an on-screen confirmation.
-    pub force_daemon_update: bool,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
     /// Local backup of every session's conversation history (see [`BackupConfig`]).
@@ -64,7 +58,6 @@ impl Default for Config {
             companion_binary: String::new(),
             auto_update: true,
             update_prompt: "ask".into(),
-            force_daemon_update: false,
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
             backup: BackupConfig::default(),
@@ -446,9 +439,6 @@ companion_binary = ""
 auto_update = true
 # What the startup check does with what it finds: "ask", "auto", or "never".
 update_prompt = "ask"
-# Archive-and-resume sessions that block a daemon handover (asks first when
-# working agents or terminals would be interrupted).
-force_daemon_update = false
 
 # Local backup of every session's conversation history (running + archived)
 # from all machines into ~/.local/state/muxloom/backup/ as compressed blobs.

@@ -19,7 +19,7 @@ use crate::{
     app::{
         App, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal,
         PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm, SettingsForm,
-        SettingsScope,
+        SettingsRow, SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
@@ -463,6 +463,18 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut rows = Vec::new();
     for target_index in &visible {
         let status = &app.targets[*target_index];
+        let codex_working = app.sessions.iter().any(|session| {
+            session.target_id == status.target.id
+                && session.kind == AgentKind::Codex
+                && session.working
+                && !session.dead
+        });
+        let claude_working = app.sessions.iter().any(|session| {
+            session.target_id == status.target.id
+                && session.kind == AgentKind::Claude
+                && session.working
+                && !session.dead
+        });
         let (marker, marker_color) = match status.state {
             ConnectionState::Disabled => (" ", MUTED),
             ConnectionState::Scanning => ("~", Color::Yellow),
@@ -503,9 +515,19 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else if status.enabled {
             let mut spans = vec![
                 Span::raw("    "),
-                runtime_capability(AgentKind::Codex, status.probe.codex),
+                runtime_capability(
+                    AgentKind::Codex,
+                    status.probe.codex,
+                    codex_working,
+                    app.animation_frame,
+                ),
                 Span::raw(" "),
-                runtime_capability(AgentKind::Claude, status.probe.claude),
+                runtime_capability(
+                    AgentKind::Claude,
+                    status.probe.claude,
+                    claude_working,
+                    app.animation_frame,
+                ),
             ];
             if let Some(version) = app.daemon_lag_version(&status.target.id) {
                 spans.push(Span::styled(
@@ -1207,7 +1229,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     } else {
         match app.focus {
-            Focus::Machines => "  Space toggle  n new  / search  q quit  ? more",
+            Focus::Machines => "  Space toggle  n new  u update daemon  / search  q quit  ? more",
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
@@ -2862,6 +2884,7 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
+        help_row("u", "Force the ⟳ daemon update: archive, hand over, resume"),
         Line::raw(""),
         help_header("History And Search"),
         help_row("Wheel / PageUp", "Scroll one line / move one history page"),
@@ -3432,41 +3455,75 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     }
     let label_width = 27u16.min(inner.width / 2);
     let value_width = inner.width.saturating_sub(label_width + 1) as usize;
-    let visible_fields = inner.height.saturating_sub(3) as usize;
-    let start = form
-        .selected
-        .saturating_add(1)
-        .saturating_sub(visible_fields);
-    for (visible_index, (index, (label, value))) in form
-        .labels()
-        .iter()
-        .zip(&form.values)
-        .enumerate()
-        .skip(start)
-        .take(visible_fields)
-        .enumerate()
+    let visible_rows = inner.height.saturating_sub(3) as usize;
+    // Lay every row out first — section headings interleaved with fields —
+    // then scroll so the selected field stays visible.
+    let mut lines: Vec<(Option<usize>, Line)> = Vec::new();
+    let mut field_index = 0usize;
+    let mut selected_row = 0usize;
+    for row in form.rows() {
+        match row {
+            SettingsRow::Section(title) => {
+                if !lines.is_empty() {
+                    lines.push((None, Line::raw("")));
+                }
+                lines.push((
+                    None,
+                    Line::styled(
+                        format!("— {title} —"),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ));
+            }
+            SettingsRow::Field(label) => {
+                let value = form.values.get(field_index).cloned().unwrap_or_default();
+                let active = field_index == form.selected;
+                if active {
+                    selected_row = lines.len();
+                }
+                let shown = tail_display(&value, value_width);
+                lines.push((
+                    Some(field_index),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {label:<width$}", width = label_width as usize - 2),
+                            Style::default().fg(if active { ACCENT } else { Color::Gray }),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            shown,
+                            if active {
+                                Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        ),
+                    ]),
+                ));
+                field_index += 1;
+            }
+        }
+    }
+    let start = selected_row.saturating_add(1).saturating_sub(visible_rows);
+    let mut cursor_position = None;
+    for (visible_index, (field, line)) in
+        lines.into_iter().skip(start).take(visible_rows).enumerate()
     {
         let row = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
-        let active = index == form.selected;
-        let shown = tail_display(value, value_width);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("{label:<width$}", width = label_width as usize),
-                    Style::default().fg(if active { ACCENT } else { Color::Gray }),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    shown,
-                    if active {
-                        Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
-                    } else {
-                        Style::default().fg(Color::White)
-                    },
-                ),
-            ])),
-            row,
-        );
+        if field == Some(form.selected)
+            && let Some(value) = form.values.get(form.selected)
+        {
+            let shown = tail_display(value, value_width);
+            cursor_position = Some((
+                inner
+                    .x
+                    .saturating_add(label_width + 1)
+                    .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
+                    .min(inner.x + inner.width.saturating_sub(1)),
+                row.y,
+            ));
+        }
+        frame.render_widget(Paragraph::new(line), row);
     }
     let error_y = inner.y + inner.height.saturating_sub(2);
     if let Some(error) = &form.error {
@@ -3488,14 +3545,8 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
             1,
         ),
     );
-    if form.selected < form.values.len() {
-        let shown = tail_display(&form.values[form.selected], value_width);
-        let cursor = inner
-            .x
-            .saturating_add(label_width + 1)
-            .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
-            .min(inner.x + inner.width.saturating_sub(1));
-        frame.set_cursor_position((cursor, inner.y + form.selected.saturating_sub(start) as u16));
+    if let Some(position) = cursor_position {
+        frame.set_cursor_position(position);
     }
 }
 
@@ -3855,14 +3906,24 @@ fn list_highlight_style(focused: bool, bold: bool) -> Style {
     }
 }
 
-/// A machine row's static capability marker. Working state animates only on
-/// the agent row itself; here it is not shown at all.
-fn runtime_capability(kind: AgentKind, available: bool) -> Span<'static> {
+/// A machine row's capability marker: it animates while that runtime has a
+/// working session on the machine, mirroring the agent row's spinner.
+fn runtime_capability(
+    kind: AgentKind,
+    available: bool,
+    working: bool,
+    frame: u64,
+) -> Span<'static> {
     let (idle, _, color) = agent_visual(kind);
+    let label = if working {
+        running_agent_effect(kind, frame)
+    } else {
+        idle
+    };
     Span::styled(
-        idle,
+        label,
         Style::default()
-            .fg(if available { color } else { MUTED })
+            .fg(if available || working { color } else { MUTED })
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -4148,15 +4209,18 @@ mod tests {
             None
         };
 
-        // The machine row shows static capability icons: no spinner frames.
+        // The machine row's icons mirror the working spinner for the runtimes
+        // busy on that machine.
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_machines(frame, &mut app, frame.area()))
             .unwrap();
         let machines: String = rows(&terminal).concat();
-        assert!(!machines.contains('⠋'), "machine rows must not animate");
-        assert!(machines.contains('◉') && machines.contains('✻'));
+        assert!(
+            machines.contains('⠋') && machines.contains('✻'),
+            "machine icons mirror the working animation"
+        );
 
         // The folder row does not animate either; it turns green while a
         // child works, and the agent rows keep the only animation.
