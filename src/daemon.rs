@@ -22,7 +22,6 @@ mod platform {
     };
 
     use anyhow::{Context, Result, anyhow, bail};
-    use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
     use crate::{
         daemon_protocol::{
@@ -30,6 +29,7 @@ mod platform {
             Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PROTOCOL_VERSION, StreamOpened,
             stream,
         },
+        keeper,
         model::{
             AgentKind, DirectoryListing, FileEntry, FileEntryKind, FileListing, FilePreview,
             FilePreviewKind,
@@ -70,6 +70,7 @@ mod platform {
         pub generation: PathBuf,
         pub history: PathBuf,
         pub sessions: PathBuf,
+        pub keepers: PathBuf,
     }
 
     impl DaemonPaths {
@@ -94,6 +95,7 @@ mod platform {
                 generation: root.join("muxloomd.generation"),
                 history: root.join("history"),
                 sessions: root.join("sessions"),
+                keepers: root.join("keepers"),
                 root,
             }
         }
@@ -106,6 +108,8 @@ mod platform {
             fs::set_permissions(&self.history, fs::Permissions::from_mode(0o700))?;
             fs::create_dir_all(&self.sessions)?;
             fs::set_permissions(&self.sessions, fs::Permissions::from_mode(0o700))?;
+            fs::create_dir_all(&self.keepers)?;
+            fs::set_permissions(&self.keepers, fs::Permissions::from_mode(0o700))?;
             Ok(())
         }
     }
@@ -120,6 +124,20 @@ mod platform {
         sessions: Mutex<HashMap<String, Arc<ManagedSession>>>,
         persisted_sessions: Mutex<HashMap<String, Arc<PersistedSession>>>,
         paths: DaemonPaths,
+        keeper_mode: KeeperMode,
+    }
+
+    /// How a launch obtains its keeper. Real daemons spawn the detached
+    /// `muxloomd keeper` process that outlives them; tests run the identical
+    /// keeper loop on a thread so `cargo test` never needs to exec a binary
+    /// that is not the one under test.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeeperMode {
+        Process,
+        /// Only tests construct this; a serving daemon always spawns the real
+        /// detached keeper.
+        #[cfg_attr(not(test), allow(dead_code))]
+        InProcess,
     }
 
     struct PersistedSession {
@@ -133,9 +151,10 @@ mod platform {
 
     struct ManagedSession {
         metadata: Mutex<DaemonSession>,
-        master: Mutex<Box<dyn MasterPty + Send>>,
-        writer: Mutex<Box<dyn Write + Send>>,
-        child: Mutex<Box<dyn Child + Send + Sync>>,
+        /// Writer half toward the keeper process that owns the PTY, the child,
+        /// and the history append. The daemon is only this session's current
+        /// client; it can disconnect — or die — without ending the session.
+        keeper: Mutex<UnixStream>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
         codex_activity: Mutex<CodexActivity>,
@@ -231,7 +250,7 @@ mod platform {
     }
 
     impl DaemonState {
-        fn new(paths: DaemonPaths) -> Self {
+        fn new(paths: DaemonPaths, keeper_mode: KeeperMode) -> Self {
             let persisted_sessions = recover_persisted_sessions(&paths);
             Self {
                 started: Instant::now(),
@@ -243,6 +262,7 @@ mod platform {
                 sessions: Mutex::new(HashMap::new()),
                 persisted_sessions: Mutex::new(persisted_sessions),
                 paths,
+                keeper_mode,
             }
         }
     }
@@ -266,6 +286,15 @@ mod platform {
                     let path = entry.path();
                     if path.extension().and_then(|value| value.to_str()) != Some("json")
                         || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                    {
+                        continue;
+                    }
+                    // A session whose keeper socket is still on disk is not a
+                    // leftover to retire: adoption decides whether it is alive.
+                    if path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|id| keeper::socket_path_for(&paths.keepers, id).exists())
                     {
                         continue;
                     }
@@ -433,6 +462,11 @@ mod platform {
             if sessions.contains_key(&id) || validate_session_id(&id).is_err() {
                 continue;
             }
+            // A log whose keeper socket is still on disk belongs to a session
+            // adoption will handle; archiving it here would bury a live one.
+            if keeper::socket_path_for(&paths.keepers, &id).exists() {
+                continue;
+            }
             let metadata_path = paths.sessions.join(format!("{id}.json"));
             if is_temporary_session_id(&id) {
                 // A temporary session leaves no transcript behind by design.
@@ -533,6 +567,17 @@ mod platform {
     }
 
     pub fn serve(paths: &DaemonPaths) -> Result<()> {
+        serve_with_mode(paths, KeeperMode::Process)
+    }
+
+    /// Test-only serve whose keepers run on threads: `cargo test` must never
+    /// exec its own test binary as a keeper.
+    #[cfg(test)]
+    pub(crate) fn serve_with_in_process_keepers(paths: &DaemonPaths) -> Result<()> {
+        serve_with_mode(paths, KeeperMode::InProcess)
+    }
+
+    fn serve_with_mode(paths: &DaemonPaths, keeper_mode: KeeperMode) -> Result<()> {
         paths.prepare()?;
         if paths.socket.exists() {
             if UnixStream::connect(&paths.socket).is_ok() {
@@ -554,11 +599,12 @@ mod platform {
             socket: paths.socket.clone(),
             pid: paths.pid.clone(),
         };
-        let state = Arc::new(DaemonState::new(paths.clone()));
-        // Every one of these signals terminates the process by default, taking
-        // the session metadata down still claiming a live PTY. Catching them
-        // costs one flag and lets the daemon write down how its sessions ended
-        // instead of leaving the next generation to work it out from the logs.
+        let state = Arc::new(DaemonState::new(paths.clone(), keeper_mode));
+        adopt_keeper_sessions(&state);
+        // Every one of these signals terminates the process by default. The
+        // sessions themselves live in their keepers, so a caught signal only
+        // has to stop serving; catching it keeps the exit deliberate instead
+        // of mid-frame.
         let signalled = Arc::new(AtomicBool::new(false));
         for signal in [
             signal_hook::consts::SIGTERM,
@@ -592,34 +638,9 @@ mod platform {
             }
             Ok(())
         })();
-        retire_live_sessions(&state);
+        // Sessions are not retired here: their keepers own them, keep writing
+        // their histories, and hand them to whichever daemon serves next.
         result
-    }
-
-    /// Write down that the sessions this daemon owns end with it.
-    ///
-    /// Their children are hung up as soon as the PTY masters close, so the
-    /// metadata would otherwise outlive the sessions claiming they are running.
-    /// Recording it here is what keeps a stop that the daemon can see — a
-    /// handover, SIGTERM, a machine shutting down — out of the recovery path.
-    fn retire_live_sessions(state: &DaemonState) {
-        let sessions: Vec<_> = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        for session in sessions {
-            if session.temporary() {
-                let _ = fs::remove_file(&session.history_path);
-                let _ = fs::remove_file(&session.metadata_path);
-                continue;
-            }
-            if !session.snapshot().dead {
-                session.mark_dead();
-            }
-        }
     }
 
     struct SocketGuard {
@@ -1370,19 +1391,11 @@ mod platform {
         if state.draining.load(Ordering::Acquire) || state.clients.load(Ordering::Acquire) != 1 {
             return false;
         }
-        let no_live_sessions = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .all(|session| {
-                let snapshot = session.snapshot();
-                snapshot.dead || snapshot.archived
-            });
-        if no_live_sessions {
-            state.draining.store(true, Ordering::Release);
-        }
-        no_live_sessions
+        // Live sessions no longer defer a handover: every session this daemon
+        // serves is owned by its keeper process, which survives the drain and
+        // is adopted by the next generation.
+        state.draining.store(true, Ordering::Release);
+        true
     }
 
     /// Resolve a program name to an absolute path using `path_env`.
@@ -1507,29 +1520,17 @@ mod platform {
                      refusing to fall back to a same-named entry inside {path}"
                 )
             })?;
-        let pair = native_pty_system().openpty(PtySize {
-            rows: rows.max(5),
-            cols: columns.max(20),
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        let mut command = CommandBuilder::new(&program);
-        command.args(args);
-        command.cwd(path.clone());
-        for (name, value) in environment {
-            command.env(name, value);
-        }
+        // The keeper applies environment pairs in order with later entries
+        // winning, so the PATH override and the terminal identity fold in at
+        // the end. Everything is resolved here: the keeper's behavior is
+        // frozen, so it must never need to learn new launch rules.
+        let mut keeper_environment = environment;
         if let Some(prepended_path) = prepended_path {
-            command.env("PATH", prepended_path);
+            keeper_environment.push(("PATH".into(), prepended_path.to_string_lossy().into_owned()));
         }
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("TERM_PROGRAM", "muxloom");
-        let child = pair.slave.spawn_command(command)?;
-        drop(pair.slave);
-        let pid = child.process_id();
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        keeper_environment.push(("TERM".into(), "xterm-256color".into()));
+        keeper_environment.push(("COLORTERM".into(), "truecolor".into()));
+        keeper_environment.push(("TERM_PROGRAM".into(), "muxloom".into()));
         let history_path = state.paths.history.join(format!("{session_id}.ansi"));
         let metadata_path = state.paths.sessions.join(format!("{session_id}.json"));
         if !temporary {
@@ -1538,14 +1539,25 @@ mod platform {
                 .append(true)
                 .open(&history_path)?;
         }
-        let metadata = DaemonSession {
+        let spec = keeper::KeeperSpec {
+            session_id: session_id.clone(),
+            program: program.to_string_lossy().into_owned(),
+            args,
+            environment: keeper_environment,
+            cwd: path.clone(),
+            columns: columns.max(20),
+            rows: rows.max(5),
+            history_path: (!temporary).then(|| history_path.clone()),
+            socket_path: keeper::socket_path_for(&state.paths.keepers, &session_id),
+        };
+        let mut metadata = DaemonSession {
             id: session_id.clone(),
             kind,
             path,
             label,
             temporary,
             created_at,
-            pid,
+            pid: None,
             dead: false,
             archived: false,
             recap: None,
@@ -1553,11 +1565,27 @@ mod platform {
             needs_attention: false,
             attention_reason: None,
         };
+        // The record precedes the keeper so a crash between the two leaves a
+        // session that can be retired, never a keeper nothing knows about.
+        persist_session_metadata(&metadata_path, &metadata)?;
+        let (stream, status) = match start_keeper(state, &spec) {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = fs::remove_file(&metadata_path);
+                if !temporary {
+                    let _ = fs::remove_file(&history_path);
+                }
+                return Err(error);
+            }
+        };
+        metadata.pid = status.child_pid;
         let session = Arc::new(ManagedSession {
             metadata: Mutex::new(metadata),
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
-            child: Mutex::new(child),
+            keeper: Mutex::new(
+                stream
+                    .try_clone()
+                    .context("failed to clone keeper stream")?,
+            ),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
@@ -1575,57 +1603,334 @@ mod platform {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id, Arc::clone(&session));
-        let managed = Arc::clone(&session);
-        let reader_state = Arc::clone(state);
+        spawn_session_reader(state, Arc::clone(&session), stream);
+        Ok(session)
+    }
+
+    /// Relay keeper frames into the session until the keeper goes away. The
+    /// keeper appends history itself, so output here only feeds the screen,
+    /// the retained ring, and the attached subscribers.
+    fn spawn_session_reader(
+        state: &Arc<DaemonState>,
+        session: Arc<ManagedSession>,
+        mut stream: UnixStream,
+    ) {
+        let state = Arc::clone(state);
         thread::spawn(move || {
-            let mut history = if managed.temporary() {
-                None
-            } else {
-                match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&managed.history_path)
-                {
-                    Ok(history) => Some(history),
-                    Err(error) => {
-                        eprintln!("muxloomd history open failed: {error}");
-                        managed.mark_dead();
-                        return;
+            let exited = loop {
+                match keeper::read_frame(&mut stream) {
+                    Ok(Some((keeper::frame::DATA, payload))) => {
+                        session.record_output(&payload);
+                        session.broadcast(&payload);
                     }
+                    Ok(Some((keeper::frame::EXITED, _))) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break false,
                 }
             };
-            let mut buffer = vec![0; DATA_CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        let bytes = &buffer[..read];
-                        if let Some(history) = history.as_mut() {
-                            let _ = history.write_all(bytes);
-                        }
-                        managed.record_output(bytes);
-                        managed.broadcast(bytes);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            if let Some(history) = history.as_mut() {
-                let _ = history.flush();
-            }
-            if managed.temporary() {
-                reader_state
+            // A deleted session was already removed from the map with its
+            // files; recording its death would recreate the metadata.
+            let still_tracked = {
+                let sessions = state
                     .sessions
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&managed.session_id());
-                let _ = fs::remove_file(&managed.history_path);
-                let _ = fs::remove_file(&managed.metadata_path);
-            } else {
-                managed.mark_dead();
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                sessions
+                    .get(&session.session_id())
+                    .is_some_and(|tracked| Arc::ptr_eq(tracked, &session))
+            };
+            if session.temporary() {
+                if still_tracked {
+                    state
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&session.session_id());
+                }
+                let _ = fs::remove_file(&session.history_path);
+                let _ = fs::remove_file(&session.metadata_path);
+                session.send_quit();
+                return;
+            }
+            if exited {
+                if still_tracked {
+                    session.mark_dead();
+                }
+                session.send_quit();
+                return;
+            }
+            // The stream ended without an exit: the keeper crashed, or a newer
+            // daemon adopted the session out from under a draining one. Only
+            // the crash is a death — a drain leaves the record alone for the
+            // generation that took over.
+            if still_tracked
+                && !state.draining.load(Ordering::Acquire)
+                && !state.shutdown.load(Ordering::Acquire)
+            {
+                session.mark_dead();
             }
         });
-        Ok(session)
+    }
+
+    /// Launch the keeper for a session and greet it. Tests run the identical
+    /// keeper loop on a thread instead of spawning the binary.
+    fn start_keeper(
+        state: &DaemonState,
+        spec: &keeper::KeeperSpec,
+    ) -> Result<(UnixStream, keeper::KeeperStatus)> {
+        match state.keeper_mode {
+            KeeperMode::InProcess => {
+                let listener = keeper::bind_socket(&spec.socket_path)?;
+                let spec = spec.clone();
+                thread::spawn(move || {
+                    if let Err(error) = keeper::run(spec, listener) {
+                        eprintln!("muxloomd in-process keeper failed: {error:#}");
+                    }
+                });
+            }
+            KeeperMode::Process => spawn_keeper_process(state, spec)?,
+        }
+        connect_keeper(&spec.socket_path, Duration::from_secs(5))
+    }
+
+    /// Spawn the detached `muxloomd keeper` that owns one session. The spec
+    /// travels over stdin so environment values never appear in `ps`.
+    fn spawn_keeper_process(state: &DaemonState, spec: &keeper::KeeperSpec) -> Result<()> {
+        let executable = std::env::current_exe().context("failed to find muxloomd executable")?;
+        let log = open_log(&state.paths.keepers.join(format!("{}.log", spec.session_id)))?;
+        let error_log = log.try_clone()?;
+        let mut command = Command::new(executable);
+        command
+            .arg("keeper")
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(error_log));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .context("failed to start the session keeper")?;
+        let mut stdin = child.stdin.take().context("keeper has no stdin")?;
+        let spec_line = serde_json::to_string(spec).context("failed to encode the keeper spec")?;
+        stdin
+            .write_all(spec_line.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .context("failed to hand the keeper its spec")?;
+        drop(stdin);
+        // Reap the keeper whenever it exits so it never lingers as a zombie of
+        // a long-lived daemon.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+
+    /// Connect to a keeper socket and read its greeting.
+    fn connect_keeper(
+        socket_path: &Path,
+        patience: Duration,
+    ) -> Result<(UnixStream, keeper::KeeperStatus)> {
+        let deadline = Instant::now() + patience;
+        let mut stream = loop {
+            match UnixStream::connect(socket_path) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("keeper never answered at {}", socket_path.display())
+                    });
+                }
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let status = keeper::read_greeting(&mut stream)?;
+        stream.set_read_timeout(None)?;
+        Ok((stream, status))
+    }
+
+    /// Adopt every session whose keeper outlived the previous daemon, and
+    /// retire the ones whose keeper is gone. Runs before the socket serves
+    /// clients so the first ListSessions already sees the adopted sessions.
+    /// Socket filenames are digests, so the walk goes record → socket; a
+    /// socket no record accounts for is dismissed rather than left running.
+    fn adopt_keeper_sessions(state: &Arc<DaemonState>) {
+        let mut accounted: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&state.paths.sessions) {
+            for entry in entries.flatten() {
+                let metadata_path = entry.path();
+                if metadata_path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(id) = metadata_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if validate_session_id(&id).is_err()
+                    || state
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains_key(&id)
+                {
+                    continue;
+                }
+                let socket_path = keeper::socket_path_for(&state.paths.keepers, &id);
+                if !socket_path.exists() {
+                    continue;
+                }
+                accounted.push(socket_path.clone());
+                match adopt_keeper_session(state, &id, &socket_path) {
+                    Ok(true) => eprintln!("muxloomd adopted running session {id}"),
+                    Ok(false) => {
+                        eprintln!("muxloomd retired session {id}; its keeper had finished")
+                    }
+                    Err(error) => eprintln!("muxloomd could not adopt session {id}: {error:#}"),
+                }
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&state.paths.keepers) {
+            for entry in entries.flatten() {
+                let socket_path = entry.path();
+                if socket_path.extension().and_then(|value| value.to_str()) != Some("sock")
+                    || accounted.contains(&socket_path)
+                {
+                    continue;
+                }
+                dismiss_orphan_keeper(&socket_path);
+            }
+        }
+    }
+
+    /// End a keeper no session record accounts for. Without a record the
+    /// session cannot be served or archived, and a keeper left running would
+    /// hold its child forever.
+    fn dismiss_orphan_keeper(socket_path: &Path) {
+        let Ok((mut stream, status)) = connect_keeper(socket_path, Duration::from_millis(300))
+        else {
+            let _ = fs::remove_file(socket_path);
+            return;
+        };
+        eprintln!(
+            "muxloomd dismissing the keeper of unrecorded session {}",
+            status.session_id
+        );
+        if status.alive {
+            let _ = keeper::write_frame(&mut stream, keeper::frame::KILL, &[]);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            while let Ok(Some((kind, _))) = keeper::read_frame(&mut stream) {
+                if kind == keeper::frame::EXITED {
+                    break;
+                }
+            }
+        }
+        let _ = keeper::write_frame(&mut stream, keeper::frame::QUIT, &[]);
+    }
+
+    /// Adopt one keeper-owned session; `Ok(true)` means it is live again under
+    /// this daemon, `Ok(false)` that it was retired into the archive.
+    fn adopt_keeper_session(
+        state: &Arc<DaemonState>,
+        id: &str,
+        socket_path: &Path,
+    ) -> Result<bool> {
+        let metadata_path = state.paths.sessions.join(format!("{id}.json"));
+        let history_path = state.paths.history.join(format!("{id}.ansi"));
+        let Ok((stream, status)) = connect_keeper(socket_path, Duration::from_millis(500)) else {
+            // The keeper is gone and left its socket behind. Retire the record
+            // the way an interrupted daemon's sessions are retired.
+            let _ = fs::remove_file(socket_path);
+            if metadata_path.is_file()
+                && let Ok(Some((id, session))) =
+                    load_persisted_session(&state.paths, &metadata_path)
+            {
+                state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id, session);
+            }
+            return Ok(false);
+        };
+        let mut metadata: DaemonSession =
+            serde_json::from_slice(&fs::read(&metadata_path).with_context(|| {
+                format!("adopted keeper has no metadata {}", metadata_path.display())
+            })?)?;
+        if metadata.id != id {
+            bail!("metadata id {} does not match {id}", metadata.id);
+        }
+        if !status.alive {
+            // The child died while no daemon was listening. The keeper kept
+            // the transcript; record the death and dismiss it.
+            metadata.dead = true;
+            metadata.pid = None;
+            metadata.working = false;
+            metadata.needs_attention = false;
+            metadata.attention_reason = None;
+            persist_session_metadata(&metadata_path, &metadata)?;
+            let mut dismiss = stream;
+            let _ = keeper::write_frame(&mut dismiss, keeper::frame::QUIT, &[]);
+            if let Ok(Some((id, session))) = load_persisted_session(&state.paths, &metadata_path) {
+                state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id, session);
+            }
+            return Ok(false);
+        }
+        metadata.dead = false;
+        metadata.pid = status.child_pid;
+        let archived = metadata.archived;
+        let temporary = metadata.temporary;
+        let columns = status.columns.max(20);
+        let rows = status.rows.max(5);
+        let session = Arc::new(ManagedSession {
+            metadata: Mutex::new(metadata),
+            keeper: Mutex::new(
+                stream
+                    .try_clone()
+                    .context("failed to clone keeper stream")?,
+            ),
+            subscribers: Mutex::new(HashMap::new()),
+            screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
+            codex_activity: Mutex::new(CodexActivity::default()),
+            recent_output: Mutex::new(Vec::new()),
+            history_path,
+            metadata_path,
+            archived: AtomicBool::new(archived),
+            line_count: AtomicUsize::new(0),
+            columns: AtomicU16::new(columns),
+            rows: AtomicU16::new(rows),
+        });
+        // Rebuild the screen, the retained ring, and with them the
+        // working/attention classification from the transcript the keeper
+        // kept appending while no daemon was watching.
+        if !temporary
+            && let Some(tail) = history_tail(&session.history_path, RECENT_OUTPUT_LIMIT as u64)
+        {
+            session.record_output(&tail);
+        }
+        session.persist_metadata()?;
+        state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_string(), Arc::clone(&session));
+        spawn_session_reader(state, session, stream);
+        Ok(true)
     }
 
     fn daemon_session(state: &DaemonState, session_id: &str) -> Result<Arc<ManagedSession>> {
@@ -2016,6 +2321,15 @@ mod platform {
             persist_session_metadata(&self.metadata_path, &self.snapshot())
         }
 
+        fn keeper_frame(&self, kind: u8, payload: &[u8]) -> Result<()> {
+            let mut stream = self
+                .keeper
+                .lock()
+                .map_err(|_| anyhow!("session keeper stream is poisoned"))?;
+            keeper::write_frame(&mut *stream, kind, payload)
+                .context("failed to reach the session keeper")
+        }
+
         fn resize(&self, columns: u16, rows: u16) -> Result<()> {
             self.columns.store(columns.max(20), Ordering::Relaxed);
             self.rows.store(rows.max(5), Ordering::Relaxed);
@@ -2027,26 +2341,14 @@ mod platform {
                 rows.max(5),
                 columns.max(20),
             );
-            self.master
-                .lock()
-                .map_err(|_| anyhow!("session PTY is poisoned"))?
-                .resize(PtySize {
-                    rows: rows.max(5),
-                    cols: columns.max(20),
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
-            Ok(())
+            let mut payload = [0u8; 4];
+            payload[..2].copy_from_slice(&columns.max(20).to_be_bytes());
+            payload[2..].copy_from_slice(&rows.max(5).to_be_bytes());
+            self.keeper_frame(keeper::frame::RESIZE, &payload)
         }
 
         fn write_input(&self, bytes: &[u8]) -> Result<()> {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| anyhow!("session input is poisoned"))?;
-            writer.write_all(bytes)?;
-            writer.flush()?;
-            Ok(())
+            self.keeper_frame(keeper::frame::DATA, bytes)
         }
 
         fn archive(&self) -> Result<()> {
@@ -2059,14 +2361,28 @@ mod platform {
             Ok(())
         }
 
+        /// Ask the keeper to kill the child. The death lands asynchronously on
+        /// the session's reader thread; an unreachable keeper falls back to
+        /// signalling the child directly so a stop always means stop.
         fn stop(&self) -> Result<()> {
-            let mut child = self
-                .child
-                .lock()
-                .map_err(|_| anyhow!("session child is poisoned"))?;
-            let _ = child.kill();
-            let _ = child.wait();
+            if self.keeper_frame(keeper::frame::KILL, &[]).is_err()
+                && let Some(pid) = self
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pid
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
             Ok(())
+        }
+
+        /// Dismiss a keeper whose child is gone; it removes its socket and
+        /// exits. Harmless if the keeper already left.
+        fn send_quit(&self) {
+            let _ = self.keeper_frame(keeper::frame::QUIT, &[]);
         }
 
         /// Render the history that sits above the retained output into rows an
@@ -3285,17 +3601,20 @@ mod platform {
         }
 
         fn test_state(name: &str) -> Arc<DaemonState> {
-            let root = std::env::temp_dir().join(format!(
-                "muxloomd-{name}-{}-{}",
+            // A short, fixed prefix: the state dir carries keeper sockets, and
+            // a socket path must stay under the ~104-byte sockaddr_un limit —
+            // macOS's per-user temp dir alone nearly exhausts it.
+            let root = PathBuf::from("/tmp").join(format!(
+                "mxl-{name}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_nanos()
+                    .subsec_nanos()
             ));
             let paths = DaemonPaths::under(root);
             paths.prepare().unwrap();
-            Arc::new(DaemonState::new(paths))
+            Arc::new(DaemonState::new(paths, KeeperMode::InProcess))
         }
 
         #[test]
@@ -3481,7 +3800,7 @@ mod platform {
         }
 
         #[test]
-        fn generation_handover_requires_an_idle_daemon() {
+        fn generation_handover_requires_a_sole_client_but_not_idle_sessions() {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -3522,32 +3841,30 @@ mod platform {
                     break;
                 }
             }
+            // The client-side probe used against legacy daemons still reports
+            // live sessions: an old daemon really cannot hand them over.
             assert!(!daemon_is_idle_for_handover(&mut client).unwrap());
-            assert!(!prepare_handover(&state));
 
-            Frame::json(
-                FrameKind::Request,
-                0,
-                71,
-                &DaemonRequest::Archive {
-                    session_id: "muxloomd-terminal-handover".into(),
-                },
-            )
-            .unwrap()
-            .write_to(&mut client)
-            .unwrap();
-            loop {
-                let frame = Frame::read_from(&mut client).unwrap().unwrap();
-                if frame.kind == FrameKind::Response && frame.request_id == 71 {
-                    assert_eq!(
-                        frame.decode_json::<DaemonResponse>().unwrap(),
-                        DaemonResponse::Ack
-                    );
-                    break;
-                }
+            // A second client defers the handover; a live keeper-owned session
+            // does not — it transfers to the next generation.
+            let (second, server) = UnixStream::pair().unwrap();
+            let second_state = Arc::clone(&state);
+            let second_handle = thread::spawn(move || serve_client(server, second_state));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.clients.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
             }
-            assert!(daemon_is_idle_for_handover(&mut client).unwrap());
-            assert!(prepare_handover(&state));
+            assert!(!prepare_handover(&state));
+            drop(second);
+            second_handle.join().unwrap().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.clients.load(Ordering::Relaxed) > 1 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                prepare_handover(&state),
+                "a live keeper session must not defer the handover"
+            );
 
             let (mut rejected, server) = UnixStream::pair().unwrap();
             let draining_state = Arc::clone(&state);
@@ -3557,6 +3874,16 @@ mod platform {
             rejected_handle.join().unwrap().unwrap();
             drop(client);
             handle.join().unwrap().unwrap();
+            for session in state
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                session.stop().unwrap();
+            }
         }
 
         #[test]
@@ -3699,7 +4026,7 @@ mod platform {
             .unwrap();
 
             for _ in 0..2 {
-                let restarted = DaemonState::new(paths.clone());
+                let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
                 assert!(restarted.sessions.lock().unwrap().is_empty());
                 let persisted = persisted_session(&restarted, session_id).unwrap();
                 let snapshot = persisted.snapshot();
@@ -3760,7 +4087,7 @@ mod platform {
             .unwrap();
 
             for restart in 0..2 {
-                let restarted = DaemonState::new(paths.clone());
+                let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
                 let persisted = persisted_session(&restarted, session_id)
                     .expect("an interrupted session must survive its daemon");
                 let snapshot = persisted.snapshot();
@@ -3805,7 +4132,7 @@ mod platform {
             )
             .unwrap();
 
-            let restarted = DaemonState::new(paths.clone());
+            let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
             assert!(restarted.persisted_sessions.lock().unwrap().is_empty());
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
@@ -3827,7 +4154,7 @@ mod platform {
             .unwrap();
             fs::write(paths.history.join("not-a-muxloom-log.ansi"), b"unrelated\n").unwrap();
 
-            let restarted = DaemonState::new(paths.clone());
+            let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
             let persisted = persisted_session(&restarted, session_id)
                 .expect("a log without metadata must still be reachable");
             let snapshot = persisted.snapshot();
@@ -3845,7 +4172,7 @@ mod platform {
             );
             // The rebuilt record is written back, so the next start is ordinary.
             assert!(
-                DaemonState::new(paths.clone())
+                DaemonState::new(paths.clone(), KeeperMode::InProcess)
                     .persisted_sessions
                     .lock()
                     .unwrap()
@@ -3866,7 +4193,7 @@ mod platform {
             metadata.archived = true;
             persist_session_metadata(&metadata_path, &metadata).unwrap();
 
-            let restarted = DaemonState::new(paths.clone());
+            let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
             let persisted = persisted_session(&restarted, session_id)
                 .expect("a missing log must not erase the session that recorded it");
             let history = persisted.read_history(0, 10, false).unwrap();
@@ -3876,14 +4203,14 @@ mod platform {
         }
 
         #[test]
-        fn a_daemon_that_stops_records_how_its_live_sessions_ended() {
-            let state = test_state("retire");
+        fn a_stopped_daemon_hands_its_live_sessions_to_the_next_generation() {
+            let state = test_state("handover-adopt");
             let paths = state.paths.clone();
-            let session_id = "muxloomd-claude-1700000000-9-2";
-            launch_session(
+            let session_id = "muxloomd-terminal-1700000000-9-2";
+            let launched = launch_session(
                 &state,
                 session_id.into(),
-                "claude".into(),
+                "terminal".into(),
                 "/tmp".into(),
                 "still running".into(),
                 false,
@@ -3895,37 +4222,55 @@ mod platform {
                 24,
             )
             .unwrap();
-            let live: DaemonSession = serde_json::from_slice(
-                &fs::read(paths.sessions.join(format!("{session_id}.json"))).unwrap(),
-            )
-            .unwrap();
-            assert!(!live.dead);
+            let child_pid = launched.snapshot().pid.expect("launched session has a pid");
+            // A handover drains the old daemon before the next one starts, so
+            // its reader must read the keeper hanging up as the transfer it is
+            // rather than a death.
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
 
-            retire_live_sessions(&state);
-            let restarted = DaemonState::new(paths.clone());
-            let snapshot = persisted_session(&restarted, session_id)
-                .unwrap()
-                .snapshot();
-            assert!(snapshot.dead && snapshot.pid.is_none() && !snapshot.working);
-            assert_eq!(snapshot.label, "still running");
-            assert!(
-                persisted_session(&restarted, session_id)
-                    .unwrap()
-                    .search_history("stopped unexpectedly", 10)
-                    .unwrap()
-                    .is_empty(),
-                "an orderly stop must not be reported as a crash"
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            let snapshot = adopted.snapshot();
+            assert!(!snapshot.dead, "adoption must keep the session live");
+            assert_eq!(
+                snapshot.pid,
+                Some(child_pid),
+                "the adopted session is the same process, not a relaunch"
             );
-            for session in state
-                .sessions
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                session.stop().unwrap();
+            assert_eq!(snapshot.label, "still running");
+
+            // The adopted session is fully served: input reaches the PTY and
+            // the transcript keeps growing across the generation change.
+            adopted.write_input(b"adopted-generation-probe\r").unwrap();
+            let probe = b"adopted-generation-probe";
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut output = Vec::new();
+            while Instant::now() < deadline {
+                output = adopted
+                    .recent_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if output.windows(probe.len()).any(|window| window == probe) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
+            assert!(
+                output.windows(probe.len()).any(|window| window == probe),
+                "typed bytes must reach the adopted PTY"
+            );
+
+            adopted.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().dead && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(adopted.snapshot().dead, "a stopped adopted session dies");
             fs::remove_dir_all(paths.root).unwrap();
         }
 

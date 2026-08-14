@@ -9,6 +9,8 @@ pub mod daemon_protocol;
 pub mod debug;
 #[cfg(feature = "controller")]
 pub mod http;
+#[cfg(unix)]
+pub mod keeper;
 pub mod mcp;
 pub mod media;
 pub mod model;

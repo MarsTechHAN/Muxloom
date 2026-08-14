@@ -1189,6 +1189,7 @@ mod tests {
     #[cfg(unix)]
     mod daemon_round_trip {
         use std::{
+            path::PathBuf,
             thread,
             time::{Duration, Instant, SystemTime, UNIX_EPOCH},
         };
@@ -1200,9 +1201,10 @@ mod tests {
         /// One serve() loop on a temporary state directory, reached the same
         /// way a real `muxloomd mcp` reaches the real daemon.
         fn surface(name: &str) -> DaemonControl {
-            // Short enough that the socket path stays under the Unix
-            // sockaddr limit even inside macOS's deep per-user temp dir.
-            let root = std::env::temp_dir().join(format!(
+            // A short, fixed prefix: the state dir carries daemon and keeper
+            // sockets, whose paths must stay under the ~104-byte sockaddr_un
+            // limit that macOS's deep per-user temp dir nearly exhausts.
+            let root = PathBuf::from("/tmp").join(format!(
                 "mxl-{name}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
@@ -1213,7 +1215,7 @@ mod tests {
             let paths = DaemonPaths::under(root);
             let serve_paths = paths.clone();
             thread::spawn(move || {
-                if let Err(error) = crate::daemon::serve(&serve_paths) {
+                if let Err(error) = crate::daemon::serve_with_in_process_keepers(&serve_paths) {
                     eprintln!("test daemon exited: {error:#}");
                 }
             });

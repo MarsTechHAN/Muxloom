@@ -1,12 +1,12 @@
 #![cfg(unix)]
 
-//! A daemon that is killed outright must not take its sessions with it. The
-//! PTY cannot survive, but the record and the log can, and the next generation
-//! is expected to bring them back as archived sessions.
+//! A daemon that dies must not take its sessions with it. Sessions are owned
+//! by keeper processes, so a killed or stopped daemon leaves them running and
+//! the next generation adopts them live. Only when the keeper itself is gone
+//! is a session retired into the archive with its transcript intact.
 
 use std::{
     fs,
-    io::Read,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -58,6 +58,21 @@ impl TestState {
             .unwrap();
         stream
     }
+
+    fn delete(&self, session_id: &str) {
+        let mut client = self.connect();
+        let response = request(
+            &mut client,
+            99,
+            &DaemonRequest::Delete {
+                session_id: session_id.into(),
+            },
+        );
+        assert!(
+            matches!(response, DaemonResponse::Ack | DaemonResponse::Error { .. }),
+            "unexpected delete response: {response:?}"
+        );
+    }
 }
 
 impl Drop for TestState {
@@ -104,7 +119,7 @@ fn sessions(stream: &mut UnixStream, request_id: u64) -> Vec<DaemonSession> {
     }
 }
 
-fn launch(stream: &mut UnixStream, request_id: u64, session_id: &str, script: &str) {
+fn launch(stream: &mut UnixStream, request_id: u64, session_id: &str, script: &str) -> Option<u32> {
     let response = request(
         stream,
         request_id,
@@ -122,10 +137,10 @@ fn launch(stream: &mut UnixStream, request_id: u64, session_id: &str, script: &s
             rows: 24,
         },
     );
-    assert!(
-        matches!(response, DaemonResponse::Launched { .. }),
-        "unexpected launch response: {response:?}"
-    );
+    match response {
+        DaemonResponse::Launched { session } => session.pid,
+        response => panic!("unexpected launch response: {response:?}"),
+    }
 }
 
 /// Read a session's history back the way an attaching client does.
@@ -167,42 +182,22 @@ fn history(state: &TestState, session_id: &str) -> String {
 }
 
 #[test]
-fn a_killed_daemon_leaves_its_sessions_recoverable_as_archived() {
+fn a_killed_daemon_leaves_its_sessions_running_for_the_next_generation() {
     let state = TestState::new();
     let killed = state.serve();
     let daemon_pid = state.pid();
     let session_id = "muxloomd-claude-1700000000-77-0";
-    let temporary_id = "muxloomd-temporal-claude-1700000000-77-1";
 
     let mut client = state.connect();
-    launch(
+    let child_pid = launch(
         &mut client,
         10,
         session_id,
         "printf '\\342\\217\\272 finished the migration\\r\\n'; sleep 300",
-    );
-    // A temporary chat keeps no transcript, so a crash must discard it rather
-    // than archive it.
-    let response = request(
-        &mut client,
-        11,
-        &DaemonRequest::Launch {
-            session_id: temporary_id.into(),
-            kind: "claude".into(),
-            path: "/tmp".into(),
-            label: "temporal".into(),
-            temporary: true,
-            executable: "/bin/sh".into(),
-            args: vec!["-c".into(), "sleep 300".into()],
-            environment: vec![],
-            created_at: 1_700_000_000,
-            columns: 80,
-            rows: 24,
-        },
-    );
-    assert!(matches!(response, DaemonResponse::Launched { .. }));
+    )
+    .expect("launched session has a pid");
 
-    // Give the child's first line time to reach the log the daemon appends to.
+    // Give the child's first line time to reach the log the keeper appends to.
     let deadline = Instant::now() + Duration::from_secs(5);
     let history_path = state.root.join(format!("history/{session_id}.ansi"));
     while fs::metadata(&history_path).is_ok_and(|metadata| metadata.len() == 0)
@@ -225,54 +220,37 @@ fn a_killed_daemon_leaves_its_sessions_recoverable_as_archived() {
     let _ = killed.wait_with_output();
     let _ = fs::remove_file(state.root.join("muxloomd.sock"));
 
+    // The keeper never noticed; the next generation adopts the session live.
     let mut recovered_daemon = state.serve();
     let mut client = state.connect();
-    let sessions = sessions(&mut client, 20);
-    let session = sessions
+    let listed = sessions(&mut client, 20);
+    let session = listed
         .iter()
         .find(|session| session.id == session_id)
-        .expect("a killed daemon must not lose the sessions it owned");
+        .expect("a killed daemon must not lose the sessions it served");
     assert!(
-        session.dead,
-        "an unattachable session must be archived, not reported as running"
+        !session.dead,
+        "the keeper owns the session, so a daemon crash must not end it"
     );
-    assert!(session.pid.is_none() && !session.working && !session.needs_attention);
-    assert_eq!(session.label, "recovery smoke");
-    assert_eq!(session.path, "/tmp");
     assert_eq!(
-        session.recap.as_deref(),
-        Some("finished the migration"),
-        "the recap must be rebuilt from the log the daemon left behind"
+        session.pid,
+        Some(child_pid),
+        "the adopted session is the same process, not a relaunch"
     );
-    assert!(
-        !sessions.iter().any(|session| session.id == temporary_id),
-        "a temporary session must not be archived"
-    );
-
+    assert_eq!(session.recap.as_deref(), Some("finished the migration"));
     let transcript = history(&state, session_id);
     assert!(
         transcript.contains("finished the migration"),
         "{transcript}"
     );
     assert!(
-        transcript.contains("muxloomd stopped unexpectedly"),
-        "the archived transcript must say why it ends: {transcript}"
+        !transcript.contains("muxloomd stopped unexpectedly"),
+        "a survived session must not read as a crash victim: {transcript}"
     );
-
-    // The recovered session reads back like any other archived one.
-    match request(
-        &mut client,
-        21,
-        &DaemonRequest::SearchHistory {
-            session_id: session_id.into(),
-            query: "migration".into(),
-            max_matches: 10,
-        },
-    ) {
-        DaemonResponse::HistoryMatches { matches } => assert_eq!(matches.len(), 1),
-        response => panic!("unexpected search response: {response:?}"),
-    }
     drop(client);
+
+    state.delete(session_id);
+    drop(recovered_daemon.try_wait());
     unsafe {
         libc::kill(state.pid(), libc::SIGTERM);
     }
@@ -287,56 +265,95 @@ fn a_killed_daemon_leaves_its_sessions_recoverable_as_archived() {
 }
 
 #[test]
-fn a_daemon_asked_to_stop_records_its_sessions_before_exiting() {
+fn a_session_whose_keeper_died_is_recovered_into_the_archive() {
     let state = TestState::new();
-    let mut daemon = state.serve();
+    let daemon = state.serve();
     let daemon_pid = state.pid();
     let session_id = "muxloomd-claude-1700000000-78-0";
 
     let mut client = state.connect();
-    launch(&mut client, 30, session_id, "sleep 300");
-    drop(client);
-
-    unsafe {
-        libc::kill(daemon_pid, libc::SIGTERM);
-    }
+    let child_pid = launch(
+        &mut client,
+        30,
+        session_id,
+        "printf '\\342\\217\\272 finished the migration\\r\\n'; sleep 300",
+    )
+    .expect("launched session has a pid");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while daemon.try_wait().unwrap().is_none() && Instant::now() < deadline {
+    let history_path = state.root.join(format!("history/{session_id}.ansi"));
+    while fs::metadata(&history_path).is_ok_and(|metadata| metadata.len() == 0)
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        daemon.try_wait().unwrap().is_some(),
-        "SIGTERM must stop muxloomd"
-    );
+    drop(client);
 
-    let mut metadata = String::new();
-    fs::File::open(state.root.join(format!("sessions/{session_id}.json")))
-        .unwrap()
-        .read_to_string(&mut metadata)
-        .unwrap();
-    let metadata: DaemonSession = serde_json::from_str(&metadata).unwrap();
-    assert!(
-        metadata.dead && metadata.pid.is_none(),
-        "an orderly stop must record that its sessions ended: {metadata:?}"
-    );
+    // The daemon dies without warning, and then so does the session's child:
+    // with no keeper left, the next generation can only archive the record.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGKILL);
+    }
+    let _ = daemon.wait_with_output();
+    let _ = fs::remove_file(state.root.join("muxloomd.sock"));
+    unsafe {
+        libc::kill(child_pid as i32, libc::SIGKILL);
+    }
+    // The keeper notices the child's death, records it, and leaves.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let keepers = state.root.join("keepers");
+    let socket_gone = |keepers: &Path| {
+        fs::read_dir(keepers).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("sock"))
+        })
+    };
+    while !socket_gone(&keepers) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
 
     let mut restarted = state.serve();
     let mut client = state.connect();
-    let sessions = sessions(&mut client, 31);
-    let session = sessions
+    let listed = sessions(&mut client, 31);
+    let session = listed
         .iter()
         .find(|session| session.id == session_id)
-        .expect("the session must still be listed after a restart");
-    assert!(session.dead);
+        .expect("the record must survive its keeper");
+    assert!(
+        session.dead,
+        "with the keeper gone there is nothing to adopt"
+    );
+    assert!(session.pid.is_none() && !session.working && !session.needs_attention);
+    assert_eq!(session.recap.as_deref(), Some("finished the migration"));
     let transcript = history(&state, session_id);
     assert!(
-        !transcript.contains("muxloomd stopped unexpectedly"),
-        "an orderly stop must not be reported as a crash: {transcript}"
+        transcript.contains("finished the migration"),
+        "{transcript}"
     );
 
+    // The archived session reads back like any other.
+    match request(
+        &mut client,
+        32,
+        &DaemonRequest::SearchHistory {
+            session_id: session_id.into(),
+            query: "migration".into(),
+            max_matches: 10,
+        },
+    ) {
+        DaemonResponse::HistoryMatches { matches } => assert_eq!(matches.len(), 1),
+        response => panic!("unexpected search response: {response:?}"),
+    }
     drop(client);
     unsafe {
         libc::kill(state.pid(), libc::SIGTERM);
     }
-    let _ = restarted.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while restarted.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        restarted.try_wait().unwrap().is_some(),
+        "muxloomd must stop when it is asked to"
+    );
 }

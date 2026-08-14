@@ -17,11 +17,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// One session's keeper: internal, launched by the daemon, never by hand.
+#[cfg(unix)]
+fn keeper_entry() -> Result<()> {
+    muxloom::keeper::keeper_main()
+}
+
+#[cfg(not(unix))]
+fn keeper_entry() -> Result<()> {
+    bail!("muxloomd is currently supported on Unix targets")
+}
+
 fn run() -> Result<()> {
     let paths = DaemonPaths::discover()?;
     match std::env::args().nth(1).as_deref() {
         Some("serve") => serve(&paths),
         Some("bridge") => bridge(&paths),
+        Some("keeper") => keeper_entry(),
         Some("mcp") => {
             let mut surface = muxloom::control::DaemonControl::new()?;
             muxloom::mcp::serve(
