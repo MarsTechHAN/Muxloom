@@ -38,25 +38,33 @@ preserve.
   calculation must live in the Rust binaries and must not depend on target
   utilities such as `sha256sum` or `shasum`.
 
-## Non-disruptive daemon upgrades
+## Session keepers and non-disruptive daemon upgrades
 
-- Never kill or replace a daemon process that owns a live PTY. Controller exit,
-  binary deployment, and daemon upgrades must not stop running agents.
-- Deploy a new binary atomically, then drain the old daemon. While it owns live
-  sessions or another controller client, the new bridge must continue using the
-  old generation through the compatible protocol.
-- Handover is allowed only after the old daemon reports no live sessions and no
-  other clients. The bridge may then request and observe its voluntary exit,
-  remove stale socket state, start the newly installed generation, and
-  reconnect.
+- Every managed session is owned by its keeper process: PTY, child process,
+  and raw history append, nothing more. The keeper's socket protocol is
+  version 1 forever — running keepers outlive arbitrarily many daemon
+  generations, so every future daemon must keep speaking it. Do not extend the
+  keeper's responsibilities; new behavior belongs in the daemon.
+- Controller exit, binary deployment, daemon upgrades, and daemon crashes must
+  not stop running agents. Typed input from the daemon goes through the keeper;
+  the daemon never owns a session PTY directly.
+- Deploy a new binary atomically, then drain the old daemon. Handover requires
+  a sole client but not idle sessions: live sessions ride their keepers across,
+  and the next generation adopts every keeper socket it finds, rebuilding
+  screen and activity state from the history tail.
 - Current daemons must enter draining atomically with client registration and
-  agent launch. Once draining starts, reject new work, acknowledge handover, and
-  exit voluntarily; do not rely on a check-then-kill race.
+  agent launch. Once draining starts, reject new work, acknowledge handover,
+  exit voluntarily, and treat the keeper hanging up as the transfer it is —
+  never as a session death.
+- A keeper that outlives its record must be dismissed, and a record that
+  outlives its keeper must be retired into the archive with its history; no
+  session may end up unaccounted for on either side.
 - Preserve session metadata and append-only history across handover. A future
   incompatible upgrade must use side-by-side routing or explicit state
   transfer; it must not sacrifice active sessions for a simpler restart.
-- Upgrade regressions must cover both an active session, where handover is
-  deferred, and an idle daemon, where the new generation starts without tmux.
+- Upgrade regressions must cover a live session crossing a handover with its
+  process intact, a daemon crash followed by adoption, and a dead keeper
+  followed by archive recovery.
 
 ## Control surfaces
 

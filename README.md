@@ -67,8 +67,9 @@ messages, PTY traffic, history pages, file operations, and encoded media.
 
 - 🗄️ **Multi-machine** — one dashboard for local and SSH targets; enable a host
   and Muxloom probes and provisions it over the existing connection.
-- 🔌 **Survives disconnects** — `muxloomd` owns the PTY, so quitting the
-  dashboard or losing SSH leaves the agent running.
+- 🔌 **Survives disconnects and upgrades** — a per-session keeper process owns
+  the PTY, so quitting the dashboard, losing SSH, replacing `muxloomd`, or
+  even a daemon crash leaves the agent running.
 - 🚀 **Start & resume** — a New/Resume flow with a fuzzy path picker that reads
   Codex and Claude Code session metadata to resume the right history.
 - 📁 **Remote file browser** — browse, filter, preview, download, and
@@ -386,6 +387,9 @@ reverse_tunnel = ""
 companion_command = "muxloomd"
 companion_binary = ""
 auto_update = true
+# What the startup check does with a newer release: "ask" (prompt), "auto"
+# (apply silently), or "never".
+update_prompt = "ask"
 
 [agents.codex]
 command = "codex"
@@ -489,6 +493,7 @@ flowchart LR
     SSH[Persistent ssh -T]
     Socket[Unix socket]
     Daemon[muxloomd]
+    Keeper[Session keeper<br/>one per session]
     PTY[portable-pty]
     CLI[Codex / Claude / shell]
     State[History + metadata]
@@ -499,24 +504,32 @@ flowchart LR
     Pool <-->|local| Socket
     SSH <--> Socket
     Socket <--> Daemon
-    Daemon <--> PTY <--> CLI
+    Daemon <--> Keeper
+    Keeper <--> PTY <--> CLI
+    Keeper --> State
     Daemon <--> State
 ```
 
-**Persistence.** `muxloomd` directly owns each PTY and child process; the
-dashboard and SSH bridge are subscribers, so either can disconnect without
-terminating the session. The daemon keeps append-only ANSI history on the
-target, and an attach gets the tail of that log rendered into scrollback rows
-followed by the retained output that repaints the screen.
+**Persistence.** Each session is owned by a minimal detached *keeper* process
+whose only jobs are the PTY, the child process, and appending the raw history
+log; its protocol is frozen so it never needs updating. The daemon is the
+keeper's current client — it serves screens, status, search, and metadata —
+and the dashboard and SSH bridge are the daemon's subscribers, so any of them
+can disconnect, restart, or crash without ending the session. An attach gets
+the tail of the log rendered into scrollback rows followed by the retained
+output that repaints the screen.
 
 **Transport.** Each remote target uses one long-lived, non-PTY SSH process. A
 framed protocol multiplexes request, PTY, file, media, and TCP-forward stream IDs
 over it, completing requests out of order with stream-credit backpressure and
 heartbeats; large payloads use LZ4 only when useful. Companion bootstrap compares SHA-256 fingerprints computed
 by the Rust binaries and ships a missing or stale binary atomically over the
-same SSH stdin. Daemon replacement is non-disruptive: a new binary cannot
-replace a daemon that owns live PTYs, so the old generation serves the
-compatible protocol until idle, then drains and exits.
+same SSH stdin. Daemon replacement is non-disruptive and does not wait for
+idle: running sessions ride their keepers across the generation change, and
+the next daemon adopts them with the same processes and transcripts. The
+footer shows a `⟳` chip while any machine's running daemon lags this build,
+and the controller quietly cycles such a machine's bridge (never while its
+terminal is attached) to complete the update.
 
 **Terminal rendering.** `vt100::Parser` maintains alternate-screen state,
 cursor, colors, styles, mouse mode, application cursor keys, bracketed paste,
@@ -538,7 +551,8 @@ old frame visible until the new stream produces its first frame.
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |
-| `src/daemon.rs` | PTY supervisor, history, archive, files, search |
+| `src/daemon.rs` | Session supervisor, history, archive, files, search |
+| `src/keeper.rs` | Per-session keeper: PTY, child, history append; frozen protocol |
 | `src/port_forward.rs` | Controller loopback listeners and TCP stream proxying |
 | `src/bin/muxloomd.rs` | Companion `serve`, `bridge`, and `status` commands |
 | `src/terminal_session.rs` | Live parser, input encoding, resize safety |
@@ -576,6 +590,9 @@ muxloom --debug-log /tmp/muxloom-debug.log
   some outer terminals do not report pixel size.
 - **Attention too broad** — inspect the matched reason and visible tail, then
   narrow that machine's `attention_patterns`.
+- **`⟳` chip in the footer** — that machine's running daemon is older than
+  this build. The controller updates it on its own once the machine's terminal
+  is not attached; sessions keep running through the change.
 - **Video will not decode** — verify the bundled `ffmpeg`, `MUXLOOM_FFMPEG`, or
   an `ffmpeg` on the controller `PATH`.
 

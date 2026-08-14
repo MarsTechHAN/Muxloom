@@ -110,7 +110,10 @@ muxloom mcp [--config PATH]
 `--config` 指定 TOML；`--debug` 写入默认 Debug Log；`--debug-log PATH` 指定日志路径。
 `muxloom init` 不会覆盖已有配置。
 `muxloom update` 会校验 SHA-256 后原地更新 Release Bundle。启动时默认在后台自动检查并
-更新；配置 `auto_update = false` 可以关闭。
+更新；配置 `auto_update = false` 可以关闭。默认情况下（`update_prompt = "ask"`）发现
+新版本会先弹窗询问：安装包构建可原地更新，源码构建则把远端机器要用的 muxloomd
+companion 拉进本地缓存；`"auto"` 恢复静默自动更新，`"never"` 跳过启动检查。GitHub
+不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。
 
 <a id="zh-first-run"></a>
 
@@ -402,9 +405,12 @@ Bootstrap 由 Rust binary 自己计算 SHA-256 Fingerprint。缺失或过期 com
 SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标有 tmux，可以进入明确
 标记且必须确认的兼容回退。
 
-daemon 升级不会打断活动 PTY：新 binary 先安装；旧 daemon 只要仍有 Live Session 或其他
-Controller，就继续用兼容协议运行。空闲后才 Drain、自行退出并由下一条 Bridge 启动新
-Generation。History 和 Metadata 始终保留在状态目录。
+每个会话由一个极小的 **keeper** 进程持有：只负责 PTY、子进程和原始历史追加，协议永久
+冻结，因此它本身几乎不需要更新。daemon 只是 keeper 的当前客户端——负责屏幕、状态、
+搜索与元数据。daemon 升级不再等待空闲：换代时会话由各自的 keeper 原地带过去，新
+daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
+运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
+终端未 attach 时自动重连完成升级。History 和 Metadata 始终保留在状态目录。
 
 Terminal 字节由 `vt100::Parser` 维护 Alternate Screen、光标、颜色、样式、Mouse Mode、
 Application Cursor 和 Bracketed Paste，并由 Ratatui 限制在对应 Pane 内。Muxloom 会用
@@ -439,6 +445,8 @@ muxloom --debug-log /tmp/muxloom-debug.log
 - Codex 缺 `bubblewrap`/`bwrap`：使用带资源的 Standalone Package 或绝对 Wrapper；
 - 竖屏仍横向：查看 Layout Log 的 Pixel/Cell，外层终端可能没有报告 Pixel Size；
 - 提醒误报：根据 Reason 和可见 Tail 收窄该机器的 `attention_patterns`；
+- footer 出现 `⟳` 标记：该机器运行中的 daemon 落后于当前构建；终端未 attach 时
+  Controller 会自动完成升级，会话不受影响；
 - 视频不能解码：检查 Bundle 内 FFmpeg、`MUXLOOM_FFMPEG` 或 Controller `PATH`。
 
 Debug Log 可能包含少量当前 Agent 可见文本，应按敏感信息处理。
