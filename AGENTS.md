@@ -98,9 +98,15 @@ preserve.
 
 ## Status, files, and media
 
-- Animate only Codex or Claude sessions whose current visible terminal state is
-  classified as working. Idle, waiting, archived, and plain terminal sessions
-  must not animate. Keep machine, folder, and agent-row indicators consistent.
+- Animate only Codex or Claude sessions whose current visible terminal state
+  is classified as working, and only on the agent row itself. Folder rows
+  carry aggregated state as steady colour (attention outranks working);
+  machine rows show static capability icons. Idle, waiting, archived, and
+  plain terminal sessions must not animate.
+- Working requires both the CLI's visible interrupt marker and recent PTY
+  output; a stale screen over a quiet PTY must read as idle. Attention
+  outranks working, and controller-configured attention patterns are sunk
+  into the daemon so both classifiers agree.
 - File-browser input is modal: while it is focused, application shortcuts must
   not leak into the machine or agent views.
 - Tag asynchronous directory and preview results with their request identity.

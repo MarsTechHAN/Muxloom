@@ -142,12 +142,20 @@ jump to a pane · `f` grouped/flat · drag any divider to resize.
 
 Codex and Claude sessions animate **only** while classified as working — cyan
 braille dots for Codex, an orange sparkle for Claude, both on a constant
-wall-clock cadence. Codex activity follows its OSC title spinner, so status
-updates survive the CLI erasing and repainting the visible `Working` line. When
-a session needs input its entire agent item turns bold yellow, it raises a
-clickable banner, rings the bell, and emits a desktop notification. Opening the
-session clears the banner — the session list keeps showing Waiting until the
-agent stops asking — and a later prompt raises it again.
+wall-clock cadence — and only on the agent row itself. Folder group rows carry
+their children's state as a steady colour (yellow when one waits for input,
+green when one works) and machine rows show static capability icons, so
+exactly one thing on screen blinks per busy agent. Working means the CLI's
+interrupt marker is on screen *and* the PTY produced output in the last
+seconds; a leftover spinner over a quiet session goes back to idle. Codex
+activity additionally follows its OSC title spinner, so status survives the
+CLI erasing and repainting the visible `Working` line. When a session needs
+input — approval prompts, numbered menus, or your own `attention_patterns`,
+which the daemon now applies itself at its own refresh cadence — its entire
+agent item turns bold yellow, it raises a clickable banner, rings the bell,
+and emits a desktop notification. Opening the session clears the banner — the
+session list keeps showing Waiting until the agent stops asking — and a later
+prompt raises it again.
 
 **Keys** — spinners are automatic · `a` show/hide archived · click the attention
 banner to jump to the session.
@@ -390,6 +398,9 @@ auto_update = true
 # What the startup check does with a newer release: "ask" (prompt), "auto"
 # (apply silently), or "never".
 update_prompt = "ask"
+# Archive-and-resume sessions that block a daemon handover. Asks on screen
+# first whenever working agents or terminals would be interrupted.
+force_daemon_update = false
 
 [agents.codex]
 command = "codex"
@@ -529,7 +540,11 @@ idle: running sessions ride their keepers across the generation change, and
 the next daemon adopts them with the same processes and transcripts. The
 footer shows a `⟳` chip while any machine's running daemon lags this build,
 and the controller quietly cycles such a machine's bridge (never while its
-terminal is attached) to complete the update.
+terminal is attached) to complete the update. Pre-keeper sessions defer that
+handover indefinitely; with `force_daemon_update` enabled the controller
+archives them, completes the handover, and resumes every agent from its own
+transcript — asking on screen first when it would interrupt a working agent
+or end a terminal, which cannot resume.
 
 **Terminal rendering.** `vt100::Parser` maintains alternate-screen state,
 cursor, colors, styles, mouse mode, application cursor keys, bracketed paste,
@@ -580,8 +595,10 @@ Start with an explicit log:
 muxloom --debug-log /tmp/muxloom-debug.log
 ```
 
-- **Target stays offline** — run `ssh -T -o BatchMode=yes <alias> true`, then
-  read the bridge bootstrap error in the log.
+- **Target stays offline** — the machine row keeps a steady red `!` while
+  background retries stay quiet; press `r` for a loud retry, or run
+  `ssh -T -o BatchMode=yes <alias> true` and read the bridge bootstrap error
+  in the log.
 - **Remote renders but ignores input** — confirm `connected ... via one
   persistent bridge` and `terminal first frame ready`, with no later `EOF`.
 - **Working animation missing** — look for both `source=live-terminal` and

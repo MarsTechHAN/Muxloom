@@ -172,11 +172,14 @@ Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 A
 | Idle | 进程存活并停在普通输入提示 |
 | Archived | Agent 已退出或被停止，元数据和历史仍保留 |
 
-Working 动画同时出现在 Machines 和 Folder/Agent 行：Codex 使用青色旋转盲文 spinner
-（`⠋⠙⠹…`），Claude 使用橙色 sparkle（`✻✽✶✳`），与 Claude Code 自身循环的字形一致。
-两者均按墙钟时间推进，速度不随重绘频率变化。Terminal、Idle、Waiting、Archived
-不播放动画。Codex Working 直接跟随 OSC 标题 spinner，因此 CLI 擦除并逐字符重绘可见
-`Working` 行时也不会漏判；Waiting Agent 的整个条目会变成黄色加粗。
+Working 动画**只出现在对应 agent 行**：Codex 使用青色旋转盲文 spinner（`⠋⠙⠹…`），
+Claude 使用橙色 sparkle（`✻✽✶✳`），均按墙钟时间推进。Folder 分组行不再闪烁，改为整
+行静态变色标示子会话状态——有等待输入的子会话时变黄，有工作中的变绿；Machines 行只显
+示静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）可见 **且** PTY 最
+近数秒内有输出，残留在屏幕上的旧 spinner 会自动回到 Idle；subagent 并行阶段、无 token
+计数的早期阶段都能正确识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
+示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
+用；Waiting Agent 的整个条目会变成黄色加粗。
 
 <a id="zh-controls"></a>
 
@@ -410,7 +413,10 @@ SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标�
 搜索与元数据。daemon 升级不再等待空闲：换代时会话由各自的 keeper 原地带过去，新
 daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
 运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
-终端未 attach 时自动重连完成升级。History 和 Metadata 始终保留在状态目录。
+终端未 attach 时自动重连完成升级。pre-keeper 旧会话会无限期推迟接管；开启
+`force_daemon_update = true` 后 Controller 会归档它们、完成接管、再从各 agent 自身的
+转录自动 resume——若会打断工作中的 agent 或终结无法恢复的终端，会先弹窗确认。History
+和 Metadata 始终保留在状态目录。
 
 Terminal 字节由 `vt100::Parser` 维护 Alternate Screen、光标、颜色、样式、Mouse Mode、
 Application Cursor 和 Bracketed Paste，并由 Ratatui 限制在对应 Pane 内。Muxloom 会用
@@ -439,7 +445,8 @@ muxloom --debug-log /tmp/muxloom-debug.log
 
 常见检查：
 
-- Machine Offline：先执行 `ssh -T -o BatchMode=yes <alias> true`，再看 Bootstrap 错误；
+- Machine Offline：机器行稳定显示红色 `!`，后台重试不再反复闪 Connecting；按 `r` 手动重试
+  才显示进度。排查先执行 `ssh -T -o BatchMode=yes <alias> true`，再看 Bootstrap 错误；
 - Remote 能显示不能输入：确认 persistent bridge、first frame ready，且随后没有 EOF；
 - Working 动画不出现：检查 `source=live-terminal` / `source=muxloomd` 和 companion Fingerprint；
 - Codex 缺 `bubblewrap`/`bwrap`：使用带资源的 Standalone Package 或绝对 Wrapper；
