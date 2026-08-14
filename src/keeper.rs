@@ -91,6 +91,10 @@ pub struct KeeperStatus {
     pub exit_code: Option<i32>,
     pub columns: u16,
     pub rows: u16,
+    /// History bytes appended before this greeting. Everything the client
+    /// receives as data frames comes strictly after this offset, so it can
+    /// rebuild the missed output from the file with no gap and no overlap.
+    pub history_bytes: u64,
 }
 
 /// The socket path for a session's keeper. Session ids are too long to embed
@@ -193,11 +197,22 @@ pub fn bind_socket(socket_path: &std::path::Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-struct KeeperState {
+/// The output side of the keeper: history file, its appended-byte count, and
+/// the current client. One lock guards all three so "append, count, forward"
+/// is atomic against a greeting — the byte count a client is greeted with
+/// splits the transcript exactly into "read it from the file" and "arriving
+/// as data frames", with no gap and no overlap.
+struct Relay {
     /// Writer half toward the one connected client, if any, tagged with its
     /// accept generation so a superseded client's thread cannot evict its
     /// replacement.
-    client: Mutex<Option<(u64, UnixStream)>>,
+    client: Option<(u64, UnixStream)>,
+    history: Option<std::fs::File>,
+    history_bytes: u64,
+}
+
+struct KeeperState {
+    relay: Mutex<Relay>,
     pty_writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -212,7 +227,7 @@ struct KeeperState {
 }
 
 impl KeeperState {
-    fn status(&self) -> KeeperStatus {
+    fn status(&self, history_bytes: u64) -> KeeperStatus {
         let exit_code = *self
             .exit_code
             .lock()
@@ -230,27 +245,47 @@ impl KeeperState {
             exit_code,
             columns,
             rows,
+            history_bytes,
+        }
+    }
+
+    /// Append one PTY chunk to the history and forward it to the client, as
+    /// one atomic step against greetings.
+    fn relay_output(&self, bytes: &[u8]) {
+        let mut relay = self
+            .relay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(history) = relay.history.as_mut() {
+            let _ = history.write_all(bytes);
+            relay.history_bytes += bytes.len() as u64;
+        }
+        if let Some((_, stream)) = relay.client.as_mut()
+            && write_frame(stream, frame::DATA, bytes).is_err()
+        {
+            // A client that cannot be written to is gone; the session
+            // continues for the next one.
+            relay.client = None;
         }
     }
 
     fn send_to_client(&self, kind: u8, payload: &[u8]) {
-        let mut client = self
-            .client
+        let mut relay = self
+            .relay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((_, stream)) = client.as_mut()
+        if let Some((_, stream)) = relay.client.as_mut()
             && write_frame(stream, kind, payload).is_err()
         {
-            // A client that cannot be written to is gone; the session
-            // continues for the next one.
-            *client = None;
+            relay.client = None;
         }
     }
 
     fn has_client(&self) -> bool {
-        self.client
+        self.relay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .client
             .is_some()
     }
 
@@ -280,9 +315,27 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
     let child_pid = child.process_id();
     let mut pty_reader = pair.master.try_clone_reader()?;
     let pty_writer = pair.master.take_writer()?;
+    // The history file starts at its current end: a keeper only ever appends,
+    // and the offset it greets clients with counts its own appends.
+    let history = spec.history_path.as_ref().and_then(|path| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| eprintln!("keeper history open failed: {error}"))
+            .ok()
+    });
+    let history_bytes = history
+        .as_ref()
+        .and_then(|file| file.metadata().ok())
+        .map_or(0, |metadata| metadata.len());
 
     let state = Arc::new(KeeperState {
-        client: Mutex::new(None),
+        relay: Mutex::new(Relay {
+            client: None,
+            history,
+            history_bytes,
+        }),
         pty_writer: Mutex::new(pty_writer),
         master: Mutex::new(pair.master),
         child: Mutex::new(child),
@@ -294,33 +347,24 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
     });
 
     let reader_state = Arc::clone(&state);
-    let history_path = spec.history_path.clone();
     thread::spawn(move || {
-        let mut history = history_path.as_ref().and_then(|path| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| eprintln!("keeper history open failed: {error}"))
-                .ok()
-        });
         let mut buffer = vec![0u8; DATA_CHUNK];
         loop {
             match pty_reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => {
-                    let bytes = &buffer[..read];
-                    if let Some(history) = history.as_mut() {
-                        let _ = history.write_all(bytes);
-                    }
-                    reader_state.send_to_client(frame::DATA, bytes);
-                }
+                Ok(read) => reader_state.relay_output(&buffer[..read]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
-        if let Some(history) = history.as_mut() {
-            let _ = history.flush();
+        {
+            let mut relay = reader_state
+                .relay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(history) = relay.history.as_mut() {
+                let _ = history.flush();
+            }
         }
         let code = reader_state
             .child
@@ -337,9 +381,11 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
             // The connected daemon hears the exit and answers with QUIT once
             // it has recorded the death.
             reader_state.send_to_client(frame::EXITED, &code.to_be_bytes());
-        } else {
-            // Nobody to tell: leave the record on disk and go. The next
-            // daemon finds no socket and retires the session from metadata.
+        }
+        // The send may just have discovered the client is gone. A keeper with
+        // a dead child and nobody listening has nothing left to wait for;
+        // leave rather than park forever.
+        if !reader_state.has_client() {
             reader_state.finish();
         }
     });
@@ -370,23 +416,26 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
         let client_id = next_client;
         {
             // One client at a time: a newer daemon adopting the session
-            // replaces whatever generation held it before.
-            let mut client = state
-                .client
+            // replaces whatever generation held it before. Holding the relay
+            // lock across the greeting freezes the history byte count it
+            // carries: everything before it is in the file, everything after
+            // it arrives on this stream.
+            let mut relay = state
+                .relay
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((_, previous)) = client.take() {
+            if let Some((_, previous)) = relay.client.take() {
                 let _ = previous.shutdown(std::net::Shutdown::Both);
             }
             let mut greeting = stream;
             if greeting.write_all(&MAGIC).is_err() {
                 continue;
             }
-            let hello = serde_json::to_vec(&state.status()).unwrap_or_default();
+            let hello = serde_json::to_vec(&state.status(relay.history_bytes)).unwrap_or_default();
             if write_frame(&mut greeting, frame::HELLO, &hello).is_err() {
                 continue;
             }
-            *client = Some((client_id, greeting));
+            relay.client = Some((client_id, greeting));
         }
         let client_state = Arc::clone(&state);
         thread::spawn(move || {
@@ -446,7 +495,13 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
                         // session is what KILL is for.
                     }
                     frame::PING => {
-                        let pong = serde_json::to_vec(&client_state.status()).unwrap_or_default();
+                        let history_bytes = client_state
+                            .relay
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .history_bytes;
+                        let pong = serde_json::to_vec(&client_state.status(history_bytes))
+                            .unwrap_or_default();
                         client_state.send_to_client(frame::PONG, &pong);
                     }
                     _ => {}
@@ -455,14 +510,18 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
             // A client that disconnects after the child died is done with the
             // session even if it never said QUIT; do not park forever.
             let this_client_left = {
-                let mut client = client_state
-                    .client
+                let mut relay = client_state
+                    .relay
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Only clear the slot while it still belongs to this
                 // connection; a replacement already took it otherwise.
-                if client.as_ref().is_some_and(|(id, _)| *id == client_id) {
-                    *client = None;
+                if relay
+                    .client
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == client_id)
+                {
+                    relay.client = None;
                     true
                 } else {
                     false
@@ -519,6 +578,7 @@ mod tests {
             exit_code: None,
             columns: 80,
             rows: 24,
+            history_bytes: 7,
         };
         let payload = serde_json::to_vec(&status).unwrap();
         assert_eq!(decode_status(&payload).unwrap(), status);

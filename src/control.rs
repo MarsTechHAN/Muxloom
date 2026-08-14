@@ -43,8 +43,6 @@ pub trait ControlSurface {
 const DEFAULT_SCREEN_LINES: usize = 200;
 /// Per-session match budget for history searches, matching the daemon's cap.
 const SEARCH_MAX_MATCHES: usize = 12;
-/// The most preview bytes a tool answer carries.
-const PREVIEW_LIMIT: usize = 256 * 1024;
 /// The most bytes of one shell stream a tool answer carries.
 const SHELL_OUTPUT_LIMIT: usize = 128 * 1024;
 
@@ -752,9 +750,9 @@ mod daemon_surface {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_SCREEN_LINES, Flavor, PREVIEW_LIMIT, SEARCH_MAX_MATCHES, agent_kind, build_input,
-        optional_bool, optional_str, optional_usize, pretty, preview_text, required_str,
-        screen_page, session_json, shell_report, specs,
+        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, agent_kind, build_input, optional_bool,
+        optional_str, optional_usize, pretty, preview_text, required_str, screen_page,
+        session_json, shell_report, specs,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -767,6 +765,8 @@ mod daemon_surface {
     /// How long one daemon request may run. Matches the bridge's own request
     /// timeout: a shell script is the slowest thing a request can carry.
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+    /// The most preview bytes a tool answer carries.
+    const PREVIEW_LIMIT: usize = 256 * 1024;
 
     /// Serves the daemon on this machine over its Unix socket. Each call opens
     /// its own connection: a resident client would hold the daemon's client

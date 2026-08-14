@@ -1597,6 +1597,19 @@ mod platform {
             columns: AtomicU16::new(columns.max(20)),
             rows: AtomicU16::new(rows.max(5)),
         });
+        // Output the child produced before the keeper connection existed —
+        // the first prompt of a fast-starting agent — is only in the history
+        // file. The greeting's byte count splits the transcript exactly, so
+        // replaying that prefix leaves the ring gapless and duplicate-free.
+        if !temporary
+            && let Some(head) = history_prefix_tail(
+                &session.history_path,
+                status.history_bytes,
+                RECENT_OUTPUT_LIMIT as u64,
+            )
+        {
+            session.record_output(&head);
+        }
         session.persist_metadata()?;
         state
             .sessions
@@ -1605,6 +1618,21 @@ mod platform {
             .insert(session_id, Arc::clone(&session));
         spawn_session_reader(state, Arc::clone(&session), stream);
         Ok(session)
+    }
+
+    /// The tail of the first `prefix` bytes of a history file, bounded by
+    /// `limit`. The file only ever grows, so the prefix is stable even while
+    /// the keeper keeps appending behind it.
+    fn history_prefix_tail(path: &Path, prefix: u64, limit: u64) -> Option<Vec<u8>> {
+        if prefix == 0 {
+            return None;
+        }
+        let mut file = File::open(path).ok()?;
+        let start = prefix.saturating_sub(limit);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = vec![0u8; (prefix - start) as usize];
+        file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
     }
 
     /// Relay keeper frames into the session until the keeper goes away. The
@@ -1917,9 +1945,14 @@ mod platform {
         });
         // Rebuild the screen, the retained ring, and with them the
         // working/attention classification from the transcript the keeper
-        // kept appending while no daemon was watching.
+        // kept appending while no daemon was watching. The greeting's byte
+        // count bounds the read so nothing streaming in now is doubled.
         if !temporary
-            && let Some(tail) = history_tail(&session.history_path, RECENT_OUTPUT_LIMIT as u64)
+            && let Some(tail) = history_prefix_tail(
+                &session.history_path,
+                status.history_bytes,
+                RECENT_OUTPUT_LIMIT as u64,
+            )
         {
             session.record_output(&tail);
         }
