@@ -1305,7 +1305,7 @@ fn resolve_companion_asset(
             "no bundled {triple} companion asset; downloading the latest GitHub Release on the controller"
         ),
     );
-    let (path, downloaded) =
+    let (path, source) =
         download_latest_companion(
             &triple,
             &executable,
@@ -1317,12 +1317,61 @@ fn resolve_companion_asset(
                     "no bundled {triple} muxloomd asset and the controller could not fetch the latest GitHub Release"
                 )
             })?;
-    let source = if downloaded {
-        "downloaded and checksum-verified from the latest GitHub Release"
-    } else {
-        "loaded from the checksum-verified controller cache"
-    };
     Ok((path, format!("deployed {triple} muxloomd {source}")))
+}
+
+/// How a companion asset was obtained, for the visible deployment notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionSource {
+    Downloaded,
+    VerifiedCache,
+    /// The release checksum could not be fetched, so the previously verified
+    /// cache was used; it may lag the latest release.
+    StaleCache,
+}
+
+impl CompanionSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Downloaded => "downloaded and checksum-verified from the latest GitHub Release",
+            Self::VerifiedCache => "loaded from the checksum-verified controller cache",
+            Self::StaleCache => {
+                "loaded from the previously verified cache because GitHub was unreachable; \
+                 it may be stale"
+            }
+        }
+    }
+}
+
+/// Refresh the controller-side companion cache from the latest release: the
+/// local platform plus every triple already cached. This is what makes a
+/// source-built controller able to update remote companions — and what the
+/// unreachable-GitHub fallback later serves from. Returns a summary line.
+pub fn refresh_companion_cache(environment: &[(String, String)]) -> Result<String> {
+    let mut triples: Vec<String> = Vec::new();
+    if let Some(triple) = current_target_triple() {
+        triples.push(triple);
+    }
+    if let Ok(entries) = fs::read_dir(companion_cache_root()) {
+        for entry in entries.flatten() {
+            if let Some(triple) = entry.file_name().to_str()
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !triples.iter().any(|known| known == triple)
+            {
+                triples.push(triple.to_string());
+            }
+        }
+    }
+    let mut refreshed = Vec::new();
+    for triple in &triples {
+        download_latest_companion(triple, "muxloomd", environment, &mut |_| {})
+            .with_context(|| format!("failed to fetch the {triple} companion"))?;
+        refreshed.push(triple.as_str());
+    }
+    Ok(format!(
+        "companion cache refreshed for {}",
+        refreshed.join(", ")
+    ))
 }
 
 fn download_latest_companion(
@@ -1330,12 +1379,28 @@ fn download_latest_companion(
     executable: &str,
     environment: &[(String, String)],
     progress: &mut impl FnMut(TaskProgress),
-) -> Result<(PathBuf, bool)> {
+) -> Result<(PathBuf, &'static str)> {
+    download_latest_companion_at(
+        &companion_cache_root(),
+        triple,
+        executable,
+        environment,
+        progress,
+    )
+}
+
+fn download_latest_companion_at(
+    cache_root: &Path,
+    triple: &str,
+    executable: &str,
+    environment: &[(String, String)],
+    progress: &mut impl FnMut(TaskProgress),
+) -> Result<(PathBuf, &'static str)> {
     let asset_name = format!(
         "muxloomd-{triple}{}",
         executable_suffix_for_name(executable)
     );
-    let cache = companion_cache_root().join(triple);
+    let cache = cache_root.join(triple);
     fs::create_dir_all(&cache)
         .with_context(|| format!("failed to create companion cache {}", cache.display()))?;
     let destination = cache.join(executable);
@@ -1343,15 +1408,31 @@ fn download_latest_companion(
     progress(TaskProgress::pending(format!(
         "Checking {triple} companion release"
     )));
-    let expected = controller_fetch_text(&checksum_url, environment)
-        .context("failed to fetch companion checksum")?;
+    let expected = match controller_fetch_text(&checksum_url, environment) {
+        Ok(expected) => expected,
+        Err(error) if destination.is_file() => {
+            // The release checksum is unreachable — a proxy-less network that
+            // cannot see GitHub, most often. The cached asset was verified
+            // when it was downloaded; a possibly-stale companion beats none,
+            // and the miss is said out loud rather than read as up to date.
+            debug::log(
+                "bridge",
+                format!(
+                    "companion release unreachable; using verified cache {}: {error:#}",
+                    destination.display()
+                ),
+            );
+            return Ok((destination, CompanionSource::StaleCache.describe()));
+        }
+        Err(error) => return Err(error).context("failed to fetch companion checksum"),
+    };
     let expected = parse_sha256_checksum(&expected)?;
     if destination.is_file() && sha256_file(&destination).is_ok_and(|actual| actual == expected) {
         debug::log(
             "bridge",
             format!("using cached {triple} companion {}", destination.display()),
         );
-        return Ok((destination, false));
+        return Ok((destination, CompanionSource::VerifiedCache.describe()));
     }
 
     let partial = cache.join(format!(".{executable}.partial-{}", std::process::id()));
@@ -1389,7 +1470,7 @@ fn download_latest_companion(
             destination.display()
         ),
     );
-    Ok((destination, true))
+    Ok((destination, CompanionSource::Downloaded.describe()))
 }
 
 fn executable_suffix_for_name(executable: &str) -> &'static str {
@@ -1962,6 +2043,46 @@ mod tests {
         assert!(error.to_string().contains("predates tcp-forward-v1"));
         connection.state.shutdown();
         drop(server);
+    }
+
+    /// GitHub being unreachable must degrade to the previously verified cache
+    /// with a visible "may be stale" source, not to no companion at all — and
+    /// with nothing cached it must still be an error.
+    #[test]
+    fn an_unreachable_release_falls_back_to_the_verified_companion_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-companion-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let triple = "x86_64-unknown-linux-musl";
+        fs::create_dir_all(root.join(triple)).unwrap();
+        fs::write(root.join(triple).join("muxloomd"), b"cached-companion").unwrap();
+        // A proxy nothing listens on makes every fetch fail immediately.
+        let unreachable = vec![
+            ("HTTPS_PROXY".to_string(), "http://127.0.0.1:1".to_string()),
+            ("HTTP_PROXY".to_string(), "http://127.0.0.1:1".to_string()),
+        ];
+
+        let (path, source) =
+            download_latest_companion_at(&root, triple, "muxloomd", &unreachable, &mut |_| {})
+                .unwrap();
+        assert_eq!(path, root.join(triple).join("muxloomd"));
+        assert!(source.contains("may be stale"), "{source}");
+
+        let error = download_latest_companion_at(
+            &root,
+            "aarch64-unknown-linux-musl",
+            "muxloomd",
+            &unreachable,
+            &mut |_| {},
+        )
+        .expect_err("no cache and no network must stay an error");
+        assert!(error.to_string().contains("checksum"), "{error:#}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

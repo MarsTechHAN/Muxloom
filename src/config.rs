@@ -26,6 +26,10 @@ pub struct Config {
     /// background so the next launch is up to date. `muxloom update` always
     /// works regardless of this setting.
     pub auto_update: bool,
+    /// What the startup check does with what it finds: "ask" opens a prompt,
+    /// "auto" applies silently (the pre-0.5 behavior), "never" skips the
+    /// check. Ignored when `auto_update` is off.
+    pub update_prompt: String,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
     /// Local backup of every session's conversation history (see [`BackupConfig`]).
@@ -53,6 +57,7 @@ impl Default for Config {
             companion_command: "muxloomd".into(),
             companion_binary: String::new(),
             auto_update: true,
+            update_prompt: "ask".into(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
             backup: BackupConfig::default(),
@@ -171,6 +176,9 @@ impl Config {
         validate_reverse_tunnel(&self.reverse_tunnel)?;
         if self.companion_command.trim().is_empty() {
             anyhow::bail!("companion command cannot be empty");
+        }
+        if !matches!(self.update_prompt.as_str(), "ask" | "auto" | "never") {
+            anyhow::bail!("update_prompt must be \"ask\", \"auto\", or \"never\"");
         }
         for (host, host_config) in &self.hosts {
             if let Some(environment) = &host_config.environment {
@@ -429,6 +437,8 @@ companion_command = "muxloomd"
 companion_binary = ""
 # Check GitHub for a newer release on startup and install it in the background.
 auto_update = true
+# What the startup check does with what it finds: "ask", "auto", or "never".
+update_prompt = "ask"
 
 # Local backup of every session's conversation history (running + archived)
 # from all machines into ~/.local/state/muxloom/backup/ as compressed blobs.
@@ -476,6 +486,23 @@ sync_files = []
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_prompt_accepts_only_its_three_modes() {
+        for mode in ["ask", "auto", "never"] {
+            let config = Config {
+                update_prompt: mode.into(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_ok(), "{mode} must be accepted");
+        }
+        let config = Config {
+            update_prompt: "sometimes".into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(EXAMPLE_CONFIG.contains("update_prompt"));
+    }
 
     #[test]
     fn built_in_agent_installers_do_not_require_system_download_tools() {

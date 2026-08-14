@@ -1268,7 +1268,8 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let help_width = UnicodeWidthStr::width(help);
     let chip_width = UnicodeWidthStr::width(chip.as_str());
-    let status_width = (area.width as usize).saturating_sub(help_width + chip_width + busy.len() + 2);
+    let status_width =
+        (area.width as usize).saturating_sub(help_width + chip_width + busy.len() + 2);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1452,6 +1453,37 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
                     .alignment(Alignment::Center)
                     .wrap(Wrap { trim: false })
                     .block(panel(" Legacy tmux compatibility fallback ", true)),
+                area,
+            );
+        }
+        Modal::UpdatePrompt(prompt) => {
+            let area = centered_rect(64, 10, outer);
+            frame.render_widget(Clear, area);
+            let action = if prompt.can_self_update {
+                "Update the installed bundle now? The change applies on the next launch."
+            } else {
+                "Fetch the release's muxloomd companions into the local cache? A source \
+                 build updates itself with cargo, but the cache is what updates machines."
+            };
+            let text = vec![
+                Line::raw(""),
+                Line::styled(
+                    format!("muxloom {} is available", prompt.latest),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Line::raw(""),
+                Line::raw(action),
+                Line::raw(""),
+                Line::styled(
+                    "Enter/y update    Esc/n not now    (config: update_prompt)",
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" Update available ", true)),
                 area,
             );
         }

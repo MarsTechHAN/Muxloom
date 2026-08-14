@@ -110,12 +110,17 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// Check GitHub for a newer release in the background and, on a real install,
-/// stage it. The result is posted into `slot` for the UI to surface; failures
-/// (offline, rate-limited, etc.) stay silent.
-fn spawn_update_check(slot: muxloom::app::UpdateSlot, environment: Vec<(String, String)>) {
+/// Check GitHub for a newer release in the background. With `ask` (the
+/// default) the finding opens a prompt in the UI; with `auto`, a real install
+/// is staged silently the way pre-0.5 releases did. Failures (offline,
+/// rate-limited, etc.) stay silent.
+fn spawn_update_check(
+    slot: muxloom::app::UpdateSlot,
+    environment: Vec<(String, String)>,
+    ask: bool,
+) {
     std::thread::spawn(move || {
-        let Ok(result) = muxloom::update::check_and_maybe_apply(true, &environment) else {
+        let Ok(result) = muxloom::update::check_and_maybe_apply(!ask, &environment) else {
             return;
         };
         let note = if result.applied {
@@ -126,6 +131,17 @@ fn spawn_update_check(slot: muxloom::app::UpdateSlot, environment: Vec<(String, 
                 )),
                 staged_version: Some(result.latest),
                 available_version: None,
+                prompt: None,
+            }
+        } else if result.update_available && ask {
+            muxloom::app::UpdateNote {
+                message: None,
+                staged_version: None,
+                available_version: Some(result.latest.clone()),
+                prompt: Some(muxloom::app::UpdatePrompt {
+                    latest: result.latest,
+                    can_self_update: cfg!(unix) && muxloom::update::is_installed_bundle(),
+                }),
             }
         } else if result.update_available {
             // Nothing was downloaded on this path, so the header must not
@@ -137,6 +153,7 @@ fn spawn_update_check(slot: muxloom::app::UpdateSlot, environment: Vec<(String, 
                 )),
                 staged_version: None,
                 available_version: Some(result.latest),
+                prompt: None,
             }
         } else {
             return;
@@ -160,7 +177,8 @@ fn run(config_path: PathBuf) -> Result<()> {
             .map(Target::ssh),
     );
 
-    let auto_update = config.auto_update;
+    let auto_update = config.auto_update && config.update_prompt != "never";
+    let ask_before_updating = config.update_prompt != "auto";
     let update_environment = config
         .environment_for(muxloom::model::LOCAL_TARGET_ID)
         .unwrap_or_default();
@@ -172,7 +190,7 @@ fn run(config_path: PathBuf) -> Result<()> {
         app.status_message = format!("Debug log: {}", path.display());
     }
     if auto_update {
-        spawn_update_check(app.update_slot(), update_environment);
+        spawn_update_check(app.update_slot(), update_environment, ask_before_updating);
     }
     app.start();
 

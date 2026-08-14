@@ -130,6 +130,17 @@ pub struct UpdateNote {
     /// Set when a newer release exists but nothing was downloaded, so the
     /// header asks for `muxloom update` rather than promising a restart.
     pub available_version: Option<String>,
+    /// Set when the user should decide what to do; opens the update modal.
+    pub prompt: Option<UpdatePrompt>,
+}
+
+/// What the startup check found and what saying yes would do.
+#[derive(Debug, Clone)]
+pub struct UpdatePrompt {
+    pub latest: String,
+    /// True on an installed release bundle, where yes replaces the bundle in
+    /// place. A source build can only refresh the companion cache.
+    pub can_self_update: bool,
 }
 
 /// A slot the startup update thread writes once; the UI drains it on the next tick.
@@ -307,6 +318,7 @@ pub enum Modal {
         target_id: String,
         detail: String,
     },
+    UpdatePrompt(UpdatePrompt),
     Help(HelpForm),
     Settings(SettingsForm),
     Search(SearchForm),
@@ -763,7 +775,76 @@ impl App {
             if note.available_version.is_some() {
                 self.available_update = note.available_version;
             }
+            // The prompt waits its turn rather than replacing whatever form
+            // the user already has open.
+            if let Some(prompt) = note.prompt
+                && self.modal.is_none()
+            {
+                self.modal = Some(Modal::UpdatePrompt(prompt));
+            }
         }
+    }
+
+    /// Do what the update prompt was told to: replace an installed bundle in
+    /// place, or refresh the companion cache on a source build. Runs on a
+    /// thread and reports through the update slot like the check itself.
+    #[cfg(feature = "controller")]
+    fn start_update_download(&mut self, prompt: UpdatePrompt) {
+        let slot = self.update_slot();
+        let environment = self
+            .config
+            .environment_for(crate::model::LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        self.set_background_status(if prompt.can_self_update {
+            format!("Downloading muxloom {}…", prompt.latest)
+        } else {
+            format!("Fetching {} companions to the cache…", prompt.latest)
+        });
+        std::thread::spawn(move || {
+            let note = if prompt.can_self_update {
+                match crate::update::check_and_maybe_apply(true, &environment) {
+                    Ok(result) if result.applied => UpdateNote {
+                        message: Some(format!(
+                            "muxloom {} downloaded — restart to apply",
+                            result.latest
+                        )),
+                        staged_version: Some(result.latest),
+                        available_version: None,
+                        prompt: None,
+                    },
+                    Ok(result) => UpdateNote {
+                        message: Some(format!("muxloom {} is already current", result.current)),
+                        staged_version: None,
+                        available_version: None,
+                        prompt: None,
+                    },
+                    Err(error) => UpdateNote {
+                        message: Some(format!("update failed: {error:#}")),
+                        staged_version: None,
+                        available_version: Some(prompt.latest),
+                        prompt: None,
+                    },
+                }
+            } else {
+                match crate::bridge::refresh_companion_cache(&environment) {
+                    Ok(summary) => UpdateNote {
+                        message: Some(summary),
+                        staged_version: None,
+                        available_version: None,
+                        prompt: None,
+                    },
+                    Err(error) => UpdateNote {
+                        message: Some(format!("companion fetch failed: {error:#}")),
+                        staged_version: None,
+                        available_version: Some(prompt.latest),
+                        prompt: None,
+                    },
+                }
+            };
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(note);
+            }
+        });
     }
 
     /// Show `message` as a failure: it is coloured in the footer and, for a
@@ -6127,6 +6208,17 @@ impl App {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {}
                 _ => self.modal = Some(Modal::LegacyFallback { target_id, detail }),
             },
+            Modal::UpdatePrompt(prompt) => match key.code {
+                #[cfg(feature = "controller")]
+                KeyCode::Char('y') | KeyCode::Enter => self.start_update_download(prompt),
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.set_background_status(format!(
+                        "muxloom {} available — run `muxloom update` when ready",
+                        prompt.latest
+                    ));
+                }
+                _ => self.modal = Some(Modal::UpdatePrompt(prompt)),
+            },
             Modal::Launch(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Tab | KeyCode::Down => {
@@ -8074,6 +8166,47 @@ mod tests {
             Some(false),
         );
         assert!(!app.sessions[0].working);
+    }
+
+    #[test]
+    fn a_startup_update_finding_opens_the_prompt_once_the_screen_is_free() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.modal = Some(Modal::Help(HelpForm::default()));
+        if let Ok(mut slot) = app.update_slot().lock() {
+            *slot = Some(UpdateNote {
+                message: None,
+                staged_version: None,
+                available_version: Some("9.9.9".into()),
+                prompt: Some(UpdatePrompt {
+                    latest: "9.9.9".into(),
+                    can_self_update: false,
+                }),
+            });
+        }
+        // An open form is not replaced by the prompt.
+        app.on_tick();
+        assert!(matches!(app.modal, Some(Modal::Help(_))));
+        assert_eq!(app.available_update.as_deref(), Some("9.9.9"));
+
+        app.modal = None;
+        if let Ok(mut slot) = app.update_slot().lock() {
+            *slot = Some(UpdateNote {
+                message: None,
+                staged_version: None,
+                available_version: None,
+                prompt: Some(UpdatePrompt {
+                    latest: "9.9.9".into(),
+                    can_self_update: false,
+                }),
+            });
+        }
+        app.on_tick();
+        assert!(matches!(app.modal, Some(Modal::UpdatePrompt(_))));
+
+        // Declining leaves a pointer at the manual path instead of silence.
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(app.status_message.contains("muxloom update"));
     }
 
     #[test]
