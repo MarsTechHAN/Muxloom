@@ -169,21 +169,49 @@ fn search_modal_never_panics() {
 #[test]
 fn settings_modal_never_panics() {
     for (w, h) in SIZES {
-        for selected in [0usize, 5, 9] {
-            let values: Vec<String> = muxloom::app::GLOBAL_SETTINGS
+        for (scope, rows) in [
+            (
+                muxloom::app::SettingsScope::Global,
+                &muxloom::app::GLOBAL_SETTINGS[..],
+            ),
+            (
+                muxloom::app::SettingsScope::Host("gpu".into()),
+                &muxloom::app::HOST_SETTINGS[..],
+            ),
+        ] {
+            let values: Vec<String> = rows
                 .iter()
                 .filter_map(|row| match row {
                     muxloom::app::SettingsRow::Field(label) => Some(format!("{label} value")),
-                    muxloom::app::SettingsRow::Section(_) => None,
+                    _ => None,
                 })
                 .collect();
-            let form = SettingsForm {
-                scope: muxloom::app::SettingsScope::Global,
-                selected: selected.min(values.len() - 1),
-                values,
-                error: Some("bad value".into()),
-            };
-            draw_with(Some(Modal::Settings(form)), *w, *h);
+            let notes: Vec<String> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    muxloom::app::SettingsRow::Note(label) => Some(format!("{label} note")),
+                    _ => None,
+                })
+                .collect();
+            let focusable = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row,
+                        muxloom::app::SettingsRow::Field(_) | muxloom::app::SettingsRow::Action(_)
+                    )
+                })
+                .count();
+            for selected in [0usize, 5, 9, focusable - 1] {
+                let form = SettingsForm {
+                    scope: scope.clone(),
+                    selected: selected.min(focusable - 1),
+                    values: values.clone(),
+                    notes: notes.clone(),
+                    error: Some("bad value".into()),
+                };
+                draw_with(Some(Modal::Settings(form)), *w, *h);
+            }
         }
     }
 }

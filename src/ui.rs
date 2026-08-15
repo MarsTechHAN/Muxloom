@@ -529,11 +529,11 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.animation_frame,
                 ),
             ];
-            if let Some(version) = app.daemon_lag_version(&status.target.id) {
-                spans.push(Span::styled(
-                    format!("  ⟳{version}"),
-                    Style::default().fg(Color::Yellow),
-                ));
+            // A lagging daemon gets a marker, not a version: the exact
+            // versions live in the machine's settings panel, next to the
+            // action that updates them.
+            if app.daemon_lag_version(&status.target.id).is_some() {
+                spans.push(Span::styled("  ⟳", Style::default().fg(Color::Yellow)));
             }
             Line::from(spans)
         } else {
@@ -1229,7 +1229,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     } else {
         match app.focus {
-            Focus::Machines => "  Space toggle  n new  u update daemon  / search  q quit  ? more",
+            Focus::Machines => "  Space toggle  n new  , settings  / search  q quit  ? more",
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
@@ -1244,15 +1244,16 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
         }
     };
-    // Machines whose running daemon lags this build get a bottom-right chip;
-    // narrow footers keep the keybindings instead.
+    // Machines whose running daemon lags this build get a bottom-right chip
+    // pointing at where the update lives; narrow footers keep the
+    // keybindings instead.
     let lagging = app.outdated_daemons();
     let chip = if lagging.is_empty() || area.width < 72 {
         String::new()
-    } else if let [(target_id, version)] = lagging.as_slice() {
-        format!(" ⟳ {target_id} daemon {version} ")
+    } else if let [(target_id, _)] = lagging.as_slice() {
+        format!(" ⟳ {target_id} daemon outdated — , to update ")
     } else {
-        format!(" ⟳ {} daemons outdated ", lagging.len())
+        format!(" ⟳ {} daemons outdated — , to update ", lagging.len())
     };
     let help_width = UnicodeWidthStr::width(help);
     let chip_width = UnicodeWidthStr::width(chip.as_str());
@@ -2884,7 +2885,6 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
-        help_row("u", "Force the ⟳ daemon update: archive, hand over, resume"),
         Line::raw(""),
         help_header("History And Search"),
         help_row("Wheel / PageUp", "Scroll one line / move one history page"),
@@ -2906,7 +2906,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         Line::raw(""),
         help_header("View And Configuration"),
         help_row("f", "Toggle grouped and flat agent views"),
-        help_row(",", "Edit configuration for the selected machine"),
+        help_row(
+            ",",
+            "Edit configuration for the selected machine; force its ⟳ daemon update",
+        ),
         help_row("Ctrl-,", "Edit global configuration defaults"),
         help_row("?", "Open or close this help"),
         help_row("q", "Quit the dashboard; leave agents running"),
@@ -3460,9 +3463,54 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     // then scroll so the selected field stays visible.
     let mut lines: Vec<(Option<usize>, Line)> = Vec::new();
     let mut field_index = 0usize;
+    let mut focus_index = 0usize;
+    let mut note_index = 0usize;
     let mut selected_row = 0usize;
     for row in form.rows() {
         match row {
+            SettingsRow::Note(label) => {
+                let value = form.notes.get(note_index).cloned().unwrap_or_default();
+                lines.push((
+                    None,
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {label:<width$}", width = label_width as usize - 2),
+                            Style::default().fg(Color::Gray),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            truncate(&value, value_width),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]),
+                ));
+                note_index += 1;
+            }
+            SettingsRow::Action(label) => {
+                let active = focus_index == form.selected;
+                if active {
+                    selected_row = lines.len();
+                }
+                lines.push((
+                    None,
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {label:<width$}", width = label_width as usize - 2),
+                            if active {
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::Gray)
+                            },
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            truncate("Enter: archive, hand over, resume", value_width),
+                            Style::default().fg(if active { Color::White } else { MUTED }),
+                        ),
+                    ]),
+                ));
+                focus_index += 1;
+            }
             SettingsRow::Section(title) => {
                 if !lines.is_empty() {
                     lines.push((None, Line::raw("")));
@@ -3477,7 +3525,7 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
             }
             SettingsRow::Field(label) => {
                 let value = form.values.get(field_index).cloned().unwrap_or_default();
-                let active = field_index == form.selected;
+                let active = focus_index == form.selected;
                 if active {
                     selected_row = lines.len();
                 }
@@ -3501,6 +3549,7 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
                     ]),
                 ));
                 field_index += 1;
+                focus_index += 1;
             }
         }
     }
@@ -3510,8 +3559,9 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
         lines.into_iter().skip(start).take(visible_rows).enumerate()
     {
         let row = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
-        if field == Some(form.selected)
-            && let Some(value) = form.values.get(form.selected)
+        if let Some(selected_value) = form.selected_value()
+            && field == Some(selected_value)
+            && let Some(value) = form.values.get(selected_value)
         {
             let shown = tail_display(value, value_width);
             cursor_position = Some((

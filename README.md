@@ -555,17 +555,20 @@ output that repaints the screen.
 framed protocol multiplexes request, PTY, file, media, and TCP-forward stream IDs
 over it, completing requests out of order with stream-credit backpressure and
 heartbeats; large payloads use LZ4 only when useful. Companion bootstrap compares SHA-256 fingerprints computed
-by the Rust binaries and ships a missing or stale binary atomically over the
-same SSH stdin. Daemon replacement is non-disruptive and does not wait for
+by the Rust binaries. A missing or stale companion is fetched by the target
+itself when the release serves exactly the bytes we would otherwise send —
+the controller passes the URL and the digest, the target verifies what landed
+against it — and is otherwise shipped atomically over the same SSH stdin. Daemon replacement is non-disruptive and does not wait for
 idle: running sessions ride their keepers across the generation change, and
 the next daemon adopts them with the same processes and transcripts. The
 footer shows a `⟳` chip while any machine's running daemon lags this build,
 and the controller quietly cycles such a machine's bridge (never while its
 terminal is attached) to complete the update. Pre-keeper sessions defer that
-handover indefinitely; pressing `u` on the marked machine forces it once —
-after an on-screen summary of what will happen, the controller archives the
-blocking sessions, completes the handover, and resumes every agent from its
-own transcript. Terminals cannot resume and are archived.
+handover indefinitely; the settings panel (`,`) reports the machine's running
+`muxloomd` version and carries a **Force update** action that breaks the
+deadlock once — after an on-screen summary of what will happen, the
+controller archives the blocking sessions, completes the handover, and resumes
+every agent from its own transcript. Terminals cannot resume and are archived.
 
 **Terminal rendering.** `vt100::Parser` maintains alternate-screen state,
 cursor, colors, styles, mouse mode, application cursor keys, bracketed paste,

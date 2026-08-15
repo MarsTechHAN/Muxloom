@@ -116,7 +116,8 @@ companion 拉进本地缓存；`"auto"` 恢复静默自动更新，`"never"` 跳
 不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。设置面板
 （`,` 机器级 / `Ctrl-,` 全局）按分组只展示常用项——刷新间隔、环境变量、各 agent 命令、
 更新提示；隧道、companion 覆盖、安装命令、sync files、attention patterns 等低频项仅在
-config.toml 中配置。
+config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行版本，并带一个
+**Force update** 动作，用来强制完成被旧会话拖住的 daemon 升级。
 
 <a id="zh-first-run"></a>
 

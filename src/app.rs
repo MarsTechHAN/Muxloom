@@ -376,7 +376,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 58;
+pub const HELP_CONTENT_ROWS: usize = 57;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -409,6 +409,8 @@ const RECOVERED_HISTORY_BYTES: usize = 512 * 1024;
 pub struct SettingsForm {
     pub scope: SettingsScope,
     pub values: Vec<String>,
+    /// Text for the read-only [`SettingsRow::Note`] rows, in row order.
+    pub notes: Vec<String>,
     pub selected: usize,
     pub error: Option<String>,
 }
@@ -431,13 +433,18 @@ pub struct SearchForm {
     pub edited_at: Instant,
 }
 
-/// One row of the settings form: a section heading, or the label of the
-/// next editable field. `values` in [`SettingsForm`] aligns with the fields
-/// in row order; sections are display-only.
+/// One row of the settings form. `values` in [`SettingsForm`] aligns with the
+/// `Field` rows in row order and `notes` with the `Note` rows; the selection
+/// walks fields and actions alike, so a one-shot operation reads as just
+/// another line of the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     Section(&'static str),
     Field(&'static str),
+    /// Read-only text the app fills in when the form opens.
+    Note(&'static str),
+    /// Runs when the selection is on it and Enter is pressed.
+    Action(&'static str),
 }
 
 /// The settings the dashboard edits. Everything else — tunnels, companion
@@ -461,7 +468,7 @@ pub const GLOBAL_SETTINGS: [SettingsRow; 15] = [
     SettingsRow::Field("Update prompt (ask/auto/never)"),
 ];
 
-pub const HOST_SETTINGS: [SettingsRow; 10] = [
+pub const HOST_SETTINGS: [SettingsRow; 13] = [
     SettingsRow::Section("Environment"),
     SettingsRow::Field("Environment (A=x B=y)"),
     SettingsRow::Section("Codex"),
@@ -472,7 +479,13 @@ pub const HOST_SETTINGS: [SettingsRow; 10] = [
     SettingsRow::Field("Args"),
     SettingsRow::Section("Terminal"),
     SettingsRow::Field("Command"),
+    SettingsRow::Section("Daemon"),
+    SettingsRow::Note("Version"),
+    SettingsRow::Action("Force update"),
 ];
+
+/// The action label the daemon row carries, matched when Enter fires.
+pub const FORCE_UPDATE_ACTION: &str = "Force update";
 
 impl SettingsForm {
     pub fn rows(&self) -> &'static [SettingsRow] {
@@ -488,9 +501,45 @@ impl SettingsForm {
             .iter()
             .filter_map(|row| match row {
                 SettingsRow::Field(label) => Some(*label),
-                SettingsRow::Section(_) => None,
+                _ => None,
             })
             .collect()
+    }
+
+    /// The rows the selection can land on, in display order.
+    fn focusable(&self) -> Vec<SettingsRow> {
+        self.rows()
+            .iter()
+            .copied()
+            .filter(|row| matches!(row, SettingsRow::Field(_) | SettingsRow::Action(_)))
+            .collect()
+    }
+
+    pub fn focus_len(&self) -> usize {
+        self.focusable().len()
+    }
+
+    /// Where the selected row's text lives in `values`, or `None` when the
+    /// selection is on an action — which has nothing to type into.
+    pub fn selected_value(&self) -> Option<usize> {
+        let mut fields = 0usize;
+        for (index, row) in self.focusable().into_iter().enumerate() {
+            match row {
+                SettingsRow::Field(_) if index == self.selected => return Some(fields),
+                SettingsRow::Field(_) => fields += 1,
+                _ if index == self.selected => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The action under the selection, when the selection is on one.
+    pub fn selected_action(&self) -> Option<&'static str> {
+        match self.focusable().get(self.selected) {
+            Some(SettingsRow::Action(label)) => Some(label),
+            _ => None,
+        }
     }
 }
 
@@ -1011,13 +1060,10 @@ impl App {
         }
     }
 
-    /// `u` on a machine whose daemon lags: show what the forced update would
-    /// do — archive, hand over, resume — and let the user pull the trigger.
-    fn force_update_selected_machine(&mut self) {
-        let Some(status) = self.targets.get(self.selected_target) else {
-            return;
-        };
-        let target_id = status.target.id.clone();
+    /// The Daemon section's action: show what the forced update would do —
+    /// archive, hand over, resume — and let the user pull the trigger.
+    fn force_update_machine(&mut self, target_id: &str) {
+        let target_id = target_id.to_string();
         if self.forced_updates.contains_key(&target_id) {
             self.set_background_status(format!("{target_id}: forced update already running"));
             return;
@@ -1520,10 +1566,6 @@ impl App {
             }
             KeyCode::Char(' ') if self.focus == Focus::Machines => {
                 self.toggle_target(self.selected_target);
-                Action::Continue
-            }
-            KeyCode::Char('u') if self.focus == Focus::Machines => {
-                self.force_update_selected_machine();
                 Action::Continue
             }
             KeyCode::Up => {
@@ -5424,9 +5466,23 @@ impl App {
                 self.config.agents.terminal.command.clone(),
                 self.config.update_prompt.clone(),
             ],
+            notes: Vec::new(),
             selected: 0,
             error: None,
         }));
+    }
+
+    /// What the Daemon section reports for a machine: the version actually
+    /// serving it, next to the build this controller would hand over to.
+    fn daemon_version_note(&self, target_id: &str) -> String {
+        let build = env!("CARGO_PKG_VERSION");
+        match self.worker.bridges.daemon_version(target_id) {
+            Some(running) if crate::model::version_is_newer(build, &running) => {
+                format!("muxloomd {running} running · {build} available")
+            }
+            Some(running) => format!("muxloomd {running} running · current"),
+            None => "not connected".to_string(),
+        }
     }
 
     fn open_machine_settings(&mut self) {
@@ -5468,6 +5524,7 @@ impl App {
                 format_shell_list(&claude.args),
                 terminal.command,
             ],
+            notes: vec![self.daemon_version_note(&target_id)],
             selected: 0,
             error: None,
         }));
@@ -6344,28 +6401,39 @@ impl App {
             Modal::Settings(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Tab | KeyCode::Down => {
-                    form.selected = clamped_index(form.selected, form.values.len(), 1);
+                    form.selected = clamped_index(form.selected, form.focus_len(), 1);
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    form.selected = clamped_index(form.selected, form.values.len(), -1);
+                    form.selected = clamped_index(form.selected, form.focus_len(), -1);
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
+                // Enter on an action runs it and leaves the panel; on a field
+                // it saves, as it always has.
                 KeyCode::Enter | KeyCode::Char('s')
                     if key.code == KeyCode::Enter
                         || key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    self.apply_settings(form);
+                    match (form.selected_action(), form.scope.clone()) {
+                        (Some(FORCE_UPDATE_ACTION), SettingsScope::Host(target_id)) => {
+                            self.force_update_machine(&target_id);
+                        }
+                        _ => self.apply_settings(form),
+                    }
                 }
                 KeyCode::Backspace => {
-                    form.values[form.selected].pop();
+                    if let Some(index) = form.selected_value() {
+                        form.values[index].pop();
+                    }
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    form.values[form.selected].clear();
+                    if let Some(index) = form.selected_value() {
+                        form.values[index].clear();
+                    }
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
@@ -6374,7 +6442,9 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    form.values[form.selected].push(character);
+                    if let Some(index) = form.selected_value() {
+                        form.values[index].push(character);
+                    }
                     form.error = None;
                     self.modal = Some(Modal::Settings(form));
                 }
@@ -8748,9 +8818,44 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_panel_carries_the_daemon_version_and_the_force_update_action() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.focus = Focus::Machines;
+        app.handle_key(KeyEvent::from(KeyCode::Char(',')));
+        let Some(Modal::Settings(form)) = app.modal.clone() else {
+            panic!(", did not open the machine settings");
+        };
+        assert!(matches!(form.scope, SettingsScope::Host(ref id) if id == "local"));
+        // The version the bar no longer shows lives here instead.
+        assert_eq!(form.notes.len(), 1);
+        assert!(form.notes[0].contains("muxloomd") || form.notes[0] == "not connected");
+
+        // Walking to the bottom of the panel lands on the action, and Enter
+        // opens the confirmation the `u` shortcut used to.
+        for _ in 0..form.focus_len() {
+            app.handle_key(KeyEvent::from(KeyCode::Down));
+        }
+        let Some(Modal::Settings(form)) = app.modal.clone() else {
+            panic!("navigation closed the settings");
+        };
+        assert_eq!(form.selected_action(), Some(FORCE_UPDATE_ACTION));
+        assert_eq!(form.selected_value(), None);
+        // Enter runs the action rather than saving the form. With no bridge
+        // behind this test machine it lands on the "nothing to update" answer,
+        // which is the one the `u` shortcut used to give.
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            app.status_message.contains("already current"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
     fn a_forced_update_is_a_one_shot_action_never_an_ambient_state() {
         // A lagging cycle result on its own opens nothing and starts
-        // nothing: the marker stays up and `u` is the only trigger.
+        // nothing: the marker stays up, and the settings panel's action is
+        // the only trigger.
         let mut app = ux_test_app(vec![Target::local()]);
         app.handle_worker_event(Event::DaemonRefreshed {
             target_id: "local".into(),
