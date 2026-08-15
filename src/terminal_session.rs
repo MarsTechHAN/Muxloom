@@ -714,6 +714,13 @@ pub(crate) fn render_scrollback_seed(
         return Ok(Vec::new());
     }
     let (mut parser, inline) = replay_history(stream, columns, rows, keep)?;
+    if parser.screen().alternate_screen() {
+        // vt100 only reaches the scrollback of the grid it is showing, and a
+        // full-screen app is drawn on one that has none. Step off it so the
+        // history underneath is what gets seeded; the client's own replay of
+        // the newest raw output repaints the app over it.
+        parser.process(b"\x1b[?1049l");
+    }
     let (cursor_row, cursor_column) = parser.screen().cursor_position();
     let input_modes = parser.screen().input_mode_formatted();
     // Growing the screen below resizes its rows, and vt100 drops a row's wrap
@@ -797,13 +804,26 @@ fn replay_history(
             Err(error) => return Err(error).context("failed to read session history"),
         }
     }
-    if parser.screen().alternate_screen() {
-        // vt100 only reaches the scrollback of the grid it is showing, and a
-        // full-screen app is drawn on one that has none. Step off it so the
-        // history underneath can be rendered; the replay repaints the app.
-        parser.process(b"\x1b[?1049l");
-    }
     Ok((parser, inline))
+}
+
+/// Read back every row a replayed emulator holds — its scrollback and its
+/// screen — as the rows a terminal would have shown.
+#[cfg(any(unix, test))]
+fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<Vec<u8>> {
+    parser.set_scrollback(usize::MAX);
+    let depth = parser.screen().scrollback();
+    // vt100 0.15 reads rows past the first screenful of scrollback through a
+    // subtraction that underflows, so grow the screen to span the buffer and
+    // the screen at once before asking for them. The emulator is discarded by
+    // the caller, and rows that already scrolled off are never reflowed by a
+    // resize.
+    let tall = u16::try_from(depth)
+        .unwrap_or(u16::MAX)
+        .saturating_add(rows);
+    parser.set_size(tall, columns);
+    parser.set_scrollback(depth);
+    parser.screen().rows_formatted(0, columns).collect()
 }
 
 /// Render `stream` — the tail of a session's raw output — into the rows a
@@ -836,33 +856,35 @@ pub(crate) fn render_history_rows(
         rows,
         offset_from_bottom.saturating_add(wanted),
     )?;
-    parser.set_scrollback(usize::MAX);
-    let depth = parser.screen().scrollback();
-    let total = depth.saturating_add(usize::from(rows));
-    let actual_offset = offset_from_bottom.min(depth);
-    // Same reach-past-the-first-screenful trick as the scrollback seed: grow
-    // the screen to span the buffer so vt100 0.15 can be asked for every row at
-    // once. The emulator is discarded here, and rows that already scrolled off
-    // are never reflowed by a resize.
-    let tall = u16::try_from(depth)
-        .unwrap_or(u16::MAX)
-        .saturating_add(rows);
-    parser.set_size(tall, columns);
-    parser.set_scrollback(depth);
-    let deep = parser.screen();
+    // An agent that draws on the alternate screen — Claude Code does, and its
+    // whole session lives there — leaves the primary grid holding only what ran
+    // before it opened. Its screen *is* the newest history, so read it off
+    // first and step off afterwards to reach what scrolled by underneath;
+    // rendering the primary alone hands back a screenful of blanks.
+    let rendered = if parser.screen().alternate_screen() {
+        let application: Vec<Vec<u8>> = parser.screen().rows_formatted(0, columns).collect();
+        parser.process(b"\x1b[?1049l");
+        let mut history = buffered_rows(&mut parser, columns, rows);
+        // The primary screen was left mid-page when the app opened, so drop the
+        // blanks below it rather than pushing the app down by a screenful.
+        while history.last().is_some_and(|row| row.is_empty()) {
+            history.pop();
+        }
+        history.extend(application);
+        history
+    } else {
+        buffered_rows(&mut parser, columns, rows)
+    };
+    let total = rendered.len();
+    let actual_offset = offset_from_bottom.min(total.saturating_sub(usize::from(rows)));
     let end = total - actual_offset;
     let start = end.saturating_sub(wanted);
     let mut page = Vec::new();
-    for (index, row) in deep
-        .rows_formatted(0, columns)
-        .take(end)
-        .enumerate()
-        .skip(start)
-    {
+    for (index, row) in rendered.iter().take(end).enumerate().skip(start) {
         if index > start {
             page.push(b'\n');
         }
-        page.extend_from_slice(&row);
+        page.extend_from_slice(row);
         // Every row is rendered as if the terminal started it with default
         // attributes, so leave it that way for the next one.
         page.extend_from_slice(b"\x1b[m");
@@ -1136,6 +1158,50 @@ fn function_sequence(number: u8, modifier: u8) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code opens the alternate screen on its first byte and never
+    /// leaves it, so a render that steps off to reach the history underneath
+    /// hands back the empty grid the agent never drew on.
+    #[test]
+    fn history_renders_the_screen_an_agent_drew_on_the_alternate_screen() {
+        let mut log = b"$ claude\r\n".to_vec();
+        log.extend_from_slice(b"\x1b[?1049h\x1b[H");
+        log.extend_from_slice(b"Do you want to create hello.txt?\r\n");
+        log.extend_from_slice(b" 1. Yes\r\n 2. No");
+
+        let (page, total, offset) = render_history_rows(&log[..], 40, 6, 0, 6).unwrap();
+        let newest = String::from_utf8_lossy(&page).into_owned();
+        assert!(
+            newest.contains("Do you want to create hello.txt?"),
+            "{newest}"
+        );
+        assert!(newest.contains("2. No"), "{newest}");
+        assert_eq!(offset, 0);
+        // The screen the agent drew, plus the shell line it opened over.
+        assert_eq!(total, 7);
+
+        // That line stays reachable above the agent's screen rather than being
+        // buried under the screenful of blanks the alternate screen replaced.
+        let (page, _, offset) = render_history_rows(&log[..], 40, 6, 1, 6).unwrap();
+        let older = String::from_utf8_lossy(&page).into_owned();
+        assert_eq!(offset, 1);
+        assert!(older.contains("$ claude"), "{older}");
+    }
+
+    /// An agent that closes the alternate screen leaves the shell's own
+    /// scrollback showing, which is what has to come back then.
+    #[test]
+    fn history_renders_what_is_left_after_an_agent_closes_the_alternate_screen() {
+        let mut log = b"$ claude\r\n".to_vec();
+        log.extend_from_slice(b"\x1b[?1049h\x1b[Hagent screen\x1b[?1049l");
+        log.extend_from_slice(b"$ echo done\r\ndone\r\n");
+
+        let (page, _, _) = render_history_rows(&log[..], 40, 6, 0, 6).unwrap();
+        let text = String::from_utf8_lossy(&page).into_owned();
+        assert!(text.contains("$ echo done"), "{text}");
+        assert!(text.contains("done"), "{text}");
+        assert!(!text.contains("agent screen"), "{text}");
+    }
 
     #[test]
     fn codex_title_spinner_tracks_activity_across_split_osc_sequences() {
