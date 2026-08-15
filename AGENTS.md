@@ -81,6 +81,13 @@ preserve.
   by name or otherwise.
 - MCP transports own stdout. Nothing but protocol messages may be printed
   while a surface is being served; diagnostics go to the debug log.
+- A starting daemon registers its own MCP surface in the agent configuration of
+  the user it runs as. It owns exactly the `muxloom` entry, rewrites it only
+  when missing or stale, leaves a file it cannot parse untouched, and honours an
+  explicit opt-out from the environment.
+- Screens handed to an adapter are plain text: styling and cursor control are
+  stripped while column positions survive as spaces, so a rendered menu stays
+  readable as one.
 
 ## Terminal correctness
 

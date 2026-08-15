@@ -461,12 +461,18 @@ Protocol's stdio transport:
   short-lived connection to the local `muxloomd` socket (starting the daemon
   if needed), so a connected MCP client never delays daemon upgrades.
 
-Register with Claude Code:
+**Registration is automatic.** Every `muxloomd` that starts — the local one and
+the companion on each remote — writes itself into that user's `~/.claude.json`
+and `~/.codex/config.toml` as an MCP server named `muxloom`, so an agent running
+on a machine can see and drive the sessions on it without any setup. Only that
+one entry is written, only when it is missing or points somewhere stale, and a
+file it cannot parse is left untouched. Set `MUXLOOM_MCP_REGISTER=0` in the
+daemon's environment to turn it off.
+
+To register the multi-machine controller surface by hand:
 
 ```bash
 claude mcp add muxloom -- muxloom mcp
-# or, for the machine-local daemon surface:
-claude mcp add muxloomd -- muxloomd mcp
 ```
 
 Codex (`~/.codex/config.toml`):
@@ -480,7 +486,10 @@ args = ["mcp"]
 Typical loop for an agent driving another agent: `list_sessions` (or
 `launch_session`), `send_input` with `submit: true` to hand it a prompt, then
 poll `list_sessions` until `working` clears — `needs_attention` carries the
-matched approval prompt — and `read_screen` to read the outcome.
+matched approval prompt — and `read_screen` to read the outcome. Screens come
+back as plain text: colors, cursor moves, and title sequences are stripped,
+while the column an escape sequence skipped to is preserved as spaces, so a
+menu still reads as a menu.
 
 Sessions launched over MCP are ordinary managed sessions: they appear in the
 dashboard, survive the MCP client exiting, and are archived or deleted like

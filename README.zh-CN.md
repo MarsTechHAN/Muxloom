@@ -273,12 +273,16 @@ Installer 需要目标直连或通过 Reverse Tunnel 访问网络。`sync_files`
   Agent。每次调用都用一条短连接访问本机 `muxloomd` socket（daemon 未运行时会自动拉起），
   因此挂着的 MCP 客户端不会推迟 daemon 升级。
 
-在 Claude Code 中注册：
+**注册是自动的。** 每个启动的 `muxloomd`——本机的和各远端的 companion——都会把自己以
+`muxloom` 为名写进该用户的 `~/.claude.json` 和 `~/.codex/config.toml`，所以跑在某台机器上
+的 agent 无需任何配置就能看到并驱动这台机器上的会话。只写这一条目，且只在缺失或指向过期
+路径时才写，解析不了的文件原样保留。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以
+关闭。
+
+手工注册跨机器的 Controller 面：
 
 ```bash
 claude mcp add muxloom -- muxloom mcp
-# 或在承载会话的机器上使用 daemon 面：
-claude mcp add muxloomd -- muxloomd mcp
 ```
 
 Codex（`~/.codex/config.toml`）：
@@ -291,7 +295,8 @@ args = ["mcp"]
 
 Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）→ `send_input` 带
 `submit: true` 提交 Prompt → 轮询 `list_sessions` 等 `working` 结束（`needs_attention`
-会带上命中的审批提示）→ `read_screen` 读取结果。
+会带上命中的审批提示）→ `read_screen` 读取结果。屏幕以纯文本返回：颜色、光标移动和标题
+序列被剥掉，而转义序列跳到的列会补成空格，因此菜单读起来仍然是菜单。
 
 通过 MCP 启动的会话就是普通托管会话：会出现在 Dashboard 中、在 MCP 客户端退出后继续运
 行，也要像其他会话一样归档或删除。未启用的机器不会被触碰——指向它的调用会被拒绝。

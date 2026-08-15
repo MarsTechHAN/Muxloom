@@ -41,6 +41,8 @@ pub trait ControlSurface {
 
 /// How many rendered rows a screen read returns when the caller does not say.
 const DEFAULT_SCREEN_LINES: usize = 200;
+/// A cursor jump wider than any terminal is a corrupt row, not indentation.
+const SCREEN_COLUMNS_LIMIT: usize = 1_000;
 /// Per-session match budget for history searches, matching the daemon's cap.
 const SEARCH_MAX_MATCHES: usize = 12;
 /// The most bytes of one shell stream a tool answer carries.
@@ -393,9 +395,74 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
 }
 
 fn screen_page(text: &str, offset_from_bottom: usize, rows: usize, older: bool) -> String {
+    let text = plain_screen(text);
     format!(
         "{text}\n\n[rows={rows} offset_from_bottom={offset_from_bottom} older_history_above={older}]"
     )
+}
+
+/// Flatten rendered rows into the text a terminal would have shown.
+///
+/// A row comes back as the bytes a terminal would be sent to paint it, and a
+/// reader of this tool wants the screen rather than the paint: colours are
+/// noise, and a run of blanks arrives as a jump over them, so dropping the
+/// escapes outright would close up the columns an agent aligned its output on.
+fn plain_screen(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut plain: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte != 0x1b {
+            plain.push(byte);
+            index += 1;
+            continue;
+        }
+        match bytes.get(index + 1) {
+            Some(b'[') => {
+                let mut end = index + 2;
+                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                    end += 1;
+                }
+                let Some(final_byte) = bytes.get(end) else {
+                    break;
+                };
+                if *final_byte == b'C' {
+                    // Cursor-forward: the blanks the renderer skipped over.
+                    let count: usize = std::str::from_utf8(&bytes[index + 2..end])
+                        .ok()
+                        .and_then(|parameters| parameters.parse().ok())
+                        .unwrap_or(1);
+                    plain.resize(plain.len() + count.min(SCREEN_COLUMNS_LIMIT), b' ');
+                }
+                index = end + 1;
+            }
+            // OSC and the other string sequences run until BEL or ST.
+            Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+                let mut end = index + 2;
+                while end < bytes.len() {
+                    if bytes[end] == 0x07 {
+                        end += 1;
+                        break;
+                    }
+                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
+                        end += 2;
+                        break;
+                    }
+                    end += 1;
+                }
+                index = end;
+            }
+            Some(_) => index += 2,
+            None => break,
+        }
+    }
+    let plain = String::from_utf8_lossy(&plain);
+    let mut lines: Vec<&str> = plain.lines().map(str::trim_end).collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 fn preview_text(preview: &FilePreview) -> String {
@@ -1111,6 +1178,20 @@ mod tests {
         assert_eq!(bytes, b"ls\t\x01\r");
         assert!(build_input(&json!({})).is_err());
         assert_eq!(build_input(&json!({"submit": true})).unwrap(), b"\r");
+    }
+
+    #[test]
+    fn a_screen_reads_back_as_text_with_its_columns_intact() {
+        // A row as the renderer writes it: colour, a jump over blanks that
+        // stands in for indentation, and a title nobody reading wants.
+        let page = screen_page(
+            "\x1b[1;32m❯ 1. Yes\x1b[m\n\x1b[m\x1b]0;claude\x07 2.\x1b[3CNo   \n\n",
+            0,
+            40,
+            false,
+        );
+        let (text, _) = page.split_once("\n\n[rows=").unwrap();
+        assert_eq!(text, "❯ 1. Yes\n 2.   No");
     }
 
     #[test]

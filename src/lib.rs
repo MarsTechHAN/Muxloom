@@ -12,6 +12,7 @@ pub mod http;
 #[cfg(unix)]
 pub mod keeper;
 pub mod mcp;
+pub mod mcp_register;
 pub mod media;
 pub mod model;
 pub mod port_forward;
