@@ -165,7 +165,8 @@ Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 A
 
 选中的侧栏会自动变宽。横屏的 Machine/Agent 宽度、竖屏的 Terminal 高度和下方分割点
 分别记录。终端尺寸过小时使用按 Focus 展示的 Compact 模式；Terminal 可以占满内容区域，
-通过组合键或 Back 返回。
+通过组合键或 Back 返回。Grouped 模式下每个目录标题会整行铺一条深色底纹，不用数缩进
+就能看清一个文件夹到哪里结束、下一个从哪里开始。
 
 会话状态：
 
@@ -198,7 +199,7 @@ Claude 使用橙色 sparkle（`✻✽✶✳`），均按墙钟时间推进。Fol
 | `Alt-1` / `Alt-2` / `Alt-3` | 跳到 Machines / Agents / Terminal |
 | `Space`（Machines） | 启用或禁用机器 |
 | `n` / `Ctrl-n` | 在当前机器进入 New/Resume 流程 |
-| `t`（Agents） | 选择 Codex 或 Claude，在当前目录启动无历史的 Temporal Chat |
+| `t`（Agents） | 选择 Codex 或 Claude，在当前目录启动无历史的 Temporal Chat，可选填别名 |
 | `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
@@ -335,9 +336,10 @@ Archived 条目，按 `Space` 可选择保留，该选择会持久记忆；启�
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
 在 Agents 面板按 `t` 会先选择 Codex 或 Claude，再启动 `Temporal Chat`。目录依次取当前选中
-Agent 的目录、该机器上次启动目录、目标用户 Home；该会话不写 Muxloom ANSI History，也不
-进入搜索或备份；Codex 还会用单次配置关闭 Transcript 持久化。按 `x` 会直接停止并删除，
-不进入 Archived。
+Agent 的目录、该机器上次启动目录、目标用户 Home；同一个表单里可以填一个别名区分多个临时
+会话，留空则统一叫 Temporal Chat。该会话不写 Muxloom ANSI History，也不进入搜索或备份；
+Codex 还会用单次配置关闭 Transcript 持久化。按 `x` 会直接停止并删除，不进入 Archived。
+临时会话永远排在会话列表最顶端、所有文件夹之上——几秒前刚开的草稿窗口就是你要找的那个。
 
 在 Agents by folder 按 `p` 可把所选机器上的服务转发到 Controller 的 Loopback。填写远端
 Host/Port 与本地 Port（`0` 表示自动分配），之后访问 `127.0.0.1:LOCAL_PORT`。Linux companion
@@ -346,7 +348,8 @@ Host/Port 与本地 Port（`0` 表示自动分配），之后访问 `127.0.0.1:L
 不会停止远端服务或 Agent。本地 Listener 只在当前 Muxloom Controller 进程期间存在。
 
 提醒只检查当前屏幕底部物理行。Attached 和 legacy-inspected Session 会组合内置审批布局与
-每机器 Pattern；后台 daemon snapshot 当前只使用内置布局。新提醒会把整个 Agent 条目显示为
+每机器 Pattern；每机器的 `attention_patterns` 现在也会下发给 daemon，由它按自身刷新节奏
+应用到后台 snapshot。新提醒会把整个 Agent 条目显示为
 黄色加粗，并显示可点击 Banner、Waiting 状态、Bell 和 OSC 9，对同一个 Prompt 去重。进入会话即消除它的 Banner——会话
 列表仍然显示 Waiting，直到 Agent 不再询问——之后的新 Prompt 会重新提醒。Attached
 Terminal 直接从实时帧更新 Working/Waiting，Codex 还读取持续变化的 OSC 标题 spinner，
@@ -416,8 +419,9 @@ Ratatui 绘制；文件、搜索、Probe 和 Runtime 操作通过强类型 Reque
 断线，大数据只在值得时使用 LZ4。daemon Bridge 的 Reverse Tunnel 作为同一 SSH 进程的
 `-R` 参数；legacy 和 staging 兼容路径仍可能使用 ControlMaster 或 `scp`。
 
-Bootstrap 由 Rust binary 自己计算 SHA-256 Fingerprint。缺失或过期 companion 通过同一
-SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标有 tmux，可以进入明确
+Bootstrap 由 Rust binary 自己计算 SHA-256 Fingerprint。缺失或过期的 companion，只要发布
+提供的正是我们本来要推的那份字节，就由目标自己去取——Controller 把 URL 和摘要交给它，
+它校验落地内容——否则仍通过同一条 SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标有 tmux，可以进入明确
 标记且必须确认的兼容回退。
 
 每个会话由一个极小的 **keeper** 进程持有：只负责 PTY、子进程和原始历史追加，协议永久
@@ -426,8 +430,9 @@ SSH stdin 原子安装。如果 daemon provisioning 或 launch 失败且目标�
 daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
 运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
 终端未 attach 时自动重连完成升级。pre-keeper 旧会话会无限期推迟接管；在 Machines 面板
-选中该机按 `u` 可一次性强制更新——先弹窗列出将被打断的 working agent 与将被终结的终端
-（终端无法恢复），确认后归档、完成接管、再从各 agent 自身的转录自动 resume。History
+选中该机按 `,` 打开设置面板，其中会显示该机 `muxloomd` 的运行版本，并提供 **Force update**
+动作一次性强制更新——先弹窗列出将被打断的 working agent 与将被终结的终端（终端无法恢复），
+确认后归档、完成接管、再从各 agent 自身的转录自动 resume。History
 和 Metadata 始终保留在状态目录。
 
 Terminal 字节由 `vt100::Parser` 维护 Alternate Screen、光标、颜色、样式、Mouse Mode、

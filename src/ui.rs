@@ -32,6 +32,8 @@ const CODEX: Color = Color::Cyan;
 const CLAUDE: Color = Color::Rgb(215, 119, 87);
 const TERMINAL: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
+/// The stripe behind a folder row, so the folders read as separate blocks.
+const GROUP_BAND: Color = Color::Rgb(42, 48, 58);
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static SYNTAX_THEME: LazyLock<Theme> = LazyLock::new(|| {
     let themes = ThemeSet::load_defaults();
@@ -642,7 +644,9 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 truncate(&group, area.width.saturating_sub(4) as usize),
                 Style::default().fg(colour).add_modifier(Modifier::BOLD),
             )];
-            items.push(ListItem::new(Line::from(spans)));
+            // A band across the whole row is what separates one folder's agents
+            // from the next; the rows between them carry no background.
+            items.push(ListItem::new(Line::from(spans)).style(Style::default().bg(GROUP_BAND)));
             row_ids.push((None, 1));
             previous_group = group;
         }
@@ -3741,7 +3745,7 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
 }
 
 fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, outer: Rect) {
-    let area = centered_rect(62, 9, outer);
+    let area = centered_rect(62, 11, outer);
     frame.render_widget(Clear, area);
     let block = panel(" Temporal Chat ", true);
     let inner = block.inner(area);
@@ -3754,6 +3758,7 @@ fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, o
         .constraints([
             Constraint::Length(1),
             Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
@@ -3769,13 +3774,33 @@ fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, o
         ])),
         rows[1],
     );
+    let mut name = vec![
+        Span::styled("Name: ", Style::default().fg(MUTED)),
+        Span::styled(
+            truncate(&form.label, inner.width.saturating_sub(8) as usize),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("█", Style::default().fg(ACCENT)),
+    ];
+    if form.label.trim().is_empty() {
+        name.push(Span::styled(
+            format!("  {}", crate::app::TemporalForm::DEFAULT_LABEL),
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(name)), rows[2]);
     frame.render_widget(
-        Paragraph::new(format!("Folder: {}", form.path)).style(Style::default().fg(Color::Gray)),
-        rows[2],
+        Paragraph::new(format!(
+            "Folder: {}",
+            truncate(&form.path, inner.width.saturating_sub(8) as usize)
+        ))
+        .style(Style::default().fg(Color::Gray)),
+        rows[3],
     );
     frame.render_widget(
-        Paragraph::new("Enter start    Esc cancel").style(Style::default().fg(MUTED)),
-        rows[4],
+        Paragraph::new("Enter start    Ctrl-u clear    Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        rows[5],
     );
 }
 

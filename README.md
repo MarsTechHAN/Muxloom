@@ -114,9 +114,12 @@ with the source history file referenced in its initial prompt.
 
 From the Agents pane, `t` opens a Codex/Claude chooser for a **Temporal Chat** in
 the selected agent's folder, then the machine's last launch folder, then that
-user's home folder. Temporal Chat stores no Muxloom ANSI history and is excluded
-from search and backup; Codex also runs with transcript persistence disabled.
-`x` destroys it instead of archiving it.
+user's home folder. Type a name in the same form to tell several of them apart;
+left blank they are all called Temporal Chat. Temporal Chat stores no Muxloom
+ANSI history and is excluded from search and backup; Codex also runs with
+transcript persistence disabled. `x` destroys it instead of archiving it. They
+sit at the very top of the session list, above every folder, because a scratch
+chat you opened seconds ago is the one you are looking for.
 
 Press `p` in Agents by folder to forward a service on the selected machine to
 controller loopback. Set the remote host/port and local port (`0` allocates one),
@@ -133,7 +136,9 @@ Panes follow the rendered geometry: landscape places navigation beside the
 terminal, portrait stacks the terminal above the sidebars, and a compact mode
 focuses a single pane on small screens. Focus moves with the platform modifier
 plus an arrow, and the session pane toggles between folder groups and a flat
-list.
+list. In the grouped view each folder heading is drawn as a shaded band across
+the full width, so where one folder ends and the next begins is visible without
+counting indentation.
 
 **Keys** — `Alt`+arrow (macOS `Cmd`/`Option`+arrow) move focus · `Alt-1/2/3`
 jump to a pane · `f` grouped/flat · drag any divider to resize.
@@ -320,18 +325,17 @@ the full categorized help inside the TUI.
 | `Up` / `Down`, `j` / `k` | Move the current selection |
 | `Space` in Machines | Enable or disable a target; mouse double-click must land on `[x]` |
 | `n`, `Ctrl-n` | Start the New/Resume flow on the selected target |
-| `t` in Agents | Choose Codex or Claude for a no-history Temporal Chat |
+| `t` in Agents | Choose Codex or Claude for a no-history Temporal Chat, and optionally name it |
 | `p` in Agents | Configure local port forwarding for the selected machine |
 | `Enter` | Open the selected terminal or confirm the current form |
 | `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
 | `Ctrl-f` | Open or close Files in the current context |
-| `,` / `Ctrl-,` | Edit the selected machine's / global configuration |
+| `,` / `Ctrl-,` | Edit the selected machine's / global configuration; read its `muxloomd` version and force a `⟳` daemon update |
 | `f` | Toggle grouped and flat session views |
 | `v`, `Ctrl-h` | Hide disabled machines or show all |
 | `r`, `Ctrl-r` | Refresh enabled targets |
-| `u` in Machines | Force a `⟳`-marked daemon update: archive, hand over, resume |
 | `?` / `q` | Open help / exit without stopping managed sessions |
 
 Focus shortcuts follow the rendered geometry; unmodified arrows stay available

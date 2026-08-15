@@ -124,6 +124,9 @@ preserve.
   output; a stale screen over a quiet PTY must read as idle. Attention
   outranks working, and controller-configured attention patterns are sunk
   into the daemon so both classifiers agree.
+- The grouped session view must separate one folder from the next visually, not
+  only by indentation, and temporal sessions sort above every folder so the
+  scratch chat just opened is the first thing on screen.
 - File-browser input is modal: while it is focused, application shortcuts must
   not leak into the machine or agent views.
 - Tag asynchronous directory and preview results with their request identity.

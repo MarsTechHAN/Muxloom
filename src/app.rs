@@ -62,6 +62,21 @@ pub struct TemporalForm {
     pub target: Target,
     pub kind: AgentKind,
     pub path: String,
+    /// What to call this chat. Blank keeps the default name.
+    pub label: String,
+}
+
+impl TemporalForm {
+    pub const DEFAULT_LABEL: &'static str = "Temporal Chat";
+
+    pub fn label(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() {
+            Self::DEFAULT_LABEL
+        } else {
+            label
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2274,6 +2289,11 @@ impl App {
         sessions.sort_by(|left, right| {
             left.dead
                 .cmp(&right.dead)
+                // A Temporal Chat is the scratch pad you reach for right now,
+                // not one folder among many, so it stays above them all.
+                .then_with(|| {
+                    is_temporary_session_id(&right.id).cmp(&is_temporary_session_id(&left.id))
+                })
                 .then_with(|| left.target_id.cmp(&right.target_id))
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| right.created_at.cmp(&left.created_at))
@@ -5260,23 +5280,25 @@ impl App {
             target,
             kind: AgentKind::Codex,
             path,
+            label: String::new(),
         }));
     }
 
     fn launch_temporary_agent(&mut self, form: TemporalForm) {
+        let label = form.label().to_string();
         self.confirm_or_submit_launch(
             LaunchForm {
                 target: form.target,
                 kind: form.kind,
                 path: form.path,
-                label: "Temporal Chat".into(),
+                label: label.clone(),
                 temporary: true,
                 field: LaunchField::Kind,
             },
             None,
             None,
         );
-        self.status_message = "Starting Temporal Chat...".into();
+        self.status_message = format!("Starting {label}...");
     }
 
     fn open_port_forward(&mut self) {
@@ -6788,21 +6810,31 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Launch(form)),
             },
+            // Every printable key names the chat, so the runtime moved off the
+            // letters it used to answer to and onto the arrows alone.
             Modal::Temporal(mut form) => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                     form.kind = match form.kind {
                         AgentKind::Codex => AgentKind::Claude,
                         AgentKind::Claude | AgentKind::Terminal => AgentKind::Codex,
                     };
                     self.modal = Some(Modal::Temporal(form));
                 }
-                KeyCode::Char('c') => {
-                    form.kind = AgentKind::Codex;
+                KeyCode::Backspace => {
+                    form.label.pop();
                     self.modal = Some(Modal::Temporal(form));
                 }
-                KeyCode::Char('l') => {
-                    form.kind = AgentKind::Claude;
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.label.clear();
+                    self.modal = Some(Modal::Temporal(form));
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    form.label.push(character);
                     self.modal = Some(Modal::Temporal(form));
                 }
                 KeyCode::Enter => self.launch_temporary_agent(form),
@@ -11889,6 +11921,27 @@ mod tests {
             panic!("Temporal Chat did not fall back to the user folder");
         };
         assert_eq!(request.path, app.user_folder(&Target::local()));
+
+        // Typing names the chat rather than picking a runtime.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        for character in "clip notes".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Temporal(TemporalForm {
+                kind: AgentKind::Codex,
+                ref label,
+                ..
+            })) if label == "clip note"
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Request::Launch { request, .. } = receive_request(&request_rx) else {
+            panic!("a named Temporal Chat did not launch");
+        };
+        assert_eq!(request.label, "clip note");
+        assert!(request.temporary);
 
         app.sessions.push(AgentSession {
             id: "muxloomd-temporal-codex-test".into(),
