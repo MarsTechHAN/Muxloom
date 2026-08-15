@@ -45,6 +45,10 @@ pub struct BridgeOptions {
     pub reverse_tunnel: String,
     pub bootstrap_binary: String,
     pub download_environment: Vec<(String, String)>,
+    /// The host's configured environment as the host itself sees it, for the
+    /// work a target does on its own behalf — pulling its companion down from
+    /// the release rather than waiting for us to push it.
+    pub remote_environment: Vec<(String, String)>,
     /// Attention patterns sunk into the daemon right after the handshake, so
     /// waiting states surface at its refresh cadence rather than the
     /// controller's full scans.
@@ -59,6 +63,7 @@ impl Default for BridgeOptions {
             reverse_tunnel: String::new(),
             bootstrap_binary: String::new(),
             download_environment: Vec::new(),
+            remote_environment: Vec::new(),
             attention_patterns: Vec::new(),
         }
     }
@@ -388,7 +393,7 @@ impl BridgeConnection {
                 options.reverse_tunnel.trim(),
             ]);
         }
-        let bootstrap = remote_bootstrap_script(&options.command);
+        let bootstrap = remote_bootstrap_script(&options.command, &options.remote_environment);
         command
             .arg(alias)
             .arg(format!("sh -c {}", shell_quote(&bootstrap)))
@@ -1056,7 +1061,33 @@ fn local_companion_command() -> String {
 
 const BOOTSTRAP_MARKER: &str = "__MUXLOOM_BOOTSTRAP__";
 
-fn remote_bootstrap_script(configured_command: &str) -> String {
+/// The environment a target reaches the release through, as `export` lines for
+/// the bootstrap's pull step. This is the host's own configuration, unmapped:
+/// a proxy the operator pointed at `127.0.0.1:<port>` is the reverse tunnel
+/// this very connection opened, and from the target that address is correct.
+fn environment_prelude(environment: &[(String, String)]) -> String {
+    let mut script = String::new();
+    for (name, value) in environment {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            continue;
+        }
+        script.push_str("        export ");
+        script.push_str(name);
+        script.push('=');
+        script.push_str(&shell_quote(value));
+        script.push('\n');
+    }
+    script
+}
+
+fn remote_bootstrap_script(
+    configured_command: &str,
+    pull_environment: &[(String, String)],
+) -> String {
     format!(
         r#"configured={configured}
 case "$configured" in "~/"*) configured="$HOME/${{configured#~/}}" ;; esac
@@ -1083,29 +1114,83 @@ if [ -n "$candidate" ]; then
 else
     printf '{marker} NEED %s %s\n' "$os" "$arch"
 fi
-IFS= read -r muxloom_action
-if [ "$muxloom_action" = USE ] && [ -n "$candidate" ]; then
-    exec "$candidate" bridge
-fi
+# The controller answers with one action at a time. A pull that comes back
+# empty-handed is reported and the loop waits for the next one, so a machine
+# that cannot reach the release still gets the bytes pushed down this pipe.
+while IFS= read -r muxloom_action; do
 case "$muxloom_action" in
-    'INSTALL '*) muxloom_size=${{muxloom_action#INSTALL }} ;;
-    *) printf 'invalid bootstrap action\n' >&2; exit 64 ;;
+    USE)
+        if [ -n "$candidate" ]; then
+            exec "$candidate" bridge
+        fi
+        printf 'invalid bootstrap action\n' >&2
+        exit 64 ;;
+    'PULL '*)
+        muxloom_rest=${{muxloom_action#PULL }}
+        muxloom_url=${{muxloom_rest%% *}}
+        muxloom_sum=${{muxloom_rest##* }}
+        muxloom_failure=
+        mkdir -p "$install_root"
+        temporary="$installed.pull.$$"
+        rm -f "$temporary"
+        (
+{pull_exports}        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 8 --max-time 120 --speed-limit 4096 --speed-time 20 -o "$temporary" "$muxloom_url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=20 --tries=1 -O "$temporary" "$muxloom_url"
+        else
+            exit 69
+        fi
+        ) >/dev/null 2>&1 || muxloom_failure='download failed'
+        if [ -z "$muxloom_failure" ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+                muxloom_actual=$(sha256sum "$temporary" | cut -d' ' -f1)
+            elif command -v shasum >/dev/null 2>&1; then
+                muxloom_actual=$(shasum -a 256 "$temporary" | cut -d' ' -f1)
+            elif command -v openssl >/dev/null 2>&1; then
+                muxloom_actual=$(openssl dgst -sha256 "$temporary" | awk '{{print $NF}}')
+            else
+                muxloom_actual=
+                muxloom_failure='no sha256 tool'
+            fi
+            if [ -z "$muxloom_failure" ] && [ "$muxloom_actual" != "$muxloom_sum" ]; then
+                muxloom_failure='checksum mismatch'
+            fi
+        fi
+        if [ -n "$muxloom_failure" ]; then
+            rm -f "$temporary"
+            printf '{marker} PULLFAILED %s\n' "$muxloom_failure"
+            continue
+        fi
+        chmod 700 "$temporary"
+        mv -f "$temporary" "$installed"
+        printf '{marker} PULLED\n'
+        exec "$installed" bridge ;;
+    'INSTALL '*)
+        muxloom_size=${{muxloom_action#INSTALL }}
+        case "$muxloom_size" in ''|*[!0-9]*) printf 'invalid bootstrap size\n' >&2; exit 64 ;; esac
+        mkdir -p "$install_root"
+        temporary="$installed.tmp.$$"
+        if head -c 0 </dev/null >/dev/null 2>&1; then
+            head -c "$muxloom_size" > "$temporary"
+        else
+            dd bs=1 count="$muxloom_size" of="$temporary" 2>/dev/null
+        fi
+        chmod 700 "$temporary"
+        mv -f "$temporary" "$installed"
+        printf '{marker} INSTALLED\n'
+        exec "$installed" bridge ;;
+    *)
+        printf 'invalid bootstrap action\n' >&2
+        exit 64 ;;
 esac
-case "$muxloom_size" in ''|*[!0-9]*) printf 'invalid bootstrap size\n' >&2; exit 64 ;; esac
-mkdir -p "$install_root"
-temporary="$installed.tmp.$$"
-if head -c 0 </dev/null >/dev/null 2>&1; then
-    head -c "$muxloom_size" > "$temporary"
-else
-    dd bs=1 count="$muxloom_size" of="$temporary" 2>/dev/null
-fi
-chmod 700 "$temporary"
-mv -f "$temporary" "$installed"
-printf '{marker} INSTALLED\n'
-exec "$installed" bridge"#,
+done
+printf 'bootstrap stream closed before an action arrived\n' >&2
+exit 64"#,
         configured = shell_quote(configured_command),
         protocol_version = PROTOCOL_VERSION,
         marker = BOOTSTRAP_MARKER,
+        pull_exports = environment_prelude(pull_environment),
     )
 }
 
@@ -1174,7 +1259,7 @@ fn negotiate_remote_companion(
             let expected = sha256_file(&asset)?;
             if !fingerprint.eq_ignore_ascii_case(&expected) {
                 return deploy_remote_companion(
-                    alias, &asset, &notice, os, arch, reader, writer, progress,
+                    alias, options, &asset, &notice, os, arch, reader, writer, progress,
                 );
             }
             writeln!(writer, "USE")?;
@@ -1206,7 +1291,9 @@ fn negotiate_remote_companion(
         }
         [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
             let (asset, notice) = resolve_companion_asset(options, os, arch, progress)?;
-            deploy_remote_companion(alias, &asset, &notice, os, arch, reader, writer, progress)
+            deploy_remote_companion(
+                alias, options, &asset, &notice, os, arch, reader, writer, progress,
+            )
         }
         _ => bail!(
             "invalid muxloomd bootstrap response from {alias}: {}",
@@ -1215,9 +1302,112 @@ fn negotiate_remote_companion(
     }
 }
 
+/// Ask the target to fetch the companion itself, and only when what it would
+/// fetch is byte-for-byte the asset we would otherwise push: the digest of the
+/// local asset has to match the published release checksum. That keeps the
+/// generation the controller decided on — a source build, a bundled asset — from
+/// being quietly swapped for whatever the latest release happens to hold.
+///
+/// `Ok(None)` means the bytes still have to go down this pipe; the caller
+/// pushes. An error means the bootstrap stream itself is no longer trustworthy,
+/// and pushing into it would be worse than failing.
+#[allow(clippy::too_many_arguments)]
+fn pull_remote_companion(
+    alias: &str,
+    options: &BridgeOptions,
+    asset: &Path,
+    os: &str,
+    arch: &str,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    progress: &mut impl FnMut(TaskProgress),
+) -> Result<Option<String>> {
+    let Some((url, digest, triple)) = companion_release_match(options, asset, os, arch) else {
+        return Ok(None);
+    };
+    debug::log(
+        "bridge",
+        format!("target={alias} fetching its own {triple} companion from {url}"),
+    );
+    exchange_companion_pull(alias, &url, &digest, &triple, reader, writer, progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exchange_companion_pull(
+    alias: &str,
+    url: &str,
+    digest: &str,
+    triple: &str,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    progress: &mut impl FnMut(TaskProgress),
+) -> Result<Option<String>> {
+    progress(TaskProgress::pending(format!(
+        "{alias} is downloading its companion"
+    )));
+    writeln!(writer, "PULL {url} {digest}")?;
+    writer.flush()?;
+    let mut status = String::new();
+    if reader.read_line(&mut status)? == 0 {
+        bail!("the bootstrap on {alias} closed while fetching its companion");
+    }
+    let status = status.trim();
+    if status == format!("{BOOTSTRAP_MARKER} PULLED") {
+        return Ok(Some(format!(
+            "{alias} downloaded the {triple} muxloomd companion itself"
+        )));
+    }
+    if let Some(reason) = status.strip_prefix(&format!("{BOOTSTRAP_MARKER} PULLFAILED")) {
+        debug::log(
+            "bridge",
+            format!(
+                "target={alias} could not fetch its own companion ({}); pushing it",
+                reason.trim()
+            ),
+        );
+        return Ok(None);
+    }
+    bail!("invalid bootstrap pull response from {alias}: {status}")
+}
+
+/// The release URL a target can fetch this exact asset from, if the published
+/// checksum says the release holds the same bytes.
+fn companion_release_match(
+    options: &BridgeOptions,
+    asset: &Path,
+    os: &str,
+    arch: &str,
+) -> Option<(String, String, String)> {
+    let triple = companion_target_triple(os, arch).ok()?;
+    let asset_name = format!("muxloomd-{triple}{}", executable_suffix(os));
+    let digest = sha256_file(asset).ok()?;
+    let published = controller_fetch_text(
+        &format!("{COMPANION_RELEASE_ROOT}/{asset_name}.sha256"),
+        &options.download_environment,
+    )
+    .ok()
+    .and_then(|text| parse_sha256_checksum(&text).ok())?;
+    if !published.eq_ignore_ascii_case(&digest) {
+        debug::log(
+            "bridge",
+            format!(
+                "companion asset {} is not the published {triple} release; it has to be pushed",
+                asset.display()
+            ),
+        );
+        return None;
+    }
+    Some((
+        format!("{COMPANION_RELEASE_ROOT}/{asset_name}"),
+        digest,
+        triple,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deploy_remote_companion(
     alias: &str,
+    options: &BridgeOptions,
     asset: &Path,
     notice: &str,
     os: &str,
@@ -1226,6 +1416,11 @@ fn deploy_remote_companion(
     writer: &mut impl Write,
     progress: &mut impl FnMut(TaskProgress),
 ) -> Result<Option<String>> {
+    if let Some(pulled) =
+        pull_remote_companion(alias, options, asset, os, arch, reader, writer, progress)?
+    {
+        return Ok(Some(pulled));
+    }
     let mut file = fs::File::open(asset)
         .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
     let size = file.metadata()?.len();
@@ -2344,7 +2539,7 @@ mod tests {
 
     #[test]
     fn bootstrap_script_updates_missing_or_stale_companions_in_place() {
-        let script = remote_bootstrap_script("~/.local/bin/muxloomd");
+        let script = remote_bootstrap_script("~/.local/bin/muxloomd", &[]);
         assert!(script.contains(BOOTSTRAP_MARKER));
         assert!(script.contains("uname -s"));
         assert!(script.contains("binary-sha256"));
@@ -2357,6 +2552,168 @@ mod tests {
         assert!(script.contains("head -c \"$muxloom_size\""));
         assert!(script.contains("mv -f \"$temporary\" \"$installed\""));
         assert!(script.contains("exec \"$installed\" bridge"));
+        // A pull the target cannot complete is reported rather than fatal, so
+        // the loop is still there to receive the pushed bytes.
+        assert!(script.contains("PULLFAILED %s"));
+        assert!(script.contains("while IFS= read -r muxloom_action"));
+
+        // The host's own environment reaches the fetch, and nothing else.
+        let script = remote_bootstrap_script(
+            "muxloomd",
+            &[
+                ("HTTPS_PROXY".into(), "http://box:8118".into()),
+                ("not a name".into(), "ignored".into()),
+            ],
+        );
+        assert!(script.contains("export HTTPS_PROXY='http://box:8118'"));
+        assert!(!script.contains("ignored"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bootstrap_installs_what_it_pulled_and_falls_back_to_the_push() {
+        use std::io::BufReader as StdBufReader;
+
+        let has_curl = Command::new("sh")
+            .args(["-c", "command -v curl >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !has_curl {
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "muxloom-bootstrap-pull-{}-{nonce}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let release = root.join("muxloomd-release");
+        fs::write(&release, b"#!/bin/sh\nprintf 'companion %s\\n' \"$1\"\n").unwrap();
+        let digest = sha256_file(&release).unwrap();
+        let url = format!("file://{}", release.display());
+        let script = remote_bootstrap_script("muxloomd-absent", &[]);
+
+        let start = |actions: &str| -> Vec<String> {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(actions.as_bytes())
+                .unwrap();
+            let output = StdBufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+                .collect();
+            let _ = child.wait();
+            output
+        };
+
+        // A digest that does not match what landed leaves nothing installed and
+        // hands the turn back to the controller.
+        let lines = start(&format!("PULL {url} {}\n", "ab".repeat(32)));
+        assert_eq!(
+            lines.first().unwrap().split(' ').next(),
+            Some(BOOTSTRAP_MARKER)
+        );
+        assert!(lines[0].contains("NEED"), "{lines:?}");
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some(format!("{BOOTSTRAP_MARKER} PULLFAILED checksum mismatch").as_str()),
+            "{lines:?}"
+        );
+        assert!(!home.join(".local/share/muxloom/bin/muxloomd").exists());
+
+        // The same failed pull, then the push it falls back to: one connection,
+        // both attempts, and the companion running at the end of it.
+        let payload = b"#!/bin/sh\nprintf 'pushed %s\\n' \"$1\"\n";
+        let lines = start(&format!(
+            "PULL {url} {}\nINSTALL {}\n{}",
+            "ab".repeat(32),
+            payload.len(),
+            String::from_utf8_lossy(payload)
+        ));
+        assert_eq!(
+            lines.get(2).map(String::as_str),
+            Some(format!("{BOOTSTRAP_MARKER} INSTALLED").as_str()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.get(3).map(String::as_str),
+            Some("pushed bridge"),
+            "{lines:?}"
+        );
+
+        // And the pull that does match: the target installs it itself and execs
+        // straight into the companion.
+        let lines = start(&format!("PULL {url} {digest}\n"));
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some(format!("{BOOTSTRAP_MARKER} PULLED").as_str()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.get(2).map(String::as_str),
+            Some("companion bridge"),
+            "{lines:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_controller_reads_every_answer_a_pull_can_come_back_with() {
+        let digest = "ab".repeat(32);
+        let exchange = |answer: &str| {
+            let mut reader = std::io::Cursor::new(answer.to_string());
+            let mut writer = Vec::new();
+            let result = exchange_companion_pull(
+                "gpu",
+                "https://example.invalid/muxloomd-linux",
+                &digest,
+                "x86_64-unknown-linux-musl",
+                &mut reader,
+                &mut writer,
+                &mut |_| {},
+            );
+            (result, String::from_utf8(writer).unwrap())
+        };
+
+        let (pulled, sent) = exchange(&format!("{BOOTSTRAP_MARKER} PULLED\n"));
+        assert_eq!(
+            sent,
+            format!("PULL https://example.invalid/muxloomd-linux {digest}\n")
+        );
+        assert!(pulled.unwrap().is_some_and(|notice| notice.contains("gpu")));
+
+        // A target with no route says so, and the caller pushes instead.
+        let (refused, _) = exchange(&format!("{BOOTSTRAP_MARKER} PULLFAILED download failed\n"));
+        assert_eq!(refused.unwrap(), None);
+
+        // Anything else means the stream no longer says what we think it says,
+        // and pushing megabytes into it would be worse than stopping.
+        let (confused, _) = exchange("something else\n");
+        assert!(
+            confused
+                .unwrap_err()
+                .to_string()
+                .contains("invalid bootstrap pull response")
+        );
+        let (closed, _) = exchange("");
+        assert!(closed.unwrap_err().to_string().contains("closed while"));
     }
 
     #[test]
@@ -2386,8 +2743,15 @@ mod tests {
         let mut reader = std::io::Cursor::new(format!("{BOOTSTRAP_MARKER} INSTALLED\n"));
         let mut writer = Vec::new();
         let mut updates = Vec::new();
+        // No route to the release: the checksum lookup fails, so the bytes go
+        // down the pipe exactly as they always have.
+        let options = BridgeOptions {
+            download_environment: vec![("HTTPS_PROXY".into(), "http://127.0.0.1:1".into())],
+            ..BridgeOptions::default()
+        };
         let notice = deploy_remote_companion(
             "gpu",
+            &options,
             &asset,
             "deployed test companion",
             "Linux",

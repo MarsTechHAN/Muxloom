@@ -119,6 +119,21 @@ impl TargetPlatform {
     }
 }
 
+/// The release a target should end up running. The controller resolves this
+/// much — a version, a URL, a digest — and either side can then act on it: the
+/// controller downloading the payload for an upload, or the target pulling it
+/// down itself and checking it against the same digest.
+#[derive(Debug, Clone)]
+struct RemoteRelease {
+    version: String,
+    platform_name: String,
+    /// The file name the payload is cached under, which is also the last
+    /// segment of `url`.
+    asset: String,
+    url: String,
+    sha256: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Runtime {
     ssh_connect_timeout_secs: u64,
@@ -140,6 +155,7 @@ impl Runtime {
             reverse_tunnel: config.reverse_tunnel.clone(),
             bootstrap_binary: config.companion_binary.clone(),
             download_environment: default_download_environment,
+            remote_environment: config.environment_for(LOCAL_TARGET_ID).unwrap_or_default(),
             attention_patterns: config.attention_patterns_for(LOCAL_TARGET_ID).to_vec(),
         };
         let bridge_options = config
@@ -163,6 +179,7 @@ impl Runtime {
                             .clone()
                             .unwrap_or_else(|| config.companion_binary.clone()),
                         download_environment: Self::controller_environment_for_config(config, host),
+                        remote_environment: config.environment_for(host).unwrap_or_default(),
                         attention_patterns: config.attention_patterns_for(host).to_vec(),
                     },
                 )
@@ -630,11 +647,38 @@ impl Runtime {
             Transport::Local => TargetPlatform::local(),
         };
         let mut installed_source = None;
-        let mut controller_download_error = None;
+        // Every built-in attempt that failed, in the order they were made, so
+        // a target that ends up with nothing installed says what was tried
+        // rather than only how the last hop went.
+        let mut attempts: Vec<String> = Vec::new();
+        // A configured command that names something else — a wrapper script, an
+        // absolute path — is the operator's business, not a release we know how
+        // to fetch.
+        let built_in = !command.command.contains('/') && command.command == executable_name;
+        let remote = matches!(target.transport, Transport::Ssh { .. });
 
-        if matches!(target.transport, Transport::Ssh { .. })
-            && !command.command.contains('/')
-            && command.command == executable_name
+        // The target fetches its own runtime first. The payload then never
+        // crosses the controller, and a machine with its own route to the
+        // release does not wait on ours.
+        if remote && built_in {
+            match self.pull_runtime_on_target(target, kind, &platform, environment, &mut progress) {
+                Ok(source) => installed_source = Some(source),
+                Err(error) => {
+                    debug::log(
+                        "install",
+                        format!(
+                            "target-side pull failed target={} kind={kind}: {error:#}; falling back to shipping it from here",
+                            target.id
+                        ),
+                    );
+                    attempts.push(format!("target-side download failed: {error:#}"));
+                }
+            }
+        }
+
+        if installed_source.is_none()
+            && remote
+            && built_in
             && platform.matches_local()
             && let Some(local_binary) = find_local_native_executable(&command.command)
             && local_runtime_can_copy(kind, &local_binary)
@@ -642,21 +686,20 @@ impl Runtime {
             progress(TaskProgress::pending(format!("Uploading {kind} runtime")));
             match self.upload_runtime_binary(target, &local_binary, executable_name) {
                 Ok(()) => installed_source = Some("compatible controller binary".to_string()),
-                Err(error) => debug::log(
-                    "install",
-                    format!(
-                        "local binary upload failed target={} kind={kind}: {error:#}; falling back",
-                        target.id
-                    ),
-                ),
+                Err(error) => {
+                    debug::log(
+                        "install",
+                        format!(
+                            "local binary upload failed target={} kind={kind}: {error:#}; falling back",
+                            target.id
+                        ),
+                    );
+                    attempts.push(format!("uploading the local binary failed: {error:#}"));
+                }
             }
         }
 
-        if installed_source.is_none()
-            && matches!(target.transport, Transport::Ssh { .. })
-            && !command.command.contains('/')
-            && command.command == executable_name
-        {
+        if installed_source.is_none() && remote && built_in {
             match self.download_and_install_runtime(
                 target,
                 kind,
@@ -666,7 +709,6 @@ impl Runtime {
             ) {
                 Ok(source) => installed_source = Some(source),
                 Err(error) => {
-                    controller_download_error = Some(error.to_string());
                     debug::log(
                         "install",
                         format!(
@@ -674,17 +716,19 @@ impl Runtime {
                             target.id
                         ),
                     );
+                    attempts.push(format!("the controller download failed: {error:#}"));
                 }
             }
         }
 
         if installed_source.is_none() {
             if command.install.trim().is_empty() {
-                if let Some(controller_error) = controller_download_error {
+                if !attempts.is_empty() {
                     bail!(
-                        "{} is unavailable on {}; built-in package install failed: {controller_error}",
+                        "{} is unavailable on {}; every built-in install failed: {}",
                         command.command,
-                        target.id
+                        target.id,
+                        attempts.join("; ")
                     );
                 }
                 bail!(
@@ -697,8 +741,11 @@ impl Runtime {
             let script = login_shell_command(&format!("{exports} {}", command.install));
             let output = self.run_shell(target, &script, false)?;
             if let Err(error) = ensure_success(&output, &format!("install {kind}")) {
-                if let Some(controller_error) = controller_download_error {
-                    bail!("{error}; built-in package install also failed: {controller_error}");
+                if !attempts.is_empty() {
+                    bail!(
+                        "{error}; the built-in installs also failed: {}",
+                        attempts.join("; ")
+                    );
                 }
                 return Err(error);
             }
@@ -752,6 +799,97 @@ impl Runtime {
         progress: &mut impl FnMut(TaskProgress),
     ) -> Result<String> {
         let controller_environment = self.controller_download_environment(target, environment);
+        let release = self.resolve_release(kind, platform, &controller_environment, progress)?;
+        let cache = controller_download_cache()
+            .join(kind.as_str())
+            .join(&release.version)
+            .join(&release.platform_name)
+            .join(&release.asset);
+        let download_label = format!("Downloading {kind} {}", release.version);
+        self.controller_download_verified(
+            &release.url,
+            &cache,
+            &release.sha256,
+            &controller_environment,
+            &download_label,
+            progress,
+        )?;
+        let version = &release.version;
+        match (kind, &target.transport) {
+            (AgentKind::Claude, Transport::Local) => {
+                progress(TaskProgress::pending(format!(
+                    "Installing {kind} {version}"
+                )));
+                install_local_runtime_binary(&cache, "claude")?;
+            }
+            (AgentKind::Claude, Transport::Ssh { .. }) => {
+                progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
+                self.upload_runtime_binary(target, &cache, "claude")?;
+            }
+            (AgentKind::Codex, Transport::Local) => {
+                progress(TaskProgress::pending(format!(
+                    "Installing {kind} {version}"
+                )));
+                install_local_codex_archive(&cache, version)?;
+            }
+            (AgentKind::Codex, Transport::Ssh { .. }) => {
+                progress(TaskProgress::pending(format!(
+                    "Extracting {kind} {version}"
+                )));
+                let executable = extract_cached_codex_archive(&cache)?;
+                progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
+                self.upload_runtime_binary(target, &executable, "codex")?;
+            }
+            (AgentKind::Terminal, _) => bail!("terminal has no downloadable agent runtime"),
+        }
+        Ok(format!(
+            "controller-downloaded {kind} {version} ({})",
+            release.platform_name
+        ))
+    }
+
+    /// Have the target fetch its own runtime. The controller resolves the
+    /// release metadata — a few hundred bytes — and the target spends its own
+    /// bandwidth on the payload, checking it against the digest we resolved
+    /// before anything is moved into place. Bounded on both ends: a target
+    /// with no route to the release says so in seconds instead of holding the
+    /// install open, and the caller falls back to shipping the bytes from here.
+    fn pull_runtime_on_target(
+        &self,
+        target: &Target,
+        kind: AgentKind,
+        platform: &TargetPlatform,
+        environment: &[(String, String)],
+        progress: &mut impl FnMut(TaskProgress),
+    ) -> Result<String> {
+        let controller_environment = self.controller_download_environment(target, environment);
+        let release = self.resolve_release(kind, platform, &controller_environment, progress)?;
+        progress(TaskProgress::pending(format!(
+            "{} is downloading {kind} {}",
+            target.label, release.version
+        )));
+        let script = login_shell_command(&remote_pull_script(
+            kind,
+            &release,
+            &environment_exports(environment),
+        ));
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, &format!("download {kind} on {}", target.label))?;
+        Ok(format!(
+            "{} downloaded {kind} {} ({}) itself",
+            target.label, release.version, release.platform_name
+        ))
+    }
+
+    /// Resolve which file a target needs and what it must hash to. Every
+    /// request here is small: a version string, a manifest, a checksum list.
+    fn resolve_release(
+        &self,
+        kind: AgentKind,
+        platform: &TargetPlatform,
+        controller_environment: &[(String, String)],
+        progress: &mut impl FnMut(TaskProgress),
+    ) -> Result<RemoteRelease> {
         match kind {
             AgentKind::Claude => {
                 let platform_name = platform.claude_name()?;
@@ -759,13 +897,13 @@ impl Runtime {
                 let version = validate_release_name(
                     self.controller_fetch_text(
                         &format!("{CLAUDE_RELEASES}/latest"),
-                        &controller_environment,
+                        controller_environment,
                     )?
                     .trim(),
                 )?;
                 let manifest = self.controller_fetch_text(
                     &format!("{CLAUDE_RELEASES}/{version}/manifest.json"),
-                    &controller_environment,
+                    controller_environment,
                 )?;
                 let manifest: Value = serde_json::from_str(&manifest)
                     .context("Claude release manifest is invalid JSON")?;
@@ -776,41 +914,19 @@ impl Runtime {
                     .and_then(Value::as_str)
                     .context("Claude manifest has no checksum for the target platform")?;
                 validate_sha256(checksum)?;
-                let cache = controller_download_cache()
-                    .join("claude")
-                    .join(&version)
-                    .join(&platform_name)
-                    .join("claude");
-                let download_label = format!("Downloading Claude {version}");
-                self.controller_download_verified(
-                    &format!("{CLAUDE_RELEASES}/{version}/{platform_name}/claude"),
-                    &cache,
-                    checksum,
-                    &controller_environment,
-                    &download_label,
-                    progress,
-                )?;
-                match &target.transport {
-                    Transport::Local => {
-                        progress(TaskProgress::pending(format!(
-                            "Installing Claude {version}"
-                        )));
-                        install_local_runtime_binary(&cache, "claude")?;
-                    }
-                    Transport::Ssh { .. } => {
-                        progress(TaskProgress::pending(format!("Uploading Claude {version}")));
-                        self.upload_runtime_binary(target, &cache, "claude")?;
-                    }
-                }
-                Ok(format!(
-                    "controller-downloaded Claude {version} ({platform_name})"
-                ))
+                Ok(RemoteRelease {
+                    url: format!("{CLAUDE_RELEASES}/{version}/{platform_name}/claude"),
+                    sha256: checksum.to_ascii_lowercase(),
+                    asset: "claude".into(),
+                    version,
+                    platform_name,
+                })
             }
             AgentKind::Codex => {
                 let platform_name = platform.codex_name()?;
                 progress(TaskProgress::pending("Resolving Codex release"));
                 let effective =
-                    self.controller_effective_url(CODEX_LATEST, &controller_environment)?;
+                    self.controller_effective_url(CODEX_LATEST, controller_environment)?;
                 let version = effective
                     .rsplit("/tag/rust-v")
                     .next()
@@ -822,39 +938,17 @@ impl Runtime {
                 let release_root = format!("{CODEX_RELEASES}/rust-v{version}");
                 let checksums = self.controller_fetch_text(
                     &format!("{release_root}/codex-package_SHA256SUMS"),
-                    &controller_environment,
+                    controller_environment,
                 )?;
                 let checksum = checksum_for_asset(&checksums, &asset)
                     .context("Codex checksum manifest has no target package")?;
-                let cache = controller_download_cache()
-                    .join("codex")
-                    .join(&version)
-                    .join(&platform_name)
-                    .join(&asset);
-                let download_label = format!("Downloading Codex {version}");
-                self.controller_download_verified(
-                    &format!("{release_root}/{asset}"),
-                    &cache,
-                    &checksum,
-                    &controller_environment,
-                    &download_label,
-                    progress,
-                )?;
-                match &target.transport {
-                    Transport::Local => {
-                        progress(TaskProgress::pending(format!("Installing Codex {version}")));
-                        install_local_codex_archive(&cache, &version)?;
-                    }
-                    Transport::Ssh { .. } => {
-                        progress(TaskProgress::pending(format!("Extracting Codex {version}")));
-                        let executable = extract_cached_codex_archive(&cache)?;
-                        progress(TaskProgress::pending(format!("Uploading Codex {version}")));
-                        self.upload_runtime_binary(target, &executable, "codex")?;
-                    }
-                }
-                Ok(format!(
-                    "controller-downloaded Codex {version} ({platform_name})"
-                ))
+                Ok(RemoteRelease {
+                    url: format!("{release_root}/{asset}"),
+                    sha256: checksum,
+                    asset,
+                    version,
+                    platform_name,
+                })
             }
             AgentKind::Terminal => bail!("terminal has no downloadable agent runtime"),
         }
@@ -2329,6 +2423,93 @@ fn tunnel_control_path(tunnel: &str) -> String {
     format!("/tmp/muxloom-tunnel-{short}-%C")
 }
 
+/// The script a target runs to fetch its own agent runtime. Everything the
+/// controller resolved is baked in, so the target only has to reach the
+/// release, hash what it got, and move it into place — and it lands in exactly
+/// the directories an upload from here would have used.
+///
+/// The transfer is bounded twice over: eight seconds to connect, and an abort
+/// if it drops under 4 KiB/s for twenty. A machine with no route to the
+/// release fails in seconds rather than holding the install open until the
+/// bridge request times out.
+fn remote_pull_script(kind: AgentKind, release: &RemoteRelease, exports: &str) -> String {
+    let prelude = format!(
+        r#"{exports}
+set -e
+url={url}
+sum={sum}
+version={version}
+cache="$HOME/.cache/muxloom/install"
+mkdir -p "$cache" "$HOME/.local/bin"
+payload="$cache/{name}.pull.$$"
+rm -f "$payload"
+fetch() {{
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 8 --max-time 150 --speed-limit 4096 --speed-time 20 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=20 --tries=1 -O "$2" "$1"
+    else
+        printf 'this machine has neither curl nor wget\n' >&2
+        return 69
+    fi
+}}
+digest() {{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{{print $NF}}'
+    else
+        printf 'this machine has no sha256 tool\n' >&2
+        return 69
+    fi
+}}
+fetch "$url" "$payload"
+actual=$(digest "$payload")
+if [ "$actual" != "$sum" ]; then
+    rm -f "$payload"
+    printf 'checksum mismatch: expected %s, got %s\n' "$sum" "$actual" >&2
+    exit 65
+fi
+"#,
+        url = shell_quote(&release.url),
+        sum = shell_quote(&release.sha256),
+        version = shell_quote(&release.version),
+        name = kind.as_str(),
+    );
+    let install = match kind {
+        AgentKind::Codex => {
+            r#"releases="$HOME/.local/share/muxloom/codex/releases"
+stage="$releases/.pull.$$"
+rm -rf "$stage"
+mkdir -p "$stage"
+if ! tar -xzf "$payload" -C "$stage"; then
+    rm -rf "$stage" "$payload"
+    printf 'could not unpack the Codex package\n' >&2
+    exit 65
+fi
+if [ ! -f "$stage/bin/codex" ]; then
+    rm -rf "$stage" "$payload"
+    printf 'the Codex package did not contain bin/codex\n' >&2
+    exit 65
+fi
+chmod 755 "$stage/bin/codex"
+rm -rf "$releases/$version"
+mv "$stage" "$releases/$version"
+ln -sfn "$releases/$version/bin/codex" "$HOME/.local/bin/codex"
+rm -f "$payload"
+"#
+        }
+        _ => {
+            r#"chmod 755 "$payload"
+mv -f "$payload" "$HOME/.local/bin/claude"
+"#
+        }
+    };
+    format!("{prelude}{install}")
+}
+
 fn controller_download_cache() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -3695,6 +3876,153 @@ mod tests {
             checksum_for_asset(manifest, "codex-package.tar.gz").as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn a_target_pulls_its_own_runtime_into_the_directories_an_upload_would_use() {
+        let claude = RemoteRelease {
+            version: "1.2.3".into(),
+            platform_name: "linux-x64".into(),
+            asset: "claude".into(),
+            url: "https://example.invalid/1.2.3/linux-x64/claude".into(),
+            sha256: "ab".repeat(32),
+        };
+        let script = remote_pull_script(AgentKind::Claude, &claude, "export HTTPS_PROXY='p';");
+        // The proxy the operator configured for this host is what the target
+        // reaches the release through, so it has to be exported first.
+        assert!(script.starts_with("export HTTPS_PROXY='p';\n"));
+        assert!(script.contains("url=https://example.invalid/1.2.3/linux-x64/claude\n"));
+        assert!(script.contains(&format!("sum={}\n", "ab".repeat(32))));
+        // Bounded twice: connecting, and stalling mid-transfer.
+        assert!(script.contains("--connect-timeout 8"));
+        assert!(script.contains("--speed-limit 4096 --speed-time 20"));
+        // Nothing is moved into place until the payload hashes to what the
+        // controller resolved.
+        let verified = script.find("checksum mismatch").unwrap();
+        let installed = script.find(r#"mv -f "$payload" "$HOME/.local/bin/claude""#);
+        assert!(installed.is_some_and(|installed| installed > verified));
+
+        let codex = RemoteRelease {
+            version: "0.9.0".into(),
+            platform_name: "aarch64-apple-darwin".into(),
+            asset: "codex-package-aarch64-apple-darwin.tar.gz".into(),
+            url: "https://example.invalid/codex-package-aarch64-apple-darwin.tar.gz".into(),
+            sha256: "cd".repeat(32),
+        };
+        let script = remote_pull_script(AgentKind::Codex, &codex, "");
+        assert!(script.contains(r#"tar -xzf "$payload" -C "$stage""#));
+        assert!(
+            script.contains(r#"ln -sfn "$releases/$version/bin/codex" "$HOME/.local/bin/codex""#)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_script_verifies_before_it_installs_and_installs_what_it_verified() {
+        let has_curl = Command::new("sh")
+            .args(["-c", "command -v curl >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !has_curl {
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("muxloom-pull-{}-{nonce}", std::process::id()));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let exports = format!("export HOME={};", shell_quote(&home.to_string_lossy()));
+
+        let binary = root.join("claude-release");
+        fs::write(&binary, b"claude-binary").unwrap();
+        let claude = RemoteRelease {
+            version: "1.2.3".into(),
+            platform_name: "linux-x64".into(),
+            asset: "claude".into(),
+            url: format!("file://{}", binary.display()),
+            sha256: sha256_file(&binary).unwrap(),
+        };
+
+        // A digest that does not match what lands is the one thing that must
+        // never leave a runtime behind.
+        let tampered = RemoteRelease {
+            sha256: "ab".repeat(32),
+            ..claude.clone()
+        };
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(remote_pull_script(AgentKind::Claude, &tampered, &exports))
+            .output()
+            .unwrap();
+        assert!(!status.status.success());
+        assert!(
+            String::from_utf8_lossy(&status.stderr).contains("checksum mismatch"),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(!home.join(".local/bin/claude").exists());
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(remote_pull_script(AgentKind::Claude, &claude, &exports))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let installed = home.join(".local/bin/claude");
+        assert_eq!(fs::read(&installed).unwrap(), b"claude-binary");
+
+        let package_root = root.join("package");
+        fs::create_dir_all(package_root.join("bin")).unwrap();
+        fs::write(package_root.join("bin/codex"), b"codex-binary").unwrap();
+        let archive = root.join("codex-package.tar.gz");
+        let packed = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&package_root)
+            .arg("bin")
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let codex = RemoteRelease {
+            version: "0.9.0".into(),
+            platform_name: "aarch64-apple-darwin".into(),
+            asset: "codex-package.tar.gz".into(),
+            url: format!("file://{}", archive.display()),
+            sha256: sha256_file(&archive).unwrap(),
+        };
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(remote_pull_script(AgentKind::Codex, &codex, &exports))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let linked = home.join(".local/bin/codex");
+        assert_eq!(fs::read(&linked).unwrap(), b"codex-binary");
+        assert_eq!(
+            fs::read_link(&linked).unwrap(),
+            home.join(".local/share/muxloom/codex/releases/0.9.0/bin/codex")
+        );
+        // Nothing is left in the staging directory the payload passed through.
+        assert!(
+            fs::read_dir(home.join(".cache/muxloom/install"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(feature = "controller")]

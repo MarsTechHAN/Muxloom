@@ -295,6 +295,16 @@ If Codex or Claude is missing, the New flow asks before installing it; if the
 target companion is missing or stale, the controller provisions the matching
 binary automatically over the existing SSH connection.
 
+Either way the target downloads for itself first. The controller resolves only
+the release metadata — the version, the URL, the SHA-256 — and the machine
+fetches the payload over its own network path and checks what landed against
+that digest before anything moves into place. The fetch is bounded (eight
+seconds to connect, and it gives up if the transfer stalls), so a machine with
+no route to the release falls back in seconds rather than hanging the install:
+first to uploading a matching binary already on the controller, then to the
+controller downloading and pushing it, then to any `install` command configured
+for that runtime. If all of them fail, the error names each attempt.
+
 ## Controls
 
 The footer shows the most useful actions for the current context. Press `?` for

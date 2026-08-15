@@ -37,6 +37,16 @@ preserve.
 - Compare companion build fingerprints, not only the wire protocol. Fingerprint
   calculation must live in the Rust binaries and must not depend on target
   utilities such as `sha256sum` or `shasum`.
+- Provisioning a runtime or a companion onto a remote target must offer the
+  target its own download first and fall back to pushing bytes over the
+  existing connection. The controller resolves only release metadata; the
+  target verifies the payload against that digest before installing it, and a
+  companion pull is offered only when the published digest equals the asset we
+  would otherwise send, so a pull can never install different bytes than a push.
+- Every target-side fetch must be bounded — connect timeout, total timeout, and
+  a stall guard — so a machine with no route to the release fails in seconds
+  instead of hanging the install. When every built-in path fails, the reported
+  error must name each attempt rather than only the last one.
 
 ## Session keepers and non-disruptive daemon upgrades
 

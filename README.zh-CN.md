@@ -253,10 +253,13 @@ HTTP_PROXY=http://proxy:8118 HTTPS_PROXY=http://proxy:8118 TOKEN='two words'
 选择机器按 `,` 编辑该机器的有效配置；按 `Ctrl-,` 编辑全局默认值。Args、Sync Files 和
 Attention Patterns 使用 Shell Word 语法。
 
-当 New 发现 Codex/Claude 不存在时，Muxloom 会先询问。它优先复用 Controller 上兼容的
-binary，否则由 Controller 下载并校验目标平台产物，再传到目标；这条 staging 路径不要求
-目标机器访问外网。Controller 无法准备时才执行该机器配置的用户态安装命令，此时默认
-Installer 需要目标直连或通过 Reverse Tunnel 访问网络。`sync_files` 会复制到目标用户 Home
+当 New 发现 Codex/Claude 不存在时，Muxloom 会先询问。无论哪条路径，都先让目标自己下载：
+Controller 只解析发布元数据——版本、URL、SHA-256——由目标机器走自己的网络取回产物，并在
+放到位之前用同一份摘要校验落地内容。这次拉取有明确上界（连接 8 秒，传输停滞即放弃），
+所以取不到发布的机器会在几秒内快速失败并回退，而不是把安装挂住：先尝试上传 Controller
+上已有的同版 binary，再由 Controller 下载并校验后推给目标，最后才执行该机器配置的用户态
+安装命令（默认 Installer 需要目标直连或通过 Reverse Tunnel 访问网络）。全部失败时，错误
+信息会逐条列出尝试过的方式。`sync_files` 会复制到目标用户 Home
 下相同的相对路径，已有文件先备份，历史目录不会作为配置同步。
 
 <a id="zh-mcp"></a>
