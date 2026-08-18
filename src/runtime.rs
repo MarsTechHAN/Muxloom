@@ -2936,13 +2936,52 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     if kind == AgentKind::Terminal {
         return false;
     }
-    // "esc to interrupt" is the one marker both CLIs keep on screen for the
-    // whole of an interruptible turn: the early phase before a token count
-    // appears, tool runs, and parallel subagent displays included. Anything
-    // stricter reads those phases as idle.
-    attention_tail(screen)
-        .to_lowercase()
-        .contains("esc to interrupt")
+    let tail = attention_tail(screen);
+    // "esc to interrupt" is the marker both CLIs keep on screen for the whole
+    // of an interruptible turn: the early phase before a token count appears,
+    // tool runs, and parallel subagent displays included. Anything stricter
+    // reads those phases as idle.
+    if tail.to_lowercase().contains("esc to interrupt") {
+        return true;
+    }
+    // Not every phase offers an interrupt, though. Claude Code drops the hint
+    // while it compacts a conversation — which can run for minutes — and while
+    // it waits out a rate limit, and it drops it whenever the footer is too
+    // narrow for the hint. The spinner keeps turning throughout, so the status
+    // line it heads is the other half of the answer.
+    tail.lines().any(spinner_status_line)
+}
+
+/// The frames Claude Code cycles at the head of its status line.
+const SPINNER_FRAMES: [char; 6] = ['✻', '✽', '✶', '✳', '✢', '·'];
+
+/// A turn's live status line: a spinner frame, the phase, and the counter it
+/// ticks — `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`. The phase
+/// itself is no help, being anything from `Cogitating` to the title of the task
+/// in hand, so the elapsed time is what makes this a line only a running turn
+/// draws rather than prose that happens to trail off. The line is drawn hard
+/// against the left edge, which is what keeps a transcript quoting one — every
+/// transcript row is indented under its marker — from reading as a live turn.
+fn spinner_status_line(line: &str) -> bool {
+    if !line.starts_with(SPINNER_FRAMES) {
+        return false;
+    }
+    let Some((_, counter)) = line.split_once('…') else {
+        return false;
+    };
+    let Some(counter) = counter.trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let elapsed = counter
+        .split(['·', '•', ')'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    elapsed.starts_with(|character: char| character.is_ascii_digit())
+        && elapsed.ends_with(['h', 'm', 's'])
+        && elapsed
+            .chars()
+            .all(|character| character.is_ascii_digit() || " hms".contains(character))
 }
 
 fn attention_tail(screen: &str) -> String {
@@ -4314,6 +4353,46 @@ mod tests {
             AgentKind::Claude,
             "✻ Worked for 27s · ↓ 24.0k tokens\n❯ \n? for shortcuts\n"
         ));
+    }
+
+    #[test]
+    fn a_phase_that_offers_no_interrupt_is_still_working() {
+        // Compaction runs for minutes with no interrupt hint anywhere on the
+        // screen — the footer shows the mode and the context meter instead —
+        // and used to read as a session that had stopped.
+        let compacting = concat!(
+            "✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)\n",
+            "  ▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱  18%\n",
+            "──────────────────────────────\n",
+            "❯\n",
+            "──────────────────────────────\n",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)   100% context used\n"
+        );
+        assert!(agent_is_working(AgentKind::Claude, compacting));
+        // The same shape carries every other phase whose hint the footer had no
+        // room for, whether the phase is a spinner word or the task in hand.
+        for phase in [
+            "· Precipitating… (36m 2s · ↓ 57.0k tokens)",
+            "✽ Sprouting… (3m 10s · ↓ 8.3k tokens · thinking with xhigh effort)",
+            "✳ Add the waveform lab module… (20m 2s · ↓ 73.0k tokens)",
+            "✻ Cogitating… (9s)",
+            "✢ 修复 forced update 根因… (1h 2m 3s · ↓ 1.0k tokens)",
+        ] {
+            assert!(
+                agent_is_working(AgentKind::Claude, &format!("{phase}\n❯\n")),
+                "{phase}"
+            );
+        }
+        // Prose that trails off, a transcript line quoting a counter, and the
+        // collapsed-output hint all keep their session idle.
+        for quiet in [
+            "· so that is where the parser gave up…\n❯\n",
+            "  ⎿  … +138 lines (ctrl+o to expand)\n❯\n",
+            "✻ Worked for 27s · ↓ 24.0k tokens\n❯\n",
+            "  ✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)  ← what it looked like\n❯\n",
+        ] {
+            assert!(!agent_is_working(AgentKind::Claude, quiet), "{quiet}");
+        }
     }
 
     #[test]

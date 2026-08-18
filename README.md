@@ -164,9 +164,11 @@ rotating π for Pi, all on a constant wall-clock cadence — and only on the age
 row itself. Folder group rows carry their children's state as a steady colour
 (yellow when one waits for input, green when one works) and machine rows show a
 static capability icon for each runtime that machine has, so exactly one thing
-on screen blinks per busy agent. Working means the CLI's
-interrupt marker is on screen *and* the PTY produced output in the last
-seconds; a leftover spinner over a quiet session goes back to idle. Codex
+on screen blinks per busy agent. Working means the CLI's interrupt marker or a
+live status line — a turning spinner over a counter, which is all a phase that
+offers no interrupt leaves behind, compaction included — is on screen *and* the
+PTY produced output in the last seconds; a leftover spinner over a quiet
+session goes back to idle. Codex
 activity additionally follows its OSC title spinner, so status survives the
 CLI erasing and repainting the visible `Working` line. When a session needs
 input — approval prompts, numbered menus, or your own `attention_patterns`,

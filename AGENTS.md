@@ -143,10 +143,11 @@ preserve.
   carry aggregated state as steady colour (attention outranks working);
   machine rows show static capability icons. Idle, waiting, archived, and
   plain terminal sessions must not animate.
-- Working requires both the CLI's visible interrupt marker and recent PTY
-  output; a stale screen over a quiet PTY must read as idle. Attention
-  outranks working, and controller-configured attention patterns are sunk
-  into the daemon so both classifiers agree.
+- Working requires recent PTY output plus a visible sign that the turn is
+  running: the CLI's interrupt marker, or the live status line a phase that
+  offers no interrupt still draws. A stale screen over a quiet PTY must read as
+  idle. Attention outranks working, and controller-configured attention
+  patterns are sunk into the daemon so both classifiers agree.
 - The grouped session view must separate one folder from the next visually, not
   only by indentation, and temporal sessions sort above every folder so the
   scratch chat just opened is the first thing on screen.

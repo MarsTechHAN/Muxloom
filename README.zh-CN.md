@@ -189,9 +189,11 @@ Working 动画**只出现在对应 agent 行**：Codex 使用青色旋转盲文 
 Claude 使用橙色 sparkle（`✻✽✶✳`），OpenCode 使用紫色菱形（`◈◇◆`），Pi 使用旋转的
 `π`，均按墙钟时间推进。Folder 分组行不再闪烁，改为整行静态变色标示子会话状态——有等待
 输入的子会话时变黄，有工作中的变绿；Machines 行为该机器实际装有的每个 Runtime 显示一
-个静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）可见 **且** PTY 最
-近数秒内有输出，残留在屏幕上的旧 spinner 会自动回到 Idle；subagent 并行阶段、无 token
-计数的早期阶段都能正确识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
+个静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）**或**实时状态行
+（行首 spinner + 计时器，如 `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`，这
+是不提供中断的阶段唯一留下的痕迹）可见 **且** PTY 最近数秒内有输出，残留在屏幕上的旧
+spinner 会自动回到 Idle；压缩对话、subagent 并行阶段、无 token 计数的早期阶段都能正确
+识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
 示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
 用；Waiting Agent 的整个条目会变成黄色加粗。
 
