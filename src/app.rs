@@ -5692,15 +5692,22 @@ impl App {
             .collect()
     }
 
-    /// What a fresh launch form starts on: the first runtime the machine
-    /// offers.
+    /// What a fresh launch form starts on: the runtime last launched on that
+    /// machine, as long as it is still on offer, and otherwise the first one
+    /// the machine offers.
     fn default_kind(&self, target_id: &str, agents_only: bool) -> AgentKind {
         let kinds = if agents_only {
             self.offered_agent_kinds(target_id)
         } else {
             self.offered_kinds(target_id)
         };
-        kinds.first().copied().unwrap_or(AgentKind::Codex)
+        self.state
+            .last_launch_kinds
+            .get(target_id)
+            .copied()
+            .filter(|kind| kinds.contains(kind))
+            .or_else(|| kinds.first().copied())
+            .unwrap_or(AgentKind::Codex)
     }
 
     fn step_kind(&self, target_id: &str, current: AgentKind, forward: bool) -> AgentKind {
@@ -7607,10 +7614,14 @@ impl App {
             .config
             .environment_for(&form.target.id)
             .unwrap_or_default();
-        // Remember this directory as the machine's default for the next launch.
+        // Remember this directory and runtime as the machine's defaults for the
+        // next launch: the pair you used last is the pair you usually want next.
         self.state
             .last_launch_dirs
             .insert(form.target.id.clone(), form.path.clone());
+        self.state
+            .last_launch_kinds
+            .insert(form.target.id.clone(), form.kind);
         self.persist_state();
         let request = LaunchRequest {
             target: form.target,
@@ -12654,7 +12665,8 @@ mod tests {
         };
         assert_eq!(request.path, app.user_folder(&Target::local()));
 
-        // Typing names the chat rather than picking a runtime.
+        // Typing names the chat rather than picking a runtime, which stays on
+        // the one the machine launched last.
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         for character in "clip notes".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -12663,7 +12675,7 @@ mod tests {
         assert!(matches!(
             app.modal,
             Some(Modal::Temporal(TemporalForm {
-                kind: AgentKind::Codex,
+                kind: AgentKind::Claude,
                 ref label,
                 ..
             })) if label == "clip note"
@@ -12833,6 +12845,70 @@ mod tests {
             panic!("expected launch modal");
         };
         assert_eq!(form.path, "/work/remembered");
+    }
+
+    /// The runtime you launched last on a machine is the one you usually want
+    /// next, so the form opens on it rather than always on the first one.
+    #[test]
+    fn a_launch_form_opens_on_the_runtime_that_machine_launched_last() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.targets[0].state = ConnectionState::Online;
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi] {
+            app.targets[0].probe.set(kind, true);
+        }
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(form.kind, AgentKind::Codex, "nothing is remembered yet");
+
+        let form = LaunchForm {
+            kind: AgentKind::Pi,
+            path: "/work".into(),
+            ..form.clone()
+        };
+        app.submit_launch(form, None, None, None);
+        assert_eq!(
+            app.state.last_launch_kinds.get("local"),
+            Some(&AgentKind::Pi)
+        );
+
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(form.kind, AgentKind::Pi);
+        // A Temporal Chat picks from the same memory.
+        app.open_temporary_agent();
+        let Some(Modal::Temporal(form)) = &app.modal else {
+            panic!("expected temporal modal");
+        };
+        assert_eq!(form.kind, AgentKind::Pi);
+
+        // A remembered runtime the machine no longer has cannot be offered, so
+        // the form falls back to the first one that is.
+        app.targets[0].probe.set(AgentKind::Pi, false);
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(form.kind, AgentKind::Codex);
+
+        // A terminal is a fine thing to remember, but never what a Temporal
+        // Chat starts on.
+        app.state
+            .last_launch_kinds
+            .insert("local".into(), AgentKind::Terminal);
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(form.kind, AgentKind::Terminal);
+        app.open_temporary_agent();
+        let Some(Modal::Temporal(form)) = &app.modal else {
+            panic!("expected temporal modal");
+        };
+        assert_eq!(form.kind, AgentKind::Codex);
     }
 
     /// A runtime a machine does not have is not a choice worth showing, so the

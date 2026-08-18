@@ -414,6 +414,9 @@ pub struct State {
     pub remove_archive_after_resume: bool,
     /// Last working directory used to launch an agent, per machine (target id).
     pub last_launch_dirs: BTreeMap<String, String>,
+    /// Last runtime picked when launching on a machine, so the next launch
+    /// there starts on the same one.
+    pub last_launch_kinds: BTreeMap<String, AgentKind>,
     /// Custom display names for agents, keyed by session id.
     pub session_labels: BTreeMap<String, String>,
 }
@@ -432,6 +435,7 @@ impl Default for State {
             show_archived: false,
             remove_archive_after_resume: true,
             last_launch_dirs: BTreeMap::new(),
+            last_launch_kinds: BTreeMap::new(),
             session_labels: BTreeMap::new(),
         }
     }

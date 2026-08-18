@@ -137,7 +137,8 @@ config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行�
 `Right` 进入子目录，`Enter` 确认当前目录。Resume 页面也支持 `Left` 返回启动表单。
 
 Runtime 一行只列出该机器实际装有的 Runtime：没装 OpenCode 的机器就不会出现 OpenCode。
-Muxloom 尚未连上的机器无从判断，仍列出全部，安装提示因此不会被挡住。
+Muxloom 尚未连上的机器无从判断，仍列出全部，安装提示因此不会被挡住。表单会和记住的目录
+一起，默认停在你上次在这台机器上启动的那个 Runtime；若它已不在，则退回第一个可选项。
 
 Codex Resume 来源是 `~/.codex/sessions` 和 `~/.codex/session_index.jsonl`；Claude
 来源是 `~/.claude/projects`。每次都会扫描两者并用 Runtime 图标标记。相同 Runtime 原生
@@ -258,7 +259,7 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 ### 配置
 
 默认配置是 `~/.config/muxloom/config.toml`；文件不存在时使用内置默认值。启用机器、
-布局分割点、Grouped/Flat 和 Archive 可见性单独保存在
+布局分割点、Grouped/Flat、Archive 可见性以及每台机器上次启动的目录与 Runtime 单独保存在
 `~/.local/state/muxloom/state.json`。
 
 完整 TOML 示例见英文部分的[配置](#en-configuration)。主要配置包括：

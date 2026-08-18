@@ -107,6 +107,9 @@ fuzzy path picker, then start fresh or resume a history discovered in that exact
 folder. The runtime row lists what the selected machine actually has — a
 machine without OpenCode never offers it — and falls back to the full list for
 a machine Muxloom has not reached yet, so the install prompt stays reachable.
+The form opens on the runtime you last launched on that machine, alongside the
+folder it remembers, and drops back to the first one on offer if that runtime
+is gone.
 Every scan includes both Codex (`~/.codex/sessions`) and Claude Code
 (`~/.claude/projects`) histories, marks each candidate with its runtime icon,
 and expands to show a recap. A matching runtime resumes natively. Selecting the
@@ -416,8 +419,8 @@ a text selection.
 
 The default file is `~/.config/muxloom/config.toml`; a missing file is valid and
 uses built-in defaults. UI state (enabled machines, layout splits, grouped/flat
-mode, archive visibility) is stored separately in
-`~/.local/state/muxloom/state.json`.
+mode, archive visibility, and each machine's last launch folder and runtime) is
+stored separately in `~/.local/state/muxloom/state.json`.
 
 ```toml
 refresh_interval_ms = 5000
