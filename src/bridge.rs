@@ -42,6 +42,12 @@ const WRITE_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
 /// backed up. Keystrokes and resizes come from the render loop, so they must
 /// fail loudly instead of blocking the UI forever.
 const WRITE_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Lines of the local bridge's stderr kept for a failed connection to quote.
+/// Its complaint is one `muxloomd: ...` line with the whole error chain on it.
+const LOCAL_BRIDGE_COMPLAINTS: usize = 8;
+/// How long a failed local connection waits for that complaint to arrive: the
+/// handshake notices the closed pipe before the reader thread has drained it.
+const LOCAL_BRIDGE_COMPLAINT_GRACE: Duration = Duration::from_millis(100);
 const COMPANION_RELEASE_ROOT: &str =
     "https://github.com/MarsTechHAN/Muxloom/releases/latest/download";
 
@@ -453,15 +459,38 @@ impl BridgeConnection {
             .with_context(|| format!("failed to open local muxloomd bridge via {executable}"))?;
         let writer = child.stdin.take().context("local bridge has no stdin")?;
         let reader = child.stdout.take().context("local bridge has no stdout")?;
+        let complaints = Arc::new(Mutex::new(Vec::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
+            let collected = Arc::clone(&complaints);
             thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     debug::log("bridge", format!("target=local daemon: {line}"));
+                    let mut collected = collected
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if collected.len() == LOCAL_BRIDGE_COMPLAINTS {
+                        collected.remove(0);
+                    }
+                    collected.push(line);
                 }
             });
         }
         let connection = Self::from_parts("local".into(), reader, writer, Some(child));
-        Self::handshake(connection, "local")
+        Self::handshake(connection, "local").map_err(|error| {
+            // A bridge that cannot reach the daemon says why on stderr and
+            // exits, which the handshake only sees as a closed pipe. Give the
+            // caller the explanation instead of the symptom.
+            thread::sleep(LOCAL_BRIDGE_COMPLAINT_GRACE);
+            let said = complaints
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .join("; ");
+            if said.is_empty() {
+                error
+            } else {
+                error.context(format!("the local muxloomd bridge reported: {said}"))
+            }
+        })
     }
 
     fn handshake(connection: Arc<Self>, target: &str) -> Result<Arc<Self>> {

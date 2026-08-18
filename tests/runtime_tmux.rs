@@ -1,6 +1,11 @@
 #![cfg(unix)]
 
-use std::{process::Command, sync::Mutex, thread, time::Duration};
+use std::{
+    process::Command,
+    sync::{Mutex, MutexGuard},
+    thread,
+    time::Duration,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use muxloom::{
@@ -17,6 +22,25 @@ struct SessionGuard<'a> {
 }
 
 static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// One failure must stay one failure. A test that panics while holding the
+/// lock poisons it, and every test after it would report the poison instead of
+/// its own result, burying the report that actually explains anything.
+fn tmux_test_lock() -> MutexGuard<'static, ()> {
+    TMUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The reason the last launch on this target fell back, as the bridge recorded
+/// it. Without it a fallback only shows up as the tmux session it left behind.
+fn fallback_notice(runtime: &Runtime, target: &Target) -> String {
+    runtime
+        .bridge_pool()
+        .take_notice(&target.id)
+        .unwrap_or_else(|| "the bridge recorded no fallback notice".into())
+}
+
 /// The runtime probe now takes one command per agent runtime. The tests only
 /// care that the probe runs, so every runtime looks for `sh`.
 fn probe_commands() -> Vec<(AgentKind, String)> {
@@ -33,7 +57,7 @@ impl Drop for SessionGuard<'_> {
 
 #[test]
 fn local_session_survives_agent_exit_and_is_discoverable() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -53,6 +77,22 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
     };
 
     let session_id = runtime.launch(&request, &command, &[]).unwrap();
+    // Whatever the launch produced is this test's to clean up, including the
+    // tmux session a fallback would have left behind.
+    let _guard = SessionGuard {
+        runtime: &runtime,
+        target: &target,
+        session_id: session_id.clone(),
+    };
+    // A launch that could not reach muxloomd silently takes the legacy tmux
+    // path, and the only trace of it downstream is a tmux session that should
+    // not exist. Check the cause before the symptom, or the report blames tmux
+    // for a daemon that never came up.
+    assert!(
+        session_id.starts_with("muxloomd-"),
+        "launch fell back to legacy tmux instead of muxloomd: {}",
+        fallback_notice(&runtime, &target)
+    );
     if Command::new("tmux").arg("-V").output().is_ok() {
         assert!(
             !Command::new("tmux")
@@ -62,11 +102,6 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
             "new muxloomd sessions must never appear in tmux ls"
         );
     }
-    let _guard = SessionGuard {
-        runtime: &runtime,
-        target: &target,
-        session_id: session_id.clone(),
-    };
 
     let mut found = None;
     for _ in 0..20 {
@@ -94,7 +129,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
 
 #[test]
 fn discovers_legacy_agent_deck_sessions_after_the_rename() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("tmux is not installed; skipping integration check");
         return;
@@ -158,7 +193,7 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
 
 #[test]
 fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("tmux is not installed; skipping integration check");
         return;
@@ -201,7 +236,7 @@ fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
 
 #[test]
 fn embedded_pty_attaches_renders_and_accepts_input() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -252,7 +287,7 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
 
 #[test]
 fn ordinary_terminal_with_empty_command_stays_running() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -287,7 +322,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
 
 #[test]
 fn exited_terminal_is_removed_instead_of_archived() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -328,7 +363,7 @@ fn exited_terminal_is_removed_instead_of_archived() {
 
 #[test]
 fn live_agent_can_be_archived_before_permanent_removal() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -484,7 +519,7 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
 
 #[test]
 fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();
@@ -553,7 +588,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
 
 #[test]
 fn local_directory_listing_and_resume_scan_commands_execute() {
-    let _test_lock = TMUX_TEST_LOCK.lock().unwrap();
+    let _test_lock = tmux_test_lock();
     let config = Config::default();
     let runtime = Runtime::new(&config);
     let target = Target::local();

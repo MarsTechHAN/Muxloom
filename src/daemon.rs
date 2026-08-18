@@ -4030,9 +4030,15 @@ mod platform {
         Ok(())
     }
 
+    /// How long a cold start may take before the caller gives up on it. A
+    /// machine under load — a CI runner compiling and testing at once — can
+    /// spend seconds only on exec'ing a large unoptimized binary, and giving
+    /// up early sends the launch down the legacy fallback for no reason.
+    const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
+
     pub fn connect_or_start(paths: &DaemonPaths) -> Result<UnixStream> {
         if let Ok(mut stream) = UnixStream::connect(&paths.socket) {
-            if running_generation_is_current(paths) {
+            if generation_is_current_after_settling(paths) {
                 return Ok(stream);
             }
             match prepare_atomic_handover(&mut stream)? {
@@ -4055,7 +4061,7 @@ mod platform {
         }
         paths.prepare()?;
         spawn_background(paths)?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {
             match UnixStream::connect(&paths.socket) {
                 Ok(stream) => return Ok(stream),
@@ -4064,12 +4070,54 @@ mod platform {
                     let _ = error;
                 }
                 Err(error) => {
+                    // The daemon writes why it could not serve into its own
+                    // log and then exits. Carry the end of it up with the
+                    // connection error, which on its own says only that
+                    // nothing was listening.
+                    let tail = log_tail(&paths.log, 20);
                     return Err(error).with_context(|| {
-                        format!("muxloomd did not start at {}", paths.socket.display())
+                        format!(
+                            "muxloomd did not start at {} within {}s{tail}",
+                            paths.socket.display(),
+                            DAEMON_START_TIMEOUT.as_secs()
+                        )
                     });
                 }
             }
         }
+    }
+
+    /// A daemon binds its socket a moment before it stamps its generation, so
+    /// a client that connects in between reads a missing or superseded stamp
+    /// and puts a daemon that just started through a handover it does not
+    /// need. Look once more before believing the stamp.
+    fn generation_is_current_after_settling(paths: &DaemonPaths) -> bool {
+        if running_generation_is_current(paths) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+        running_generation_is_current(paths)
+    }
+
+    /// The end of the daemon's log, phrased to sit inside an error message.
+    /// Empty when there is nothing to read, so the error reads normally.
+    fn log_tail(path: &Path, lines: usize) -> String {
+        let Ok(text) = fs::read_to_string(path) else {
+            return String::new();
+        };
+        let tail = text
+            .lines()
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tail.trim().is_empty() {
+            return String::new();
+        }
+        format!("; the daemon log ends with: {tail}")
     }
 
     fn spawn_background(paths: &DaemonPaths) -> Result<()> {
