@@ -1751,7 +1751,7 @@ mod platform {
             ),
             DaemonRequest::PrepareHandover => {
                 let ready = prepare_handover(state);
-                write_response(
+                let delivered = write_response(
                     writer,
                     request_id,
                     if ready {
@@ -1759,11 +1759,17 @@ mod platform {
                     } else {
                         &DaemonResponse::HandoverDeferred
                     },
-                )?;
+                );
+                // Draining is the promise this daemon cannot take back: it has
+                // already stopped accepting work. Keep it even when the client
+                // that asked hung up before the answer reached it, because a
+                // daemon left alive and draining answers every later launch
+                // with a refusal, and its callers spend the rest of its life
+                // on the compatibility fallback.
                 if ready {
                     state.shutdown.store(true, Ordering::Release);
                 }
-                Ok(())
+                delivered
             }
             DaemonRequest::ProbeExecutables { executables } => {
                 let available = executables
@@ -4810,6 +4816,37 @@ mod platform {
             {
                 session.stop().unwrap();
             }
+        }
+
+        /// A handover the asking client never hears about still has to happen.
+        /// By the time the daemon answers it has already stopped taking work,
+        /// so if the answer cannot be delivered it must go anyway: a daemon
+        /// left alive and draining refuses every later launch, and its callers
+        /// spend the rest of its life on the compatibility fallback.
+        #[test]
+        fn an_accepted_handover_stops_the_daemon_even_when_the_answer_is_lost() {
+            let (client, server) = UnixStream::pair().unwrap();
+            let state = test_state("handover-hangup");
+            // The sole client the handover requires, counted exactly as
+            // serve_client counts it on the way in.
+            state.clients.store(1, Ordering::Relaxed);
+            // The request has already been read; only the answer has nowhere
+            // left to go.
+            drop(client);
+            let writer = Arc::new(Mutex::new(server));
+            let delivered = handle_request(&writer, &state, 71, DaemonRequest::PrepareHandover);
+            assert!(
+                delivered.is_err(),
+                "this test is about a lost answer, so writing one must fail"
+            );
+            assert!(
+                state.draining.load(Ordering::Acquire),
+                "a sole client's handover request must be accepted"
+            );
+            assert!(
+                state.shutdown.load(Ordering::Acquire),
+                "a daemon that accepted a handover must stop even if the answer never arrived"
+            );
         }
 
         #[test]
