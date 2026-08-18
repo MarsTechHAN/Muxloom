@@ -1180,18 +1180,18 @@ mod platform {
         // Messages the last generation was still holding for a busy session
         // are this one's to deliver now that it owns the sessions.
         spawn_outbox_drainer(&state);
-        // Tell this machine's agents where the control surface is, so one
-        // launched here — or on a remote the user never configures by hand —
-        // can drive the sessions around it. Nothing here is worth refusing to
-        // serve over.
+        // Tell this machine's agents where the control surface is and how the
+        // fleet works, so one launched here — or on a remote the user never
+        // configures by hand — can drive the sessions around it. Nothing here
+        // is worth refusing to serve over.
         match crate::mcp_register::register_for_this_daemon() {
             Ok(written) if !written.is_empty() => {
                 for path in written {
-                    eprintln!("muxloomd registered its MCP server in {}", path.display());
+                    eprintln!("muxloomd wrote its agent setup into {}", path.display());
                 }
             }
             Ok(_) => {}
-            Err(error) => eprintln!("muxloomd could not register its MCP server: {error:#}"),
+            Err(error) => eprintln!("muxloomd could not set up its agents: {error:#}"),
         }
         // Every one of these signals terminates the process by default. The
         // sessions themselves live in their keepers, so a caught signal only

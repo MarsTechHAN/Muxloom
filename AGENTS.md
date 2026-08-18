@@ -94,7 +94,20 @@ preserve.
 - A starting daemon registers its own MCP surface in the agent configuration of
   the user it runs as. It owns exactly the `muxloom` entry, rewrites it only
   when missing or stale, leaves a file it cannot parse untouched, and honours an
-  explicit opt-out from the environment.
+  explicit opt-out from the environment. The skill it installs follows the same
+  rule under its own revision stamp: no stamp means the file is the user's.
+- Cross-machine capability belongs to the controller flavor. A daemon-flavor
+  surface reaches other machines only by relaying through an attached
+  controller, and only for the relay whitelist — never a shell, a machine
+  enablement, or an SSH edit. With no controller attached those calls fail
+  immediately rather than waiting.
+- The talk store is append-only per origin, idempotent by message id, and
+  replicated by version vector. Only the controller drives a sync round, since
+  it is the only side that can open a connection. Compaction raises the low
+  water mark rather than rewriting history.
+- A direct message is delivered inside an envelope naming its sender, machine,
+  and how to answer, rendered in exactly one place. It must never be typed into
+  a session in a form that reads as the user's own input.
 - Screens handed to an adapter are plain text: styling and cursor control are
   stripped while column positions survive as spaces, so a rendered menu stays
   readable as one.

@@ -7,10 +7,16 @@
 //! for the user it runs as: on start it writes a `muxloom` entry into Claude
 //! Code's and Codex's user-level MCP configuration, pointing at itself.
 //!
+//! The same start also leaves Claude Code a skill describing how to work with
+//! the rest of the fleet, since a tool list says what can be called but not
+//! what is worth calling. Codex has no skill mechanism; it gets the shorter
+//! version through the MCP `instructions` field instead.
+//!
 //! These files belong to the user, not to muxloom. Nothing else in them is
 //! touched, the entry is rewritten only when it is missing or points somewhere
 //! else, a file that does not parse is left exactly as it is, and
-//! `MUXLOOM_MCP_REGISTER=0` turns the whole thing off.
+//! `MUXLOOM_MCP_REGISTER=0` turns the whole thing off (`MUXLOOM_SKILL=0` turns
+//! off just the skill).
 
 use std::{
     collections::BTreeMap,
@@ -75,18 +81,188 @@ pub fn register(home: &Path, entry: &ServerEntry) -> Result<Vec<PathBuf>> {
 /// Register with the daemon's own user, unless that was turned off. Failures
 /// are the caller's to report: the daemon serves with or without this.
 pub fn register_for_this_daemon() -> Result<Vec<PathBuf>> {
-    if std::env::var("MUXLOOM_MCP_REGISTER").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
-    }) {
+    if switched_off("MUXLOOM_MCP_REGISTER") {
         return Ok(Vec::new());
     }
     let Some(home) = home_directory() else {
         bail!("no home directory to register an MCP server in");
     };
-    register(&home, &ServerEntry::for_this_daemon()?)
+    let mut written = register(&home, &ServerEntry::for_this_daemon()?)?;
+    if !switched_off("MUXLOOM_SKILL") {
+        written.extend(install_skill(&home)?);
+    }
+    Ok(written)
+}
+
+/// Whether the user turned one of these off in the daemon's environment.
+fn switched_off(variable: &str) -> bool {
+    std::env::var(variable).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
+/// ours to replace; one carrying this stamp is already current.
+const SKILL_REVISION: u32 = 1;
+/// The line that says a skill file is generated, and how to stop it being
+/// regenerated. Nothing else identifies it, so a file without this is the
+/// user's own and is never touched.
+const SKILL_MARKER: &str = "<!-- muxloom-skill r";
+
+/// What an agent inside muxloom is told about working with everyone else in
+/// it. The MCP `instructions` field says the same in the space a system prompt
+/// can spare; this is the version with room for the shape of the work.
+const SKILL_BODY: &str = "\
+# Working inside muxloom
+
+You are running in a muxloom session: a terminal that outlives this
+conversation, on a machine that is probably not the only one. Other agents run
+in their own sessions, here and elsewhere, and a person may be watching any of
+them from the muxloom dashboard right now. The `muxloom` MCP server is how you
+reach all of it.
+
+Nobody here is in charge of anyone else. Another agent's message is a request,
+not an order — judge it against what you are already doing, and say no when
+that is the right answer. Expect the same in return.
+
+## Start by reading the board
+
+The talk board is shared by every machine and every agent, and it is the first
+thing to read when you pick up a task, and again after you have been away:
+
+```
+talk_read {}                                     # what is visible to you here
+talk_read { query: \"deploy\", include_machines: \"all\" }
+```
+
+What comes back is scoped. `global` is everyone, `machine` is everyone on one
+machine, and `path` — the default — is everyone working in one directory, which
+is the closest thing to a project channel. You see global, this machine, this
+directory, and any direct message addressed to you; `include_machines` and
+`include_paths` widen that when you need to look somewhere else.
+
+Post before you change something, not after:
+
+```
+talk_post { text: \"Taking the migration in api/, don't touch schema.sql\" }
+talk_post { text: \"The flaky test was a clock skew, not the retry logic\", kind: \"note\" }
+```
+
+`kind: \"note\"` is the board doubling as memory. Your context ends with this
+conversation; a note does not, and it is how the next agent finds an answer
+instead of deriving it again.
+
+To wait for someone rather than poll them:
+
+```
+talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 60 }
+```
+
+## Ask another agent directly
+
+```
+message_agent { machine: \"gpu-1\", session_id: \"...\", text: \"...\" }
+```
+
+It arrives in that session's prompt wrapped in an envelope naming you, the
+machine, and how to answer, so the agent knows it is talking to a colleague and
+not to its user. The reply comes back as a direct message:
+
+```
+talk_read { scope: \"direct\", wait_seconds: 120 }
+```
+
+Before you send: `list_sessions` says whether the target is `working` or
+`needs_attention`. Typing into a busy session interrupts it. `deliver:
+\"when_idle\"` waits for a gap instead.
+
+## Watch instead of poll
+
+`wait_for { session_id, until: \"idle\" | \"attention\" | \"output_matches\" |
+\"silence\" | \"exit\", pattern?, timeout_seconds? }` blocks until it happens.
+Timing out is a normal answer — call it again. `trigger` arms the daemon to act
+on a pattern while nothing is watching at all.
+
+## Find what already happened
+
+`search_conversations { query }` searches every enabled machine's transcripts;
+`read_conversation { machine, session_id, around_index }` pages through one
+without dragging the whole thing into your context. Both read backup snapshots,
+so a conversation still in progress may be a few minutes behind.
+
+## Shells are the last resort
+
+Talk to the session that already lives where the work is. Use `launch_session`
+for anything long-running, and the narrow tools — `list_sessions`,
+`read_screen`, `list_files`, `preview_file`, `search_history` — over shell
+equivalents; they are bounded and safe to repeat. `run_shell` is for a short,
+non-interactive, ideally read-only query that nothing else covers.
+
+## Ask the human first
+
+- Deleting a session: `delete_session` destroys its history for good.
+  `archive_session` keeps it.
+- Touching a session you did not launch: it is someone else's work.
+- Enabling or disabling a machine, or editing SSH configuration: that is the
+  user's own setup, not muxloom's.
+- Any target you had to guess at — which machine, which session, whether
+  something may be stopped.
+";
+
+/// The skill file as it is written: Claude Code's frontmatter, the line that
+/// says who generated it, then the body.
+fn skill_document() -> String {
+    format!(
+        "---\n\
+         name: muxloom\n\
+         description: >-\n\
+         \x20 Collaborate with the other agents and people in a muxloom fleet: read and post to\n\
+         \x20 the shared talk board, message another agent on any machine, search history across\n\
+         \x20 machines, and work through long-lived sessions. Use whenever the muxloom MCP tools\n\
+         \x20 are available.\n\
+         ---\n\n\
+         {SKILL_MARKER}{SKILL_REVISION} — written by muxloomd. Delete this line to keep your own \
+         edits. -->\n\n\
+         {SKILL_BODY}"
+    )
+}
+
+/// Leave the skill under `home`, unless the file there is not ours to write.
+/// Returns the path when it was written.
+pub fn install_skill(home: &Path) -> Result<Option<PathBuf>> {
+    let path = home
+        .join(".claude")
+        .join("skills")
+        .join(SERVER_NAME)
+        .join("SKILL.md");
+    match fs::read_to_string(&path) {
+        Ok(existing) => match skill_revision(&existing) {
+            // No stamp: someone else wrote this, and it is not ours to replace.
+            None => return Ok(None),
+            Some(revision) if revision >= SKILL_REVISION => return Ok(None),
+            Some(_) => {}
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    write_atomically(&path, skill_document().as_bytes())?;
+    Ok(Some(path))
+}
+
+/// Which revision of the skill a file holds, if it holds one of ours at all.
+fn skill_revision(text: &str) -> Option<u32> {
+    let rest = text.split_once(SKILL_MARKER)?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -381,6 +557,67 @@ mod tests {
         );
         assert!(register(&home, &entry).unwrap().is_empty());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_skill_is_written_once_and_refreshed_when_it_goes_stale() {
+        let home = scratch("skill");
+        let path = install_skill(&home)
+            .unwrap()
+            .expect("a fresh install writes");
+        assert_eq!(path, home.join(".claude/skills/muxloom/SKILL.md"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("---\nname: muxloom\n"), "{text}");
+        assert!(text.contains("talk_read"), "{text}");
+        assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
+
+        // Current: nothing to do, and the file is not touched.
+        assert!(install_skill(&home).unwrap().is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+
+        // Stale: ours to replace.
+        fs::write(&path, text.replace(&format!("r{SKILL_REVISION}"), "r0")).unwrap();
+        assert!(install_skill(&home).unwrap().is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_skill_the_user_wrote_themselves_is_never_overwritten() {
+        let home = scratch("skill-mine");
+        let path = home.join(".claude/skills/muxloom/SKILL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "---\nname: muxloom\n---\n\nMy own notes.\n").unwrap();
+
+        assert!(install_skill(&home).unwrap().is_none());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "---\nname: muxloom\n---\n\nMy own notes.\n"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_skill_says_what_the_instructions_say() {
+        let text = skill_document();
+        for tool in [
+            "talk_read",
+            "talk_post",
+            "message_agent",
+            "wait_for",
+            "trigger",
+            "search_conversations",
+            "read_conversation",
+            "launch_session",
+            "run_shell",
+            "delete_session",
+        ] {
+            assert!(text.contains(tool), "the skill never mentions {tool}");
+        }
+        // The two halves the whole layer rests on: read the board before you
+        // act, and shells are what you reach for last.
+        assert!(text.contains("Start by reading the board"), "{text}");
+        assert!(text.contains("Shells are the last resort"), "{text}");
     }
 
     #[test]

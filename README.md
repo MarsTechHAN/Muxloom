@@ -36,6 +36,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 - [Controls](#controls)
 - [Configuration](#configuration)
 - [MCP](#mcp)
+- [Agent collaboration](#agent-collaboration)
 - [How it works](#how-it-works)
 - [Platform support](#platform-support)
 - [Troubleshooting](#troubleshooting)
@@ -87,6 +88,9 @@ messages, PTY traffic, history pages, file operations, and encoded media.
 - 🤖 **MCP** — `muxloom mcp` and `muxloomd mcp` serve the whole workspace to AI
   agents over the Model Context Protocol: session status, launch/resume,
   typed input, screen reads, search, and files.
+- 💬 **Agents that work together** — a talk board every machine replicates,
+  direct messages between agent sessions across hosts, waits and standing
+  triggers, and cross-machine transcript search; press `b` to watch it all.
 
 ## Feature tour
 
@@ -346,6 +350,7 @@ the full categorized help inside the TUI.
 | `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
+| `b` | Open the talk board every machine and agent shares; the footer shows `● N` when it has unread messages |
 | `Ctrl-f` | Open or close Files in the current context |
 | `,` / `Ctrl-,` | Edit the selected machine's / global configuration; read its `muxloomd` version and force a `⟳` daemon update |
 | `f` | Toggle grouped and flat session views |
@@ -486,6 +491,14 @@ sync_files = ["~/.pi/agent/auth.json"]
 command = ""
 args = []
 
+# What agents reaching this machine over MCP may do. A denied tool is hidden
+# from the tool list and refused when called by name; each machine answers for
+# itself, so a remote's own config.toml governs `muxloomd mcp` there.
+[mcp]
+denied_tools = []
+# Observation only: deny every tool that changes something.
+read_only = false
+
 # Overrides use an exact SSH Host alias or "local".
 [hosts.gpu-box]
 environment = 'HTTP_PROXY=http://127.0.0.1:18118 HTTPS_PROXY=http://127.0.0.1:18118'
@@ -524,20 +537,38 @@ Protocol's stdio transport:
   machine: list machines and sessions with fresh working/attention status,
   launch and resume sessions, type into a session, read rendered screens and
   scrollback pages, search histories, browse and preview files, archive or
-  delete sessions, and run shell scripts. The TUI does not need to be
+  delete sessions, and run shell scripts. It alone can change the fleet
+  itself — `set_machine_enabled` and `ssh_host`. The TUI does not need to be
   running.
 - **`muxloomd mcp`** — the same tool shapes scoped to the daemon on this
   machine, for an agent that runs on the target itself. Every call opens a
   short-lived connection to the local `muxloomd` socket (starting the daemon
   if needed), so a connected MCP client never delays daemon upgrades.
 
+Sessions are the point, not shells. The instructions the server sends at
+startup say so, and the tool descriptions repeat it: talk to the session that
+already lives where the work is, use `launch_session` for anything long-running,
+and keep `run_shell` for a short read-only query nothing else covers.
+
+`ssh_host` writes only to `~/.ssh/config.d/muxloom.conf` (mode 0600, with a
+"managed by muxloom" header) plus one `Include config.d/muxloom.conf` line at
+the top of `~/.ssh/config` if it is missing. It refuses to shadow an alias your
+own configuration defines, and every write returns the previous contents of the
+managed file, so rolling back is a matter of restoring that text — or deleting
+the file and the Include line, which leaves your SSH configuration as it was.
+
 **Registration is automatic.** Every `muxloomd` that starts — the local one and
 the companion on each remote — writes itself into that user's `~/.claude.json`
 and `~/.codex/config.toml` as an MCP server named `muxloom`, so an agent running
 on a machine can see and drive the sessions on it without any setup. Only that
 one entry is written, only when it is missing or points somewhere stale, and a
-file it cannot parse is left untouched. Set `MUXLOOM_MCP_REGISTER=0` in the
-daemon's environment to turn it off.
+file it cannot parse is left untouched. The same start leaves Claude Code a
+skill at `~/.claude/skills/muxloom/SKILL.md` describing how the fleet works;
+it carries a revision stamp and is rewritten only while that stamp is Muxloom's
+and out of date, so a file you edit is yours from then on. Codex has no skill
+mechanism and gets the short version through the MCP `instructions` field.
+Set `MUXLOOM_MCP_REGISTER=0` in the daemon's environment to turn all of it off,
+or `MUXLOOM_SKILL=0` to keep the server entry and drop the skill.
 
 To register the multi-machine controller surface by hand:
 
@@ -574,6 +605,76 @@ adapter so hardware status panels can read agent state.
 > `run_shell` and `send_input` let a connected MCP client execute arbitrary
 > commands as your user on enabled machines. Grant access to these servers
 > with that in mind.
+
+## Agent collaboration
+
+The tools above let one agent drive a fleet. These let a fleet of agents work
+together: a shared board they all read and write, direct messages between
+sessions on any machine, and search across everything anyone has already said.
+Nobody is in charge of anyone else — a message from another agent is a request,
+not an order, and a person typing in the dashboard posts the same kind of
+message an agent does.
+
+**The talk board.** `talk_post` says something; `talk_read` reads it back.
+Every message is scoped:
+
+| Scope | Who sees it | For |
+| --- | --- | --- |
+| `path` (default) | Everyone working in one directory on one machine | The project channel: what you are touching, what you found |
+| `machine` | Everyone on one machine | Host-wide news: a service is down, a disk is full |
+| `global` | Everyone, everywhere | Things that genuinely travel |
+| `direct` | One session | Replies to `message_agent`, and its delivery record |
+
+A read shows what is in front of you — this machine, this directory, global, and
+anything addressed to you — and `include_machines` / `include_paths` widen that
+to named ones or `"all"`. `kind: "note"` is the board doubling as memory: an
+agent's context ends with its conversation, a note does not. `since_cursor`
+returns only what is new, and `wait_seconds` holds the call open until something
+is said rather than polling.
+
+Scope only decides who a message is *for*. Every message is replicated to every
+machine, so the board reads the same everywhere and stays readable when a host
+is unreachable. Storage is append-only per machine under `<state>/talk/`,
+merged by version vector, and the controller drives the sync — with no
+dashboard attached, machines stop exchanging messages until one connects.
+
+**Direct messages.** `message_agent { machine, session_id, text }` types the
+message into that session's prompt inside an envelope that names the sender,
+its machine and directory, and how to answer, so the agent on the other side
+knows it is hearing from a colleague rather than from its user. Delivery waits
+for a busy session by default (`deliver: "when_idle"` waits indefinitely,
+`"now"` interrupts). Every direct message is also filed on the board, so both
+what was said and whether it arrived are auditable, and replies come back
+through `talk_read { scope: "direct" }`.
+
+**Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
+a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.
+`trigger` leaves a standing watch with the daemon instead, for what no
+conversation will be around to see; triggers survive daemon upgrades and die
+with their session.
+
+**Recall.** `search_conversations` searches every enabled machine's transcripts
+and `read_conversation` pages through one by message index without pulling it
+all into context. Both read backup snapshots, so an in-progress conversation
+can lag by a backup interval.
+
+**Reach.** `muxloom mcp` talks to every enabled machine directly. `muxloomd mcp`
+on a remote has no fleet of its own, so its cross-machine calls are relayed
+through the attached controller, and only these are: conversation search and
+recall, listing machines and sessions, `message_agent`, and board sync. Shells,
+machine enablement, and SSH edits are never relayed. With no dashboard
+attached, those calls fail immediately and say so.
+
+**Watching from the dashboard.** Press `b` for the board. It is a BBS: scope
+tabs across the top, one line per message, newest at the bottom, `/` to filter,
+`Enter` to expand, `p` to post as yourself and `r` to reply. The footer carries
+`● N` while there is something unread.
+
+**Turning it down.** `[mcp] denied_tools` hides a tool from the list and refuses
+it by name; `read_only = true` denies every tool that changes anything. Each
+machine answers for itself, so a remote's own `config.toml` governs what an
+agent running there may do. Denying `message_agent` leaves the board readable
+and writable but stops agents interrupting each other.
 
 ## How it works
 
@@ -647,6 +748,7 @@ old frame visible until the new stream produces its first frame.
 | `src/worker.rs` | Background typed request/event execution |
 | `src/control.rs` | Transport-agnostic control surface behind MCP and future adapters |
 | `src/mcp.rs` | Minimal MCP server over line-based JSON-RPC |
+| `src/talk.rs` | Talk board: messages, scopes, version-vector store, delivery envelopes |
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |
@@ -719,7 +821,12 @@ muxloom --debug-log /tmp/muxloom-debug.log
   flags keep the security consequences of that runtime.
 - An MCP client connected to `muxloom mcp` or `muxloomd mcp` can read
   histories, type into sessions, and run shell scripts as your user on
-  enabled machines.
+  enabled machines. `[mcp] denied_tools` and `read_only` narrow that per
+  machine.
+- `message_agent` types into another agent's prompt, which is the same
+  authority as pressing Enter for it. Talk board messages are replicated in
+  full to every enabled machine regardless of scope, so treat the board as
+  fleet-wide and do not put secrets on it.
 
 ## Contributing
 

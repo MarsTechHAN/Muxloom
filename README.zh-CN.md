@@ -31,6 +31,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 - [触摸屏](#zh-touch)
 - [配置](#zh-configuration)
 - [MCP](#zh-mcp)
+- [Agent 协作层](#zh-collaboration)
 - [会话、历史与提醒](#zh-sessions)
 - [文件管理与预览](#zh-files)
 - [实现架构](#zh-architecture)
@@ -49,7 +50,8 @@ Muxloom 是一个用 Rust 实现的终端工作台，用于从一个 TUI 管理�
 - 在 Dashboard 内完整渲染并交互真实 PTY；
 - Resume、Recap、Archive、交互提醒和跨会话全文搜索；
 - 本地/远程文件浏览、结构化文本、图片和视频预览、下载与拖拽上传；
-- 横屏、竖屏和小尺寸 Compact 布局，以及独立持久化的分割位置。
+- 横屏、竖屏和小尺寸 Compact 布局，以及独立持久化的分割位置；
+- 一层跨机同步的 Agent 协作面：共用公告板、Agent 之间的私信、等待与触发器。
 
 正常会话由目标机器上的 `muxloomd` 持有，不会出现在 `tmux ls`。退出 Dashboard、
 SSH 断开或 Controller 休眠都不会结束 Agent。正常 daemon 数据面为每台远端机器维护
@@ -212,6 +214,7 @@ Claude 使用橙色 sparkle（`✻✽✶✳`），OpenCode 使用紫色菱形（
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
 | `a` | 展开或收起 Archived |
 | `/` / `Ctrl-p` | 搜索全部会话历史 |
+| `b` | 打开所有机器和 Agent 共用的 Talk Board；有未读时 Footer 会显示 `● N` |
 | `Ctrl-f` | 按当前上下文展开或关闭 Files |
 | `,` / `Ctrl-,` | 编辑当前机器配置 / 全局配置 |
 | `f` | 切换 Grouped / Flat |
@@ -305,16 +308,30 @@ Controller 只解析发布元数据——版本、URL、SHA-256——由目标�
 - **`muxloom mcp`** —— Controller 面，headless 运行。读取与 Dashboard 相同的配置和状态，
   可触达所有**已启用**的机器：列出机器与会话（含实时 working / needs_attention 状态与
   Recap）、启动与恢复会话、向会话输入、读取渲染后的屏幕与回滚、全文搜索历史、浏览与预览
-  文件、归档或删除会话、执行 Shell 脚本。TUI 不需要在运行。
+  文件、归档或删除会话、执行 Shell 脚本。只有它能改动机队本身——`set_machine_enabled`
+  和 `ssh_host`。TUI 不需要在运行。
 - **`muxloomd mcp`** —— 同样的工具形态，但只作用于本机 daemon，适合运行在目标机器上的
   Agent。每次调用都用一条短连接访问本机 `muxloomd` socket（daemon 未运行时会自动拉起），
   因此挂着的 MCP 客户端不会推迟 daemon 升级。
 
+重点是会话，不是 Shell。MCP 在 `initialize` 时下发的 instructions 就这么写，各个工具的
+description 也反复强调：优先跟已经在那个目录里的会话对话，长任务用 `launch_session` 起，
+`run_shell` 留给别的工具覆盖不到的、一次性的只读查询。
+
+`ssh_host` 的写入只落在 `~/.ssh/config.d/muxloom.conf`（0600，带 "managed by muxloom"
+头），外加在 `~/.ssh/config` 顶部补一行 `Include config.d/muxloom.conf`（缺了才补）。
+如果某个别名是你自己的配置定义的，Muxloom 拒绝遮蔽它；每次写入都会把托管文件的旧内容
+一并返回，所以回滚就是把那段文本写回去——或者删掉托管文件和那行 Include，SSH 配置就回到
+原样。
+
 **注册是自动的。** 每个启动的 `muxloomd`——本机的和各远端的 companion——都会把自己以
 `muxloom` 为名写进该用户的 `~/.claude.json` 和 `~/.codex/config.toml`，所以跑在某台机器上
 的 agent 无需任何配置就能看到并驱动这台机器上的会话。只写这一条目，且只在缺失或指向过期
-路径时才写，解析不了的文件原样保留。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以
-关闭。
+路径时才写，解析不了的文件原样保留。同一次启动还会给 Claude Code 留一份
+`~/.claude/skills/muxloom/SKILL.md`，讲清楚这套机队怎么协作；文件带版本戳，只在戳是
+Muxloom 的且已过期时才重写，所以你一旦改过它，它就归你了。Codex 没有 skill 机制，靠 MCP
+`instructions` 拿到精简版。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以整体关闭，
+`MUXLOOM_SKILL=0` 则只关 skill、保留 MCP 条目。
 
 手工注册跨机器的 Controller 面：
 
@@ -344,6 +361,61 @@ Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）�
 > [!WARNING]
 > `run_shell` 与 `send_input` 允许连接的 MCP 客户端在启用机器上以你的用户身份执行任意
 > 命令，请据此决定向哪些客户端开放。
+
+<a id="zh-collaboration"></a>
+
+### Agent 协作层
+
+上面那组工具让一个 Agent 驱动整个机队；这一组让一群 Agent 一起干活：一块所有人共读共写的
+公告板、可跨机直达另一个会话的私信，以及对所有人说过的话的检索。这里没有主从——别的 Agent
+发来的消息是请求不是命令，人在 Dashboard 里发的帖和 Agent 发的帖也完全同构。
+
+**Talk Board。** `talk_post` 发言，`talk_read` 读取。每条消息都有 scope：
+
+| Scope | 谁看得到 | 用途 |
+| --- | --- | --- |
+| `path`（默认） | 同一台机器同一个目录里的所有人 | 项目频道：我在改什么、我发现了什么 |
+| `machine` | 这台机器上的所有人 | 主机级消息：某个服务挂了、盘满了 |
+| `global` | 所有机器上的所有人 | 真正需要传遍全网的事 |
+| `direct` | 单个会话 | `message_agent` 的回复，以及它的投递记录 |
+
+默认读到的是"摆在你面前的"——本机、本目录、global，以及发给你的私信；
+`include_machines` / `include_paths` 可以放宽到指定的机器和目录，或者 `"all"` 搜遍全部。
+`kind: "note"` 把公告板当记忆用：Agent 的上下文随对话结束，note 不会。`since_cursor` 只返回
+新增内容，`wait_seconds` 则把调用挂住直到有人说话，不用轮询。
+
+scope 只决定消息**是给谁的**。所有消息都会复制到每台机器，所以公告板在哪台机器上读起来
+都一样，某台机器连不上时也照样能读。存储是每台机器一份 append-only 日志（`<state>/talk/`），
+按版本向量合并，同步由 Controller 驱动——没有 Dashboard 连着时，机器之间会暂停交换消息，
+直到有一个连上来。
+
+**私信。** `message_agent { machine, session_id, text }` 会把消息连同一段信封打进对方会话的
+输入框，信封写明发件人、所在机器与目录，以及怎么回信，因此对面的 Agent 知道这是同事在说话，
+不是它的用户在说话。默认会等对方忙完再投（`deliver: "when_idle"` 一直等，`"now"` 直接打断）。
+每条私信同时落在公告板上，所以说了什么、有没有送到都可追溯，回信走
+`talk_read { scope: "direct" }`。
+
+**等待。** `wait_for` 会阻塞到会话空闲、需要人介入、屏幕出现某段文本、安静下来或退出为止——
+超时是正常返回，不是失败。`trigger` 则把这份守望交给 daemon，用于没有任何对话在场的时候；
+触发器能跨 daemon 升级存活，会随会话消失而消失。
+
+**回忆。** `search_conversations` 检索所有已启用机器的历史对话，`read_conversation` 按消息
+序号分页读取其中一段，不会把整段对话灌进上下文。两者读的都是备份快照，进行中的对话可能
+落后一个备份周期。
+
+**可达性。** `muxloom mcp` 直接连所有已启用机器；远端的 `muxloomd mcp` 自己没有机队，
+它的跨机调用由挂着的 Controller 代跑，而且只代跑这些：对话检索与回忆、列机器与会话、
+`message_agent`、公告板同步。Shell、机器启停和 SSH 改写永远不代跑。没有 Dashboard 连着时，
+这些调用立刻失败并说明原因。
+
+**在 Dashboard 里看。** 按 `b` 打开公告板，版式就是 BBS：顶部 scope 标签页，一行一条，
+新的在下面，`/` 过滤，`Enter` 展开，`p` 以你自己的身份发帖，`r` 回复。有未读时 Footer 上
+挂着 `● N`。
+
+**收紧权限。** `[mcp] denied_tools` 让某个工具从工具列表里消失、按名字调用也被拒；
+`read_only = true` 一次禁掉所有会改变状态的工具。每台机器各自说了算，所以远端上跑的 Agent
+能做什么，由那台机器自己的 `config.toml` 决定。只禁 `message_agent` 的话，公告板照样可读
+可写，但 Agent 之间不能互相打断。
 
 <a id="zh-sessions"></a>
 
@@ -521,7 +593,9 @@ Debug Log 可能包含少量当前 Agent 可见文本，应按敏感信息处理
 - 启用机器意味着允许周期性 BatchMode SSH 和 companion 管理；
 - 目标 History、Debug Snippet 和搜索结果都可能包含敏感内容；
 - 连接 `muxloom mcp` / `muxloomd mcp` 的 MCP 客户端可以读取历史、向会话输入并以你的用户
-  身份在启用机器上执行 Shell 脚本；
+  身份在启用机器上执行 Shell 脚本，`[mcp] denied_tools` 与 `read_only` 可以按机器收窄；
+- `message_agent` 是往别的 Agent 输入框里打字，等同于替它按回车；Talk Board 上的消息无论
+  scope 都会完整复制到每台启用机器，因此应当把公告板视为全机队可见，不要在上面放密钥；
 - Muxloom 默认不添加跳过 Agent 权限检查的参数，用户配置的 Runtime Args 仍具有对应风险。
 
 ---
