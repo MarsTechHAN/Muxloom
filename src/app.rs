@@ -391,7 +391,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 57;
+pub const HELP_CONTENT_ROWS: usize = 63;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -465,7 +465,7 @@ pub enum SettingsRow {
 /// The settings the dashboard edits. Everything else — tunnels, companion
 /// overrides, install commands, sync files, attention patterns, history
 /// bounds — stays in `config.toml`, where the rare edit belongs.
-pub const GLOBAL_SETTINGS: [SettingsRow; 15] = [
+pub const GLOBAL_SETTINGS: [SettingsRow; 17] = [
     SettingsRow::Section("General"),
     SettingsRow::Field("Refresh interval (ms)"),
     SettingsRow::Field("SSH config path"),
@@ -481,6 +481,8 @@ pub const GLOBAL_SETTINGS: [SettingsRow; 15] = [
     SettingsRow::Field("Command"),
     SettingsRow::Section("Updates"),
     SettingsRow::Field("Update prompt (ask/auto/never)"),
+    SettingsRow::Section("Input"),
+    SettingsRow::Field("Touch gestures (auto/on/off)"),
 ];
 
 pub const HOST_SETTINGS: [SettingsRow; 13] = [
@@ -1915,121 +1917,34 @@ impl App {
         {
             self.last_machine_click = None;
         }
-        if let Some(modal) = self.modal.as_mut() {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                self.last_machine_click = None;
-            }
-            match modal {
-                Modal::Help(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp => form.offset = form.offset.saturating_sub(1),
-                    MouseEventKind::ScrollDown => {
-                        form.offset = form.offset.saturating_add(1).min(HELP_CONTENT_ROWS - 1)
-                    }
-                    _ => {}
-                },
-                Modal::Settings(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        form.selected = clamped_index(form.selected, form.values.len(), -1)
-                    }
-                    MouseEventKind::ScrollDown => {
-                        form.selected = clamped_index(form.selected, form.values.len(), 1)
-                    }
-                    _ => {}
-                },
-                Modal::Search(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp if !form.results.is_empty() => {
-                        form.selected = form.selected.saturating_sub(1);
-                    }
-                    MouseEventKind::ScrollDown if !form.results.is_empty() => {
-                        form.selected = (form.selected + 1).min(form.results.len() - 1);
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some((index, _)) = form
-                            .result_rows
-                            .iter()
-                            .find(|(_, area)| inside(*area, mouse.column, mouse.row))
-                        {
-                            form.selected = *index;
-                        }
-                    }
-                    _ => {}
-                },
-                Modal::PathPicker(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp if !form.loading => {
-                        form.selected =
-                            clamped_index(form.selected, matched_directories(form).len(), -1)
-                    }
-                    MouseEventKind::ScrollDown if !form.loading => {
-                        form.selected =
-                            clamped_index(form.selected, matched_directories(form).len(), 1)
-                    }
-                    _ => {}
-                },
-                Modal::Resume(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        if form.history_active() {
-                            form.history_selected =
-                                clamped_index(form.history_selected, form.history_hits.len(), -1);
-                        } else if !form.loading {
-                            form.selected =
-                                clamped_index(form.selected, form.candidates.len() + 1, -1);
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if form.history_active() {
-                            form.history_selected =
-                                clamped_index(form.history_selected, form.history_hits.len(), 1);
-                        } else if !form.loading {
-                            form.selected =
-                                clamped_index(form.selected, form.candidates.len() + 1, 1);
-                        }
-                    }
-                    _ => {}
-                },
-                Modal::PortForward(form) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        form.selected = clamped_index(form.selected, form.row_count(), -1)
-                    }
-                    MouseEventKind::ScrollDown => {
-                        form.selected = clamped_index(form.selected, form.row_count(), 1)
-                    }
-                    _ => {}
-                },
-                _ => {
-                    // Modal clicks must never activate panes behind the overlay.
+        if self.modal.is_some() {
+            return self.handle_modal_mouse(mouse);
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pointer = None;
+                if self.on_divider(mouse.column, mouse.row) {
+                    return Action::Continue;
+                }
+                // A press on a pane is only a click once it lifts nearby: the
+                // same report a mouse sends to start a drag is what a finger
+                // sends to start a swipe.
+                if let Some(pane) = self.gesture_pane_at(mouse) {
+                    self.begin_gesture(pane, mouse);
+                    return Action::Continue;
                 }
             }
-            return Action::Continue;
-        }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-            && self.on_divider(mouse.column, mouse.row)
-        {
-            return Action::Continue;
+            MouseEventKind::Drag(MouseButton::Left) if self.pointer.is_some() => {
+                self.advance_gesture(mouse);
+                return Action::Continue;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.pointer.is_some() => {
+                self.finish_gesture(mouse);
+                return Action::Continue;
+            }
+            _ => {}
         }
         if self.dragging.is_none() && self.handle_file_mouse(mouse) {
-            return Action::Continue;
-        }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-            && !mouse.modifiers.contains(KeyModifiers::ALT)
-            && self.begin_terminal_selection(mouse.column, mouse.row)
-        {
-            return Action::Continue;
-        }
-        if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
-            && self
-                .terminal_selection
-                .is_some_and(|selection| selection.dragging)
-        {
-            self.update_terminal_selection(mouse.column, mouse.row);
-            return Action::Continue;
-        }
-        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
-            && self
-                .terminal_selection
-                .is_some_and(|selection| selection.dragging)
-        {
-            self.update_terminal_selection(mouse.column, mouse.row);
-            self.finish_terminal_selection(mouse);
             return Action::Continue;
         }
         match mouse.kind {
@@ -2088,6 +2003,418 @@ impl App {
             }
         }
         Action::Continue
+    }
+
+    /// Mouse input while a modal is up. Clicks must never reach the panes
+    /// behind the overlay, so every event ends here.
+    fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.last_machine_click = None;
+                self.pointer = Some(PointerGesture::new(GesturePane::Modal, mouse));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let (steps, up) = self.track_swipe(mouse);
+                for _ in 0..steps {
+                    self.scroll_modal(up);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(gesture) = self.pointer.take()
+                    && gesture.pane == GesturePane::Modal
+                    && !gesture.swiped
+                {
+                    let (column, row) = gesture.origin();
+                    self.click_modal(column, row);
+                }
+            }
+            MouseEventKind::ScrollUp => self.scroll_modal(true),
+            MouseEventKind::ScrollDown => self.scroll_modal(false),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// One wheel notch, or one row of a swipe, inside the open modal.
+    fn scroll_modal(&mut self, up: bool) {
+        let delta = if up { -1 } else { 1 };
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        match modal {
+            Modal::Help(form) => {
+                form.offset = if up {
+                    form.offset.saturating_sub(1)
+                } else {
+                    form.offset.saturating_add(1).min(HELP_CONTENT_ROWS - 1)
+                };
+            }
+            Modal::Settings(form) => {
+                form.selected = clamped_index(form.selected, form.values.len(), delta)
+            }
+            Modal::Search(form) => {
+                if form.results.is_empty() {
+                    return;
+                }
+                form.selected = if up {
+                    form.selected.saturating_sub(1)
+                } else {
+                    (form.selected + 1).min(form.results.len() - 1)
+                };
+            }
+            Modal::PathPicker(form) => {
+                if form.loading {
+                    return;
+                }
+                form.selected =
+                    clamped_index(form.selected, matched_directories(form).len(), delta);
+            }
+            Modal::Resume(form) => {
+                if form.history_active() {
+                    form.history_selected =
+                        clamped_index(form.history_selected, form.history_hits.len(), delta);
+                } else if !form.loading {
+                    form.selected = clamped_index(form.selected, form.candidates.len() + 1, delta);
+                }
+            }
+            Modal::PortForward(form) => {
+                form.selected = clamped_index(form.selected, form.row_count(), delta)
+            }
+            _ => {}
+        }
+    }
+
+    /// A tap inside the open modal.
+    fn click_modal(&mut self, column: u16, row: u16) {
+        if let Some(Modal::Search(form)) = self.modal.as_mut()
+            && let Some((index, _)) = form
+                .result_rows
+                .iter()
+                .find(|(_, area)| inside(*area, column, row))
+        {
+            form.selected = *index;
+        }
+    }
+
+    /// Which pane a press belongs to, in the order the panes overlap.
+    fn gesture_pane_at(&self, mouse: MouseEvent) -> Option<GesturePane> {
+        if let Some(form) = self.file_manager.as_ref() {
+            if form
+                .list_area
+                .is_some_and(|area| inside(area, mouse.column, mouse.row))
+            {
+                return Some(GesturePane::FileList);
+            }
+            if form
+                .preview_area
+                .is_some_and(|area| inside(area, mouse.column, mouse.row))
+            {
+                return Some(GesturePane::FilePreview);
+            }
+        }
+        // Alt+click is how a pointer reaches an application that asked for
+        // mouse reporting, so it must keep landing there directly.
+        if !mouse.modifiers.contains(KeyModifiers::ALT)
+            && self.terminal_cell_at(mouse.column, mouse.row).is_some()
+        {
+            return Some(GesturePane::Terminal);
+        }
+        if self
+            .pane_layout
+            .machines
+            .is_some_and(|area| inside(area, mouse.column, mouse.row))
+        {
+            return Some(GesturePane::Machines);
+        }
+        if self
+            .pane_layout
+            .agents
+            .is_some_and(|area| inside(area, mouse.column, mouse.row))
+        {
+            return Some(GesturePane::Agents);
+        }
+        None
+    }
+
+    /// Whether a drag in the terminal pane or the file preview scrolls instead
+    /// of selecting: configured on, or left on auto with a touch screen seen.
+    fn touch_gestures_active(&self) -> bool {
+        match self.config.touch.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => self.touch_detected,
+        }
+    }
+
+    /// A pointer that moved the way only a finger moves reveals a touch
+    /// screen. Say so once: it changes what a drag means in the terminal pane,
+    /// and changing that silently would read as lost text selection.
+    fn note_touch_pointer(&mut self) {
+        if self.touch_detected || self.config.touch != "auto" {
+            return;
+        }
+        self.touch_detected = true;
+        self.status_message =
+            "Touch screen detected: swipe scrolls, long-press starts a selection".into();
+    }
+
+    fn begin_gesture(&mut self, pane: GesturePane, mouse: MouseEvent) {
+        let mut gesture = PointerGesture::new(pane, mouse);
+        // Without touch gestures a drag still means selection, so the press
+        // starts one right away and the gesture only watches for the tap.
+        if !self.touch_gestures_active() {
+            match pane {
+                GesturePane::Terminal => {
+                    gesture.selecting = self.begin_terminal_selection(mouse.column, mouse.row);
+                }
+                GesturePane::FilePreview => {
+                    self.handle_file_mouse(mouse);
+                    gesture.selecting = true;
+                }
+                _ => {}
+            }
+        }
+        self.pointer = Some(gesture);
+    }
+
+    /// Fold one drag report into the live gesture: mark it a swipe once it
+    /// leaves the tap tolerance, notice a finger, and return the scroll steps
+    /// it owes its pane. Content follows the pointer, so a drag downward walks
+    /// back toward older rows.
+    fn track_swipe(&mut self, mouse: MouseEvent) -> (u16, bool) {
+        let Some(gesture) = self.pointer.as_mut() else {
+            return (0, false);
+        };
+        let jump = mouse.row.abs_diff(gesture.last_row);
+        let touch_like = jump >= TOUCH_JUMP_ROWS;
+        if mouse.row.abs_diff(gesture.origin_row) > TAP_SLOP
+            || mouse.column.abs_diff(gesture.origin_column) > TAP_SLOP
+        {
+            gesture.swiped = true;
+        }
+        let up = mouse.row > gesture.last_row;
+        gesture.last_row = mouse.row;
+        if touch_like {
+            self.note_touch_pointer();
+        }
+        (jump.min(MAX_SWIPE_STEPS), up)
+    }
+
+    fn advance_gesture(&mut self, mouse: MouseEvent) {
+        let Some(before) = self.pointer else {
+            return;
+        };
+        if before.pane == GesturePane::Modal {
+            self.pointer = None;
+            return;
+        }
+        let was_touch = self.touch_detected;
+        let (steps, up) = self.track_swipe(mouse);
+        let revealed = self.touch_detected && !was_touch;
+        let touch = self.touch_gestures_active();
+        let mut selecting = before.selecting;
+        // The flick that reveals the screen is also the one the user meant to
+        // scroll with, so the selection it started is dropped rather than
+        // copied.
+        if selecting && revealed && before.pressed_at.elapsed() < LONG_PRESS {
+            self.abandon_selection(before.pane);
+            selecting = false;
+            if let Some(gesture) = self.pointer.as_mut() {
+                gesture.selecting = false;
+            }
+        }
+        if selecting {
+            match before.pane {
+                GesturePane::Terminal => self.update_terminal_selection(mouse.column, mouse.row),
+                GesturePane::FilePreview => {
+                    self.handle_file_mouse(mouse);
+                }
+                _ => {}
+            }
+            return;
+        }
+        // A press that sat still before it moved reaches for text, the way a
+        // long press does on any phone.
+        if touch
+            && !before.swiped
+            && matches!(
+                before.pane,
+                GesturePane::Terminal | GesturePane::FilePreview
+            )
+            && before.pressed_at.elapsed() >= LONG_PRESS
+        {
+            let (column, row) = before.origin();
+            let started = if before.pane == GesturePane::Terminal {
+                let started = self.begin_terminal_selection(column, row);
+                if started {
+                    self.update_terminal_selection(mouse.column, mouse.row);
+                }
+                started
+            } else {
+                let press = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: mouse.modifiers,
+                };
+                self.handle_file_mouse(press);
+                self.handle_file_mouse(mouse);
+                true
+            };
+            if let Some(gesture) = self.pointer.as_mut() {
+                gesture.selecting = started;
+            }
+            return;
+        }
+        if self.swipe_switched_pane(mouse) {
+            return;
+        }
+        let (column, row) = before.origin();
+        for _ in 0..steps {
+            self.wheel_at(column, row, up);
+        }
+    }
+
+    fn finish_gesture(&mut self, mouse: MouseEvent) {
+        let Some(gesture) = self.pointer.take() else {
+            return;
+        };
+        if gesture.pane == GesturePane::Modal {
+            return;
+        }
+        if gesture.selecting {
+            match gesture.pane {
+                GesturePane::Terminal => {
+                    self.update_terminal_selection(mouse.column, mouse.row);
+                    self.finish_terminal_selection(mouse);
+                }
+                GesturePane::FilePreview => {
+                    self.handle_file_mouse(mouse);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if gesture.swiped {
+            return;
+        }
+        // A tap acts where the pointer landed: the wobble it lifts with is not
+        // aim.
+        let (column, row) = gesture.origin();
+        match gesture.pane {
+            GesturePane::FileList | GesturePane::FilePreview => {
+                let press = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: mouse.modifiers,
+                };
+                self.handle_file_mouse(press);
+                self.handle_file_mouse(MouseEvent {
+                    column,
+                    row,
+                    ..mouse
+                });
+            }
+            GesturePane::Terminal => self.tap_terminal(MouseEvent {
+                column,
+                row,
+                ..mouse
+            }),
+            GesturePane::Machines | GesturePane::Agents => {
+                self.terminal_selection = None;
+                self.click_pane(column, row);
+            }
+            GesturePane::Modal => {}
+        }
+    }
+
+    /// Undo the selection a press started, for when the pointer turns out to
+    /// have been a finger.
+    fn abandon_selection(&mut self, pane: GesturePane) {
+        match pane {
+            GesturePane::Terminal => self.terminal_selection = None,
+            GesturePane::FilePreview => {
+                if let Some(form) = self.file_manager.as_mut() {
+                    form.preview_selection = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What a press that lifts where it landed means in the terminal pane: the
+    /// application below gets the click, and if it wants no mouse, the pane
+    /// takes the focus.
+    fn tap_terminal(&mut self, mouse: MouseEvent) {
+        self.terminal_selection = None;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..mouse
+        };
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..mouse
+        };
+        let forwarded = self.forward_terminal_mouse(press);
+        let released = self.forward_terminal_mouse(release);
+        if !forwarded && !released {
+            self.click_pane(mouse.column, mouse.row);
+        }
+    }
+
+    /// A sideways swipe in a layout that shows one pane at a time means "show
+    /// me the pane beside this one", the way a phone moves between tabs.
+    fn swipe_switched_pane(&mut self, mouse: MouseEvent) -> bool {
+        let Some(gesture) = self.pointer else {
+            return false;
+        };
+        let compact = self
+            .layout_debug_signature
+            .is_some_and(|(_, _, _, _, _, compact)| compact);
+        if gesture.switched || !compact {
+            return false;
+        }
+        let sideways = mouse.column.abs_diff(gesture.origin_column);
+        let vertical = mouse.row.abs_diff(gesture.origin_row);
+        if sideways < PANE_SWIPE_COLUMNS || sideways < vertical.saturating_mul(2) {
+            return false;
+        }
+        // The panes follow the finger: dragging right reveals the pane to the
+        // left of the one on screen.
+        let direction = if mouse.column > gesture.origin_column {
+            FocusDirection::Left
+        } else {
+            FocusDirection::Right
+        };
+        self.move_focus(direction);
+        if let Some(gesture) = self.pointer.as_mut() {
+            gesture.switched = true;
+            gesture.swiped = true;
+        }
+        true
+    }
+
+    /// Replay the wheel at a point, so a swipe scrolls exactly what a notch
+    /// there would: the file browser first, then an application that asked for
+    /// mouse reporting, then Muxloom's own panes.
+    fn wheel_at(&mut self, column: u16, row: u16, up: bool) {
+        let event = MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        if self.handle_file_mouse(event) {
+            return;
+        }
+        if !self.forward_terminal_mouse(event) {
+            self.scroll_at(column, row, up);
+        }
     }
 
     fn handle_file_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -5570,6 +5897,7 @@ impl App {
                 format_shell_list(&self.config.agents.claude.args),
                 self.config.agents.terminal.command.clone(),
                 self.config.update_prompt.clone(),
+                self.config.touch.clone(),
             ],
             notes: Vec::new(),
             selected: 0,
@@ -7030,6 +7358,7 @@ impl App {
                     config.agents.claude.args = parse_shell_list(&form.values[6], "Claude args")?;
                     config.agents.terminal.command = form.values[7].clone();
                     config.update_prompt = form.values[8].trim().to_string();
+                    config.touch = form.values[9].trim().to_string();
                 }
                 SettingsScope::Host(target_id) => {
                     // The form edits the common fields; everything it no
@@ -9634,6 +9963,164 @@ mod tests {
         assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
     }
 
+    /// A pane with three lines of history under a small terminal pane, which
+    /// is enough to select text in and to scroll back through.
+    fn touch_test_app() -> App {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.pane_layout.recap = Some(Rect::new(0, 0, 10, 5));
+        app.agent_viewport_width = 8;
+        app.agent_viewport_height = 3;
+        app.history_offset = 3;
+        app.history = HistoryPage {
+            text: "one\ntwo\nthree".into(),
+            history_size: 40,
+            pane_height: 3,
+            pane_width: 8,
+            offset_from_bottom: 3,
+            rendered: true,
+            more_history: false,
+        };
+        app.history_message.clear();
+        app
+    }
+
+    fn pointer(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_swipe_scrolls_a_list_instead_of_selecting_what_it_landed_on() {
+        let mut app = ux_test_app(vec![
+            Target::local(),
+            Target::ssh("a"),
+            Target::ssh("b"),
+            Target::ssh("c"),
+            Target::ssh("d"),
+            Target::ssh("e"),
+        ]);
+        app.pane_layout.machines = Some(Rect::new(0, 0, 30, 12));
+        app.machine_rows = (0..6).map(|index| (index, 1)).collect();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 4, 4));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 4, 1));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 4, 1));
+        // Three rows of swipe move three rows of list. The row the finger
+        // landed on was never selected on the way, and the lift selects
+        // nothing either.
+        assert_eq!(app.selected_target, 3);
+
+        // A press that lifts where it landed is still a click.
+        tap(
+            &mut app,
+            pointer(MouseEventKind::Down(MouseButton::Left), 4, 2),
+        );
+        assert_eq!(app.selected_target, 1);
+    }
+
+    #[test]
+    fn a_flick_in_the_terminal_scrolls_the_scrollback_and_copies_nothing() {
+        let mut app = touch_test_app();
+        app.history_offset = 0;
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        // Five rows between two reports is a finger, not a pointing device.
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 6));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 6));
+
+        assert!(app.touch_detected, "the flick reveals a touch screen");
+        assert_eq!(app.history_offset, 5, "the pane walked back five rows");
+        assert!(
+            app.take_clipboard_request().is_none(),
+            "a swipe selects nothing"
+        );
+    }
+
+    #[test]
+    fn a_short_mouse_drag_in_the_terminal_still_selects_text() {
+        let mut app = touch_test_app();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 2));
+
+        assert!(!app.touch_detected, "a mouse crosses cells one at a time");
+        assert_eq!(app.history_offset, 3, "selecting never scrolls");
+        assert_eq!(
+            app.take_clipboard_request().as_deref(),
+            Some("one\ntwo"),
+            "the drag copied the rows it covered"
+        );
+    }
+
+    #[test]
+    fn a_long_press_then_drag_selects_terminal_text_on_a_touch_screen() {
+        let mut app = touch_test_app();
+        app.config.touch = "on".into();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        // The press sat still long enough to mean "select from here".
+        let held = app.pointer.as_mut().expect("press tracked");
+        held.pressed_at = Instant::now() - LONG_PRESS - Duration::from_millis(50);
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 1));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 1));
+
+        assert_eq!(app.history_offset, 3, "a held press never scrolls");
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn touch_off_keeps_every_drag_a_selection() {
+        let mut app = touch_test_app();
+        app.config.touch = "off".into();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 2));
+
+        assert!(!app.touch_gestures_active());
+        assert_eq!(app.history_offset, 3);
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn a_swipe_scrolls_the_open_modal() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.modal = Some(Modal::Help(HelpForm::default()));
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 10, 10));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 10, 6));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 10, 6));
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Help(HelpForm { offset: 4 }))
+        ));
+    }
+
+    #[test]
+    fn a_sideways_swipe_moves_panes_where_only_one_is_on_screen() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.focus = Focus::Machines;
+        app.pane_layout = PaneLayout {
+            machines: Some(Rect::new(0, 0, 40, 20)),
+            ..PaneLayout::default()
+        };
+        app.layout_debug_signature = Some((40, 20, 0, 0, false, true));
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 30, 10));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 8, 11));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 8, 11));
+
+        // The panes follow the finger: dragging left brings in the pane on the
+        // right, and one swipe moves exactly one pane.
+        assert_eq!(app.focus, Focus::Agents);
+    }
+
     #[test]
     fn history_windows_materialize_small_scroll_steps() {
         let source = HistoryPage {
@@ -11336,9 +11823,9 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        app.handle_mouse(click(1));
+        tap(&mut app, click(1));
         assert!(request_rx.try_recv().is_err(), "single click only selects");
-        app.handle_mouse(click(1));
+        tap(&mut app, click(1));
         assert!(matches!(
             request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Request::PreviewFile { path, .. } if path == "/work/README.md"
@@ -11355,16 +11842,16 @@ mod tests {
                 truncated: true,
             }),
         });
-        app.handle_mouse(click(1));
-        app.handle_mouse(click(1));
+        tap(&mut app, click(1));
+        tap(&mut app, click(1));
         assert!(
             app.file_manager
                 .as_ref()
                 .is_some_and(|form| form.preview_path.is_none())
         );
 
-        app.handle_mouse(click(2));
-        app.handle_mouse(click(2));
+        tap(&mut app, click(2));
+        tap(&mut app, click(2));
         assert!(matches!(
             request_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Request::ListFiles { path, .. } if path == "/work/src"
@@ -11764,6 +12251,19 @@ mod tests {
             waiting_session("two", "approve?"),
         ]));
         assert_eq!(app.take_notifications().len(), 1);
+    }
+
+    /// Press and release at one point. A click is two reports, and the pane
+    /// acts on the second one, so tests must send both.
+    fn tap(app: &mut App, mouse: MouseEvent) {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..mouse
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..mouse
+        });
     }
 
     fn ux_test_app(targets: Vec<Target>) -> App {
@@ -12259,25 +12759,25 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        app.handle_mouse(click_remote);
+        tap(&mut app, click_remote);
         assert_eq!(app.selected_target, 1);
         assert!(app.targets[1].enabled, "single click only selects");
 
-        app.handle_mouse(click_remote);
+        tap(&mut app, click_remote);
         assert!(
             app.targets[1].enabled,
             "double-clicking outside [x] must only select"
         );
-        app.handle_mouse(click_remote);
+        tap(&mut app, click_remote);
         assert!(app.targets[1].enabled);
 
         let click_checkbox = MouseEvent {
             column: 6,
             ..click_remote
         };
-        app.handle_mouse(click_checkbox);
+        tap(&mut app, click_checkbox);
         assert!(app.targets[1].enabled, "first checkbox click only selects");
-        app.handle_mouse(click_checkbox);
+        tap(&mut app, click_checkbox);
         assert!(
             !app.targets[1].enabled,
             "double-click inside [x] toggles the machine"

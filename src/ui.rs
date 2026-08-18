@@ -2908,6 +2908,15 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("Ctrl-y", "Copy the selected target path to the clipboard"),
         help_row("Drop local files", "Upload them into the visible directory"),
         Line::raw(""),
+        help_header("Touch Screens"),
+        help_row("Swipe a list", "Scroll it; a tap selects what it lands on"),
+        help_row("Swipe the terminal", "Walk through the scrollback"),
+        help_row(
+            "Long-press then drag",
+            "Select terminal or file preview text",
+        ),
+        help_row("Swipe sideways", "Move panes where only one is on screen"),
+        Line::raw(""),
         help_header("View And Configuration"),
         help_row("f", "Toggle grouped and flat agent views"),
         help_row(
@@ -4850,7 +4859,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("History And Search"));
+        assert!(rendered.contains("Touch Screens"));
         assert!(rendered.contains("View And Configuration"));
         assert!(rendered.contains("Home/End jump"));
     }

@@ -14,6 +14,8 @@
 //! (used by `muxloom mcp`). The daemon surface omits the `machine` parameter
 //! and the discovery tools that need a controller's view.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -21,7 +23,7 @@ use crate::{
     config::{Config, McpConfig, State, default_state_path},
     model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Target},
     runtime::Runtime,
-    ssh_config,
+    ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
 };
 
 /// One tool an adapter can offer on behalf of a surface. `input_schema` is a
@@ -64,6 +66,8 @@ const WRITE_TOOLS: &[&str] = &[
     "archive_session",
     "delete_session",
     "run_shell",
+    "set_machine_enabled",
+    "ssh_host",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +124,17 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
             "on this machine (a muxloom controller elsewhere may be watching the same sessions)"
         }
     };
+    // Which machines exist, and how to reach them, is only the controller's to
+    // change — and changing it reaches past muxloom into the user's own tools.
+    let manage = match flavor {
+        Flavor::Controller => {
+            "- The set of machines and the user's SSH configuration belong to them. \
+             set_machine_enabled changes what every agent on this controller can reach, and \
+             ssh_host edits a file every ssh command on this machine reads. Run either only \
+             when the human asked for that change.\n"
+        }
+        Flavor::Daemon => "",
+    };
     let mut text = format!(
         "muxloom manages long-lived terminal sessions — Codex, Claude Code, and plain shells — \
          {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
@@ -144,6 +159,7 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          delete, or reconfigure it unless you were asked to.\n\
          - delete_session destroys a session's history irreversibly. Ask the human first; \
          archive_session keeps the history.\n\
+         {manage}\
          - Typing into a session interrupts whoever is using it. Check `working` and \
          `needs_attention` in list_sessions before you type, and keep the interruption short.\n\n\
          When the target is ambiguous — which machine, which session, whether something may be \
@@ -174,6 +190,55 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                           aliases. Other tools address a machine by its id."
                 .into(),
             input_schema: schema(false, json!({}), &[]),
+        });
+        tools.push(ToolSpec {
+            name: "set_machine_enabled",
+            description: "Let muxloom reach a machine, or stop it: needs explicit human \
+                          authorization. Only enabled machines are addressable, so disabling one \
+                          cuts it off from every agent and every tool at once, and enabling one \
+                          opens it to all of them. The machine must already be \"local\" or an \
+                          SSH alias — see ssh_host. A muxloom dashboard that is already running \
+                          keeps its own view of this until it restarts."
+                .into(),
+            input_schema: schema(
+                false,
+                json!({
+                    "machine": { "type": "string", "description": "\"local\" or an SSH alias." },
+                    "enabled": { "type": "boolean", "description": "Whether muxloom may reach it." },
+                }),
+                &["machine", "enabled"],
+            ),
+        });
+        tools.push(ToolSpec {
+            name: "ssh_host",
+            description: format!(
+                "Read or write the SSH aliases this machine can connect to. `list` reports every \
+                 alias with the file that defines it and whether muxloom manages it. `set` and \
+                 `remove` need explicit human authorization: they edit the user's SSH \
+                 configuration, which every ssh command on this machine reads, not just muxloom. \
+                 Writes only ever touch {MANAGED_INCLUDE} next to their config plus one Include \
+                 line pointing at it, and muxloom refuses to write an alias defined anywhere \
+                 else. A new alias still has to be enabled with set_machine_enabled, and \
+                 authentication (keys, agent forwarding) is the human's to arrange."
+            ),
+            input_schema: schema(
+                false,
+                json!({
+                    "action": { "type": "string", "enum": ["list", "set", "remove"] },
+                    "host": { "type": "string", "description": "The alias to write or remove. One concrete name, no patterns." },
+                    "hostname": { "type": "string", "description": "Address to connect to (HostName)." },
+                    "user": { "type": "string", "description": "Login user (User)." },
+                    "port": { "type": "integer", "description": "Port (Port), 1-65535." },
+                    "identity_file": { "type": "string", "description": "Private key path (IdentityFile)." },
+                    "proxy_jump": { "type": "string", "description": "Jump host (ProxyJump)." },
+                    "extra": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Further option lines verbatim, e.g. \"ForwardAgent yes\". One keyword and value per entry.",
+                    },
+                }),
+                &["action"],
+            ),
         });
     }
     tools.push(ToolSpec {
@@ -429,6 +494,81 @@ fn optional_usize(arguments: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// One SSH alias to write: a single concrete name. Patterns belong to the
+/// user's own configuration, and a name carrying whitespace or a comment could
+/// rewrite the lines around it once it reaches the file.
+fn ssh_alias(arguments: &Value) -> Result<String> {
+    let host = required_str(arguments, "host")?.trim();
+    if host.len() > 128
+        || host
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || host.contains(['*', '?', '!', '#', '"', '\'', '='])
+    {
+        bail!("host must be one concrete alias: no spaces, wildcards, quotes, or comments");
+    }
+    Ok(host.to_string())
+}
+
+/// One SSH option value, held to a single uncommented line for the same
+/// reason: everything muxloom writes has to stay inside the block it wrote.
+fn ssh_option_value(value: &str, key: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{key} cannot be empty");
+    }
+    if value.len() > 512 || value.chars().any(char::is_control) || value.contains('#') {
+        bail!("{key} must be one line, without control characters or a # comment");
+    }
+    Ok(value.to_string())
+}
+
+fn ssh_value(arguments: &Value, key: &str) -> Result<Option<String>> {
+    match optional_str(arguments, key) {
+        Some(value) => Ok(Some(ssh_option_value(value, key)?)),
+        None => Ok(None),
+    }
+}
+
+/// The `Keyword value` lines a caller passes through verbatim.
+fn ssh_extra_options(arguments: &Value) -> Result<Vec<(String, String)>> {
+    let Some(lines) = arguments.get("extra") else {
+        return Ok(Vec::new());
+    };
+    let lines = lines
+        .as_array()
+        .context("extra must be an array of \"Keyword value\" strings")?;
+    let mut options = Vec::new();
+    for line in lines {
+        let line = line
+            .as_str()
+            .context("extra must be an array of \"Keyword value\" strings")?
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (keyword, value) = line
+            .split_once(char::is_whitespace)
+            .with_context(|| format!("extra entry {line:?} needs a keyword and a value"))?;
+        if !keyword
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        {
+            bail!("extra keyword {keyword:?} is not an SSH option name");
+        }
+        // Anything that opens a block would take the options after it with
+        // it, including the ones muxloom wrote for a different alias.
+        if ["host", "match", "include"]
+            .iter()
+            .any(|reserved| keyword.eq_ignore_ascii_case(reserved))
+        {
+            bail!("extra may not contain {keyword}: muxloom writes the block structure itself");
+        }
+        options.push((keyword.to_string(), ssh_option_value(value, "extra")?));
+    }
+    Ok(options)
+}
+
 fn agent_kind(arguments: &Value) -> Result<AgentKind> {
     required_str(arguments, "kind")?
         .parse()
@@ -632,16 +772,19 @@ pub struct ControllerControl {
     runtime: Runtime,
     config: Config,
     state: State,
+    state_path: PathBuf,
 }
 
 impl ControllerControl {
     pub fn new(config: Config) -> Result<Self> {
-        let state = State::load(&default_state_path())?;
+        let state_path = default_state_path();
+        let state = State::load(&state_path)?;
         let runtime = Runtime::new(&config);
         Ok(Self {
             runtime,
             config,
             state,
+            state_path,
         })
     }
 
@@ -697,6 +840,183 @@ impl ControllerControl {
             }));
         }
         Ok(pretty(&Value::Array(machines)))
+    }
+
+    /// Add a machine to the reachable set or take it out of it. The state file
+    /// is read again first: the dashboard owns the same file, and an MCP
+    /// process that started an hour ago must not write back a stale view.
+    fn set_machine_enabled(&mut self, arguments: &Value) -> Result<String> {
+        let machine = required_str(arguments, "machine")?.to_string();
+        let enabled = arguments
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .context("set_machine_enabled requires enabled: true or false")?;
+        if enabled && machine != crate::model::LOCAL_TARGET_ID {
+            let aliases = ssh_config::load_hosts(&self.config.ssh_config_path())?;
+            if !aliases.iter().any(|alias| alias == &machine) {
+                bail!(
+                    "{machine} is neither \"local\" nor an SSH alias this machine knows; \
+                     add it with ssh_host first"
+                );
+            }
+        }
+        let mut state = State::load(&self.state_path)?;
+        let changed = if enabled {
+            state.enabled_hosts.insert(machine.clone())
+        } else {
+            state.enabled_hosts.remove(&machine)
+        };
+        if changed {
+            state.save(&self.state_path)?;
+        }
+        self.state = state;
+        Ok(pretty(&json!({
+            "machine": machine,
+            "enabled": enabled,
+            "changed": changed,
+            "enabled_machines": self.state.enabled_hosts.iter().collect::<Vec<_>>(),
+        })))
+    }
+
+    /// Read the SSH aliases this machine knows, or write one into the file
+    /// muxloom owns. Hosts the user maintains are read but never rewritten.
+    fn ssh_host(&mut self, arguments: &Value) -> Result<String> {
+        let ssh_path = self.config.ssh_config_path();
+        let managed_path = ssh_config::managed_path(&ssh_path);
+        match required_str(arguments, "action")? {
+            "list" => {
+                let managed_file = ssh_config::normalize(&managed_path);
+                let managed = ManagedHosts::load(&managed_path)?;
+                let hosts: Vec<Value> = ssh_config::load_host_sources(&ssh_path)?
+                    .into_iter()
+                    .map(|(alias, sources)| {
+                        json!({
+                            "host": alias,
+                            "enabled": self.state.enabled_hosts.contains(&alias),
+                            "managed": sources.iter().any(|source| source == &managed_file),
+                            "defined_in": sources
+                                .iter()
+                                .map(|source| source.display().to_string())
+                                .collect::<Vec<_>>(),
+                            "options": managed.get(&alias).map(|entry| {
+                                entry
+                                    .options
+                                    .iter()
+                                    .map(|(keyword, value)| format!("{keyword} {value}"))
+                                    .collect::<Vec<_>>()
+                            }),
+                        })
+                    })
+                    .collect();
+                Ok(pretty(&json!({
+                    "ssh_config": ssh_path.display().to_string(),
+                    "managed_file": managed_path.display().to_string(),
+                    "hosts": hosts,
+                })))
+            }
+            "set" => {
+                let alias = ssh_alias(arguments)?;
+                let outside = ssh_config::defined_outside(&ssh_path, &alias)?;
+                if !outside.is_empty() {
+                    bail!(
+                        "{alias} is already defined in {}; muxloom will not shadow a host the \
+                         user maintains — choose another alias, or ask them to change that file",
+                        outside
+                            .iter()
+                            .map(|source| source.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let mut options = Vec::new();
+                if let Some(hostname) = ssh_value(arguments, "hostname")? {
+                    options.push(("HostName".to_string(), hostname));
+                }
+                if let Some(user) = ssh_value(arguments, "user")? {
+                    options.push(("User".to_string(), user));
+                }
+                if let Some(port) = arguments.get("port").filter(|port| !port.is_null()) {
+                    let port = port
+                        .as_u64()
+                        .filter(|port| (1..=65_535).contains(port))
+                        .context("port must be a number from 1 to 65535")?;
+                    options.push(("Port".to_string(), port.to_string()));
+                }
+                if let Some(identity) = ssh_value(arguments, "identity_file")? {
+                    options.push(("IdentityFile".to_string(), identity));
+                }
+                if let Some(jump) = ssh_value(arguments, "proxy_jump")? {
+                    options.push(("ProxyJump".to_string(), jump));
+                }
+                options.extend(ssh_extra_options(arguments)?);
+                if options.is_empty() {
+                    bail!(
+                        "set needs at least one of hostname, user, port, identity_file, \
+                         proxy_jump, or extra"
+                    );
+                }
+                let mut managed = ManagedHosts::load(&managed_path)?;
+                let previous = managed.get(&alias).map(|entry| {
+                    entry
+                        .options
+                        .iter()
+                        .map(|(keyword, value)| format!("{keyword} {value}"))
+                        .collect::<Vec<_>>()
+                });
+                managed.set(&alias, options.clone());
+                ssh_config::write_private(&managed_path, &managed.render())?;
+                // Only once the file is there: an Include of nothing is not an
+                // Include muxloom can recognise on the next call.
+                let included = ssh_config::ensure_include(&ssh_path, &managed_path)?;
+                Ok(pretty(&json!({
+                    "host": alias,
+                    "options": options
+                        .iter()
+                        .map(|(keyword, value)| format!("{keyword} {value}"))
+                        .collect::<Vec<_>>(),
+                    "previous": previous,
+                    "managed_file": managed_path.display().to_string(),
+                    "include_added": included,
+                    "enabled": self.state.enabled_hosts.contains(&alias),
+                    "note": "muxloom cannot address this machine until set_machine_enabled \
+                             turns it on, and connecting still needs working SSH credentials.",
+                })))
+            }
+            "remove" => {
+                let alias = ssh_alias(arguments)?;
+                let mut managed = ManagedHosts::load(&managed_path)?;
+                if !managed.remove(&alias) {
+                    let outside = ssh_config::defined_outside(&ssh_path, &alias)?;
+                    if outside.is_empty() {
+                        bail!("{alias} is not in muxloom's managed SSH file");
+                    }
+                    bail!(
+                        "{alias} is defined in {}; muxloom did not write it and will not remove it",
+                        outside
+                            .iter()
+                            .map(|source| source.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                ssh_config::write_private(&managed_path, &managed.render())?;
+                // An alias nobody can resolve is not a machine anyone can
+                // reach, so it leaves the enabled set with its definition.
+                let mut state = State::load(&self.state_path)?;
+                let disabled = state.enabled_hosts.remove(&alias);
+                if disabled {
+                    state.save(&self.state_path)?;
+                }
+                self.state = state;
+                Ok(pretty(&json!({
+                    "host": alias,
+                    "removed": true,
+                    "disabled": disabled,
+                    "managed_file": managed_path.display().to_string(),
+                })))
+            }
+            other => bail!("unknown ssh_host action {other}: use list, set, or remove"),
+        }
     }
 
     fn list_sessions(&self, arguments: &Value) -> Result<String> {
@@ -870,6 +1190,8 @@ impl ControlSurface for ControllerControl {
         enforce_policy(&self.config.mcp, name)?;
         match name {
             "list_machines" => self.list_machines(),
+            "set_machine_enabled" => self.set_machine_enabled(arguments),
+            "ssh_host" => self.ssh_host(arguments),
             "list_sessions" => self.list_sessions(arguments),
             "read_screen" => self.read_screen(arguments),
             "send_input" => {
@@ -1336,7 +1658,15 @@ mod tests {
                 .remove("machine");
             assert_eq!(twin_schema, tool.input_schema, "{} diverged", tool.name);
         }
-        for name in ["list_machines", "list_resume_candidates", "search_files"] {
+        for name in [
+            "list_machines",
+            "list_resume_candidates",
+            "search_files",
+            // The machine set and the SSH config live on the controller: a
+            // daemon has neither to offer.
+            "set_machine_enabled",
+            "ssh_host",
+        ] {
             assert!(controller.iter().any(|tool| tool.name == name));
             assert!(!daemon.iter().any(|tool| tool.name == name));
         }
@@ -1403,22 +1733,38 @@ mod tests {
         assert!(!daemon.contains("`machine` argument"));
     }
 
-    #[test]
-    fn controller_surface_gates_machines_on_the_enabled_set() {
-        let ssh_config =
-            std::env::temp_dir().join(format!("muxloom-control-ssh-config-{}", std::process::id()));
-        std::fs::write(&ssh_config, "Host gpu\n  HostName 10.0.0.1\n").unwrap();
+    /// A controller surface over a throwaway home: its own SSH config and its
+    /// own state file, so a test can write both.
+    fn controller_over_temp(name: &str) -> (ControllerControl, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-control-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(root.join("ssh")).unwrap();
         let config = Config {
-            ssh_config: ssh_config.to_str().unwrap().into(),
+            ssh_config: root.join("ssh/config").to_str().unwrap().into(),
             ..Config::default()
         };
         let mut state = State::default();
         state.enabled_hosts.insert("local".into());
-        let mut control = ControllerControl {
+        let control = ControllerControl {
             runtime: Runtime::new(&config),
             config,
             state,
+            state_path: root.join("state.json"),
         };
+        (control, root)
+    }
+
+    #[test]
+    fn controller_surface_gates_machines_on_the_enabled_set() {
+        let (mut control, root) = controller_over_temp("gate");
+        let ssh_config = control.config.ssh_config_path();
+        std::fs::write(&ssh_config, "Host gpu\n  HostName 10.0.0.1\n").unwrap();
 
         assert_eq!(control.target(&json!({})).unwrap().id, "local");
         // A machine the user has not enabled must be unreachable even by name.
@@ -1452,7 +1798,143 @@ mod tests {
             control.targets(&json!({ "machine": "gpu" })).unwrap().len(),
             1
         );
-        std::fs::remove_file(&ssh_config).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ssh_writes_stay_inside_the_file_muxloom_owns() {
+        let (mut control, root) = controller_over_temp("ssh");
+        let ssh_path = control.config.ssh_config_path();
+        std::fs::write(&ssh_path, "Host mine\n  HostName mine.example\n").unwrap();
+
+        // An alias this machine cannot resolve is not a machine: enabling it
+        // would leave a name in the state file that never connects.
+        let error = control
+            .call(
+                "set_machine_enabled",
+                &json!({ "machine": "gpu", "enabled": true }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ssh_host"), "{error}");
+
+        let written = control
+            .call(
+                "ssh_host",
+                &json!({
+                    "action": "set",
+                    "host": "gpu",
+                    "hostname": "10.0.0.5",
+                    "user": "ada",
+                    "port": 2222,
+                    "extra": ["ForwardAgent yes"],
+                }),
+            )
+            .unwrap();
+        let written: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(written["include_added"], true);
+        let managed_path = ssh_config::managed_path(&ssh_path);
+        let managed = std::fs::read_to_string(&managed_path).unwrap();
+        assert!(
+            managed.contains(
+                "Host gpu\n    HostName 10.0.0.5\n    User ada\n    Port 2222\n    \
+                 ForwardAgent yes\n"
+            ),
+            "{managed}"
+        );
+        // The user's own file keeps every line it had, and gains one Include.
+        let config_text = std::fs::read_to_string(&ssh_path).unwrap();
+        assert!(config_text.starts_with("# Added by muxloom"));
+        assert!(config_text.contains("Host mine\n  HostName mine.example\n"));
+
+        // Writing the alias does not make it reachable; enabling it does.
+        assert!(control.target(&json!({ "machine": "gpu" })).is_err());
+        control
+            .call(
+                "set_machine_enabled",
+                &json!({ "machine": "gpu", "enabled": true }),
+            )
+            .unwrap();
+        assert_eq!(
+            control.target(&json!({ "machine": "gpu" })).unwrap().id,
+            "gpu"
+        );
+        assert!(
+            State::load(&control.state_path)
+                .unwrap()
+                .enabled_hosts
+                .contains("gpu")
+        );
+
+        // A host the user wrote is readable, and theirs alone to change.
+        let error = control
+            .call(
+                "ssh_host",
+                &json!({ "action": "set", "host": "mine", "hostname": "stolen" }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("will not shadow"), "{error}");
+        let error = control
+            .call("ssh_host", &json!({ "action": "remove", "host": "mine" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("will not remove"), "{error}");
+
+        // Arguments that would break out of the block they are written into.
+        for arguments in [
+            json!({ "action": "set", "host": "gpu", "hostname": "a\nHost evil" }),
+            json!({ "action": "set", "host": "e vil", "hostname": "a" }),
+            json!({ "action": "set", "host": "*", "hostname": "a" }),
+            json!({ "action": "set", "host": "gpu", "extra": ["Host evil"] }),
+            json!({ "action": "set", "host": "gpu", "port": 0 }),
+            json!({ "action": "set", "host": "gpu" }),
+        ] {
+            assert!(
+                control.call("ssh_host", &arguments).is_err(),
+                "{arguments} must be refused"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&managed_path).unwrap(), managed);
+
+        let listed: Value = serde_json::from_str(
+            &control
+                .call("ssh_host", &json!({ "action": "list" }))
+                .unwrap(),
+        )
+        .unwrap();
+        let host = |name: &str| {
+            listed["hosts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|host| host["host"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from ssh_host list"))
+                .clone()
+        };
+        assert_eq!(host("gpu")["managed"], true);
+        assert_eq!(host("gpu")["enabled"], true);
+        assert_eq!(host("mine")["managed"], false);
+        assert!(host("mine")["options"].is_null());
+
+        // Removing the definition takes the machine out of reach with it.
+        control
+            .call("ssh_host", &json!({ "action": "remove", "host": "gpu" }))
+            .unwrap();
+        assert!(control.target(&json!({ "machine": "gpu" })).is_err());
+        assert!(
+            !State::load(&control.state_path)
+                .unwrap()
+                .enabled_hosts
+                .contains("gpu")
+        );
+        assert!(
+            !std::fs::read_to_string(&managed_path)
+                .unwrap()
+                .contains("Host gpu")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
