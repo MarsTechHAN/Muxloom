@@ -4313,11 +4313,12 @@ impl App {
                             self.close_terminal();
                             self.history = HistoryPage::default();
                         }
+                        // The archive stays as the user left it: archiving is
+                        // how a session gets out of the way, so unfolding the
+                        // whole archive to show where it went undoes that.
                         self.status_message =
-                            "Agent stopped and moved to Archived; x there removes it permanently"
+                            "Agent stopped and moved to Archived; a opens it, x there removes it"
                                 .into();
-                        self.state.show_archived = true;
-                        self.persist_state();
                         self.refresh_target(&target_id);
                     }
                     Err(error) => {
@@ -11829,6 +11830,18 @@ mod tests {
         assert_eq!(app.archived_count(), 1);
         app.state.show_archived = true;
         assert_eq!(app.visible_sessions().len(), 1);
+
+        // Archiving something is how it gets out of the way. Whatever the
+        // archive was doing, it goes on doing.
+        for folded in [false, true] {
+            app.state.show_archived = folded;
+            app.handle_worker_event(Event::Archived {
+                target_id: "local".into(),
+                session_id: "ad-codex-dead".into(),
+                result: Ok(()),
+            });
+            assert_eq!(app.state.show_archived, folded);
+        }
     }
 
     #[test]
