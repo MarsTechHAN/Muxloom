@@ -16,6 +16,7 @@ use crate::{
         SearchMatchKind, SearchResult, Target, TaskProgress,
     },
     runtime::{Runtime, is_temporary_session_id},
+    talk::{TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkSelector, decode_cursor},
 };
 
 #[derive(Debug, Clone)]
@@ -158,6 +159,16 @@ pub enum Request {
     TalkSync {
         targets: Vec<Target>,
         config: Box<Config>,
+        /// What the dashboard's board already holds, so the round brings back
+        /// only what was said since. Empty on the first round, which is how the
+        /// board is filled the first time it is drawn.
+        board_since: String,
+    },
+    /// Say something on the board as the person at the keyboard. The draft goes
+    /// to this machine's daemon like any other post; replication carries it from
+    /// there.
+    TalkPost {
+        draft: Box<TalkDraft>,
     },
 }
 
@@ -303,9 +314,16 @@ pub enum Event {
         session_id: String,
         result: Result<RestoredTranscript, String>,
     },
-    /// One talk replication round finished. The payload says what it moved.
+    /// One talk replication round finished. The payload says what it moved, and
+    /// carries whatever the local board has to say that the dashboard has not
+    /// seen yet.
     TalkSynced {
         result: Result<String, String>,
+        board: Option<TalkPage>,
+    },
+    /// A message the human wrote is on the board, or could not be put there.
+    TalkPosted {
+        result: Box<Result<TalkMessage, String>>,
     },
 }
 
@@ -1032,7 +1050,20 @@ impl Worker {
                             let _ = (machine_key, target_id, session_id);
                         }
                     }
-                    Request::TalkSync { targets, config } => {
+                    Request::TalkPost { draft } => {
+                        let result = runtime
+                            .bridge_pool()
+                            .talk_post(&Target::local(), *draft)
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::TalkPosted {
+                            result: Box::new(result),
+                        });
+                    }
+                    Request::TalkSync {
+                        targets,
+                        config,
+                        board_since,
+                    } => {
                         let result = crate::talk::run_sync(&runtime, &targets)
                             .map(|summary| summary.to_string())
                             .map_err(|error| format!("{error:#}"));
@@ -1050,7 +1081,11 @@ impl Worker {
                                 debug::log("relay", format!("errands failed: {error:#}"));
                             }
                         }
-                        let _ = events.send(Event::TalkSynced { result });
+                        // Whatever the round pulled is on the local board by
+                        // now, so the dashboard reads one board rather than
+                        // every machine in turn.
+                        let board = read_board(&runtime, &board_since);
+                        let _ = events.send(Event::TalkSynced { result, board });
                     }
                 });
             }
@@ -1060,6 +1095,33 @@ impl Worker {
             requests: request_tx,
             events: event_rx,
             bridges,
+        }
+    }
+}
+
+/// How much of the board one round carries to the dashboard. The overlay shows
+/// a tail, not an archive: what does not fit was said before anyone opened it.
+const BOARD_PAGE: usize = 200;
+
+/// What the local board has said since the dashboard last looked.
+///
+/// Read as the owner rather than as a session: the person watching the
+/// dashboard is the one both ends of a direct message are working for, and the
+/// point of the board is that they can see what was said.
+fn read_board(runtime: &Runtime, since: &str) -> Option<TalkPage> {
+    let filter = TalkFilter {
+        since: decode_cursor(since),
+        machines: TalkSelector::All,
+        paths: TalkSelector::All,
+        limit: BOARD_PAGE,
+        owner: true,
+        ..TalkFilter::default()
+    };
+    match runtime.bridge_pool().talk_read(&Target::local(), filter) {
+        Ok(page) => Some(page),
+        Err(error) => {
+            debug::log("talk", format!("board unreadable ({error:#})"));
+            None
         }
     }
 }

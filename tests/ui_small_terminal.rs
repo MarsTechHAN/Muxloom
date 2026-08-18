@@ -7,13 +7,14 @@ use std::path::PathBuf;
 
 use muxloom::{
     app::{
-        App, HelpForm, LaunchForm, Modal, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
-        SettingsForm,
+        App, BoardForm, BoardTab, HelpForm, LaunchForm, Modal, PathPickerForm, PortForwardForm,
+        ResumeForm, SearchForm, SettingsForm,
     },
     config::{Config, State},
     model::{AgentKind, AgentSession, Target},
     port_forward::{PortForwardState, PortForwardSummary},
     runtime::Runtime,
+    talk::{TalkAuthor, TalkKind, TalkMessage, TalkScope, TalkVoice},
     ui,
     worker::Worker,
 };
@@ -299,6 +300,110 @@ fn footer_keeps_its_row_on_a_short_terminal() {
             footer.contains("quit"),
             "the key hints vanished at {w}x{h}: {footer:?}"
         );
+    }
+}
+
+/// A board with something on every tab, one message per scope plus a direct.
+fn board_messages() -> Vec<TalkMessage> {
+    let scopes = [
+        (
+            TalkScope::Global,
+            TalkKind::Message,
+            "the fleet can read this",
+        ),
+        (
+            TalkScope::Machine {
+                machine: "mars".into(),
+            },
+            TalkKind::Note,
+            "a note left on this machine for whoever comes next",
+        ),
+        (
+            TalkScope::Path {
+                machine: "mars".into(),
+                path: "/work/terminal".into(),
+            },
+            TalkKind::Message,
+            "a line long enough to run past the edge of a narrow board, and then some more",
+        ),
+        (
+            TalkScope::Path {
+                machine: "mars".into(),
+                path: "/work/terminal".into(),
+            },
+            TalkKind::Direct,
+            "meant for one session only",
+        ),
+    ];
+    scopes
+        .into_iter()
+        .enumerate()
+        .map(|(index, (scope, kind, text))| TalkMessage {
+            id: format!("mars:{}", index + 1),
+            origin: "mars".into(),
+            seq: index as u64 + 1,
+            ts: 1_760_000_000_000 + index as u64 * 60_000,
+            scope,
+            author: TalkAuthor {
+                machine: "mars".into(),
+                machine_label: "mars".into(),
+                voice: TalkVoice {
+                    session_id: Some("ad-claude-1".into()),
+                    label: Some("review-bot".into()),
+                    kind: Some("claude".into()),
+                    human: false,
+                },
+            },
+            kind,
+            to: None,
+            reply_to: (index == 3).then(|| "mars:1".to_string()),
+            text: text.into(),
+        })
+        .collect()
+}
+
+#[test]
+fn board_modal_never_panics() {
+    for (w, h) in SIZES {
+        for tab in BoardTab::ORDER {
+            for (expanded, composing) in [(false, false), (true, false), (true, true)] {
+                let mut app = make_app();
+                app.board.merge(board_messages());
+                app.modal = Some(Modal::Board(BoardForm {
+                    tab,
+                    selected: Some("mars:3".into()),
+                    expanded,
+                    compose: composing.then(|| "half-written".to_string()),
+                    error: Some("nothing to reply to".into()),
+                    ..BoardForm::default()
+                }));
+                let backend = TestBackend::new(*w, *h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            }
+        }
+    }
+}
+
+/// Clicking the unread chip opens the board, so the rectangle it is clickable
+/// in has to be the one the chip was drawn in — and the footer packs its spans
+/// from the left, so that is wherever the status and hints happen to end.
+#[test]
+fn the_board_chip_is_only_clickable_where_it_is_drawn() {
+    for (w, h) in [(80u16, 8u16), (100, 12), (120, 40)] {
+        let mut app = make_app();
+        app.board.unread = app.board.merge(board_messages());
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let chip = app
+            .board_chip
+            .unwrap_or_else(|| panic!("no chip registered at {w}x{h}"));
+        let drawn: String = (chip.x..chip.x + chip.width)
+            .map(|x| buffer[(x, chip.y)].symbol())
+            .collect();
+        assert_eq!(drawn.trim(), "● 4 board", "at {w}x{h}");
     }
 }
 

@@ -317,6 +317,12 @@ pub struct TalkFilter {
     pub before: Option<u64>,
     #[serde(default)]
     pub limit: usize,
+    /// Read as the person these machines belong to rather than as a session on
+    /// one of them: the dashboard shows what the agents said to each other, so
+    /// their messages are not a place to hide things from the human watching.
+    /// The MCP surface builds its own filter and never sets this.
+    #[serde(default)]
+    pub owner: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,7 +678,7 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
         let sent = message.author.machine == mine
             && message.author.voice.session_id == filter.session_id
             && filter.session_id.is_some();
-        return addressed || sent || filter.scope.as_deref() == Some("direct");
+        return addressed || sent || filter.owner || filter.scope.as_deref() == Some("direct");
     }
     match &message.scope {
         TalkScope::Global => true,
@@ -1059,10 +1065,17 @@ pub fn folded(body: &str) -> String {
         .join(" ⏎ ")
 }
 
+/// Just the hour and minute of a stamp, for a board that gives each message one
+/// line. UTC like [`civil_utc`], and labelled as such where it is drawn.
+pub fn clock_utc(ms: u64) -> String {
+    let time = (ms / 1000) % 86_400;
+    format!("{:02}:{:02}", time / 3600, (time % 3600) / 60)
+}
+
 /// Epoch milliseconds as a plain UTC stamp. UTC because the two ends of a
 /// message rarely keep the same clock, let alone the same zone, and a stamp
 /// that says which is which is worth more than a local one that lies.
-fn civil_utc(ms: u64) -> String {
+pub fn civil_utc(ms: u64) -> String {
     let seconds = ms / 1000;
     let (time, days) = (seconds % 86_400, seconds / 86_400);
     // Howard Hinnant's civil_from_days, with the era shifted to 1970.
@@ -1446,6 +1459,18 @@ mod tests {
                 .read(&TalkFilter {
                     session_id: Some("session-3".into()),
                     scope: Some("direct".into()),
+                    ..TalkFilter::default()
+                })
+                .messages
+                .len(),
+            1
+        );
+        // And the dashboard, which is the person the machine belongs to, sees
+        // it among everything else without having to ask for it by name.
+        assert_eq!(
+            store
+                .read(&TalkFilter {
+                    owner: true,
                     ..TalkFilter::default()
                 })
                 .messages

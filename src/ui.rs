@@ -17,14 +17,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, Modal,
-        PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm, SettingsForm,
-        SettingsRow, SettingsScope,
+        App, BoardForm, BoardTab, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
+        LaunchForm, Modal, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
+        SettingsForm, SettingsRow, SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
     port_forward::PortForwardState,
     runtime::is_temporary_session_id,
+    talk::{TalkKind, TalkMessage, TalkScope, civil_utc, clock_utc, folded},
 };
 
 const ACCENT: Color = Color::Rgb(112, 184, 255);
@@ -109,8 +110,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Some(Modal::Temporal(form)) => app.offered_agent_kinds(&form.target.id),
         _ => Vec::new(),
     };
-    if let Some(modal) = app.modal.as_mut() {
-        draw_modal(frame, modal, area, &kinds);
+    // The board is drawn from the app's own copy of what every machine has been
+    // saying, so it steps out of the modal slot for the length of the frame —
+    // the renderer cannot borrow the app and the form at once — and back in
+    // after. Every other modal carries everything it needs.
+    match app.modal.take() {
+        Some(Modal::Board(mut form)) => {
+            draw_board_modal(frame, app, &mut form, area);
+            app.modal = Some(Modal::Board(form));
+        }
+        Some(mut modal) => {
+            draw_modal(frame, &mut modal, area, &kinds);
+            app.modal = Some(modal);
+        }
+        None => {}
     }
 }
 
@@ -1159,7 +1172,8 @@ fn ansi_basic_color(index: u16, bright: bool) -> Color {
     }
 }
 
-fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.board_chip = None;
     let busy = if app.busy_operations > 0 {
         "  [working]"
     } else {
@@ -1246,7 +1260,9 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     } else {
         match app.focus {
-            Focus::Machines => "  Space toggle  n new  , settings  / search  q quit  ? more",
+            Focus::Machines => {
+                "  Space toggle  n new  , settings  / search  b board  q quit  ? more"
+            }
             Focus::Agents => {
                 if app.archived_count() > 0 {
                     if app.state.show_archived {
@@ -1255,10 +1271,12 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         "  Enter open  a expand  p ports  / search  n new  t temporal  q quit"
                     }
                 } else {
-                    "  Enter open  p ports  / search  n new  t temporal  q quit  ? more"
+                    "  Enter open  p ports  / search  n new  t temporal  b board  q quit  ? more"
                 }
             }
-            Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit  ? more",
+            Focus::Recap => {
+                "  Cmd/Opt+Arrow panes  PgUp history  / search  b board  q quit  ? more"
+            }
         }
     };
     // Machines whose running daemon lags this build get a bottom-right chip
@@ -1272,18 +1290,40 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         format!(" ⟳ {} daemons outdated — , to update ", lagging.len())
     };
+    // Something said on the board while nobody was reading gets a chip of its
+    // own, after that one: it is news rather than a warning, and it is the one
+    // piece of footer chrome that opens what it points at.
+    let board = if app.board.unread == 0 || area.width < 60 {
+        String::new()
+    } else {
+        format!(" ● {} board ", app.board.unread)
+    };
     let help_width = UnicodeWidthStr::width(help);
     let chip_width = UnicodeWidthStr::width(chip.as_str());
-    let status_width =
-        (area.width as usize).saturating_sub(help_width + chip_width + busy.len() + 2);
+    let board_width = UnicodeWidthStr::width(board.as_str());
+    let status_width = (area.width as usize)
+        .saturating_sub(help_width + chip_width + board_width + busy.len() + 2);
+    let status = format!(" {}{busy}", truncate(&app.status_message, status_width));
+    // The spans are laid out left to right rather than right-aligned, so the
+    // chip's rectangle is whatever the three widths before it add up to.
+    let board_x = UnicodeWidthStr::width(status.as_str()) + help_width + chip_width;
+    if board_width > 0 && board_x + board_width <= area.width as usize {
+        app.board_chip = Some(Rect::new(
+            area.x + board_x as u16,
+            area.y,
+            board_width as u16,
+            1,
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {}{busy}", truncate(&app.status_message, status_width)),
-                status_style,
-            ),
+            Span::styled(status, status_style),
             Span::styled(help, Style::default().fg(MUTED)),
             Span::styled(chip, Style::default().fg(Color::Yellow)),
+            Span::styled(
+                board,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
         ])),
         area,
     );
@@ -1543,6 +1583,8 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
         Modal::Help(form) => draw_help_modal(frame, form, outer),
         Modal::Settings(form) => draw_settings_modal(frame, form, outer),
         Modal::Search(form) => draw_search_modal(frame, form, outer),
+        // Drawn by `draw` instead, which still holds the board it reads from.
+        Modal::Board(_) => {}
         Modal::PathPicker(form) => draw_path_picker(frame, form, outer),
         Modal::Resume(form) => draw_resume_modal(frame, form, outer),
         Modal::RenameAgent { value, .. } => {
@@ -2912,6 +2954,19 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("/ / Ctrl-p", "Search every discovered agent history"),
         help_row("Enter in search", "Open the selected match"),
         Line::raw(""),
+        help_header("Talk Board"),
+        help_row(
+            "b / footer ● chip",
+            "Open what every machine has been saying",
+        ),
+        help_row("Tab / Left / Right", "All, Global, Machine, Path, Direct"),
+        help_row("Enter in board", "Expand the selected message in full"),
+        help_row(
+            "p / r in board",
+            "Post to the open scope; reply to the selection",
+        ),
+        help_row("/ in board", "Narrow to messages matching what you type"),
+        Line::raw(""),
         help_header("File Manager"),
         help_row(
             "Ctrl-f",
@@ -3466,6 +3521,312 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
             .saturating_add(UnicodeWidthStr::width(form.query.as_str()) as u16)
             .min(inner.x + inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, inner.y));
+    }
+}
+
+/// The colour a scope reads in. Global is the accent everyone shares, a machine
+/// borrows the header's cyan, a directory takes the green the terminals use,
+/// and a direct message is yellow because it was aimed at someone.
+fn board_scope_color(message: &TalkMessage) -> Color {
+    if message.kind == TalkKind::Direct {
+        return Color::Yellow;
+    }
+    match message.scope {
+        TalkScope::Global => ACCENT,
+        TalkScope::Machine { .. } => CODEX,
+        TalkScope::Path { .. } => TERMINAL,
+    }
+}
+
+/// How a message names where it was said: the tab it would sit under.
+fn board_scope_tag(message: &TalkMessage) -> &'static str {
+    if message.kind == TalkKind::Direct {
+        "direct"
+    } else {
+        message.scope.name()
+    }
+}
+
+/// Who said it, short enough for a line: `name@machine` plus the last part of
+/// the directory when the message belongs to one, since the whole path is
+/// rarely what tells two channels apart.
+fn board_author(message: &TalkMessage) -> String {
+    let machine = if message.author.machine_label.is_empty() {
+        message.author.machine.as_str()
+    } else {
+        message.author.machine_label.as_str()
+    };
+    let mut who = format!("{}@{}", message.author.voice.name(), machine);
+    if let Some(path) = message.scope.path() {
+        let leaf = Path::new(path)
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        if !leaf.is_empty() {
+            who.push(':');
+            who.push_str(&leaf);
+        }
+    }
+    who
+}
+
+/// The board: everything every machine has said, in the order it was said.
+///
+/// Drawn from [`App::board_view`] rather than from anything held on the form,
+/// so switching tabs costs a filter over what is already in hand instead of a
+/// round trip to the daemons.
+fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, outer: Rect) {
+    let area = centered_rect(110, 32, outer);
+    frame.render_widget(Clear, area);
+    let block = panel(" Talk board ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    form.rows.clear();
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let view = app.board_view(form.tab, &form.query);
+    let selected_at = form
+        .selected
+        .as_ref()
+        .and_then(|id| view.iter().position(|message| message.id == *id));
+    // Nothing selected follows the newest, which is also what gets expanded.
+    let opened = selected_at
+        .map(|at| view[at])
+        .or_else(|| view.last().copied());
+
+    // The tab strip, then the hint line at the bottom, then the status or
+    // compose line above it — whatever height is left over is the board.
+    let mut rest = inner.height - 1;
+    let tabs = Rect::new(inner.x, inner.y, inner.width, 1);
+    let hints = (rest > 0).then(|| {
+        rest -= 1;
+        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1)
+    });
+    let status = (rest > 0).then(|| {
+        rest -= 1;
+        Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1)
+    });
+    // An expanded message takes the room its own text needs and no more, up to
+    // half the board, and only while there is still a list to read above it.
+    let wrapped = opened
+        .filter(|_| form.expanded && rest >= 6)
+        .map(|message| wrap_display(&message.text, inner.width as usize))
+        .unwrap_or_default();
+    let detail_height = if wrapped.is_empty() {
+        0
+    } else {
+        // One row for the stamp line, one for the rule the block draws.
+        (wrapped.len() as u16 + 2).min(rest / 2).min(10)
+    };
+    let list_height = (rest - detail_height) as usize;
+    form.page = list_height.max(1);
+
+    let mut tab_spans = Vec::new();
+    for tab in BoardTab::ORDER {
+        let here = tab == form.tab;
+        tab_spans.push(Span::styled(
+            if here {
+                format!("[{}] ", tab.title())
+            } else {
+                format!(" {}  ", tab.title())
+            },
+            if here {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ));
+    }
+    let counted = format!(
+        "{} of {} · times UTC ",
+        view.len(),
+        app.board.messages.len()
+    );
+    let used: usize = tab_spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let gap = (inner.width as usize)
+        .saturating_sub(used + UnicodeWidthStr::width(counted.as_str()))
+        .max(1);
+    tab_spans.push(Span::raw(" ".repeat(gap)));
+    tab_spans.push(Span::styled(counted, Style::default().fg(MUTED)));
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            truncate_spans(tab_spans, inner.width as usize).0,
+        )),
+        tabs,
+    );
+
+    // Nothing selected means following the newest, which is the bottom of the
+    // board; a selection keeps itself in the middle of what is on screen.
+    let max_start = view.len().saturating_sub(list_height);
+    let start = match selected_at {
+        None => max_start,
+        Some(at) => at.saturating_sub(list_height / 2).min(max_start),
+    };
+    // A board is read from the bottom: a half-full one leaves the gap above the
+    // messages, not below them, so the newest line is always in the same place.
+    let shown = view.len().saturating_sub(start).min(list_height);
+    let head = inner.y + 1 + (list_height - shown) as u16;
+    if view.is_empty() && list_height > 0 {
+        frame.render_widget(
+            Paragraph::new(if form.query.trim().is_empty() {
+                "Nothing said here yet."
+            } else {
+                "Nothing here matches."
+            })
+            .style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, head - 1, inner.width, 1),
+        );
+    }
+    for (offset, message) in view.iter().skip(start).take(list_height).enumerate() {
+        let row = Rect::new(inner.x, head + offset as u16, inner.width, 1);
+        let here = selected_at == Some(start + offset);
+        let background = if here { GROUP_BAND } else { Color::Reset };
+        let voice = if message.author.voice.human {
+            Color::White
+        } else {
+            message
+                .author
+                .voice
+                .kind
+                .as_deref()
+                .and_then(|kind| kind.parse::<AgentKind>().ok())
+                .map(|kind| agent_visual(kind).2)
+                .unwrap_or(Color::Gray)
+        };
+        let marker = match message.kind {
+            TalkKind::Note => "✎ ",
+            _ if message.reply_to.is_some() => "↳ ",
+            _ => "",
+        };
+        let spans = vec![
+            Span::styled(
+                format!("{} ", clock_utc(message.ts)),
+                Style::default().fg(MUTED).bg(background),
+            ),
+            Span::styled(
+                format!("{:<7} ", board_scope_tag(message)),
+                Style::default()
+                    .fg(board_scope_color(message))
+                    .bg(background),
+            ),
+            Span::styled(
+                format!("{:<26} ", truncate(&board_author(message), 26)),
+                Style::default().fg(voice).bg(background),
+            ),
+            Span::styled(
+                format!("{marker}{}", folded(&message.text)),
+                Style::default().fg(Color::White).bg(background),
+            ),
+        ];
+        let (spans, width) = truncate_spans(spans, inner.width as usize);
+        let mut spans = spans;
+        // The highlight has to run to the edge or the selected row reads as a
+        // ragged block rather than a line.
+        if here && width < inner.width as usize {
+            spans.push(Span::styled(
+                " ".repeat(inner.width as usize - width),
+                Style::default().bg(background),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        form.rows.push((message.id.clone(), row));
+    }
+
+    if let Some(message) = opened.filter(|_| detail_height > 0) {
+        let detail = Rect::new(
+            inner.x,
+            inner.y + 1 + list_height as u16,
+            inner.width,
+            detail_height,
+        );
+        let answered = message
+            .reply_to
+            .as_ref()
+            .map(|id| format!(" · reply to {id}"));
+        let mut lines = vec![Line::styled(
+            truncate(
+                &format!(
+                    "{} · {} · {}{}",
+                    civil_utc(message.ts),
+                    board_scope_tag(message),
+                    board_author(message),
+                    answered.unwrap_or_default()
+                ),
+                inner.width as usize,
+            ),
+            Style::default().fg(MUTED),
+        )];
+        // The rule the block draws costs a row, and the stamp above costs
+        // another; what is left is how much of the message fits.
+        lines.extend(
+            wrapped
+                .into_iter()
+                .take(detail_height as usize - 2)
+                .map(Line::raw),
+        );
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(MUTED)),
+            ),
+            detail,
+        );
+    }
+
+    if let Some(status) = status {
+        let (line, style) = if let Some(text) = form.compose.as_ref() {
+            let into = form
+                .reply_to
+                .as_ref()
+                .map(|id| format!("Reply to {id}"))
+                .unwrap_or_else(|| format!("Post to {}", form.tab.title().to_lowercase()));
+            (
+                format!("{into}: {text}█"),
+                Style::default().fg(Color::White),
+            )
+        } else if form.searching {
+            (
+                format!("Find: {}█", form.query),
+                Style::default().fg(Color::White),
+            )
+        } else if let Some(error) = form.error.as_ref() {
+            (error.clone(), Style::default().fg(Color::Yellow))
+        } else if form.query.trim().is_empty() {
+            (
+                "Everyone posts here as themselves — agents and you alike.".into(),
+                Style::default().fg(MUTED),
+            )
+        } else {
+            (
+                format!("Filtered by \"{}\" — Esc in / clears it", form.query),
+                Style::default().fg(MUTED),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(&line, status.width as usize)).style(style),
+            status,
+        );
+    }
+    if let Some(hints) = hints {
+        let help = if form.compose.is_some() {
+            "Enter send    Ctrl-u clear    Esc cancel"
+        } else if form.searching {
+            "Enter keep filter    Esc clear"
+        } else if hints.width < 84 {
+            "Tab scope  j/k move  p post  Esc close"
+        } else {
+            "Tab scope   j/k move   Enter expand   / find   p post   r reply   Esc close"
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(help, hints.width as usize)).style(Style::default().fg(MUTED)),
+            hints,
+        );
     }
 }
 

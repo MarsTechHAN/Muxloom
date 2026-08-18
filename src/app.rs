@@ -23,6 +23,7 @@ use crate::{
     recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
     ssh_config,
+    talk::{TalkAuthor, TalkDraft, TalkKind, TalkMessage, TalkPage, TalkScope, TalkVoice},
     terminal_session::TerminalSession,
     worker::{Event, Request, ScanRequest, TaskKind, Worker},
 };
@@ -378,6 +379,7 @@ pub enum Modal {
     Help(HelpForm),
     Settings(SettingsForm),
     Search(SearchForm),
+    Board(BoardForm),
     PathPicker(PathPickerForm),
     Resume(ResumeForm),
     RenameAgent {
@@ -391,7 +393,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 63;
+pub const HELP_CONTENT_ROWS: usize = 70;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -453,6 +455,173 @@ pub struct SearchForm {
     pub loading: bool,
     pub error: Option<String>,
     pub edited_at: Instant,
+}
+
+/// The tail of the talk board as the dashboard holds it: what has been said
+/// across every machine, and how much of it arrived while nobody was reading.
+#[derive(Debug, Clone, Default)]
+pub struct Board {
+    /// Oldest first. Capped at [`BOARD_MEMORY`]; the rest is on the machines
+    /// that minted it, and stays there.
+    pub messages: Vec<TalkMessage>,
+    /// What the local board held when it was last read. Handed back with the
+    /// next read so it only answers with what has been said since.
+    pub cursor: String,
+    /// Messages that arrived while the overlay was closed.
+    pub unread: usize,
+}
+
+/// How many messages the dashboard keeps in front of it. A board is read from
+/// the bottom, and a thousand lines is already more than anyone scrolls.
+const BOARD_MEMORY: usize = 1000;
+
+impl Board {
+    /// File a page of messages, newest last, ignoring any already held. Returns
+    /// how many were new, which is what the unread mark counts.
+    pub fn merge(&mut self, messages: Vec<TalkMessage>) -> usize {
+        let mut added = 0;
+        for message in messages {
+            if self.messages.iter().any(|held| held.id == message.id) {
+                continue;
+            }
+            self.messages.push(message);
+            added += 1;
+        }
+        if added > 0 {
+            // Two machines' clocks disagree and replication arrives out of
+            // order, so the board is sorted rather than appended to: the origin
+            // and sequence break ties the timestamps cannot.
+            self.messages.sort_by(|left, right| {
+                (left.ts, &left.origin, left.seq).cmp(&(right.ts, &right.origin, right.seq))
+            });
+            if self.messages.len() > BOARD_MEMORY {
+                self.messages.drain(..self.messages.len() - BOARD_MEMORY);
+            }
+        }
+        added
+    }
+}
+
+/// Which slice of the board is on screen. The tabs are the scopes, plus the
+/// directs agents sent each other and the everything view they all fold into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BoardTab {
+    #[default]
+    All,
+    Global,
+    Machine,
+    Path,
+    Direct,
+}
+
+impl BoardTab {
+    pub const ORDER: [BoardTab; 5] = [
+        BoardTab::All,
+        BoardTab::Global,
+        BoardTab::Machine,
+        BoardTab::Path,
+        BoardTab::Direct,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Global => "Global",
+            Self::Machine => "Machine",
+            Self::Path => "Path",
+            Self::Direct => "Direct",
+        }
+    }
+
+    /// Whether a message belongs on this tab. A direct message answers for its
+    /// delivery rather than for the scope it was filed under: it was said to
+    /// one session, not to everyone standing in that directory.
+    pub fn admits(self, message: &TalkMessage) -> bool {
+        let direct = message.kind == TalkKind::Direct;
+        match self {
+            Self::All => true,
+            Self::Direct => direct,
+            Self::Global => !direct && matches!(message.scope, TalkScope::Global),
+            Self::Machine => !direct && matches!(message.scope, TalkScope::Machine { .. }),
+            Self::Path => !direct && matches!(message.scope, TalkScope::Path { .. }),
+        }
+    }
+
+    fn stepped(self, delta: isize) -> Self {
+        let at = Self::ORDER.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        let len = Self::ORDER.len() as isize;
+        Self::ORDER[((at + delta).rem_euclid(len)) as usize]
+    }
+}
+
+/// The board overlay: a scope tab, what is being looked for, and whatever the
+/// person at the keyboard is in the middle of writing.
+#[derive(Debug, Clone, Default)]
+pub struct BoardForm {
+    pub tab: BoardTab,
+    /// The message under the cursor. `None` follows the newest, which is where
+    /// a conversation happens; picking one stops the view from moving.
+    pub selected: Option<String>,
+    /// Substring the visible messages are narrowed to.
+    pub query: String,
+    /// Whether keys are going into `query` rather than the board.
+    pub searching: bool,
+    /// What is being written, and what it answers. `Some` means keys go here.
+    pub compose: Option<String>,
+    pub reply_to: Option<String>,
+    /// Whether the selected message is shown in full below the list.
+    pub expanded: bool,
+    /// Which message each drawn row holds, for clicks.
+    pub rows: Vec<(String, Rect)>,
+    /// How many rows the list had room for when it was last drawn, so a page
+    /// key moves by what the reader can see.
+    pub page: usize,
+    pub error: Option<String>,
+}
+
+impl BoardForm {
+    /// Move the cursor through what is on screen. Walking off the bottom goes
+    /// back to following the newest message, which is where someone reading a
+    /// live conversation wants to be.
+    fn step(&mut self, view: &[String], delta: isize) {
+        if view.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let last = view.len() - 1;
+        let at = match self.selected.as_ref() {
+            None if delta >= 0 => return,
+            // Leaving the bottom starts from the newest message rather than
+            // from wherever the last selection happened to be.
+            None => last,
+            Some(id) => match view.iter().position(|held| held == id) {
+                Some(at) => at,
+                None => last,
+            },
+        };
+        let moved = at as isize + delta;
+        self.selected = if moved > last as isize {
+            None
+        } else {
+            Some(view[moved.max(0) as usize].clone())
+        };
+    }
+}
+
+/// Who a message posted from the dashboard is from. A person has no session to
+/// speak from, so they are named by the account running muxloom.
+fn human_voice() -> TalkVoice {
+    let name = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "human".into());
+    TalkVoice {
+        session_id: None,
+        label: Some(name),
+        kind: None,
+        human: true,
+    }
 }
 
 /// One row of the settings form. `values` in [`SettingsForm`] aligns with the
@@ -787,6 +956,10 @@ pub struct App {
     pub status_error: Option<(String, Instant)>,
     pub busy_operations: usize,
     pub pane_layout: PaneLayout,
+    /// What every machine has been saying, and where the footer drew the chip
+    /// that opens it.
+    pub board: Board,
+    pub board_chip: Option<Rect>,
     pub attention_banner: Option<Rect>,
     pub terminal_back: Option<Rect>,
     pub layout_debug_signature: Option<(u16, u16, u16, u16, bool, bool)>,
@@ -943,6 +1116,8 @@ impl App {
             status_error: None,
             busy_operations: 0,
             pane_layout: PaneLayout::default(),
+            board: Board::default(),
+            board_chip: None,
             attention_banner: None,
             terminal_back: None,
             layout_debug_signature: None,
@@ -1668,6 +1843,10 @@ impl App {
                 self.open_search();
                 Action::Continue
             }
+            KeyCode::Char('b') => {
+                self.open_board();
+                Action::Continue
+            }
             KeyCode::Char(',') => {
                 self.open_machine_settings();
                 Action::Continue
@@ -2006,6 +2185,14 @@ impl App {
                     self.jump_to_attention();
                     return Action::Continue;
                 }
+                if button == MouseButton::Left
+                    && self
+                        .board_chip
+                        .is_some_and(|area| inside(area, mouse.column, mouse.row))
+                {
+                    self.open_board();
+                    return Action::Continue;
+                }
                 if button == MouseButton::Left {
                     self.terminal_selection = None;
                 }
@@ -2129,6 +2316,18 @@ impl App {
             Modal::PortForward(form) => {
                 form.selected = clamped_index(form.selected, form.row_count(), delta)
             }
+            Modal::Board(_) => {
+                let Some(Modal::Board(mut form)) = self.modal.take() else {
+                    return;
+                };
+                let view: Vec<String> = self
+                    .board_view(form.tab, &form.query)
+                    .into_iter()
+                    .map(|message| message.id.clone())
+                    .collect();
+                form.step(&view, delta);
+                self.modal = Some(Modal::Board(form));
+            }
             _ => {}
         }
     }
@@ -2142,6 +2341,14 @@ impl App {
                 .find(|(_, area)| inside(*area, column, row))
         {
             form.selected = *index;
+        }
+        if let Some(Modal::Board(form)) = self.modal.as_mut()
+            && let Some((id, _)) = form
+                .rows
+                .iter()
+                .find(|(_, area)| inside(*area, column, row))
+        {
+            form.selected = Some(id.clone());
         }
     }
 
@@ -4396,13 +4603,32 @@ impl App {
                     }
                 }
             }
-            Event::TalkSynced { result } => {
+            Event::TalkSynced { result, board } => {
                 self.talk_in_flight = false;
                 match result {
                     Ok(summary) => debug::log("talk", summary),
                     Err(error) => debug::log("talk", format!("sync failed: {error}")),
                 }
+                if let Some(page) = board {
+                    self.absorb_board(page);
+                }
             }
+            Event::TalkPosted { result } => match *result {
+                Ok(message) => {
+                    // It is on the board already; showing it now rather than on
+                    // the next round is what makes the overlay feel like a
+                    // conversation instead of a form.
+                    self.board.merge(vec![message]);
+                    self.status_message = "Posted to the board".into();
+                }
+                Err(error) => {
+                    let error = short_error(&error);
+                    if let Some(Modal::Board(form)) = self.modal.as_mut() {
+                        form.error = Some(error.clone());
+                    }
+                    self.set_error(format!("Could not post: {error}"));
+                }
+            },
             Event::BackupSynced { result } => {
                 self.backup_in_flight = false;
                 match result {
@@ -4754,7 +4980,244 @@ impl App {
         let _ = self.worker.requests.send(Request::TalkSync {
             targets,
             config: Box::new(self.config.clone()),
+            board_since: self.board.cursor.clone(),
         });
+    }
+
+    /// File what the round read off the local board. Everything anyone said
+    /// anywhere passes through here, whether the overlay is open or not: the
+    /// unread mark is the only difference.
+    fn absorb_board(&mut self, page: TalkPage) {
+        self.board.cursor = page.cursor;
+        let added = self.board.merge(page.messages);
+        if added == 0 {
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Board(_))) {
+            self.board.unread = 0;
+        } else {
+            self.board.unread += added;
+        }
+    }
+
+    pub fn open_board(&mut self) {
+        self.board.unread = 0;
+        self.modal = Some(Modal::Board(BoardForm::default()));
+        self.status_message =
+            "Board: Tab scope  p post  r reply  Enter expand  / find  Esc close".into();
+    }
+
+    /// The messages the open tab and filter leave on screen, oldest last —
+    /// which is the order they were said in, and the order a board is read in.
+    pub fn board_view(&self, tab: BoardTab, query: &str) -> Vec<&TalkMessage> {
+        let needle = query.trim().to_lowercase();
+        self.board
+            .messages
+            .iter()
+            .filter(|message| tab.admits(message))
+            .filter(|message| {
+                needle.is_empty()
+                    || message.text.to_lowercase().contains(&needle)
+                    || message.author.voice.name().to_lowercase().contains(&needle)
+                    || message
+                        .author
+                        .machine_label
+                        .to_lowercase()
+                        .contains(&needle)
+            })
+            .collect()
+    }
+
+    /// Say something on the board as the person at the keyboard. It is minted
+    /// by the local daemon like any other post and replicated from there, so a
+    /// human's message and an agent's are the same thing on every machine that
+    /// receives it.
+    fn post_board(&mut self, text: String, reply_to: Option<String>, scope: TalkScope) {
+        let draft = TalkDraft {
+            scope,
+            author: TalkAuthor {
+                voice: human_voice(),
+                ..TalkAuthor::default()
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to,
+            text,
+        };
+        if self
+            .worker
+            .requests
+            .send(Request::TalkPost {
+                draft: Box::new(draft),
+            })
+            .is_err()
+        {
+            self.set_error("The board is unreachable from here");
+        } else {
+            self.status_message = "Posting to the board...".into();
+        }
+    }
+
+    /// Where a message written on this tab belongs. The tab is the channel
+    /// being read, so it is also the one being spoken into.
+    fn board_scope(&self, tab: BoardTab) -> Result<TalkScope, String> {
+        Ok(match tab {
+            // Nothing on the everything view says which channel a new message
+            // belongs to, and the one everybody reads is the honest default.
+            BoardTab::All | BoardTab::Global => TalkScope::Global,
+            // The machine is left empty on purpose: the daemon that mints the
+            // message is the one that knows what this machine is called.
+            BoardTab::Machine => TalkScope::Machine {
+                machine: String::new(),
+            },
+            BoardTab::Path => TalkScope::Path {
+                machine: String::new(),
+                path: env::current_dir()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .map_err(|error| {
+                        format!("this directory has no name to post under: {error}")
+                    })?,
+            },
+            BoardTab::Direct => {
+                return Err(
+                    "A direct message is between two sessions — open the session to answer it"
+                        .into(),
+                );
+            }
+        })
+    }
+
+    /// Keys inside the board overlay. Answers whether it stays open.
+    fn handle_board_key(&mut self, key: KeyEvent, form: &mut BoardForm) -> bool {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if let Some(mut text) = form.compose.take() {
+            match key.code {
+                KeyCode::Esc => {
+                    form.reply_to = None;
+                    form.error = None;
+                }
+                KeyCode::Enter => {
+                    let said = text.trim().to_string();
+                    if said.is_empty() {
+                        form.error = Some("Nothing to say yet".into());
+                        form.compose = Some(text);
+                        return true;
+                    }
+                    // A reply belongs in the conversation it answers, wherever
+                    // that was; anything else belongs to the tab being read.
+                    let scope = match form
+                        .reply_to
+                        .as_ref()
+                        .and_then(|id| self.board.messages.iter().find(|held| held.id == *id))
+                        .map(|answered| Ok(answered.scope.clone()))
+                        .unwrap_or_else(|| self.board_scope(form.tab))
+                    {
+                        Ok(scope) => scope,
+                        Err(error) => {
+                            form.error = Some(error);
+                            form.compose = Some(text);
+                            return true;
+                        }
+                    };
+                    let reply_to = form.reply_to.take();
+                    form.error = None;
+                    self.post_board(said, reply_to, scope);
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                    form.compose = Some(text);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    text.clear();
+                    form.compose = Some(text);
+                }
+                KeyCode::Char(character) if plain => {
+                    text.push(character);
+                    form.compose = Some(text);
+                }
+                _ => form.compose = Some(text),
+            }
+            return true;
+        }
+        if form.searching {
+            match key.code {
+                KeyCode::Esc => {
+                    form.query.clear();
+                    form.searching = false;
+                }
+                KeyCode::Enter => form.searching = false,
+                KeyCode::Backspace => {
+                    form.query.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.query.clear();
+                }
+                KeyCode::Char(character) if plain => form.query.push(character),
+                _ => {}
+            }
+            form.selected = None;
+            return true;
+        }
+        let view: Vec<String> = self
+            .board_view(form.tab, &form.query)
+            .into_iter()
+            .map(|message| message.id.clone())
+            .collect();
+        let page = form.page.max(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => return false,
+            KeyCode::Tab | KeyCode::Right => {
+                form.tab = form.tab.stepped(1);
+                form.selected = None;
+                form.expanded = false;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                form.tab = form.tab.stepped(-1);
+                form.selected = None;
+                form.expanded = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => form.step(&view, -1),
+            KeyCode::Down | KeyCode::Char('j') => form.step(&view, 1),
+            KeyCode::PageUp => form.step(&view, -(page as isize)),
+            KeyCode::PageDown => form.step(&view, page as isize),
+            KeyCode::Home | KeyCode::Char('g') => form.selected = view.first().cloned(),
+            KeyCode::End | KeyCode::Char('G') => form.selected = None,
+            KeyCode::Enter => form.expanded = !form.expanded,
+            KeyCode::Char('/') => {
+                form.searching = true;
+                form.error = None;
+            }
+            KeyCode::Char('p') => {
+                form.error = self.board_scope(form.tab).err();
+                if form.error.is_none() {
+                    form.reply_to = None;
+                    form.compose = Some(String::new());
+                }
+            }
+            KeyCode::Char('r') => {
+                let answered = form
+                    .selected
+                    .clone()
+                    .or_else(|| view.last().cloned())
+                    .and_then(|id| self.board.messages.iter().find(|held| held.id == id));
+                match answered {
+                    None => form.error = Some("Nothing here to reply to".into()),
+                    Some(message) if message.kind == TalkKind::Direct => {
+                        form.error =
+                            Some("That was said to one session — open it and answer there".into());
+                    }
+                    Some(message) => {
+                        form.reply_to = Some(message.id.clone());
+                        form.compose = Some(String::new());
+                        form.error = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn refresh_enabled(&mut self) {
@@ -7035,6 +7498,11 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Settings(form)),
             },
+            Modal::Board(mut form) => {
+                if self.handle_board_key(key, &mut form) {
+                    self.modal = Some(Modal::Board(form));
+                }
+            }
             Modal::Search(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Up | KeyCode::BackTab if !form.results.is_empty() => {
@@ -13674,5 +14142,202 @@ mod tests {
             "building the page took {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One message on the board, as it arrives from the local daemon.
+    fn said(seq: u64, ts: u64, scope: TalkScope, kind: TalkKind, text: &str) -> TalkMessage {
+        TalkMessage {
+            id: format!("mars:{seq}"),
+            origin: "mars".into(),
+            seq,
+            ts,
+            scope,
+            author: TalkAuthor {
+                machine: "mars".into(),
+                machine_label: "mars".into(),
+                voice: TalkVoice {
+                    session_id: Some("ad-claude-1".into()),
+                    label: Some("review-bot".into()),
+                    kind: Some("claude".into()),
+                    human: false,
+                },
+            },
+            kind,
+            to: None,
+            reply_to: None,
+            text: text.into(),
+        }
+    }
+
+    /// A dashboard whose worker is a plain channel, so a test can read what the
+    /// board asked for instead of watching it happen.
+    fn board_app() -> (App, std::sync::mpsc::Receiver<Request>) {
+        let config = Config::default();
+        let bridges = Runtime::new(&config).bridge_pool();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            Worker {
+                requests: request_tx,
+                events: event_rx,
+                bridges,
+            },
+        );
+        (app, request_rx)
+    }
+
+    #[test]
+    fn each_board_tab_holds_the_scope_it_names() {
+        let (mut app, _requests) = board_app();
+        app.board.merge(vec![
+            said(1, 10, TalkScope::Global, TalkKind::Message, "fleet-wide"),
+            said(
+                2,
+                20,
+                TalkScope::Machine {
+                    machine: "mars".into(),
+                },
+                TalkKind::Message,
+                "this machine",
+            ),
+            said(
+                3,
+                30,
+                TalkScope::Path {
+                    machine: "mars".into(),
+                    path: "/work/terminal".into(),
+                },
+                TalkKind::Note,
+                "left for later",
+            ),
+            // A direct message is filed under a scope like anything else, but
+            // it was said to one session, so it answers on its own tab.
+            said(
+                4,
+                40,
+                TalkScope::Path {
+                    machine: "mars".into(),
+                    path: "/work/terminal".into(),
+                },
+                TalkKind::Direct,
+                "just for you",
+            ),
+        ]);
+        let texts = |app: &App, tab| {
+            app.board_view(tab, "")
+                .into_iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&app, BoardTab::Global), ["fleet-wide"]);
+        assert_eq!(texts(&app, BoardTab::Machine), ["this machine"]);
+        assert_eq!(texts(&app, BoardTab::Path), ["left for later"]);
+        assert_eq!(texts(&app, BoardTab::Direct), ["just for you"]);
+        assert_eq!(texts(&app, BoardTab::All).len(), 4);
+        // The filter looks at what was said and who said it, not at the scope.
+        assert_eq!(
+            app.board_view(BoardTab::All, "review-bot").len(),
+            4,
+            "every message here has the same author"
+        );
+        assert_eq!(
+            app.board_view(BoardTab::All, "LATER")
+                .into_iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>(),
+            ["left for later"]
+        );
+    }
+
+    #[test]
+    fn a_board_round_asks_only_for_what_it_has_not_seen() {
+        let (mut app, requests) = board_app();
+        app.maybe_talk_sync();
+        assert!(
+            matches!(
+                receive_request(&requests),
+                Request::TalkSync { board_since, .. } if board_since.is_empty()
+            ),
+            "the first round has no board to catch up from"
+        );
+        app.talk_in_flight = false;
+        app.last_talk_sync = None;
+        app.absorb_board(TalkPage {
+            messages: vec![said(1, 10, TalkScope::Global, TalkKind::Message, "hello")],
+            cursor: "mars:1".into(),
+            truncated: false,
+        });
+        assert_eq!(app.board.unread, 1);
+        // The same page again is the same message: replication replays, and a
+        // board that counted it twice would be lying about what is new.
+        app.absorb_board(TalkPage {
+            messages: vec![said(1, 10, TalkScope::Global, TalkKind::Message, "hello")],
+            cursor: "mars:1".into(),
+            truncated: false,
+        });
+        assert_eq!(app.board.messages.len(), 1);
+        assert_eq!(app.board.unread, 1);
+        app.maybe_talk_sync();
+        assert!(matches!(
+            receive_request(&requests),
+            Request::TalkSync { board_since, .. } if board_since == "mars:1"
+        ));
+        app.open_board();
+        assert_eq!(app.board.unread, 0, "reading the board clears the mark");
+    }
+
+    #[test]
+    fn a_message_posted_here_is_the_same_thing_an_agent_would_post() {
+        let (mut app, requests) = board_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Board(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        for character in "ship it".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Request::TalkPost { draft } = receive_request(&requests) else {
+            panic!("the post never reached the worker");
+        };
+        assert_eq!(draft.text, "ship it");
+        // Same store, same replication, same shape — the only difference is
+        // that a person has no session to speak from.
+        assert_eq!(draft.kind, TalkKind::Message);
+        assert_eq!(draft.scope, TalkScope::Global);
+        assert!(draft.author.voice.human);
+        assert_eq!(draft.author.voice.session_id, None);
+        assert!(matches!(app.modal, Some(Modal::Board(_))));
+    }
+
+    #[test]
+    fn the_board_refuses_to_answer_a_direct_message_in_public() {
+        let (mut app, _requests) = board_app();
+        app.board.merge(vec![said(
+            1,
+            10,
+            TalkScope::Global,
+            TalkKind::Direct,
+            "just for you",
+        )]);
+        app.open_board();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let Some(Modal::Board(form)) = app.modal.as_ref() else {
+            panic!("the board closed");
+        };
+        assert!(form.compose.is_none(), "nothing should be being written");
+        assert!(
+            form.error
+                .as_deref()
+                .is_some_and(|error| error.contains("open it and answer there")),
+            "the board has to say why: {:?}",
+            form.error
+        );
     }
 }

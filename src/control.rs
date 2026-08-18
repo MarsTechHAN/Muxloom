@@ -1274,6 +1274,10 @@ fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
             .or_else(|| session_env("MUXLOOM_SESSION_PATH")),
         before: arguments.get("before").and_then(Value::as_u64),
         limit: optional_usize(arguments, "limit", 50),
+        // An agent reads the board as the session it runs in. Seeing every
+        // direct message on the machine is the dashboard's privilege, and it
+        // is not something a caller can ask for.
+        owner: false,
     })
 }
 
