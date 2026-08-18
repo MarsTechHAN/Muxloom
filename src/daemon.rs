@@ -1706,6 +1706,13 @@ mod platform {
                     .is_some_and(|tracked| Arc::ptr_eq(tracked, &session))
             };
             if session.temporary() {
+                // The files go before the map entry. Leaving the session in the
+                // map a moment longer costs nothing, while dropping it first
+                // publishes a gone session whose record is still on disk — and
+                // whatever looks next, a scan or a restarting daemon, would
+                // find a temporary session that was supposed to leave nothing.
+                let _ = fs::remove_file(&session.history_path);
+                let _ = fs::remove_file(&session.metadata_path);
                 if still_tracked {
                     state
                         .sessions
@@ -1713,8 +1720,6 @@ mod platform {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&session.session_id());
                 }
-                let _ = fs::remove_file(&session.history_path);
-                let _ = fs::remove_file(&session.metadata_path);
                 session.send_quit();
                 return;
             }
@@ -4126,10 +4131,14 @@ mod platform {
 
             session.stop().unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
+            // Spun rather than slept: the point of the assertions below is that
+            // the record is already gone the instant the session leaves the
+            // map, and a poll that naps for 20ms hands a daemon that cleans up
+            // in the other order 20ms of cover.
             while state.sessions.lock().unwrap().contains_key(session_id)
                 && Instant::now() < deadline
             {
-                thread::sleep(Duration::from_millis(20));
+                thread::yield_now();
             }
             assert!(!state.sessions.lock().unwrap().contains_key(session_id));
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
