@@ -30,10 +30,18 @@ pub struct Config {
     /// "auto" applies silently (the pre-0.5 behavior), "never" skips the
     /// check. Ignored when `auto_update` is off.
     pub update_prompt: String,
+    /// How a press-drag-release is read. Lists and modals always follow the
+    /// finger; this only decides the terminal pane and the file preview, where
+    /// a drag otherwise selects text: "on" swipes to scroll and selects after
+    /// a long press, "off" always selects, and "auto" selects until a pointer
+    /// jump no mouse produces reveals a touch screen.
+    pub touch: String,
     pub agents: AgentCommands,
     pub hosts: BTreeMap<String, HostConfig>,
     /// Local backup of every session's conversation history (see [`BackupConfig`]).
     pub backup: BackupConfig,
+    /// What an MCP adapter may do on this machine (see [`McpConfig`]).
+    pub mcp: McpConfig,
 }
 
 impl Default for Config {
@@ -58,10 +66,37 @@ impl Default for Config {
             companion_binary: String::new(),
             auto_update: true,
             update_prompt: "ask".into(),
+            touch: "auto".into(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
             backup: BackupConfig::default(),
+            mcp: McpConfig::default(),
         }
+    }
+}
+
+/// What an agent reaching muxloom through a control surface may do on this
+/// machine. The policy lives with the configuration rather than with one
+/// adapter because every transport serves the same surface: a denied tool is
+/// hidden from the tool list *and* refused when an agent calls it by name.
+///
+/// Each machine answers for itself — `muxloomd mcp` on a remote host reads
+/// that host's config — so a machine can be observation-only while the rest
+/// stay writable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Tool names no adapter may offer or run.
+    pub denied_tools: Vec<String>,
+    /// Deny every tool that changes something: observation only.
+    pub read_only: bool,
+}
+
+impl McpConfig {
+    /// Whether the named tool is denied outright, ignoring the read-only
+    /// switch (which the control surface applies to its own write list).
+    pub fn denies(&self, tool: &str) -> bool {
+        self.denied_tools.iter().any(|denied| denied.trim() == tool)
     }
 }
 
@@ -179,6 +214,9 @@ impl Config {
         }
         if !matches!(self.update_prompt.as_str(), "ask" | "auto" | "never") {
             anyhow::bail!("update_prompt must be \"ask\", \"auto\", or \"never\"");
+        }
+        if !matches!(self.touch.as_str(), "auto" | "on" | "off") {
+            anyhow::bail!("touch must be \"auto\", \"on\", or \"off\"");
         }
         for (host, host_config) in &self.hosts {
             if let Some(environment) = &host_config.environment {
@@ -439,6 +477,11 @@ companion_binary = ""
 auto_update = true
 # What the startup check does with what it finds: "ask", "auto", or "never".
 update_prompt = "ask"
+# Touch screens: lists and modals always follow the finger. This decides the
+# terminal pane and the file preview, where a drag otherwise selects text.
+# "on" swipes to scroll and selects after a long press, "off" always selects,
+# "auto" selects until a pointer jump no mouse produces reveals a touch screen.
+touch = "auto"
 
 # Local backup of every session's conversation history (running + archived)
 # from all machines into ~/.local/state/muxloom/backup/ as compressed blobs.
@@ -450,6 +493,14 @@ interval_secs = 300
 include_ansi = true
 # Per-session cap on the compressed terminal capture (0 = unlimited).
 ansi_max_bytes = 67108864
+
+# What agents reaching this machine over MCP (`muxloom mcp`, `muxloomd mcp`)
+# may do. A denied tool is hidden from the tool list and refused when called
+# by name, e.g. denied_tools = ["run_shell", "delete_session"].
+[mcp]
+denied_tools = []
+# Observation only: deny every tool that changes something.
+read_only = false
 
 [agents.codex]
 command = "codex"

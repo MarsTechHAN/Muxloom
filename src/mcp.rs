@@ -87,7 +87,7 @@ fn handle_line(surface: &mut dyn ControlSurface, name: &str, line: &str) -> Opti
     }
 
     Some(match method {
-        "initialize" => initialize_reply(id, name, &params),
+        "initialize" => initialize_reply(surface, id, name, &params),
         "ping" => reply(id, json!({})),
         "tools/list" => {
             let tools: Vec<Value> = surface
@@ -108,7 +108,7 @@ fn handle_line(surface: &mut dyn ControlSurface, name: &str, line: &str) -> Opti
     })
 }
 
-fn initialize_reply(id: Value, name: &str, params: &Value) -> Value {
+fn initialize_reply(surface: &dyn ControlSurface, id: Value, name: &str, params: &Value) -> Value {
     let proposed = params
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -118,17 +118,21 @@ fn initialize_reply(id: Value, name: &str, params: &Value) -> Value {
     } else {
         PROTOCOL_REVISION
     };
-    reply(
-        id,
-        json!({
-            "protocolVersion": revision,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": name,
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        }),
-    )
+    let mut result = json!({
+        "protocolVersion": revision,
+        "capabilities": { "tools": {} },
+        "serverInfo": {
+            "name": name,
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    });
+    // The protocol's own home for "here is what this server is for and what
+    // you must not do with it": clients hand it to the model before the first
+    // tool call, where per-tool descriptions arrive too late to set policy.
+    if let Some(instructions) = surface.instructions().filter(|text| !text.is_empty()) {
+        result["instructions"] = Value::String(instructions);
+    }
+    reply(id, result)
 }
 
 fn tool_call_reply(surface: &mut dyn ControlSurface, id: Value, params: &Value) -> Value {
@@ -185,6 +189,10 @@ mod tests {
             }]
         }
 
+        fn instructions(&self) -> Option<String> {
+            Some("echo back what you are told".into())
+        }
+
         fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
             assert_eq!(name, "echo");
             let message = arguments
@@ -217,6 +225,12 @@ mod tests {
         assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(replies[0]["result"]["serverInfo"]["name"], "test");
         assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
+        // Scope guidance rides the handshake, where a client can put it in
+        // front of the model before it picks its first tool.
+        assert_eq!(
+            replies[0]["result"]["instructions"],
+            "echo back what you are told"
+        );
         assert_eq!(replies[1]["result"]["tools"][0]["name"], "echo");
         assert!(replies[1]["result"]["tools"][0]["inputSchema"].is_object());
     }

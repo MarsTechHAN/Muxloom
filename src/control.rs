@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    config::{Config, State, default_state_path},
+    config::{Config, McpConfig, State, default_state_path},
     model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Target},
     runtime::Runtime,
     ssh_config,
@@ -37,6 +37,13 @@ pub struct ToolSpec {
 pub trait ControlSurface {
     fn tools(&self) -> Vec<ToolSpec>;
     fn call(&mut self, name: &str, arguments: &Value) -> Result<String>;
+
+    /// How a consumer is meant to use this surface: what muxloom is for, which
+    /// tool to reach for first, and what it must not do. Adapters that have a
+    /// place for it (MCP's `instructions`) pass it to the agent verbatim.
+    fn instructions(&self) -> Option<String> {
+        None
+    }
 }
 
 /// How many rendered rows a screen read returns when the caller does not say.
@@ -48,6 +55,17 @@ const SEARCH_MAX_MATCHES: usize = 12;
 /// The most bytes of one shell stream a tool answer carries.
 const SHELL_OUTPUT_LIMIT: usize = 128 * 1024;
 
+/// Every tool that changes something rather than reporting it. `read_only`
+/// denies exactly this set, so a tool added here is denied by that switch from
+/// the day it exists.
+const WRITE_TOOLS: &[&str] = &[
+    "send_input",
+    "launch_session",
+    "archive_session",
+    "delete_session",
+    "run_shell",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
     /// Every enabled machine, addressed by a `machine` argument.
@@ -56,6 +74,94 @@ enum Flavor {
     /// a Windows lib build sees no non-test constructor.
     #[cfg_attr(not(unix), allow(dead_code))]
     Daemon,
+}
+
+/// Why the configured policy refuses this tool, if it does.
+fn denial(policy: &McpConfig, tool: &str) -> Option<String> {
+    if policy.denies(tool) {
+        return Some(format!(
+            "tool {tool} is disabled by muxloom policy on this machine (mcp.denied_tools)"
+        ));
+    }
+    if policy.read_only && WRITE_TOOLS.contains(&tool) {
+        return Some(format!(
+            "tool {tool} changes state and muxloom is configured read-only on this machine \
+             (mcp.read_only)"
+        ));
+    }
+    None
+}
+
+/// The tools a surface offers: its flavor's set, minus what policy denies.
+fn allowed_specs(flavor: Flavor, policy: &McpConfig) -> Vec<ToolSpec> {
+    let mut tools = specs(flavor);
+    tools.retain(|tool| denial(policy, tool.name).is_none());
+    tools
+}
+
+/// Refuse a denied tool even when an agent calls it by a name it remembers
+/// from another machine: hiding it from the list is advice, this is the gate.
+fn enforce_policy(policy: &McpConfig, tool: &str) -> Result<()> {
+    match denial(policy, tool) {
+        Some(reason) => bail!("{reason}"),
+        None => Ok(()),
+    }
+}
+
+/// The guidance an agent gets before its first call. Kept short enough to sit
+/// in a system prompt: what muxloom is, what to reach for, what is off limits.
+fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
+    let reach = match flavor {
+        Flavor::Controller => {
+            "on this machine and on every other machine the user has enabled (address one with \
+             the `machine` argument; see list_machines)"
+        }
+        Flavor::Daemon => {
+            "on this machine (a muxloom controller elsewhere may be watching the same sessions)"
+        }
+    };
+    let mut text = format!(
+        "muxloom manages long-lived terminal sessions — Codex, Claude Code, and plain shells — \
+         {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
+         be watching any of them right now.\n\n\
+         Work through the sessions rather than around them:\n\
+         - To get work done on a machine, talk to the agent session that lives there: send_input \
+         (with submit) to say something, then read_screen to read the reply. Treat a session as a \
+         colleague you are messaging, not as a subprocess you drive.\n\
+         - run_shell is a last resort. Reach for it only for a short, non-interactive, ideally \
+         read-only query that no other tool covers. Never start long-running or interactive work \
+         with it — that is what launch_session is for — and never use it to do something a \
+         session you could talk to would do better.\n\
+         - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
+         search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\n\
+         Boundaries that are not negotiable:\n\
+         - Machines the user has not enabled are unreachable. Naming one is an error, not a \
+         workaround to route around.\n\
+         - send_input is the only supported way to type. Never open a terminal stream just to \
+         write bytes — it resizes the session under whoever is attached.\n\
+         - Sessions are persistent state. A session you launched is yours to archive or delete \
+         when it is done; a session you did not launch is someone else's — do not archive, \
+         delete, or reconfigure it unless you were asked to.\n\
+         - delete_session destroys a session's history irreversibly. Ask the human first; \
+         archive_session keeps the history.\n\
+         - Typing into a session interrupts whoever is using it. Check `working` and \
+         `needs_attention` in list_sessions before you type, and keep the interruption short.\n\n\
+         When the target is ambiguous — which machine, which session, whether something may be \
+         stopped — ask the human instead of guessing."
+    );
+    let denied: Vec<&str> = specs(flavor)
+        .into_iter()
+        .map(|tool| tool.name)
+        .filter(|name| denial(policy, name).is_some())
+        .collect();
+    if !denied.is_empty() {
+        text.push_str(&format!(
+            "\n\nThe user has disabled these tools here: {}. They are not available on this \
+             machine; do not look for a way around them.",
+            denied.join(", ")
+        ));
+    }
+    text
 }
 
 fn specs(flavor: Flavor) -> Vec<ToolSpec> {
@@ -105,11 +211,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "send_input",
-        description: "Type into a session's terminal without disturbing an attached viewer. \
-                      `text` is written verbatim, then each named key in `keys` (enter, esc, \
-                      tab, backspace, space, delete, up, down, left, right, home, end, \
-                      page-up, page-down, or ctrl-a…ctrl-z), then submit=true appends Enter. \
-                      Prompts submitted to an agent take effect asynchronously: poll \
+        description: "Talk to a session: type into its terminal without disturbing an attached \
+                      viewer. This is the main way to get work done on a machine — ask the agent \
+                      that lives there. `text` is written verbatim, then each named key in `keys` \
+                      (enter, esc, tab, backspace, space, delete, up, down, left, right, home, \
+                      end, page-up, page-down, or ctrl-a…ctrl-z), then submit=true appends Enter. \
+                      Typing interrupts whoever is using the session, so check `working` and \
+                      `needs_attention` first. Prompts take effect asynchronously: poll \
                       list_sessions or read_screen to watch the result."
             .into(),
         input_schema: schema(
@@ -126,7 +234,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "launch_session",
         description: "Start a persistent codex, claude, or terminal session in a working \
-                      directory. `resume_id` resumes that agent-native conversation; \
+                      directory. Use this for anything long-running or interactive instead of \
+                      run_shell. `resume_id` resumes that agent-native conversation; \
                       `initial_prompt` seeds a fresh agent instead. The session survives \
                       this process: pair every launch with a later archive or delete."
             .into(),
@@ -173,8 +282,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "delete_session",
-        description: "Kill a session's process and delete its history and metadata. \
-                      Irreversible; archive_session keeps the history instead."
+        description: "Destroy a session: needs explicit human authorization. Kills the process \
+                      and deletes its history and metadata, irreversibly. Delete only sessions \
+                      you launched yourself, or ones the human named; archive_session keeps the \
+                      history instead."
             .into(),
         input_schema: schema(
             multi,
@@ -251,9 +362,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "run_shell",
-        description: "Run a shell script on the machine with `sh -lc` and return its output \
-                      and exit code. Runs with the user's full permissions — prefer the \
-                      narrower tools when one fits."
+        description: "Last resort: run a shell script on the machine with `sh -lc` and return its \
+                      output and exit code. Runs with the user's full permissions and with no \
+                      terminal, so it fits only short, non-interactive, ideally read-only \
+                      queries no other tool covers. Long-running or interactive work belongs in \
+                      launch_session; reading files or history belongs in list_files, \
+                      preview_file, and search_history; work another agent could do belongs in a \
+                      message to its session."
             .into(),
         input_schema: schema(
             multi,
@@ -744,10 +859,15 @@ impl ControllerControl {
 
 impl ControlSurface for ControllerControl {
     fn tools(&self) -> Vec<ToolSpec> {
-        specs(Flavor::Controller)
+        allowed_specs(Flavor::Controller, &self.config.mcp)
+    }
+
+    fn instructions(&self) -> Option<String> {
+        Some(instructions(Flavor::Controller, &self.config.mcp))
     }
 
     fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
+        enforce_policy(&self.config.mcp, name)?;
         match name {
             "list_machines" => self.list_machines(),
             "list_sessions" => self.list_sessions(arguments),
@@ -819,9 +939,9 @@ mod daemon_surface {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, agent_kind, build_input, optional_bool,
-        optional_str, optional_usize, pretty, preview_text, required_str, screen_page,
-        session_json, shell_report, specs,
+        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, agent_kind, allowed_specs, build_input,
+        enforce_policy, instructions, optional_bool, optional_str, optional_usize, pretty,
+        preview_text, required_str, screen_page, session_json, shell_report,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -1046,10 +1166,15 @@ mod daemon_surface {
 
     impl super::ControlSurface for DaemonControl {
         fn tools(&self) -> Vec<super::ToolSpec> {
-            specs(Flavor::Daemon)
+            allowed_specs(Flavor::Daemon, &self.config.mcp)
+        }
+
+        fn instructions(&self) -> Option<String> {
+            Some(instructions(Flavor::Daemon, &self.config.mcp))
         }
 
         fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
+            enforce_policy(&self.config.mcp, name)?;
             match name {
                 "list_sessions" => {
                     let include_archived = optional_bool(arguments, "include_archived");
@@ -1215,6 +1340,67 @@ mod tests {
             assert!(controller.iter().any(|tool| tool.name == name));
             assert!(!daemon.iter().any(|tool| tool.name == name));
         }
+    }
+
+    #[test]
+    fn denied_tools_leave_the_list_and_are_refused_by_name() {
+        let mut policy = McpConfig {
+            denied_tools: vec!["run_shell".into()],
+            read_only: false,
+        };
+        let offered: Vec<&str> = allowed_specs(Flavor::Controller, &policy)
+            .iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(!offered.contains(&"run_shell"));
+        assert!(offered.contains(&"read_screen"));
+        // Hiding the tool is advice; the gate is the call itself, because an
+        // agent can remember a name from a machine where it is allowed.
+        let error = enforce_policy(&policy, "run_shell")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("denied_tools"), "{error}");
+        assert!(enforce_policy(&policy, "read_screen").is_ok());
+        assert!(instructions(Flavor::Controller, &policy).contains("disabled these tools"));
+
+        // Read-only denies every write tool and leaves the observers alone.
+        policy = McpConfig {
+            denied_tools: Vec::new(),
+            read_only: true,
+        };
+        for tool in WRITE_TOOLS {
+            assert!(
+                enforce_policy(&policy, tool).is_err(),
+                "{tool} must be denied read-only"
+            );
+        }
+        let offered: Vec<&str> = allowed_specs(Flavor::Daemon, &policy)
+            .iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                "list_sessions",
+                "read_screen",
+                "search_history",
+                "list_directory",
+                "list_files",
+                "preview_file"
+            ]
+        );
+    }
+
+    #[test]
+    fn instructions_point_at_sessions_and_fence_the_shell() {
+        let text = instructions(Flavor::Controller, &McpConfig::default());
+        assert!(text.contains("run_shell is a last resort"));
+        assert!(text.contains("send_input"));
+        assert!(text.contains("not enabled") || text.contains("has not enabled"));
+        assert!(!text.contains("disabled these tools"));
+        // The daemon surface has no machine argument to talk about.
+        let daemon = instructions(Flavor::Daemon, &McpConfig::default());
+        assert!(!daemon.contains("`machine` argument"));
     }
 
     #[test]

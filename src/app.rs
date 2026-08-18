@@ -572,6 +572,81 @@ enum DragDivider {
     PortraitTerminal,
 }
 
+/// How far a pointer may wander before its press stops being a tap. A
+/// fingertip covers more than one cell and lifts with a wobble, so a one-cell
+/// slip must still act on the row it landed on.
+const TAP_SLOP: u16 = 1;
+/// How long a press must sit still before a drag from it means "select from
+/// here" instead of "scroll from here" on a touch screen, matching the
+/// long-press every phone already teaches.
+const LONG_PRESS: Duration = Duration::from_millis(350);
+/// A single pointer report this far from the previous one is a finger, not a
+/// mouse: pointing devices cross cells one at a time, touch screens deliver
+/// most of a flick between two reports.
+const TOUCH_JUMP_ROWS: u16 = 3;
+/// Columns a swipe must cross, against at most half as many rows, to mean
+/// "show me the pane beside this one" in a layout that shows one at a time.
+const PANE_SWIPE_COLUMNS: u16 = 8;
+/// Most scroll steps one pointer report may produce. A finger cannot cross
+/// more than a screen, and a wild report must not walk a list for a second.
+const MAX_SWIPE_STEPS: u16 = 32;
+
+/// The pane a press landed in. A gesture keeps steering that pane until the
+/// button lifts, even once the pointer has left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GesturePane {
+    Machines,
+    Agents,
+    Terminal,
+    FileList,
+    FilePreview,
+    Modal,
+}
+
+/// A press being followed to its release. A touch screen reports a swipe
+/// exactly the way a mouse reports a drag, so a press only counts as a click
+/// once it lifts near where it landed; anything longer scrolls the pane it
+/// started in.
+#[derive(Debug, Clone, Copy)]
+struct PointerGesture {
+    pane: GesturePane,
+    origin_column: u16,
+    origin_row: u16,
+    /// Row the last scroll step was taken from, so every report scrolls by the
+    /// rows crossed since the previous one rather than since the press.
+    last_row: u16,
+    pressed_at: Instant,
+    /// Set once the pointer left the tap tolerance: the release selects
+    /// nothing and clicks nothing.
+    swiped: bool,
+    /// Set once the press became a text selection, which the selection state
+    /// itself then carries.
+    selecting: bool,
+    /// Set once the swipe changed panes, so one long swipe moves one pane.
+    switched: bool,
+}
+
+impl PointerGesture {
+    fn new(pane: GesturePane, mouse: MouseEvent) -> Self {
+        Self {
+            pane,
+            origin_column: mouse.column,
+            origin_row: mouse.row,
+            last_row: mouse.row,
+            pressed_at: Instant::now(),
+            swiped: false,
+            selecting: false,
+            switched: false,
+        }
+    }
+
+    /// The press position, which is what a tap acts on: the finger landed
+    /// there, and the wobble it lifts with is not aim.
+    fn origin(&self) -> (u16, u16) {
+        (self.origin_column, self.origin_row)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusDirection {
     Left,
@@ -702,6 +777,12 @@ pub struct App {
     history_cache: HashMap<String, Vec<HistoryPage>>,
     history_cache_dir: PathBuf,
     dragging: Option<DragDivider>,
+    /// The press being followed from button-down to button-up, and the pane it
+    /// belongs to.
+    pointer: Option<PointerGesture>,
+    /// Whether this run has seen a pointer move the way only a finger moves.
+    /// Consulted when `touch` is left on "auto".
+    touch_detected: bool,
     last_refresh: Instant,
     last_activity_refresh: Instant,
     last_backup_sync: Option<Instant>,
@@ -842,6 +923,8 @@ impl App {
             history_cache: HashMap::new(),
             history_cache_dir,
             dragging: None,
+            pointer: None,
+            touch_detected: false,
             last_refresh: Instant::now(),
             last_activity_refresh: Instant::now(),
             last_backup_sync: None,
