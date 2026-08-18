@@ -456,6 +456,17 @@ fn horizontal_divider(area: Rect, top: Rect) -> Rect {
     )
 }
 
+/// How long a drag handle is: a share of the divider it sits on, kept between
+/// a visible minimum and a length that still reads as a handle rather than a
+/// second border. Never longer than the divider itself.
+fn grip(span: u16, share: u16, shortest: u16, longest: u16) -> u16 {
+    (span / share).clamp(shortest, longest).min(span)
+}
+
+/// The grab handles in the middle of each divider. One cell was easy to miss
+/// on a line that already looks like a border — a horizontal divider spans the
+/// window, so a lone dash in the middle of it disappeared entirely — so each
+/// handle is a short heavy run in the accent colour.
 fn draw_divider_handles(frame: &mut Frame<'_>, panes: &PaneLayout) {
     let style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     for divider in [
@@ -466,17 +477,23 @@ fn draw_divider_handles(frame: &mut Frame<'_>, panes: &PaneLayout) {
     .into_iter()
     .flatten()
     {
-        let y = divider.y.saturating_add(divider.height / 2);
+        let height = grip(divider.height, 6, 3, 7);
+        let y = divider
+            .y
+            .saturating_add(divider.height.saturating_sub(height) / 2);
         frame.render_widget(
-            Paragraph::new("│").style(style),
-            Rect::new(divider.x, y, 1, 1),
+            Paragraph::new(vec!["┃"; height as usize].join("\n")).style(style),
+            Rect::new(divider.x, y, 1, height),
         );
     }
     if let Some(divider) = panes.portrait_terminal_divider {
-        let x = divider.x.saturating_add(divider.width / 2);
+        let width = grip(divider.width, 6, 9, 21);
+        let x = divider
+            .x
+            .saturating_add(divider.width.saturating_sub(width) / 2);
         frame.render_widget(
-            Paragraph::new("─").style(style),
-            Rect::new(x, divider.y, 1, 1),
+            Paragraph::new("━".repeat(width as usize)).style(style),
+            Rect::new(x, divider.y, width, 1),
         );
     }
 }
@@ -5191,6 +5208,46 @@ mod tests {
         assert_eq!(machines.height, 35);
         assert_eq!(folders.x, machines.width);
         assert_eq!(machines.width + folders.width, 60);
+    }
+
+    /// The handle is what tells you the split can be dragged, and a horizontal
+    /// divider is a full-width line: one accent cell in the middle of it was
+    /// indistinguishable from the border it sits on.
+    #[test]
+    fn a_divider_handle_is_a_bar_wide_enough_to_notice() {
+        assert_eq!(grip(80, 6, 9, 21), 13);
+        assert_eq!(grip(30, 6, 9, 21), 9, "short dividers keep the minimum");
+        assert_eq!(grip(300, 6, 9, 21), 21, "long ones stop being a border");
+        assert_eq!(grip(4, 6, 9, 21), 4, "never longer than what it sits on");
+
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let backend = TestBackend::new(60, 100);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let divider = app
+            .pane_layout
+            .portrait_terminal_divider
+            .expect("a tall window splits horizontally");
+        let buffer = terminal.backend().buffer();
+        let bar: Vec<u16> = (0..60)
+            .filter(|x| buffer.cell((*x, divider.y)).unwrap().symbol() == "━")
+            .collect();
+        assert_eq!(bar.len(), grip(divider.width, 6, 9, 21) as usize);
+        // Centred, and unbroken.
+        assert_eq!(bar.last().unwrap() - bar[0], bar.len() as u16 - 1);
+        assert_eq!(bar[0] + *bar.last().unwrap(), 59);
+        assert_eq!(buffer.cell((bar[0], divider.y)).unwrap().fg, ACCENT);
     }
 
     #[test]
