@@ -153,7 +153,11 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              the `machine` argument; see list_machines)"
         }
         Flavor::Daemon => {
-            "on this machine (a muxloom controller elsewhere may be watching the same sessions)"
+            "on this machine, which a muxloom controller may be watching along with others. While \
+             it is attached you can also see what is on those machines and speak to the agents \
+             there — list_machines, list_sessions, search_conversations, read_conversation and \
+             message_agent take a `machine` argument, and the controller runs them for you. \
+             Everything else happens here"
         }
     };
     // Which machines exist, and how to reach them, is only the controller's to
@@ -165,7 +169,12 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              ssh_host edits a file every ssh command on this machine reads. Run either only \
              when the human asked for that change.\n"
         }
-        Flavor::Daemon => "",
+        Flavor::Daemon => {
+            "- Another machine is only ever reached through the controller, and only for those \
+             few tools. If it is not attached you are told so immediately — that is the whole \
+             answer, not a reason to retry. To have something else done over there, ask an agent \
+             on that machine with message_agent.\n"
+        }
     };
     let mut text = format!(
         "muxloom manages long-lived terminal sessions — Codex, Claude Code, and plain shells — \
@@ -226,14 +235,14 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
 fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     let multi = flavor == Flavor::Controller;
     let mut tools = Vec::new();
+    tools.push(ToolSpec {
+        name: "list_machines",
+        description: "List the machines muxloom manages: the local host and enabled SSH \
+                      aliases. Other tools address a machine by its id."
+            .into(),
+        input_schema: schema(false, json!({}), &[]),
+    });
     if multi {
-        tools.push(ToolSpec {
-            name: "list_machines",
-            description: "List the machines muxloom manages: the local host and enabled SSH \
-                          aliases. Other tools address a machine by its id."
-                .into(),
-            input_schema: schema(false, json!({}), &[]),
-        });
         tools.push(ToolSpec {
             name: "set_machine_enabled",
             description: "Let muxloom reach a machine, or stop it: needs explicit human \
@@ -291,8 +300,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       waits for input (needs_attention plus the matched reason), and a recap \
                       line. Archived sessions are included only with include_archived."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "include_archived": { "type": "boolean", "description": "Also list archived sessions." },
             }),
@@ -355,8 +364,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       \"auto\" waits for a busy session to finish, up to a minute; \"when_idle\" \
                       waits as long as it takes; \"now\" types it in mid-turn."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions: who to tell." },
                 "text": { "type": "string", "description": "What to say. Say it as you would to a colleague: what you want, and what you already know." },
@@ -562,6 +571,57 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         ),
     });
     tools.push(ToolSpec {
+        name: "search_conversations",
+        description: "Search what the agents actually said, on every machine: the backed-up \
+                      Codex and Claude Code transcripts, live and archived. This is the \
+                      memory of work already done — look here before working something out \
+                      again, and to find who dealt with a thing last time. Each hit names the \
+                      machine, directory, session and message it came from; feed session_id \
+                      and message_index to read_conversation to read around it. Narrow with \
+                      machines, paths, kinds, and since/until (epoch ms, on when the \
+                      conversation started). The corpus is a backup taken every few minutes, \
+                      so the newest turns of a conversation happening right now may not be in \
+                      it yet — read_screen sees those."
+            .into(),
+        input_schema: schema(
+            false,
+            json!({
+                "query": { "type": "string", "description": "Text to look for, matched case-insensitively." },
+                "machines": { "type": "array", "items": { "type": "string" }, "description": "Machine ids from list_machines. Default: every enabled machine." },
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "Only conversations held in these directories or below them." },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["codex", "claude", "terminal"] } },
+                "since": { "type": "integer", "description": "Epoch ms: only conversations started at or after this." },
+                "until": { "type": "integer", "description": "Epoch ms: only conversations started at or before this." },
+                "limit": { "type": "integer", "description": "Most hits to return, 1-100. Default 20." },
+            }),
+            &["query"],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "read_conversation",
+        description: "Read a stretch of one backed-up conversation, addressed by message \
+                      index. `around_index` centres the window on a search_conversations hit; \
+                      `from_index` reads forward from one; neither starts at the beginning. \
+                      A conversation is far too long to read whole, so this returns at most \
+                      `limit` messages and `max_chars` characters of text and tells you what \
+                      is left: `next_cursor` is where to carry on, has_more_before and \
+                      has_more_after say which way there is more. Same backup as \
+                      search_conversations, so it may lag a live session by a few minutes."
+            .into(),
+        input_schema: schema(
+            false,
+            json!({
+                "session_id": { "type": "string", "description": "Session id, as reported by search_conversations." },
+                "machine": { "type": "string", "description": "Which machine's session. Default: whichever enabled machine holds it." },
+                "around_index": { "type": "integer", "description": "Centre the window on this message index." },
+                "from_index": { "type": "integer", "description": "Start the window at this message index. Default 0." },
+                "limit": { "type": "integer", "description": "Most messages to return, 1-200. Default 20." },
+                "max_chars": { "type": "integer", "description": "Character budget for the whole answer, 500-64000. Default 8000." },
+            }),
+            &["session_id"],
+        ),
+    });
+    tools.push(ToolSpec {
         name: "list_directory",
         description: "List the subdirectories of a directory on the machine.".into(),
         input_schema: schema(
@@ -652,6 +712,22 @@ fn schema(multi_machine: bool, properties: Value, required: &[&str]) -> Value {
         "properties": properties,
         "required": required,
     })
+}
+
+/// The schema of a tool that addresses any machine from either surface. The
+/// daemon reaches the others by asking an attached controller to run the call,
+/// so the argument is the same and only what it costs differs.
+fn schema_across(flavor: Flavor, properties: Value, required: &[&str]) -> Value {
+    let mut schema = schema(true, properties, required);
+    if flavor == Flavor::Daemon {
+        schema["properties"]["machine"] = json!({
+            "type": "string",
+            "description": "Machine id from list_machines. Defaults to this machine; another one \
+                            is reached through the muxloom controller watching this machine, \
+                            which has to be running.",
+        });
+    }
+    schema
 }
 
 fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
@@ -1438,6 +1514,46 @@ fn shell_report(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> String {
     report
 }
 
+/// One page of a conversation under a character budget: the messages as JSON,
+/// where to carry on if the budget ran out mid-page, and whether anything came
+/// back clipped. The budget covers the whole page rather than each message,
+/// because a page that fills the reader's context is not a page.
+#[cfg(feature = "controller")]
+fn conversation_page(
+    window: &[(usize, crate::backup::ExtractedMessage)],
+    max_chars: usize,
+) -> (Vec<Value>, Option<usize>, bool) {
+    let mut budget = max_chars;
+    let mut clipped_any = false;
+    let mut messages = Vec::new();
+    for (position, message) in window {
+        if budget == 0 {
+            return (messages, Some(*position), clipped_any);
+        }
+        let first = messages.is_empty();
+        let text: String = message.text.chars().take(budget).collect();
+        let kept = text.chars().count();
+        let clipped = kept < message.text.chars().count();
+        clipped_any |= clipped;
+        budget -= kept;
+        messages.push(json!({
+            "index": position,
+            "role": message.role,
+            "ts": message.ts,
+            "text": text,
+            "truncated": clipped,
+        }));
+        if clipped {
+            // Resume at the message that got cut, so a fresh budget can read it
+            // whole — unless it alone overran the budget, in which case reading
+            // it again would return the same half and page forever.
+            let resume = if first { position + 1 } else { *position };
+            return (messages, Some(resume), clipped_any);
+        }
+    }
+    (messages, None, clipped_any)
+}
+
 /// Serves every enabled machine through a headless [`Runtime`]: the same
 /// config, state, and backend the dashboard uses, without the dashboard.
 pub struct ControllerControl {
@@ -1449,9 +1565,16 @@ pub struct ControllerControl {
 
 impl ControllerControl {
     pub fn new(config: Config) -> Result<Self> {
+        let runtime = Runtime::new(&config);
+        Self::with_runtime(config, runtime)
+    }
+
+    /// The same surface over a runtime that already exists. The dashboard's
+    /// runtime holds the connections to every machine; a surface that ran
+    /// errands over its own would dial all of them a second time.
+    pub fn with_runtime(config: Config, runtime: Runtime) -> Result<Self> {
         let state_path = default_state_path();
         let state = State::load(&state_path)?;
-        let runtime = Runtime::new(&config);
         Ok(Self {
             runtime,
             config,
@@ -1915,6 +2038,145 @@ impl ControllerControl {
         Ok(pretty(&Value::Array(results)))
     }
 
+    /// The backup partitions an agent here may look in: one per enabled
+    /// machine. A machine the user switched off is unreachable, and what was
+    /// said on it is not readable either.
+    #[cfg(feature = "controller")]
+    fn searchable_machines(
+        &self,
+        index: &crate::backup::BackupIndex,
+        asked: &[String],
+    ) -> Result<Vec<String>> {
+        if asked.is_empty() {
+            return Ok(self
+                .state
+                .enabled_hosts
+                .iter()
+                .map(|host| index.machine_key_for_alias(host))
+                .collect());
+        }
+        asked
+            .iter()
+            .map(|machine| {
+                if !self.state.enabled_hosts.contains(machine.as_str()) {
+                    bail!(
+                        "machine {machine} is not enabled in muxloom; ask the user to enable it \
+                         rather than working around it"
+                    );
+                }
+                Ok(index.machine_key_for_alias(machine))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "controller")]
+    fn search_conversations(&self, arguments: &Value) -> Result<String> {
+        use crate::backup::{BackupStore, SearchFilter, search_where};
+
+        let query = required_str(arguments, "query")?;
+        let limit = optional_u64(arguments, "limit", 20).clamp(1, 100) as usize;
+        let store = BackupStore::new(BackupStore::default_root());
+        let index = store.load_index()?;
+        let machines = self.searchable_machines(&index, &string_list(arguments, "machines")?)?;
+        let filter = SearchFilter {
+            machines: machines.clone(),
+            paths: string_list(arguments, "paths")?,
+            kinds: string_list(arguments, "kinds")?,
+            since: optional_u64(arguments, "since", 0),
+            until: optional_u64(arguments, "until", 0),
+        };
+        let hits = search_where(&store, query, limit, &filter)?;
+        let rendered: Vec<Value> = hits
+            .iter()
+            .map(|hit| {
+                json!({
+                    "machine": hit.target_id,
+                    "session_id": hit.session_id,
+                    "kind": hit.kind,
+                    "path": hit.cwd,
+                    "title": hit.title,
+                    "started_at": hit.created_at,
+                    "role": hit.role,
+                    "ts": hit.ts,
+                    // A title match belongs to no message, so there is no index
+                    // to read around — open the conversation from the start.
+                    "message_index": (hit.message_index != usize::MAX).then_some(hit.message_index),
+                    "snippet": hit.snippet,
+                    "matches": hit.score,
+                })
+            })
+            .collect();
+        Ok(pretty(&json!({
+            "query": query,
+            "machines_searched": machines,
+            "hits": rendered,
+            "note": "read around a hit with read_conversation { session_id, machine, \
+                     around_index }. This is a backup taken every few minutes, so a conversation \
+                     happening right now may be missing its last turns.",
+        })))
+    }
+
+    #[cfg(not(feature = "controller"))]
+    fn search_conversations(&self, _arguments: &Value) -> Result<String> {
+        bail!("this muxloom build keeps no conversation backup to search")
+    }
+
+    #[cfg(feature = "controller")]
+    fn read_conversation(&self, arguments: &Value) -> Result<String> {
+        use crate::backup::{BackupStore, read_messages};
+
+        let session_id = required_str(arguments, "session_id")?;
+        let limit = optional_u64(arguments, "limit", 20).clamp(1, 200) as usize;
+        let max_chars = optional_u64(arguments, "max_chars", 8_000).clamp(500, 64_000) as usize;
+        let store = BackupStore::new(BackupStore::default_root());
+        let index = store.load_index()?;
+        let asked: Vec<String> = optional_str(arguments, "machine")
+            .map(|machine| vec![machine.to_string()])
+            .unwrap_or_default();
+        let machines = self.searchable_machines(&index, &asked)?;
+        let record = index
+            .records
+            .iter()
+            .find(|record| record.session_id == session_id && machines.contains(&record.target_id))
+            .with_context(|| {
+                format!("no backed-up conversation {session_id} on any enabled machine")
+            })?;
+
+        let from = match optional_u64(arguments, "around_index", u64::MAX) {
+            u64::MAX => optional_u64(arguments, "from_index", 0) as usize,
+            around => (around as usize).saturating_sub(limit / 2),
+        };
+        let (window, total) = read_messages(&store, &record.target_id, session_id, from, limit)?;
+
+        let (messages, next, clipped_any) = conversation_page(&window, max_chars);
+        let after = window
+            .last()
+            .map(|(position, _)| position + 1)
+            .unwrap_or(from);
+        let next_cursor = next
+            .filter(|resume| *resume < total)
+            .or((after < total).then_some(after));
+        Ok(pretty(&json!({
+            "machine": record.target_id,
+            "session_id": record.session_id,
+            "kind": record.kind,
+            "path": record.cwd,
+            "title": record.title,
+            "total_messages": total,
+            "from_index": from,
+            "messages": messages,
+            "has_more_before": from > 0,
+            "has_more_after": next_cursor.is_some(),
+            "next_cursor": next_cursor,
+            "truncated": clipped_any,
+        })))
+    }
+
+    #[cfg(not(feature = "controller"))]
+    fn read_conversation(&self, _arguments: &Value) -> Result<String> {
+        bail!("this muxloom build keeps no conversation backup to read")
+    }
+
     fn run_shell(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let script = required_str(arguments, "script")?;
@@ -1971,6 +2233,8 @@ impl ControlSurface for ControllerControl {
                 Ok(format!("deleted {session_id}"))
             }
             "search_history" => self.search_history(arguments),
+            "search_conversations" => self.search_conversations(arguments),
+            "read_conversation" => self.read_conversation(arguments),
             "list_directory" => {
                 let target = self.target(arguments)?;
                 let path = required_str(arguments, "path")?;
@@ -2010,7 +2274,10 @@ pub use daemon_surface::DaemonControl;
 
 #[cfg(unix)]
 mod daemon_surface {
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
 
     use anyhow::{Context, Result, bail};
     use serde_json::{Value, json};
@@ -2037,6 +2304,13 @@ mod daemon_surface {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
     /// The most preview bytes a tool answer carries.
     const PREVIEW_LIMIT: usize = 256 * 1024;
+    /// How long a call the controller runs for us may take, and how often we
+    /// look for its answer. A controller comes round for work every couple of
+    /// seconds and the call itself takes as long as it takes; a minute covers
+    /// a search across a slow link, and failing after it is better than being
+    /// dropped by the client mid-call.
+    const RELAY_WAIT: Duration = Duration::from_secs(60);
+    const RELAY_POLL: Duration = Duration::from_millis(250);
 
     /// Serves the daemon on this machine over its Unix socket. Each call opens
     /// its own connection: a resident client would hold the daemon's client
@@ -2244,6 +2518,63 @@ mod daemon_surface {
             })
         }
 
+        /// Whether these arguments name a machine other than this one, in
+        /// which case the call is the controller's to make. The board knows
+        /// both names this machine goes by: the key it mints messages under
+        /// and the label the controller calls it. Not knowing them is not
+        /// fatal — the errand comes back to this daemon and is answered here,
+        /// one hop later than it needed to be.
+        fn elsewhere(&self, arguments: &Value) -> Option<String> {
+            let machine = optional_str(arguments, "machine")?;
+            let here = match self.transact(&DaemonRequest::TalkStatus { label: None }) {
+                Ok((DaemonResponse::TalkBoard { state }, _)) => state,
+                _ => return Some(machine.into()),
+            };
+            (machine != here.origin && machine != here.label).then(|| machine.into())
+        }
+
+        /// Have the controller run one call and wait for the answer. Every
+        /// look is its own short connection, the same as any other call here:
+        /// a wait that held one open would be the resident client the daemon
+        /// must not have.
+        fn relay(&self, tool: &str, arguments: &Value) -> Result<String> {
+            let id = match self
+                .transact(&DaemonRequest::RelaySubmit {
+                    tool: tool.into(),
+                    arguments: arguments.to_string(),
+                })?
+                .0
+            {
+                DaemonResponse::RelayTicket { id } => id,
+                response => bail!("unexpected relay response: {response:?}"),
+            };
+            let deadline = Instant::now() + RELAY_WAIT;
+            loop {
+                std::thread::sleep(RELAY_POLL);
+                let answer = match self
+                    .transact(&DaemonRequest::RelayResult { id: id.clone() })?
+                    .0
+                {
+                    DaemonResponse::Relayed { answer } => answer,
+                    response => bail!("unexpected relay response: {response:?}"),
+                };
+                if answer.done {
+                    if answer.ok {
+                        return Ok(answer.output);
+                    }
+                    bail!("{}", answer.output);
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "the muxloom controller has not answered in {} seconds. It may be busy or \
+                         the machine may be unreachable from it; try again, or ask an agent on \
+                         that machine instead.",
+                        RELAY_WAIT.as_secs()
+                    );
+                }
+            }
+        }
+
         fn message_agent(&self, arguments: &Value) -> Result<String> {
             // The board here is the one the message will be filed on, so an
             // author with no machine on it would be right anyway; asking keeps
@@ -2387,6 +2718,16 @@ mod daemon_surface {
 
         fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
             enforce_policy(&self.config.mcp, name)?;
+            // What another machine holds is the controller's to answer. The
+            // two that are only ever about other machines go straight out;
+            // the rest go out only when they name one.
+            if matches!(
+                name,
+                "list_machines" | "search_conversations" | "read_conversation"
+            ) || (crate::relay::relayed(name) && self.elsewhere(arguments).is_some())
+            {
+                return self.relay(name, arguments);
+            }
             match name {
                 "list_sessions" => {
                     let include_archived = optional_bool(arguments, "include_archived");
@@ -2522,6 +2863,44 @@ mod tests {
         assert_eq!(build_input(&json!({"submit": true})).unwrap(), b"\r");
     }
 
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_conversation_page_stops_at_its_budget_and_says_where_to_carry_on() {
+        let said = |text: &str| crate::backup::ExtractedMessage {
+            role: "user".into(),
+            text: text.into(),
+            ts: "2026-08-18T14:02:11Z".into(),
+        };
+        let window = vec![(4, said("aaaa")), (5, said("bbbbbb")), (6, said("c"))];
+
+        // Everything fits: the whole window comes back, nowhere left to go.
+        let (page, next, clipped) = conversation_page(&window, 100);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0]["index"], 4);
+        assert_eq!(page[2]["text"], "c");
+        assert_eq!(next, None);
+        assert!(!clipped);
+
+        // The budget runs out inside the second message: it comes back cut and
+        // flagged, and the cursor points at it so the next page reads it whole.
+        let (page, next, clipped) = conversation_page(&window, 6);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[1]["text"], "bb");
+        assert_eq!(page[1]["truncated"], true);
+        assert!(clipped);
+        assert_eq!(next, Some(5));
+
+        // One message alone over the budget can't be the cursor, or paging
+        // forward would hand back the same half forever.
+        let (page, next, _) = conversation_page(&window[1..], 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["text"], "bb");
+        assert_eq!(next, Some(6));
+
+        // Nothing to read pages nowhere.
+        assert_eq!(conversation_page(&[], 100), (Vec::new(), None, false));
+    }
+
     #[test]
     fn a_screen_reads_back_as_text_with_its_columns_intact() {
         // A row as the renderer writes it: colour, a jump over blanks that
@@ -2545,16 +2924,30 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == tool.name)
                 .unwrap_or_else(|| panic!("{} missing from controller surface", tool.name));
-            // The controller adds machine addressing; everything else matches.
+            // Machine addressing is the difference between the surfaces: the
+            // controller reaches every machine, and the daemon only the few
+            // the controller will run errands for. Everything else matches.
             let mut twin_schema = twin.input_schema.clone();
+            let mut tool_schema = tool.input_schema.clone();
             twin_schema["properties"]
                 .as_object_mut()
                 .unwrap()
                 .remove("machine");
-            assert_eq!(twin_schema, tool.input_schema, "{} diverged", tool.name);
+            if tool_schema["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("machine")
+                .is_some()
+            {
+                assert!(
+                    crate::relay::relayed(tool.name),
+                    "{} takes a machine the controller will not relay",
+                    tool.name
+                );
+            }
+            assert_eq!(twin_schema, tool_schema, "{} diverged", tool.name);
         }
         for name in [
-            "list_machines",
             "list_resume_candidates",
             "search_files",
             // The machine set and the SSH config live on the controller: a
@@ -2606,6 +2999,7 @@ mod tests {
         assert_eq!(
             offered,
             [
+                "list_machines",
                 "list_sessions",
                 "read_screen",
                 // Waiting only watches; arming a trigger acts, so `trigger`
@@ -2614,6 +3008,10 @@ mod tests {
                 "wait_for",
                 "talk_read",
                 "search_history",
+                // Reading someone else's conversation back is watching as
+                // well, even when the controller has to fetch it.
+                "search_conversations",
+                "read_conversation",
                 "list_directory",
                 "list_files",
                 "preview_file"
@@ -2628,9 +3026,14 @@ mod tests {
         assert!(text.contains("send_input"));
         assert!(text.contains("not enabled") || text.contains("has not enabled"));
         assert!(!text.contains("disabled these tools"));
-        // The daemon surface has no machine argument to talk about.
+        // The daemon surface reaches other machines only through the
+        // controller, and only for the errands it will run.
         let daemon = instructions(Flavor::Daemon, &McpConfig::default());
-        assert!(!daemon.contains("`machine` argument"));
+        assert!(daemon.contains("`machine` argument"));
+        for tool in crate::relay::RELAYED_TOOLS {
+            assert!(daemon.contains(tool), "{tool} goes unmentioned");
+        }
+        assert!(daemon.contains("not a reason to retry"));
     }
 
     /// A controller surface over a throwaway home: its own SSH config and its
@@ -2846,7 +3249,11 @@ mod tests {
         };
 
         use super::super::{ControlSurface, DaemonControl};
-        use crate::{config::Config, daemon::DaemonPaths};
+        use crate::{
+            config::Config,
+            daemon::DaemonPaths,
+            daemon_protocol::{DaemonRequest, DaemonResponse, Frame, FrameKind},
+        };
         use serde_json::{Value, json};
 
         /// One serve() loop on a temporary state directory, reached the same
@@ -2859,6 +3266,12 @@ mod tests {
         /// tests that need a session the daemon reads as an agent's point
         /// `claude` at a shell.
         fn surface_with(name: &str, config: Config) -> DaemonControl {
+            surface_and_paths(name, config).0
+        }
+
+        /// The same again, keeping the state directory: a test that plays the
+        /// controller as well as the agent needs its own way in.
+        fn surface_and_paths(name: &str, config: Config) -> (DaemonControl, DaemonPaths) {
             // A short, fixed prefix: the state dir carries daemon and keeper
             // sockets, whose paths must stay under the ~104-byte sockaddr_un
             // limit that macOS's deep per-user temp dir nearly exhausts.
@@ -2882,7 +3295,23 @@ mod tests {
                 assert!(Instant::now() < deadline, "daemon socket never came up");
                 thread::sleep(Duration::from_millis(20));
             }
-            DaemonControl::with_paths(paths, config)
+            (DaemonControl::with_paths(paths.clone(), config), paths)
+        }
+
+        /// One request to the daemon as something other than the surface under
+        /// test — the controller, in the tests that need one.
+        fn ask(paths: &DaemonPaths, request: &DaemonRequest) -> DaemonResponse {
+            let mut connection = crate::daemon::connect_or_start(paths).unwrap();
+            Frame::json(FrameKind::Request, 0, 1, request)
+                .unwrap()
+                .write_to(&mut connection)
+                .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut connection).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            }
         }
 
         fn call(surface: &mut DaemonControl, name: &str, arguments: Value) -> String {
@@ -3178,6 +3607,71 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(refused.contains("message_agent"), "{refused}");
+        }
+
+        #[test]
+        fn an_errand_reaches_a_watching_controller_and_fails_at_once_without_one() {
+            let (mut surface, paths) = surface_and_paths("relay", Config::default());
+
+            // Nothing is watching this machine. The agent is told so on the
+            // call it made, rather than left holding a minute-long wait.
+            let started = Instant::now();
+            let error = surface
+                .call("list_machines", &json!({}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("attached muxloom controller"), "{error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "waited {:?} to be told nobody is there",
+                started.elapsed()
+            );
+
+            // A controller turns up and asks for work, which is the only way
+            // this daemon learns it is there.
+            let controller = paths.clone();
+            let (ready, attached) = std::sync::mpsc::channel();
+            let round = thread::spawn(move || {
+                let first = ask(&controller, &DaemonRequest::RelayPoll);
+                assert!(
+                    matches!(&first, DaemonResponse::RelayWork { jobs } if jobs.is_empty()),
+                    "{first:?}"
+                );
+                ready.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let DaemonResponse::RelayWork { jobs } =
+                        ask(&controller, &DaemonRequest::RelayPoll)
+                        && let Some(job) = jobs.into_iter().next()
+                    {
+                        assert_eq!(job.tool, "search_conversations");
+                        let arguments: Value = serde_json::from_str(&job.arguments).unwrap();
+                        assert_eq!(arguments["query"], "the envelope");
+                        ask(
+                            &controller,
+                            &DaemonRequest::RelayComplete {
+                                id: job.id,
+                                ok: true,
+                                output: "[]".into(),
+                            },
+                        );
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "the errand never came round");
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+            attached.recv().unwrap();
+
+            // The corpus lives on the controller, so the answer does too: what
+            // comes back is whatever it said, verbatim.
+            let answer = call(
+                &mut surface,
+                "search_conversations",
+                json!({ "query": "the envelope" }),
+            );
+            assert_eq!(answer, "[]");
+            round.join().unwrap();
         }
 
         #[test]

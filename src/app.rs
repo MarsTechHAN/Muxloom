@@ -4746,13 +4746,15 @@ impl App {
             .map(|status| status.target.clone())
             .collect();
         self.last_talk_sync = Some(Instant::now());
-        if targets.is_empty() {
-            // Alone on this machine there is nothing to carry, and the local
-            // board is read directly.
-            return;
-        }
         self.talk_in_flight = true;
-        let _ = self.worker.requests.send(Request::TalkSync { targets });
+        // This runs even with nowhere to carry anything to: the round is also
+        // when agents on this machine get the errands they cannot run
+        // themselves, and an agent asking for another machine while nothing
+        // polls for work is told so rather than left waiting.
+        let _ = self.worker.requests.send(Request::TalkSync {
+            targets,
+            config: Box::new(self.config.clone()),
+        });
     }
 
     fn refresh_enabled(&mut self) {

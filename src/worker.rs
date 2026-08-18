@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     bridge::BridgePool,
-    config::CommandConfig,
+    config::{CommandConfig, Config},
     debug,
     media::{MediaPlayback, MediaUpdate, decode_image_stream, decode_video_stream},
     model::{
@@ -150,10 +150,14 @@ pub enum Request {
         machine_key: String,
         session_id: String,
     },
-    /// Carry talk board messages between the given targets and this machine.
-    /// Only the controller can see two daemons at once, so only it can.
+    /// Carry talk board messages between the given targets and this machine,
+    /// then run whatever errands the agents on them left for a controller.
+    /// Only the controller can see two daemons at once, so only it can do
+    /// either. The config travels because the errands are run through the same
+    /// tool surface the MCP adapter serves, policy included.
     TalkSync {
         targets: Vec<Target>,
+        config: Box<Config>,
     },
 }
 
@@ -1028,12 +1032,23 @@ impl Worker {
                             let _ = (machine_key, target_id, session_id);
                         }
                     }
-                    Request::TalkSync { targets } => {
+                    Request::TalkSync { targets, config } => {
                         let result = crate::talk::run_sync(&runtime, &targets)
                             .map(|summary| summary.to_string())
                             .map_err(|error| format!("{error:#}"));
                         if let Err(error) = &result {
                             debug::log("worker", format!("talk sync failed: {error}"));
+                        }
+                        // Errands run whether or not the board moved: an agent
+                        // waiting on one is waiting on this round.
+                        match crate::relay::run_pump(&runtime, &config, &targets) {
+                            Ok(round) if round != Default::default() => {
+                                debug::log("relay", round.to_string());
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                debug::log("relay", format!("errands failed: {error:#}"));
+                            }
                         }
                         let _ = events.send(Event::TalkSynced { result });
                     }

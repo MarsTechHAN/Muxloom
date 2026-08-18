@@ -35,6 +35,7 @@ mod platform {
             FilePreviewKind,
         },
         recap::extract_recap,
+        relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
             DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, is_temporary_session_id,
         },
@@ -179,6 +180,11 @@ mod platform {
         /// When each sender last reached each session, for the rate limit that
         /// keeps one agent from typing into another in a loop.
         directs: Mutex<HashMap<String, u64>>,
+        /// Work this machine's agents have asked an attached controller to do
+        /// for them, because it reaches machines this daemon cannot. Held in
+        /// memory only: a job outlives neither the daemon nor the minute it
+        /// was asked in.
+        relay: Mutex<RelayQueue>,
     }
 
     /// A stored trigger plus the edge state that decides when it fires.
@@ -348,6 +354,7 @@ mod platform {
                 pending,
                 draining_outbox: AtomicBool::new(false),
                 directs: Mutex::new(HashMap::new()),
+                relay: Mutex::new(RelayQueue::default()),
             }
         }
 
@@ -1713,6 +1720,7 @@ mod platform {
                             "triggers-v1".into(),
                             TALK_CAPABILITY.into(),
                             DIRECT_CAPABILITY.into(),
+                            RELAY_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -1943,6 +1951,38 @@ mod platform {
                         reason,
                     },
                 )
+            }
+            DaemonRequest::RelaySubmit { tool, arguments } => {
+                let id = state
+                    .relay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .submit(&tool, &arguments, crate::relay::now_ms())?;
+                write_response(writer, request_id, &DaemonResponse::RelayTicket { id })
+            }
+            DaemonRequest::RelayPoll => {
+                let jobs = state
+                    .relay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .poll(crate::relay::now_ms());
+                write_response(writer, request_id, &DaemonResponse::RelayWork { jobs })
+            }
+            DaemonRequest::RelayComplete { id, ok, output } => {
+                state
+                    .relay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .complete(&id, ok, output, crate::relay::now_ms());
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::RelayResult { id } => {
+                let answer = state
+                    .relay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result(&id, crate::relay::now_ms())?;
+                write_response(writer, request_id, &DaemonResponse::Relayed { answer })
             }
             DaemonRequest::TalkAppend { messages } => {
                 let added = state.talk()?.merge(messages)?;

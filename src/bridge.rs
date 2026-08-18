@@ -23,6 +23,7 @@ use crate::{
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
+    relay::{RELAY_CAPABILITY, RelayJob},
     talk::{
         DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
         TalkPage, TalkState, TalkVector,
@@ -864,6 +865,24 @@ impl BridgeConnection {
             } => Ok((*message, delivery, reason)),
             response => bail!("unexpected talk response: {response:?}"),
         }
+    }
+
+    /// Take whatever work this machine's agents have left for a controller.
+    /// A daemon too old to have a relay simply has no work: an agent there
+    /// never had a way to ask for any.
+    pub fn relay_poll(&self) -> Result<Vec<RelayJob>> {
+        if !self.has_capability(RELAY_CAPABILITY) {
+            return Ok(Vec::new());
+        }
+        match self.request(DaemonRequest::RelayPoll)?.response {
+            DaemonResponse::RelayWork { jobs } => Ok(jobs),
+            response => bail!("unexpected relay response: {response:?}"),
+        }
+    }
+
+    /// Hand back what a job produced, successfully or not.
+    pub fn relay_complete(&self, id: String, ok: bool, output: String) -> Result<()> {
+        self.expect_ack(DaemonRequest::RelayComplete { id, ok, output })
     }
 
     fn has_capability(&self, capability: &str) -> bool {
@@ -2158,6 +2177,21 @@ impl BridgePool {
 
     pub fn talk_append(&self, target: &Target, messages: Vec<TalkMessage>) -> Result<usize> {
         self.connection_for_target(target)?.talk_append(messages)
+    }
+
+    pub fn relay_poll(&self, target: &Target) -> Result<Vec<RelayJob>> {
+        self.connection_for_target(target)?.relay_poll()
+    }
+
+    pub fn relay_complete(
+        &self,
+        target: &Target,
+        id: String,
+        ok: bool,
+        output: String,
+    ) -> Result<()> {
+        self.connection_for_target(target)?
+            .relay_complete(id, ok, output)
     }
 
     /// The serving daemon's pid and client count.

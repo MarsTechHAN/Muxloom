@@ -1276,24 +1276,89 @@ pub struct SearchHit {
     pub snippet: String,
     /// Match count in the message — used for ranking.
     pub score: usize,
+    /// Which message in the conversation matched, counted from the start —
+    /// the line number in the extracted jsonl, and what a reader pages around.
+    /// `usize::MAX` when the match was in the title rather than a message.
+    pub message_index: usize,
+    /// The agent's own timestamp for the matching message, verbatim and
+    /// possibly empty: transcripts write it in their own format.
+    pub ts: String,
+}
+
+/// Which conversations a search will look at. Every empty field means "all of
+/// them", so the default filter searches everything.
+#[derive(Debug, Default, Clone)]
+pub struct SearchFilter {
+    /// Machine partition keys.
+    pub machines: Vec<String>,
+    /// Working directories: a conversation counts if it was held in one of
+    /// them or anywhere below it.
+    pub paths: Vec<String>,
+    /// Agent kinds (`codex`, `claude`, `terminal`).
+    pub kinds: Vec<String>,
+    /// Bounds on when the conversation started, epoch ms. 0 is unbounded.
+    pub since: u64,
+    pub until: u64,
+}
+
+impl SearchFilter {
+    pub fn keeps(&self, record: &BackupRecord) -> bool {
+        if !self.machines.is_empty() && !self.machines.contains(&record.target_id) {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&record.kind) {
+            return false;
+        }
+        if !self.paths.is_empty() && !self.paths.iter().any(|path| within(&record.cwd, path)) {
+            return false;
+        }
+        if self.since > 0 && record.created_at < self.since {
+            return false;
+        }
+        if self.until > 0 && record.created_at > self.until {
+            return false;
+        }
+        true
+    }
+}
+
+/// Whether `cwd` is `root` or sits below it.
+fn within(cwd: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    cwd == root
+        || cwd
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Full-text search across every backed-up conversation (all machines, running
 /// and archived). Case-insensitive substring match over extracted messages and
 /// titles; results are ranked by match count then recency and capped at `limit`.
 pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    search_where(store, query, limit, &SearchFilter::default())
+}
+
+/// The same search, over the conversations `filter` admits.
+pub fn search_where(
+    store: &BackupStore,
+    query: &str,
+    limit: usize,
+    filter: &SearchFilter,
+) -> Result<Vec<SearchHit>> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return Ok(Vec::new());
     }
     let index = store.load_index()?;
     let mut hits: Vec<SearchHit> = Vec::new();
-    for record in &index.records {
+    for record in index.records.iter().filter(|record| filter.keeps(record)) {
         let mut matched_message = false;
         let raw = store
             .read_blob(&record.target_id, &record.session_id, MESSAGES_BLOB)
             .unwrap_or_default();
-        for line in String::from_utf8_lossy(&raw).lines() {
+        // Enumerated over every line, parseable or not, so an index here is the
+        // same index `read_messages` pages around.
+        for (position, line) in String::from_utf8_lossy(&raw).lines().enumerate() {
             let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) else {
                 continue;
             };
@@ -1312,6 +1377,8 @@ pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<Sear
                 role: message.role,
                 snippet: make_snippet(&message.text, &needle),
                 score: count,
+                message_index: position,
+                ts: message.ts,
             });
         }
         // Surface a title/recap match even when no message body matched.
@@ -1335,6 +1402,8 @@ pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<Sear
                         &needle,
                     ),
                     score: 1,
+                    message_index: usize::MAX,
+                    ts: String::new(),
                 });
             }
         }
@@ -1342,6 +1411,35 @@ pub fn search(store: &BackupStore, query: &str, limit: usize) -> Result<Vec<Sear
     hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.created_at.cmp(&a.created_at)));
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// A window of one backed-up conversation, addressed by message index: the
+/// line number in the extracted jsonl, which is what a search hit reports.
+///
+/// Returns the messages in the window, each with its index, and how many the
+/// conversation holds in total — enough for a caller to know whether there is
+/// anything before or after what it asked for.
+pub fn read_messages(
+    store: &BackupStore,
+    target_id: &str,
+    session_id: &str,
+    from: usize,
+    limit: usize,
+) -> Result<(Vec<(usize, ExtractedMessage)>, usize)> {
+    let raw = store.read_blob(target_id, session_id, MESSAGES_BLOB)?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut window = Vec::new();
+    let mut total = 0;
+    for (position, line) in text.lines().enumerate() {
+        total = position + 1;
+        if position < from || window.len() >= limit {
+            continue;
+        }
+        if let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) {
+            window.push((position, message));
+        }
+    }
+    Ok((window, total))
 }
 
 /// A one-line excerpt of `text` centered on the first match of `needle`
@@ -1674,6 +1772,149 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.target_id == "local"));
         // Empty query yields nothing.
         assert!(search(&store, "   ", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_narrowed_search_says_which_message_matched_and_reads_back_around_it() {
+        let store = temp_store();
+        let write = |target: &str,
+                     session: &str,
+                     cwd: &str,
+                     kind: &str,
+                     created: u64,
+                     msgs: &[(&str, &str)]| {
+            let messages: Vec<ExtractedMessage> = msgs
+                .iter()
+                .map(|(role, text)| ExtractedMessage {
+                    role: (*role).into(),
+                    text: (*text).into(),
+                    ts: String::new(),
+                })
+                .collect();
+            store
+                .write_blob(
+                    target,
+                    session,
+                    MESSAGES_BLOB,
+                    messages_to_jsonl(&messages).as_bytes(),
+                )
+                .unwrap();
+            let mut index = store.load_index().unwrap();
+            index.upsert(BackupRecord {
+                target_id: target.into(),
+                session_id: session.into(),
+                kind: kind.into(),
+                cwd: cwd.into(),
+                created_at: created,
+                message_count: messages.len(),
+                ..Default::default()
+            });
+            store.save_index(&index).unwrap();
+        };
+        write(
+            "local",
+            "s1",
+            "/work/loom",
+            "claude",
+            100,
+            &[
+                ("user", "where is the parser"),
+                ("assistant", "in src/parse.rs"),
+                ("user", "the parser again"),
+            ],
+        );
+        write(
+            "gpu",
+            "s2",
+            "/work/other",
+            "codex",
+            300,
+            &[("user", "the parser lives elsewhere")],
+        );
+
+        let narrow = |filter: SearchFilter| search_where(&store, "parser", 10, &filter).unwrap();
+        assert_eq!(search(&store, "parser", 10).unwrap().len(), 3);
+        assert_eq!(
+            narrow(SearchFilter {
+                machines: vec!["gpu".into()],
+                ..SearchFilter::default()
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            narrow(SearchFilter {
+                kinds: vec!["claude".into()],
+                ..SearchFilter::default()
+            })
+            .len(),
+            2
+        );
+        // A directory takes everything below it, and only what is below it: a
+        // path is a place, not a prefix.
+        assert_eq!(
+            narrow(SearchFilter {
+                paths: vec!["/work".into()],
+                ..SearchFilter::default()
+            })
+            .len(),
+            3
+        );
+        assert_eq!(
+            narrow(SearchFilter {
+                paths: vec!["/work/loom".into()],
+                ..SearchFilter::default()
+            })
+            .len(),
+            2
+        );
+        assert!(
+            narrow(SearchFilter {
+                paths: vec!["/work/loo".into()],
+                ..SearchFilter::default()
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            narrow(SearchFilter {
+                since: 200,
+                ..SearchFilter::default()
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            narrow(SearchFilter {
+                until: 200,
+                ..SearchFilter::default()
+            })
+            .len(),
+            2
+        );
+
+        // A hit says which message it was, and that index reads back as the
+        // same message on the same conversation.
+        let late = narrow(SearchFilter {
+            machines: vec!["local".into()],
+            ..SearchFilter::default()
+        })
+        .into_iter()
+        .find(|hit| hit.snippet.contains("again"))
+        .expect("the second mention is a hit of its own");
+        assert_eq!(late.message_index, 2);
+        let (window, total) = read_messages(&store, "local", "s1", 1, 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            window.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(window[1].1.text, "the parser again");
+
+        // Reading past the end is an empty page that still says how long the
+        // conversation is, not an error.
+        let (past, total) = read_messages(&store, "local", "s1", 9, 5).unwrap();
+        assert!(past.is_empty());
+        assert_eq!(total, 3);
     }
 
     #[test]

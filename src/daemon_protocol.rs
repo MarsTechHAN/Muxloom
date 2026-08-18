@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     model::{DirectoryListing, FileListing, FilePreview},
+    relay::{RelayAnswer, RelayJob},
     talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
 };
 
@@ -342,6 +343,27 @@ pub enum DaemonRequest {
         #[serde(default)]
         reply_expected: bool,
     },
+    /// Ask whichever controller is watching this machine to run one tool
+    /// somewhere this daemon cannot reach. Refused on the spot if no
+    /// controller is asking for work, or if the tool is not one a controller
+    /// runs on another machine's behalf.
+    RelaySubmit {
+        tool: String,
+        arguments: String,
+    },
+    /// A controller asking what it can carry. Answering it is also how a
+    /// daemon learns a controller is there at all.
+    RelayPoll,
+    /// A controller handing back what a job produced.
+    RelayComplete {
+        id: String,
+        ok: bool,
+        output: String,
+    },
+    /// The submitter asking whether its job has come back.
+    RelayResult {
+        id: String,
+    },
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -479,6 +501,19 @@ pub enum DaemonResponse {
         delivery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// Answers `RelaySubmit`: what to ask about later.
+    RelayTicket {
+        id: String,
+    },
+    /// Answers `RelayPoll`.
+    RelayWork {
+        #[serde(default)]
+        jobs: Vec<RelayJob>,
+    },
+    /// Answers `RelayResult`.
+    Relayed {
+        answer: RelayAnswer,
     },
     Error {
         message: String,
