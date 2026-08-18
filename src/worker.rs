@@ -150,6 +150,11 @@ pub enum Request {
         machine_key: String,
         session_id: String,
     },
+    /// Carry talk board messages between the given targets and this machine.
+    /// Only the controller can see two daemons at once, so only it can.
+    TalkSync {
+        targets: Vec<Target>,
+    },
 }
 
 #[derive(Debug)]
@@ -293,6 +298,10 @@ pub enum Event {
         target_id: String,
         session_id: String,
         result: Result<RestoredTranscript, String>,
+    },
+    /// One talk replication round finished. The payload says what it moved.
+    TalkSynced {
+        result: Result<String, String>,
     },
 }
 
@@ -1018,6 +1027,15 @@ impl Worker {
                         {
                             let _ = (machine_key, target_id, session_id);
                         }
+                    }
+                    Request::TalkSync { targets } => {
+                        let result = crate::talk::run_sync(&runtime, &targets)
+                            .map(|summary| summary.to_string())
+                            .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            debug::log("worker", format!("talk sync failed: {error}"));
+                        }
+                        let _ = events.send(Event::TalkSynced { result });
                     }
                 });
             }

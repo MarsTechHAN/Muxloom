@@ -398,6 +398,10 @@ pub const HELP_CONTENT_ROWS: usize = 63;
 /// constant regardless of how frequently the UI redraws.
 const ANIMATION_FRAME_MS: u128 = 180;
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
+/// How often the talk board is carried between machines. A conversation this
+/// slow is still a conversation; a machine polled faster than this is being
+/// asked to answer more often than anyone types.
+const TALK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// How long one phase of a forced daemon update may take before the
 /// orchestration gives up and says so. Generous: the cycle can carry a
 /// companion upload over a slow link, and the escalation waits out a
@@ -829,6 +833,8 @@ pub struct App {
     last_activity_refresh: Instant,
     last_backup_sync: Option<Instant>,
     backup_in_flight: bool,
+    last_talk_sync: Option<Instant>,
+    talk_in_flight: bool,
     /// The aggregated history store, beside the state file. Restoring reads it;
     /// listing a machine's lost sessions reads its index.
     backup_root: PathBuf,
@@ -971,6 +977,8 @@ impl App {
             last_activity_refresh: Instant::now(),
             last_backup_sync: None,
             backup_in_flight: false,
+            last_talk_sync: None,
+            talk_in_flight: false,
             backup_root,
             recoverable: HashMap::new(),
             restoring: HashSet::new(),
@@ -1559,6 +1567,7 @@ impl App {
         self.maybe_refresh_daemons();
         self.sweep_forced_updates();
         self.maybe_backup_sync();
+        self.maybe_talk_sync();
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -4387,6 +4396,13 @@ impl App {
                     }
                 }
             }
+            Event::TalkSynced { result } => {
+                self.talk_in_flight = false;
+                match result {
+                    Ok(summary) => debug::log("talk", summary),
+                    Err(error) => debug::log("talk", format!("sync failed: {error}")),
+                }
+            }
             Event::BackupSynced { result } => {
                 self.backup_in_flight = false;
                 match result {
@@ -4707,6 +4723,36 @@ impl App {
             include_ansi: self.config.backup.include_ansi,
             ansi_max_bytes: self.config.backup.ansi_max_bytes,
         });
+    }
+
+    /// Carry the talk board between machines when a round is due and none is
+    /// running. People and agents are waiting on each other's messages here,
+    /// so this runs far more often than a backup — it moves what has been
+    /// said, not what has been recorded.
+    fn maybe_talk_sync(&mut self) {
+        if self.talk_in_flight {
+            return;
+        }
+        let due = self
+            .last_talk_sync
+            .is_none_or(|at| at.elapsed() >= TALK_SYNC_INTERVAL);
+        if !due {
+            return;
+        }
+        let targets: Vec<Target> = self
+            .targets
+            .iter()
+            .filter(|status| status.enabled && status.target.id != LOCAL_TARGET_ID)
+            .map(|status| status.target.clone())
+            .collect();
+        self.last_talk_sync = Some(Instant::now());
+        if targets.is_empty() {
+            // Alone on this machine there is nothing to carry, and the local
+            // board is read directly.
+            return;
+        }
+        self.talk_in_flight = true;
+        let _ = self.worker.requests.send(Request::TalkSync { targets });
     }
 
     fn refresh_enabled(&mut self) {

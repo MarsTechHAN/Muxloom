@@ -16,6 +16,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -25,6 +26,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    bridge::BridgePool,
+    debug,
+    model::{Target, Transport},
+    runtime::Runtime,
+};
 
 /// Capability that says a daemon carries a talk board.
 pub const TALK_CAPABILITY: &str = "talk-v1";
@@ -895,6 +903,105 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// How many messages one round carries in each direction per machine. A round
+/// that falls behind catches up on the next one.
+const SYNC_BATCH: usize = MAX_PAGE;
+
+/// What one replication round moved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TalkSyncSummary {
+    pub machines: usize,
+    pub pulled: usize,
+    pub pushed: usize,
+    /// Machines that could not be reached or are too old to have a board.
+    pub skipped: usize,
+}
+
+impl fmt::Display for TalkSyncSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} machines, {} pulled, {} pushed, {} skipped",
+            self.machines, self.pulled, self.pushed, self.skipped
+        )
+    }
+}
+
+/// Carry messages between the machines a controller can reach.
+///
+/// Two daemons never speak to each other: the controller is the only thing
+/// that can see both, so it is the only thing that can replicate. Each round
+/// diffs a machine's version vector against the local board, pulls what is
+/// missing, and pushes what that machine has not got. Both directions are
+/// idempotent and additive, so a round that dies halfway is just a round that
+/// runs again.
+pub fn run_sync(runtime: &Runtime, targets: &[Target]) -> Result<TalkSyncSummary> {
+    let pool = runtime.bridge_pool();
+    let local = Target::local();
+    let mut summary = TalkSyncSummary::default();
+    let mut mine = pool
+        .talk_status(&local, None)
+        .context("the local talk board is unreachable")?
+        .vector;
+    for target in targets.iter().filter(|target| target.id != local.id) {
+        // The name a human gave the machine travels with it: the daemon knows
+        // its own hostname and nothing else about how it is spoken of.
+        let label = match &target.transport {
+            Transport::Ssh { alias } => Some(alias.clone()),
+            _ => None,
+        };
+        let theirs = match pool.talk_status(target, label) {
+            Ok(state) => state,
+            Err(error) => {
+                debug::log("talk", format!("{}: no board ({error})", target.id));
+                summary.skipped += 1;
+                continue;
+            }
+        };
+        summary.machines += 1;
+        match carry(&pool, target, &local, mine.clone(), &theirs.vector) {
+            Ok((pulled, pushed)) => {
+                summary.pulled += pulled;
+                summary.pushed += pushed;
+                if pulled > 0 {
+                    // The next machine should be told what this one just said,
+                    // and not be asked for it a second time.
+                    mine = pool.talk_status(&local, None)?.vector;
+                }
+            }
+            Err(error) => {
+                debug::log("talk", format!("{}: sync failed ({error})", target.id));
+                summary.skipped += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// One machine's half of a round: pull first, so what it minted is on the
+/// local board before the next machine is pushed to.
+fn carry(
+    pool: &BridgePool,
+    target: &Target,
+    local: &Target,
+    mine: TalkVector,
+    theirs: &TalkVector,
+) -> Result<(usize, usize)> {
+    let inbound = pool.talk_fetch(target, mine, SYNC_BATCH)?;
+    let pulled = if inbound.is_empty() {
+        0
+    } else {
+        pool.talk_append(local, inbound)?
+    };
+    let outbound = pool.talk_fetch(local, theirs.clone(), SYNC_BATCH)?;
+    let pushed = if outbound.is_empty() {
+        0
+    } else {
+        pool.talk_append(target, outbound)?
+    };
+    Ok((pulled, pushed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +1271,51 @@ mod tests {
         );
 
         fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_round_between_two_boards_leaves_them_holding_the_same_thing() {
+        let here = store("sync-here");
+        let there = store("sync-there");
+        here.post(draft("starting on the parser", TalkScope::Global))
+            .unwrap();
+        there
+            .post(draft(
+                "the parser is mine, take the lexer",
+                TalkScope::Global,
+            ))
+            .unwrap();
+
+        // Exactly what `carry` does, without needing two daemons and a
+        // controller between them: diff the vectors, pull, then push.
+        let round = |pull_into: &TalkStore, from: &TalkStore| -> (usize, usize) {
+            let pulled = pull_into
+                .merge(from.since(&pull_into.state().vector, MAX_PAGE))
+                .unwrap();
+            let pushed = from
+                .merge(pull_into.since(&from.state().vector, MAX_PAGE))
+                .unwrap();
+            (pulled, pushed)
+        };
+
+        assert_eq!(round(&here, &there), (1, 1));
+        assert_eq!(here.state().vector, there.state().vector);
+        // Both boards read the same, in the same order, on either machine.
+        let texts = |store: &TalkStore| -> Vec<String> {
+            store
+                .read(&TalkFilter::default())
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        assert_eq!(texts(&here).len(), 2);
+        assert_eq!(texts(&here), texts(&there));
+        // Nothing new was said, so the next round carries nothing: replication
+        // is a diff, not a resend.
+        assert_eq!(round(&here, &there), (0, 0));
+
+        fs::remove_dir_all(&here.root).ok();
+        fs::remove_dir_all(&there.root).ok();
     }
 }
