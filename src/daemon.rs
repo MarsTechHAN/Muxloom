@@ -106,6 +106,12 @@ mod platform {
             if let Some(path) = std::env::var_os("MUXLOOMD_STATE_DIR") {
                 return Ok(Self::under(PathBuf::from(path)));
             }
+            Self::the_machines_own()
+        }
+
+        /// Where a muxloom on this machine looks when it was not told
+        /// otherwise: the one state directory every other muxloom here finds.
+        pub fn the_machines_own() -> Result<Self> {
             if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
                 return Ok(Self::under(PathBuf::from(path).join("muxloom")));
             }
@@ -113,6 +119,18 @@ mod platform {
             Ok(Self::under(
                 PathBuf::from(home).join(".local/state/muxloom"),
             ))
+        }
+
+        /// Whether this daemon is serving that directory. One serving anywhere
+        /// else was handed somewhere to run — a test, an experiment — and the
+        /// sessions in it are nobody else's business, however it was started.
+        pub fn is_the_machines_own(&self) -> bool {
+            let Ok(machines) = Self::the_machines_own() else {
+                return false;
+            };
+            let settle =
+                |path: &PathBuf| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            settle(&machines.root) == settle(&self.root)
         }
 
         pub fn under(root: PathBuf) -> Self {
@@ -1182,9 +1200,12 @@ mod platform {
         spawn_outbox_drainer(&state);
         // Tell this machine's agents where the control surface is and how the
         // fleet works, so one launched here — or on a remote the user never
-        // configures by hand — can drive the sessions around it. Nothing here
-        // is worth refusing to serve over.
-        match crate::mcp_register::register_for_this_daemon() {
+        // configures by hand — can drive the sessions around it. Only when
+        // this is the machine's own daemon: that entry is shared by every
+        // agent here, and a daemon serving a scratch directory would point
+        // them all at an empty fleet. Nothing here is worth refusing to
+        // serve over.
+        match crate::mcp_register::register_for_this_daemon(paths.is_the_machines_own()) {
             Ok(written) if !written.is_empty() => {
                 for path in written {
                     eprintln!("muxloomd wrote its agent setup into {}", path.display());

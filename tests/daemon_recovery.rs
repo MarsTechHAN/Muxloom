@@ -34,6 +34,9 @@ impl TestState {
     fn serve(&self) -> Child {
         let mut child = Command::new(env!("CARGO_BIN_EXE_muxloomd"))
             .env("MUXLOOMD_STATE_DIR", &self.root)
+            // Never the machine's daemon, and never allowed to write itself
+            // into the agent configuration of whoever is running the tests.
+            .env("MUXLOOM_MCP_REGISTER", "0")
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

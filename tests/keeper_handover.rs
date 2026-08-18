@@ -35,6 +35,10 @@ impl TestState {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_muxloomd"));
         command.env("MUXLOOMD_STATE_DIR", &self.root);
+        // A daemon in a scratch directory keeps out of the machine's agent
+        // configuration on its own, but this is a test writing to the home of
+        // whoever is running it. Say it twice.
+        command.env("MUXLOOM_MCP_REGISTER", "0");
         command
     }
 

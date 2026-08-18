@@ -41,12 +41,21 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
-    /// The entry for the currently running binary, serving its own state.
-    pub fn for_this_daemon() -> Result<Self> {
-        let command = std::env::current_exe()
-            .context("failed to locate the running muxloomd")?
-            .to_string_lossy()
-            .into_owned();
+    /// The entry for this machine's control surface. There is one entry and it
+    /// is the machine's, so a machine that has the controller registers that:
+    /// `muxloom mcp` reaches every machine the user enabled directly, where the
+    /// daemon's own surface has to relay through an attached controller for
+    /// anything off this machine. A target that only ever received the
+    /// companion has no controller to point at, and the daemon serves it.
+    pub fn for_this_machine() -> Result<Self> {
+        let daemon = std::env::current_exe().context("failed to locate the running muxloomd")?;
+        if let Some(controller) = controller_beside(&daemon) {
+            return Ok(Self {
+                command: controller,
+                args: vec!["mcp".into()],
+                environment: BTreeMap::new(),
+            });
+        }
         let mut environment = BTreeMap::new();
         if let Some(state_dir) = std::env::var_os("MUXLOOMD_STATE_DIR") {
             environment.insert(
@@ -55,11 +64,27 @@ impl ServerEntry {
             );
         }
         Ok(Self {
-            command,
+            command: daemon.to_string_lossy().into_owned(),
             args: vec!["mcp".into()],
             environment,
         })
     }
+}
+
+/// The controller installed alongside this daemon, if there is one. The same
+/// two places the controller looks for the companion, in reverse: they are
+/// installed together, and a release layout may put the pair one level up.
+fn controller_beside(daemon: &Path) -> Option<String> {
+    let name = format!("muxloom{}", std::env::consts::EXE_SUFFIX);
+    let parent = daemon.parent()?;
+    [
+        Some(parent.join(&name)),
+        parent.parent().map(|root| root.join(&name)),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| candidate.is_file())
+    .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
 /// Write the entry into every agent configuration under `home`, reporting the
@@ -78,20 +103,41 @@ pub fn register(home: &Path, entry: &ServerEntry) -> Result<Vec<PathBuf>> {
     Ok(written)
 }
 
-/// Register with the daemon's own user, unless that was turned off. Failures
+/// Register with the daemon's own user, unless that was turned off or this
+/// daemon is not the one the machine's agents should be talking to. Failures
 /// are the caller's to report: the daemon serves with or without this.
-pub fn register_for_this_daemon() -> Result<Vec<PathBuf>> {
-    if switched_off("MUXLOOM_MCP_REGISTER") {
+///
+/// `serves_the_machines_state` is false for a daemon that was handed a state
+/// directory of its own — a test harness, a second daemon someone started to
+/// try something out. The entry is shared by every agent on the machine, so
+/// claiming it from one of those points all of them at a fleet that is not
+/// there.
+pub fn register_for_this_daemon(serves_the_machines_state: bool) -> Result<Vec<PathBuf>> {
+    let setting = std::env::var("MUXLOOM_MCP_REGISTER").ok();
+    if !wanted(setting.as_deref(), serves_the_machines_state) {
         return Ok(Vec::new());
     }
     let Some(home) = home_directory() else {
         bail!("no home directory to register an MCP server in");
     };
-    let mut written = register(&home, &ServerEntry::for_this_daemon()?)?;
+    let mut written = register(&home, &ServerEntry::for_this_machine()?)?;
     if !switched_off("MUXLOOM_SKILL") {
         written.extend(install_skill(&home)?);
     }
     Ok(written)
+}
+
+/// Whether this daemon should claim the machine's entry, given what the user
+/// asked for and whether it is serving the machine's own state. Unset is the
+/// answer for almost everyone: register when this is the machine's daemon, and
+/// keep out of the way when it is not. Saying so explicitly settles it either
+/// way, which is what a deliberate second daemon needs.
+fn wanted(setting: Option<&str>, serves_the_machines_state: bool) -> bool {
+    match setting.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
+        _ => serves_the_machines_state,
+    }
 }
 
 /// Whether the user turned one of these off in the daemon's environment.
@@ -618,6 +664,47 @@ mod tests {
         // act, and shells are what you reach for last.
         assert!(text.contains("Start by reading the board"), "{text}");
         assert!(text.contains("Shells are the last resort"), "{text}");
+    }
+
+    /// One machine, one entry. The controller's surface reaches the whole
+    /// fleet without relaying, so where both are installed it is the one the
+    /// agents on that machine should be given.
+    #[test]
+    fn the_controller_takes_the_entry_on_a_machine_that_has_one() {
+        let root = scratch("beside");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let daemon = bin.join(format!("muxloomd{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&daemon, "").unwrap();
+
+        // A target that only ever received the companion has nothing else to
+        // point at.
+        assert_eq!(controller_beside(&daemon), None);
+
+        let controller = bin.join(format!("muxloom{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&controller, "").unwrap();
+        assert_eq!(
+            controller_beside(&daemon).as_deref(),
+            Some(controller.to_string_lossy().as_ref())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The entry belongs to the machine, not to whoever started a daemon: a
+    /// test harness or a second daemon in a scratch directory must not send
+    /// every agent here to a fleet that does not exist.
+    #[test]
+    fn only_the_machines_own_daemon_claims_the_entry_unless_told_otherwise() {
+        assert!(wanted(None, true));
+        assert!(!wanted(None, false));
+        // Asked for, in either direction, settles it.
+        assert!(wanted(Some("1"), false));
+        assert!(wanted(Some(" yes "), false));
+        assert!(!wanted(Some("0"), true));
+        assert!(!wanted(Some("off"), true));
+        // Anything else is not an instruction.
+        assert!(wanted(Some("maybe"), true));
+        assert!(!wanted(Some("maybe"), false));
     }
 
     #[test]

@@ -324,10 +324,16 @@ description 也反复强调：优先跟已经在那个目录里的会话对话�
 一并返回，所以回滚就是把那段文本写回去——或者删掉托管文件和那行 Include，SSH 配置就回到
 原样。
 
-**注册是自动的。** 每个启动的 `muxloomd`——本机的和各远端的 companion——都会把自己以
-`muxloom` 为名写进该用户的 `~/.claude.json` 和 `~/.codex/config.toml`，所以跑在某台机器上
-的 agent 无需任何配置就能看到并驱动这台机器上的会话。只写这一条目，且只在缺失或指向过期
-路径时才写，解析不了的文件原样保留。同一次启动还会给 Claude Code 留一份
+**注册是自动的。** 每个服务于本机自己状态目录的 `muxloomd`——本机的和各远端的
+companion——都会以 `muxloom` 为名往该用户的 `~/.claude.json` 和 `~/.codex/config.toml`
+写一条 MCP 条目，所以跑在某台机器上的 agent 无需任何配置就能看到并驱动这台机器上的会话。
+每台机器只有这一条，指向那台机器上装了的最好那一面：daemon 旁边就装着 controller 时指向
+`muxloom mcp`（够得着整个机队），只装了 companion 的机器则指向 `muxloomd mcp`。你推过
+companion 的远端拿到 daemon 的条目，你用来驱动机队的这台拿到 controller 的，绝不会两条
+并存。而一个被交付了状态目录才起来的 daemon——测试用的、临时的、你正在调试的第二个——
+不属于这台机器，什么都不认领，于是你手边的 agent 仍然指着那个真正装着你会话的 daemon。
+确实想让这类 daemon 接管条目，就设 `MUXLOOM_MCP_REGISTER=1`。只写这一条目，且只在缺失或
+指向过期路径时才写，解析不了的文件原样保留。同一次启动还会给 Claude Code 留一份
 `~/.claude/skills/muxloom/SKILL.md`，讲清楚这套机队怎么协作；文件带版本戳，只在戳是
 Muxloom 的且已过期时才重写，所以你一旦改过它，它就归你了。Codex 没有 skill 机制，靠 MCP
 `instructions` 拿到精简版。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以整体关闭，

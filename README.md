@@ -557,12 +557,22 @@ own configuration defines, and every write returns the previous contents of the
 managed file, so rolling back is a matter of restoring that text — or deleting
 the file and the Include line, which leaves your SSH configuration as it was.
 
-**Registration is automatic.** Every `muxloomd` that starts — the local one and
-the companion on each remote — writes itself into that user's `~/.claude.json`
-and `~/.codex/config.toml` as an MCP server named `muxloom`, so an agent running
-on a machine can see and drive the sessions on it without any setup. Only that
-one entry is written, only when it is missing or points somewhere stale, and a
-file it cannot parse is left untouched. The same start leaves Claude Code a
+**Registration is automatic.** Every `muxloomd` that serves its machine's own
+state directory — the local one and the companion on each remote — writes an MCP
+server named `muxloom` into that user's `~/.claude.json` and
+`~/.codex/config.toml`, so an agent running on a machine can see and drive the
+sessions on it without any setup. There is exactly one such entry per machine and
+it points at the best surface installed there: `muxloom mcp` when the controller
+sits beside the daemon, which reaches the whole fleet, and `muxloomd mcp` on a
+machine that only runs the companion. A remote you pushed the companion to gets
+the daemon entry; the machine you drive the fleet from gets the controller's,
+never both. A daemon started on a state directory handed to it — a test harness,
+a scratch instance, a second daemon you are debugging — is not the machine's and
+claims nothing, so the agents on your desk keep pointing at the daemon that has
+your sessions. Set `MUXLOOM_MCP_REGISTER=1` if you do want such a daemon to take
+the entry. Only that one entry is written, only when it is missing or points
+somewhere stale, and a file it cannot parse is left untouched. The same start
+leaves Claude Code a
 skill at `~/.claude/skills/muxloom/SKILL.md` describing how the fleet works;
 it carries a revision stamp and is rewritten only while that stamp is Muxloom's
 and out of date, so a file you edit is yours from then on. Codex has no skill

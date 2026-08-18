@@ -91,11 +91,17 @@ preserve.
   by name or otherwise.
 - MCP transports own stdout. Nothing but protocol messages may be printed
   while a surface is being served; diagnostics go to the debug log.
-- A starting daemon registers its own MCP surface in the agent configuration of
-  the user it runs as. It owns exactly the `muxloom` entry, rewrites it only
-  when missing or stale, leaves a file it cannot parse untouched, and honours an
+- A starting daemon registers an MCP surface in the agent configuration of the
+  user it runs as. It owns exactly the `muxloom` entry, rewrites it only when
+  missing or stale, leaves a file it cannot parse untouched, and honours an
   explicit opt-out from the environment. The skill it installs follows the same
   rule under its own revision stamp: no stamp means the file is the user's.
+- That entry belongs to the machine, not to a process: one per machine, pointing
+  at the controller when one is installed beside the daemon and at the companion
+  otherwise, and claimed only by the daemon serving the machine's own state
+  directory. A daemon handed someone else's state directory stays out unless it
+  is told otherwise, so no test, scratch instance, or second daemon can quietly
+  repoint the user's agents at a fleet that isn't theirs.
 - Cross-machine capability belongs to the controller flavor. A daemon-flavor
   surface reaches other machines only by relaying through an attached
   controller, and only for the relay whitelist — never a shell, a machine
