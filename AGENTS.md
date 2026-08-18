@@ -111,6 +111,10 @@ preserve.
 - Screens handed to an adapter are plain text: styling and cursor control are
   stripped while column positions survive as spaces, so a rendered menu stays
   readable as one.
+- A moderator is an ordinary local session in a folder muxloom owns, and the
+  scope it was given is a briefing, not a sandbox: the surface answers for
+  everything the user enabled, whoever is asking. The briefing has to say so,
+  and so does the form that collects it.
 
 ## Terminal correctness
 

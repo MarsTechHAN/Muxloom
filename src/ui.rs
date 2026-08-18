@@ -18,8 +18,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         App, BoardForm, BoardTab, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
-        LaunchForm, Modal, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
-        SettingsForm, SettingsRow, SettingsScope,
+        LaunchForm, MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
+        PortForwardForm, ResumeForm, SearchForm, SettingsForm, SettingsRow, SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
@@ -108,6 +108,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let kinds = match app.modal.as_ref() {
         Some(Modal::Launch(form)) => app.offered_kinds(&form.target.id),
         Some(Modal::Temporal(form)) => app.offered_agent_kinds(&form.target.id),
+        Some(Modal::Moderator(_)) => app.moderator_kinds(),
         _ => Vec::new(),
     };
     // The board is drawn from the app's own copy of what every machine has been
@@ -485,6 +486,42 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let name_width = area.width.saturating_sub(10).max(1) as usize;
     let mut items = Vec::new();
     let mut rows = Vec::new();
+    {
+        // The moderators row sits above the machines because the agents behind
+        // it are not on any one machine: they coordinate across all of them.
+        let live = app
+            .sessions
+            .iter()
+            .filter(|session| !session.dead && app.is_moderator_session(session))
+            .count();
+        let busy = app
+            .sessions
+            .iter()
+            .filter(|session| !session.dead && session.working && app.is_moderator_session(session))
+            .count();
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                "* ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            // Four spaces where a machine draws its `[x]`: this row has
+            // nothing to enable, and the names still line up.
+            Span::raw("    "),
+            Span::styled("Moderators", Style::default().add_modifier(Modifier::BOLD)),
+        ])];
+        lines.push(match live {
+            0 => Line::styled("    none yet - n to start", Style::default().fg(MUTED)),
+            _ if busy > 0 => Line::styled(
+                format!("    {live} running, {busy} working"),
+                Style::default().fg(Color::Cyan),
+            ),
+            _ => Line::styled(format!("    {live} running"), Style::default().fg(MUTED)),
+        });
+        rows.push((MachineRow::Moderators, lines.len() as u16));
+        items.push(ListItem::new(lines));
+    }
     for target_index in &visible {
         let status = &app.targets[*target_index];
         // One capability glyph per agent runtime the machine has, plus any
@@ -570,19 +607,21 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Line::styled("    disabled", Style::default().fg(MUTED))
         };
         lines.push(detail);
-        rows.push((*target_index, lines.len() as u16));
+        rows.push((MachineRow::Machine(*target_index), lines.len() as u16));
         items.push(ListItem::new(lines));
     }
-    if items.is_empty() {
+    // Trails the rows it explains, and carries no entry in `rows`, so a click
+    // on it lands on nothing rather than on the last machine.
+    if visible.is_empty() {
         items.push(ListItem::new(Line::styled(
             "No enabled machines. Press v to show all.",
             Style::default().fg(MUTED),
         )));
     }
-    app.machine_rows = rows;
-    let selected = visible
+    let selected = rows
         .iter()
-        .position(|target_index| *target_index == app.selected_target);
+        .position(|(row, _)| *row == app.selected_machine_row());
+    app.machine_rows = rows;
     app.machine_list_state.select(selected);
     let title = if app.state.hide_disabled {
         " Machines - enabled "
@@ -798,6 +837,8 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.agent_list_state.select(selected_row);
     let title = if app.state.flatten {
         " Agents - all machines "
+    } else if app.showing_moderators() {
+        " Moderators "
     } else {
         " Agents by folder "
     };
@@ -1333,6 +1374,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
     match modal {
         Modal::Launch(form) => draw_launch_modal(frame, form, outer, kinds),
         Modal::Temporal(form) => draw_temporal_modal(frame, form, outer, kinds),
+        Modal::Moderator(form) => draw_moderator_modal(frame, form, outer, kinds),
         Modal::PortForward(form) => draw_port_forward_modal(frame, form, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
@@ -2948,6 +2990,17 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
         Line::raw(""),
+        help_header("Moderators"),
+        help_row(
+            "Top row of Machines",
+            "Agents muxloom runs to coordinate the others",
+        ),
+        help_row("n there", "Name one and choose what it looks after"),
+        help_row(
+            "Space in its form",
+            "Check a machine or agent; on a header, the group",
+        ),
+        Line::raw(""),
         help_header("History And Search"),
         help_row("Wheel / PageUp", "Scroll one line / move one history page"),
         help_row("PageDown", "Move back toward the live terminal"),
@@ -4199,6 +4252,151 @@ fn draw_temporal_modal(
             .style(Style::default().fg(MUTED)),
         rows[5],
     );
+}
+
+/// The new-moderator form: a runtime, a name, and two lists of checkboxes that
+/// scroll as one column. The scope is written into the moderator's briefing and
+/// is not enforced anywhere, so the panel says so where the user chooses it —
+/// a checkbox that reads like a permission and is not one is worse than none.
+fn draw_moderator_modal(
+    frame: &mut Frame<'_>,
+    form: &ModeratorForm,
+    outer: Rect,
+    kinds: &[AgentKind],
+) {
+    let area = centered_rect(72, 24, outer);
+    frame.render_widget(Clear, area);
+    let block = panel(" New moderator ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height < 6 {
+        return;
+    }
+    let width = inner.width as usize;
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let rows = form.rows();
+    let selected = form.row();
+    frame.render_widget(Paragraph::new(kind_line(kinds, form.kind)), layout[0]);
+    let name_style = if selected == ModeratorRow::Name {
+        Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let mut name = vec![
+        Span::styled("Name  ", Style::default().fg(MUTED)),
+        Span::styled(truncate(&form.name, width.saturating_sub(8)), name_style),
+    ];
+    if selected == ModeratorRow::Name {
+        name.push(Span::styled("█", Style::default().fg(ACCENT)));
+    }
+    if form.name.trim().is_empty() {
+        name.push(Span::styled(
+            "  required",
+            Style::default().fg(if selected == ModeratorRow::Name {
+                Color::Yellow
+            } else {
+                MUTED
+            }),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(name)), layout[1]);
+    frame.render_widget(
+        Paragraph::new(truncate(
+            "Scope goes in its briefing. muxloom does not enforce it.",
+            width,
+        ))
+        .style(Style::default().fg(MUTED)),
+        layout[2],
+    );
+
+    // One scrolling column over both lists, so a long fleet does not push the
+    // agents off the panel and out of reach.
+    let list_rows = layout[3].height as usize;
+    let first_list_row = 2;
+    let cursor = form.selected.max(first_list_row) - first_list_row;
+    let offset = cursor.saturating_sub(list_rows.saturating_sub(1));
+    let mut lines = Vec::with_capacity(list_rows);
+    for (index, row) in rows.iter().enumerate().skip(first_list_row + offset) {
+        if lines.len() >= list_rows {
+            break;
+        }
+        let active = index == form.selected;
+        let (text, style) = match *row {
+            ModeratorRow::MachinesHeader => (
+                moderator_group_line("Machines", &form.machines),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            ModeratorRow::AgentsHeader => (
+                moderator_group_line("Agents", &form.agents),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            ModeratorRow::Machine(item) => (
+                moderator_item_line(&form.machines[item]),
+                Style::default().fg(Color::White),
+            ),
+            ModeratorRow::Agent(item) => (
+                moderator_item_line(&form.agents[item]),
+                Style::default().fg(Color::White),
+            ),
+            ModeratorRow::Kind | ModeratorRow::Name => continue,
+        };
+        let style = if active {
+            style.bg(Color::Rgb(42, 48, 58))
+        } else {
+            style
+        };
+        lines.push(Line::styled(
+            format!("{:<width$}", truncate(&text, width), width = width),
+            style,
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), layout[3]);
+
+    if let Some(error) = &form.error {
+        frame.render_widget(
+            Paragraph::new(truncate(error, width)).style(Style::default().fg(Color::Red)),
+            layout[4],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Enter start    Space toggle    Left/Right runtime    Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        layout[5],
+    );
+}
+
+/// A group header, carrying what its checkboxes currently add up to. "All"
+/// matters because it is the one answer the briefing writes as "every machine",
+/// including the ones that appear after the moderator starts.
+fn moderator_group_line(title: &str, items: &[crate::app::ScopeItem]) -> String {
+    let chosen = items.iter().filter(|item| item.selected).count();
+    let summary = if items.is_empty() {
+        "none to choose from".into()
+    } else if chosen == items.len() {
+        format!("all {chosen}, and any that appear later")
+    } else {
+        format!("{chosen} of {}", items.len())
+    };
+    format!("{title} - {summary}")
+}
+
+fn moderator_item_line(item: &crate::app::ScopeItem) -> String {
+    format!(
+        "  [{}] {}",
+        if item.selected { "x" } else { " " },
+        item.label
+    )
 }
 
 fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer: Rect) {

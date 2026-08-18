@@ -670,6 +670,30 @@ tabs across the top, one line per message, newest at the bottom, `/` to filter,
 `Enter` to expand, `p` to post as yourself and `r` to reply. The footer carries
 `● N` while there is something unread.
 
+**Moderators.** A moderator is an agent you talk to instead of talking to the
+fleet: you give it the work, it decides who should do it, hands it out with
+`message_agent`, follows it up, and reports back. The machine list has a
+**Moderators** row pinned above the machines; press `n` there to start one.
+
+The form asks for a runtime — Codex or Claude, the two muxloom registers its
+control surface with — a name, and which machines and which agents the
+moderator is meant to look after. Everything is checked to begin with, which
+reads as "the whole fleet, including what appears later"; unchecking narrows
+it. There is no directory to choose: muxloom makes the moderator a folder of
+its own under `<state>/projects/<name>/` and writes the briefing there as both
+`CLAUDE.md` and `AGENTS.md`, so the agent reads it on start without a prompt
+being fired at it.
+
+The scope is a briefing, not a sandbox. Nothing narrows what the MCP surface
+answers — a moderator can reach every machine you have enabled, exactly like
+any other agent here — and the briefing says so in as many words, telling it to
+ask you before going outside the list. To actually fence one in, use
+`[mcp] denied_tools` on the machine you want protected.
+
+Moderators are listed under their own row rather than under this machine, and a
+moderator's folder never becomes this machine's default launch directory. Stop
+one the way you stop any agent, with `x`.
+
 **Turning it down.** `[mcp] denied_tools` hides a tool from the list and refuses
 it by name; `read_only = true` denies every tool that changes anything. Each
 machine answers for itself, so a remote's own `config.toml` governs what an
@@ -749,6 +773,7 @@ old frame visible until the new stream produces its first frame.
 | `src/control.rs` | Transport-agnostic control surface behind MCP and future adapters |
 | `src/mcp.rs` | Minimal MCP server over line-based JSON-RPC |
 | `src/talk.rs` | Talk board: messages, scopes, version-vector store, delivery envelopes |
+| `src/moderator.rs` | Moderator folders and the briefing an agent finds in one |
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |

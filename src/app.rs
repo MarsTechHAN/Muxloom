@@ -48,6 +48,15 @@ pub enum LaunchField {
     Label,
 }
 
+/// One row of the machine pane. The moderators row is pinned above the machines
+/// and stands for the agents muxloom runs to coordinate the others, so it
+/// cannot be an index into `targets`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineRow {
+    Moderators,
+    Machine(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct LaunchForm {
     pub target: Target,
@@ -56,6 +65,83 @@ pub struct LaunchForm {
     pub label: String,
     pub temporary: bool,
     pub field: LaunchField,
+}
+
+/// One line of a moderator's scope: a machine it may drive, or an agent it may
+/// hand work to. Checked means in scope.
+#[derive(Debug, Clone)]
+pub struct ScopeItem {
+    /// What the moderator's briefing calls it.
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The new-moderator form. No directory field: muxloom makes the folder.
+#[derive(Debug, Clone)]
+pub struct ModeratorForm {
+    pub kind: AgentKind,
+    pub name: String,
+    pub machines: Vec<ScopeItem>,
+    pub agents: Vec<ScopeItem>,
+    /// Which row the cursor is on, over the flattened row list.
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+/// What a row of the moderator form is, once the machine and agent lists have
+/// been flattened into one navigable column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeratorRow {
+    Kind,
+    Name,
+    MachinesHeader,
+    Machine(usize),
+    AgentsHeader,
+    Agent(usize),
+}
+
+impl ModeratorForm {
+    /// Every row in the order they are drawn and navigated. Headers are in the
+    /// list so an empty group still says why it is empty.
+    pub fn rows(&self) -> Vec<ModeratorRow> {
+        let mut rows = vec![
+            ModeratorRow::Kind,
+            ModeratorRow::Name,
+            ModeratorRow::MachinesHeader,
+        ];
+        rows.extend((0..self.machines.len()).map(ModeratorRow::Machine));
+        rows.push(ModeratorRow::AgentsHeader);
+        rows.extend((0..self.agents.len()).map(ModeratorRow::Agent));
+        rows
+    }
+
+    pub fn row(&self) -> ModeratorRow {
+        let rows = self.rows();
+        rows.get(self.selected)
+            .copied()
+            .unwrap_or(ModeratorRow::Kind)
+    }
+
+    /// The checked labels, or an empty list when everything is checked — the
+    /// briefing says "every machine" rather than listing the fleet back.
+    fn chosen(items: &[ScopeItem]) -> Vec<String> {
+        if items.iter().all(|item| item.selected) {
+            return Vec::new();
+        }
+        items
+            .iter()
+            .filter(|item| item.selected)
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    pub fn chosen_machines(&self) -> Vec<String> {
+        Self::chosen(&self.machines)
+    }
+
+    pub fn chosen_agents(&self) -> Vec<String> {
+        Self::chosen(&self.agents)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +427,7 @@ struct FileClick {
 #[derive(Debug, Clone)]
 pub enum Modal {
     Launch(LaunchForm),
+    Moderator(ModeratorForm),
     Temporal(TemporalForm),
     PortForward(PortForwardForm),
     ConfirmKill {
@@ -393,7 +480,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 70;
+pub const HELP_CONTENT_ROWS: usize = 75;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -921,6 +1008,14 @@ pub struct App {
     pub sessions: Vec<AgentSession>,
     pub focus: Focus,
     pub selected_target: usize,
+    /// Whether the cursor is on the moderators row, which is pinned above the
+    /// machines and is not one. While it is, `selected_target` still points at
+    /// this machine — a moderator runs here, so every machine-scoped action
+    /// around it means this machine.
+    pub moderators_selected: bool,
+    /// Where muxloom keeps the folder it makes for each moderator. A local
+    /// session working inside it is a moderator; that is the only marker.
+    moderator_state_dir: PathBuf,
     pub selected_session_id: Option<String>,
     /// Last highlighted session for each machine. Machine navigation restores
     /// this before falling back to the first visible session.
@@ -971,7 +1066,7 @@ pub struct App {
     attention_ack: HashMap<String, String>,
     pub machine_list_state: ListState,
     pub agent_list_state: ListState,
-    pub machine_rows: Vec<(usize, u16)>,
+    pub machine_rows: Vec<(MachineRow, u16)>,
     pub agent_rows: Vec<(Option<String>, u16)>,
     pub archive_row: Option<usize>,
     pub agent_viewport_width: u16,
@@ -1098,6 +1193,8 @@ impl App {
             sessions: Vec::new(),
             focus: Focus::Machines,
             selected_target: 0,
+            moderators_selected: false,
+            moderator_state_dir: state_dir.clone(),
             selected_session_id: None,
             selected_sessions_by_target: HashMap::new(),
             history: HistoryPage::default(),
@@ -1893,7 +1990,12 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char(' ') if self.focus == Focus::Machines => {
-                self.toggle_target(self.selected_target);
+                if self.showing_moderators() {
+                    self.status_message =
+                        "Moderators are not a machine — press n to start one".into();
+                } else {
+                    self.toggle_target(self.selected_target);
+                }
                 Action::Continue
             }
             KeyCode::Up => {
@@ -2937,16 +3039,43 @@ impl App {
             .collect()
     }
 
-    pub fn visible_sessions(&self) -> Vec<&AgentSession> {
+    /// Whether a session is one of the coordinating agents muxloom runs: a
+    /// local session working inside the folder muxloom made for it.
+    pub fn is_moderator_session(&self, session: &AgentSession) -> bool {
+        session.target_id == LOCAL_TARGET_ID
+            && crate::moderator::is_moderator_path(&self.moderator_state_dir, &session.path)
+    }
+
+    /// Whether the machine pane's current row shows moderators rather than one
+    /// machine's agents. Never true in flattened mode, which has no machine
+    /// pane to pin a row above.
+    pub fn showing_moderators(&self) -> bool {
+        self.moderators_selected && !self.state.flatten
+    }
+
+    /// Which sessions belong under the row the machine pane is on. Moderators
+    /// are gathered under their own row and kept out of the machine they run
+    /// on, so this machine's list stays the work rather than the coordination.
+    fn belongs_to_selected_row(&self, session: &AgentSession) -> bool {
+        if self.state.flatten {
+            return true;
+        }
+        if self.showing_moderators() {
+            return self.is_moderator_session(session);
+        }
         let selected_target = self
             .targets
             .get(self.selected_target)
             .map(|target| target.target.id.as_str());
+        selected_target == Some(session.target_id.as_str()) && !self.is_moderator_session(session)
+    }
+
+    pub fn visible_sessions(&self) -> Vec<&AgentSession> {
         let mut sessions: Vec<_> = self
             .sessions
             .iter()
             .filter(|session| {
-                (self.state.flatten || selected_target == Some(session.target_id.as_str()))
+                self.belongs_to_selected_row(session)
                     && !(session.dead && session.kind == AgentKind::Terminal)
                     && !(session.dead && is_temporary_session_id(&session.id))
                     && (!session.dead || self.state.show_archived)
@@ -2968,17 +3097,13 @@ impl App {
     }
 
     pub fn archived_count(&self) -> usize {
-        let selected_target = self
-            .targets
-            .get(self.selected_target)
-            .map(|target| target.target.id.as_str());
         self.sessions
             .iter()
             .filter(|session| {
                 session.dead
                     && session.kind != AgentKind::Terminal
                     && !is_temporary_session_id(&session.id)
-                    && (self.state.flatten || selected_target == Some(session.target_id.as_str()))
+                    && self.belongs_to_selected_row(session)
             })
             .count()
     }
@@ -5453,6 +5578,62 @@ impl App {
     /// Select a machine by index, rebinding the file browser so it follows the
     /// active machine: the previous machine's browser is parked and the
     /// destination machine's browser (if any) is restored.
+    /// The machine pane top to bottom: the pinned moderators row, then the
+    /// machines the view is showing.
+    pub fn machine_column(&self) -> Vec<MachineRow> {
+        let mut rows = vec![MachineRow::Moderators];
+        rows.extend(
+            self.visible_target_indices()
+                .into_iter()
+                .map(MachineRow::Machine),
+        );
+        rows
+    }
+
+    pub fn selected_machine_row(&self) -> MachineRow {
+        if self.moderators_selected {
+            MachineRow::Moderators
+        } else {
+            MachineRow::Machine(self.selected_target)
+        }
+    }
+
+    /// Move the machine pane's cursor. The moderators row keeps `selected_target`
+    /// on this machine rather than clearing it: a moderator runs here, so the
+    /// file browser, the settings panel and a launch all still mean this
+    /// machine while the row is highlighted.
+    pub fn select_machine_row(&mut self, row: MachineRow) {
+        match row {
+            MachineRow::Machine(index) => {
+                let leaving_moderators = self.moderators_selected;
+                self.moderators_selected = false;
+                self.set_selected_target(index);
+                // Stepping off the moderators row back onto this machine is not
+                // a change of machine, so nothing there restores what was
+                // selected here before. Do it, or the cursor lands on whichever
+                // agent happens to be first.
+                if leaving_moderators {
+                    self.selected_session_id = self
+                        .targets
+                        .get(index)
+                        .and_then(|status| self.selected_sessions_by_target.get(&status.target.id))
+                        .cloned();
+                }
+            }
+            MachineRow::Moderators => {
+                if let Some(local) = self
+                    .targets
+                    .iter()
+                    .position(|status| status.target.id == LOCAL_TARGET_ID)
+                {
+                    self.set_selected_target(local);
+                }
+                self.moderators_selected = true;
+                self.selected_session_id = None;
+            }
+        }
+    }
+
     fn set_selected_target(&mut self, index: usize) {
         let previous = self
             .targets
@@ -5611,15 +5792,15 @@ impl App {
     fn move_selection(&mut self, delta: isize) {
         match self.focus {
             Focus::Machines => {
-                let visible = self.visible_target_indices();
-                if visible.is_empty() {
+                let rows = self.machine_column();
+                if rows.is_empty() {
                     return;
                 }
-                let current = visible
+                let current = rows
                     .iter()
-                    .position(|index| *index == self.selected_target)
+                    .position(|row| *row == self.selected_machine_row())
                     .unwrap_or(0);
-                self.set_selected_target(visible[clamped_index(current, visible.len(), delta)]);
+                self.select_machine_row(rows[clamped_index(current, rows.len(), delta)]);
                 self.release_terminal_input("Machine selected");
                 self.history_offset = 0;
                 self.ensure_session_selection();
@@ -5744,7 +5925,11 @@ impl App {
             self.selected_session_id = None;
             self.close_terminal();
             self.history = HistoryPage::default();
-            self.history_message = "No agents on this machine.".into();
+            self.history_message = if self.showing_moderators() {
+                "No moderators yet. Press n to start one.".into()
+            } else {
+                "No agents on this machine.".into()
+            };
             self.history_loading = false;
             return;
         }
@@ -6137,6 +6322,12 @@ impl App {
     }
 
     fn open_launch(&mut self) {
+        // The moderators row is not a machine, so the one key that starts an
+        // agent starts the kind of agent that row holds.
+        if self.showing_moderators() {
+            self.open_moderator_launch();
+            return;
+        }
         let Some(target) = self.launch_target() else {
             self.status_message = "Enable a machine before launching an agent".into();
             return;
@@ -6288,6 +6479,136 @@ impl App {
             path,
             label: String::new(),
         }));
+    }
+
+    /// The new-moderator form, with everything muxloom can currently see
+    /// already in scope. Starting from "the whole fleet" and unchecking is the
+    /// usual shape of the answer, and it also means a form submitted untouched
+    /// says "everything" rather than "nothing".
+    fn open_moderator_launch(&mut self) {
+        let machines = self
+            .targets
+            .iter()
+            .filter(|status| status.enabled)
+            .map(|status| ScopeItem {
+                label: status.target.label.clone(),
+                selected: true,
+            })
+            .collect::<Vec<_>>();
+        let agents = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                !session.dead
+                    && session.kind != AgentKind::Terminal
+                    && !self.is_moderator_session(session)
+            })
+            .map(|session| ScopeItem {
+                label: self.scope_line(session),
+                selected: true,
+            })
+            .collect::<Vec<_>>();
+        let kinds = self.moderator_kinds();
+        let kind = self
+            .state
+            .last_launch_kinds
+            .get(LOCAL_TARGET_ID)
+            .copied()
+            .filter(|kind| kinds.contains(kind))
+            .or_else(|| kinds.first().copied())
+            .unwrap_or(AgentKind::Codex);
+        self.modal = Some(Modal::Moderator(ModeratorForm {
+            kind,
+            name: String::new(),
+            machines,
+            agents,
+            selected: 1,
+            error: None,
+        }));
+    }
+
+    /// The runtimes a moderator can be. A moderator that cannot call the
+    /// muxloom tools has nothing to moderate with, and the daemon writes its
+    /// MCP entry into exactly two agents' configuration, so the picker offers
+    /// only those — this machine's, or both when the probe found neither and
+    /// the install prompt will handle it.
+    pub fn moderator_kinds(&self) -> Vec<AgentKind> {
+        const MODERATES: [AgentKind; 2] = [AgentKind::Codex, AgentKind::Claude];
+        let installed: Vec<_> = self
+            .offered_agent_kinds(LOCAL_TARGET_ID)
+            .into_iter()
+            .filter(|kind| MODERATES.contains(kind))
+            .collect();
+        if installed.is_empty() {
+            MODERATES.to_vec()
+        } else {
+            installed
+        }
+    }
+
+    /// How one agent reads in a moderator's brief. The moderator finds sessions
+    /// by id through `list_sessions`, so this is written for the person filling
+    /// the form in and for the moderator to recognise later, not to be parsed.
+    fn scope_line(&self, session: &AgentSession) -> String {
+        let machine = self
+            .target(&session.target_id)
+            .map(|target| target.label.clone())
+            .unwrap_or_else(|| session.target_id.clone());
+        format!(
+            "{} · {} on {machine} ({})",
+            session.kind,
+            session.display_label(),
+            session.id
+        )
+    }
+
+    /// Start a moderator: make it a folder, leave the brief in it, make sure
+    /// the tools it coordinates with are registered, and then launch it like
+    /// any other local agent.
+    fn launch_moderator(&mut self, mut form: ModeratorForm) {
+        let name = form.name.trim().to_string();
+        if name.is_empty() {
+            form.error =
+                Some("A moderator needs a name — it is how you and the others call it".into());
+            form.selected = 1;
+            self.modal = Some(Modal::Moderator(form));
+            return;
+        }
+        let Some(target) = self.target(LOCAL_TARGET_ID).cloned() else {
+            self.set_error("This machine is unavailable, and a moderator runs here");
+            return;
+        };
+        let moderator = crate::moderator::Moderator {
+            name: name.clone(),
+            kind: form.kind,
+            machines: form.chosen_machines(),
+            agents: form.chosen_agents(),
+        };
+        let folder = match crate::moderator::prepare(&self.moderator_state_dir, &moderator) {
+            Ok(folder) => folder,
+            Err(error) => {
+                form.error = Some(format!("{error:#}"));
+                self.modal = Some(Modal::Moderator(form));
+                return;
+            }
+        };
+        // The MCP entry and the skill are already in place: the local daemon
+        // writes both into this user's agent configuration when it starts, and
+        // it has to be running for anything to launch at all. A moderator gets
+        // them the way every other agent on this machine does.
+        self.status_message = format!("Starting moderator {name}...");
+        self.confirm_or_submit_launch(
+            LaunchForm {
+                target,
+                kind: form.kind,
+                path: folder.display().to_string(),
+                label: name,
+                temporary: false,
+                field: LaunchField::Kind,
+            },
+            None,
+            None,
+        );
     }
 
     fn launch_temporary_agent(&mut self, form: TemporalForm) {
@@ -7841,6 +8162,74 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Launch(form)),
             },
+            // The name field takes every printable key, space included, so the
+            // scope checkboxes answer to Enter as well as to space and the
+            // runtime answers to the arrows alone.
+            Modal::Moderator(mut form) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Tab | KeyCode::Down => {
+                    form.selected = clamped_index(form.selected, form.rows().len(), 1);
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.selected = clamped_index(form.selected, form.rows().len(), -1);
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Left if form.row() == ModeratorRow::Kind => {
+                    form.kind = step_within(&self.moderator_kinds(), form.kind, false);
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Right | KeyCode::Char(' ') if form.row() == ModeratorRow::Kind => {
+                    form.kind = step_within(&self.moderator_kinds(), form.kind, true);
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Enter if form.row() == ModeratorRow::Kind => {
+                    form.selected = 1;
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                // A header toggles its whole group, which is how "all but two"
+                // gets entered without walking the list.
+                KeyCode::Enter | KeyCode::Char(' ')
+                    if !matches!(form.row(), ModeratorRow::Kind | ModeratorRow::Name) =>
+                {
+                    match form.row() {
+                        ModeratorRow::Machine(index) => {
+                            form.machines[index].selected = !form.machines[index].selected;
+                        }
+                        ModeratorRow::Agent(index) => {
+                            form.agents[index].selected = !form.agents[index].selected;
+                        }
+                        ModeratorRow::MachinesHeader => toggle_all(&mut form.machines),
+                        ModeratorRow::AgentsHeader => toggle_all(&mut form.agents),
+                        ModeratorRow::Kind | ModeratorRow::Name => {}
+                    }
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Enter => self.launch_moderator(form),
+                KeyCode::Backspace if form.row() == ModeratorRow::Name => {
+                    form.name.pop();
+                    form.error = None;
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Char('u')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && form.row() == ModeratorRow::Name =>
+                {
+                    form.name.clear();
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                KeyCode::Char(character)
+                    if form.row() == ModeratorRow::Name
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    form.name.push(character);
+                    form.error = None;
+                    self.modal = Some(Modal::Moderator(form));
+                }
+                _ => self.modal = Some(Modal::Moderator(form)),
+            },
             // Every printable key names the chat, so the runtime moved off the
             // letters it used to answer to and onto the arrows alone.
             Modal::Temporal(mut form) => match key.code {
@@ -8132,9 +8521,13 @@ impl App {
             .unwrap_or_default();
         // Remember this directory and runtime as the machine's defaults for the
         // next launch: the pair you used last is the pair you usually want next.
-        self.state
-            .last_launch_dirs
-            .insert(form.target.id.clone(), form.path.clone());
+        // A moderator's folder is muxloom's own and belongs to no workflow, so
+        // starting one must not aim the machine's next ordinary launch at it.
+        if !crate::moderator::is_moderator_path(&self.moderator_state_dir, &form.path) {
+            self.state
+                .last_launch_dirs
+                .insert(form.target.id.clone(), form.path.clone());
+        }
         self.state
             .last_launch_kinds
             .insert(form.target.id.clone(), form.kind);
@@ -8471,35 +8864,43 @@ impl App {
             self.focus = Focus::Machines;
             let mut line = row.saturating_sub(area.y.saturating_add(1));
             let mut hit = None;
-            for (target_index, height) in self
+            for (machine_row, height) in self
                 .machine_rows
                 .iter()
                 .skip(self.machine_list_state.offset())
             {
                 if line < *height {
-                    hit = Some((*target_index, line));
+                    hit = Some((*machine_row, line));
                     break;
                 }
                 line = line.saturating_sub(*height);
             }
-            if let Some((target_index, item_line)) = hit {
-                self.set_selected_target(target_index);
-                self.ensure_session_selection();
-                let target_id = self.targets[target_index].target.id.clone();
-                // Border + list highlight + two-character state marker put the
-                // rendered `[x]` checkbox in these three columns.
-                let checkbox_start = area.x.saturating_add(5);
-                let checkbox_end = checkbox_start.saturating_add(3);
-                let checkbox_hit =
-                    item_line == 0 && (checkbox_start..checkbox_end).contains(&column);
-                if checkbox_hit && self.is_machine_double_click(&target_id) {
-                    self.last_machine_click = None;
-                    self.toggle_target(target_index);
-                } else if !checkbox_hit {
+            match hit {
+                Some((MachineRow::Machine(target_index), item_line)) => {
+                    self.select_machine_row(MachineRow::Machine(target_index));
+                    self.ensure_session_selection();
+                    let target_id = self.targets[target_index].target.id.clone();
+                    // Border + list highlight + two-character state marker put
+                    // the rendered `[x]` checkbox in these three columns.
+                    let checkbox_start = area.x.saturating_add(5);
+                    let checkbox_end = checkbox_start.saturating_add(3);
+                    let checkbox_hit =
+                        item_line == 0 && (checkbox_start..checkbox_end).contains(&column);
+                    if checkbox_hit && self.is_machine_double_click(&target_id) {
+                        self.last_machine_click = None;
+                        self.toggle_target(target_index);
+                    } else if !checkbox_hit {
+                        self.last_machine_click = None;
+                    }
+                }
+                // The moderators row has no checkbox to hit: it is not a
+                // machine and there is nothing about it to enable.
+                Some((MachineRow::Moderators, _)) => {
+                    self.select_machine_row(MachineRow::Moderators);
+                    self.ensure_session_selection();
                     self.last_machine_click = None;
                 }
-            } else {
-                self.last_machine_click = None;
+                None => self.last_machine_click = None,
             }
             return;
         }
@@ -9001,6 +9402,16 @@ fn previous_field(field: LaunchField) -> LaunchField {
         LaunchField::Kind => LaunchField::Label,
         LaunchField::Path => LaunchField::Kind,
         LaunchField::Label => LaunchField::Path,
+    }
+}
+
+/// Check a whole scope group, or clear it if it was already fully checked.
+/// "Everything except these two" is the answer most often wanted, and walking
+/// the list to get there is the part worth skipping.
+fn toggle_all(items: &mut [ScopeItem]) {
+    let all = items.iter().all(|item| item.selected);
+    for item in items {
+        item.selected = !all;
     }
 }
 
@@ -10677,7 +11088,9 @@ mod tests {
             Target::ssh("e"),
         ]);
         app.pane_layout.machines = Some(Rect::new(0, 0, 30, 12));
-        app.machine_rows = (0..6).map(|index| (index, 1)).collect();
+        app.machine_rows = std::iter::once((MachineRow::Moderators, 1))
+            .chain((0..6).map(|index| (MachineRow::Machine(index), 1)))
+            .collect();
 
         app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 4, 4));
         app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 4, 1));
@@ -10690,7 +11103,7 @@ mod tests {
         // A press that lifts where it landed is still a click.
         tap(
             &mut app,
-            pointer(MouseEventKind::Down(MouseButton::Left), 4, 2),
+            pointer(MouseEventKind::Down(MouseButton::Left), 4, 3),
         );
         assert_eq!(app.selected_target, 1);
     }
@@ -13350,6 +13763,152 @@ mod tests {
         assert!(app.visible_task_progress().is_none());
     }
 
+    /// A scratch state directory for a test that writes moderator folders, so
+    /// two of them never meet in the shared temporary directory.
+    fn moderator_scratch(app: &mut App, name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "muxloom-moderator-app-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        app.moderator_state_dir = path.clone();
+        path
+    }
+
+    /// The moderators row is pinned above the machines and is not one of them:
+    /// it has nothing to enable, and selecting it must not move the machine the
+    /// rest of the window is pointed at.
+    #[test]
+    fn the_moderators_row_sits_above_the_machines_without_being_one() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("gpu")]);
+        app.selected_target = 1;
+        assert_eq!(
+            app.machine_column(),
+            vec![
+                MachineRow::Moderators,
+                MachineRow::Machine(0),
+                MachineRow::Machine(1)
+            ]
+        );
+
+        app.select_machine_row(MachineRow::Moderators);
+        assert!(app.showing_moderators());
+        assert_eq!(
+            app.selected_target, 0,
+            "the moderators row runs on this machine, and the panes that need a machine keep working"
+        );
+
+        // Space enables a machine, and there is no machine here to enable.
+        app.focus = Focus::Machines;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.targets[0].enabled, "the local machine was not toggled");
+        assert!(app.status_message.contains("not a machine"));
+    }
+
+    /// A moderator lives in a folder muxloom owns on this machine, which is the
+    /// only thing that marks it. It must not also show up as one of the local
+    /// machine's own agents.
+    #[test]
+    fn a_moderator_shows_under_its_own_row_and_not_under_this_machine() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let state = moderator_scratch(&mut app, "listing");
+        let session = |id: &str, path: &str| AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: path.into(),
+            label: id.into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        };
+        app.sessions = vec![
+            session("worker", "/work/Terminal"),
+            session(
+                "lead",
+                &state.join("projects/fleet-lead").display().to_string(),
+            ),
+        ];
+
+        app.select_machine_row(MachineRow::Machine(0));
+        let ids: Vec<_> = app
+            .visible_sessions()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["worker"]);
+
+        app.select_machine_row(MachineRow::Moderators);
+        let ids: Vec<_> = app
+            .visible_sessions()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["lead"]);
+    }
+
+    /// Nothing enforces a moderator's scope, so the one thing the form must get
+    /// right is what it hands the briefing: everything checked means "the whole
+    /// fleet, including what appears later", not a snapshot of today's list.
+    #[test]
+    fn an_untouched_scope_means_everything_rather_than_todays_list() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("gpu")]);
+        app.select_machine_row(MachineRow::Moderators);
+        app.open_launch();
+        let Some(Modal::Moderator(mut form)) = app.modal.clone() else {
+            panic!("the moderators row starts a moderator, not an agent");
+        };
+        assert_eq!(form.machines.len(), 2);
+        assert!(form.chosen_machines().is_empty(), "all checked is 'every'");
+
+        // What the briefing carries is what the dashboard calls a machine, not
+        // its internal id: the moderator has to recognise it, and so does the
+        // person who reads the brief back.
+        form.machines[1].selected = false;
+        assert_eq!(form.chosen_machines(), vec!["This machine".to_string()]);
+    }
+
+    #[test]
+    fn a_moderator_needs_a_name_and_starts_with_its_briefing_written() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let state = moderator_scratch(&mut app, "launch");
+        app.targets[0].state = ConnectionState::Online;
+        app.targets[0].probe.set(AgentKind::Claude, true);
+        app.select_machine_row(MachineRow::Moderators);
+        app.open_launch();
+
+        // The form opens on the name, and Enter on an unnamed one says why
+        // rather than starting something nobody can address.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Modal::Moderator(form)) = &app.modal else {
+            panic!("the form stays up until it can be submitted");
+        };
+        assert!(form.error.as_deref().is_some_and(|e| e.contains("name")));
+
+        for character in "Fleet Lead".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.modal.is_none(), "a named moderator starts");
+
+        let folder = state.join("projects/fleet-lead");
+        let brief = std::fs::read_to_string(folder.join("CLAUDE.md")).expect("briefing written");
+        assert!(brief.contains("You are **Fleet Lead**"), "{brief}");
+        assert!(brief.contains("This is a brief, not a fence."), "{brief}");
+
+        // The folder is muxloom's, so it must not become where the next
+        // ordinary agent on this machine is launched from.
+        assert!(
+            !app.state.last_launch_dirs.contains_key("local"),
+            "a moderator's folder is not the machine's default launch directory"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     #[test]
     fn new_agent_defaults_to_the_machines_last_launch_dir() {
         let mut app = ux_test_app(vec![Target::local()]);
@@ -13636,11 +14195,16 @@ mod tests {
     fn machine_click_selects_and_double_click_toggles() {
         let mut app = ux_test_app(vec![Target::local(), Target::ssh("remote")]);
         app.pane_layout.machines = Some(Rect::new(0, 0, 30, 8));
-        app.machine_rows = vec![(0, 2), (1, 2)];
+        // As the pane renders it: the moderators row first, then the machines.
+        app.machine_rows = vec![
+            (MachineRow::Moderators, 2),
+            (MachineRow::Machine(0), 2),
+            (MachineRow::Machine(1), 2),
+        ];
         let click_remote = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         };
 

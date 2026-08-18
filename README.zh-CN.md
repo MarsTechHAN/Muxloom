@@ -412,6 +412,23 @@ scope 只决定消息**是给谁的**。所有消息都会复制到每台机器�
 新的在下面，`/` 过滤，`Enter` 展开，`p` 以你自己的身份发帖，`r` 回复。有未读时 Footer 上
 挂着 `● N`。
 
+**Moderator。** Moderator 是你用来代替"对着整个机队说话"的那个 Agent：活交给它，由它判断该谁
+来做、用 `message_agent` 分下去、跟进、然后回来告诉你结果。机器列表最上面钉着一行
+**Moderators**，在那行按 `n` 就能起一个。
+
+表单问三件事：运行时（Codex 或 Claude，muxloom 只把控制面注册进这两个）、名字，以及这个
+Moderator 该看着哪些机器、哪些 Agent。初始全部勾上，读作"整个机队，包括之后才出现的"，
+取消勾选就是收窄。不用选目录：muxloom 会在 `<state>/projects/<名字>/` 下给它开一个专属
+文件夹，并把 briefing 同时写成 `CLAUDE.md` 和 `AGENTS.md`，所以 Agent 一起来就读到，不需要
+往它嘴里塞一段开场白。
+
+这个范围是 briefing，不是沙箱。MCP 面不会因此少答应什么——Moderator 和这里任何一个 Agent
+一样，够得着你启用的每一台机器——briefing 里也把这句话原样写着，并要求它越界之前先问你。
+真想拦住它，用要保护的那台机器上的 `[mcp] denied_tools`。
+
+Moderator 列在自己那一行下面，不算在"本机"里；它的文件夹也永远不会变成本机下次启动的默认
+目录。要停掉它，和停掉任何 Agent 一样按 `x`。
+
 **收紧权限。** `[mcp] denied_tools` 让某个工具从工具列表里消失、按名字调用也被拒；
 `read_only = true` 一次禁掉所有会改变状态的工具。每台机器各自说了算，所以远端上跑的 Agent
 能做什么，由那台机器自己的 `config.toml` 决定。只禁 `message_agent` 的话，公告板照样可读

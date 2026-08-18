@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod mcp_register;
 pub mod media;
 pub mod model;
+pub mod moderator;
 pub mod port_forward;
 pub mod recap;
 pub mod relay;
