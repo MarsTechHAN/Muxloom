@@ -28,6 +28,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 - [首次使用](#zh-first-run)
 - [界面与布局](#zh-interface)
 - [操作](#zh-controls)
+- [触摸屏](#zh-touch)
 - [配置](#zh-configuration)
 - [MCP](#zh-mcp)
 - [会话、历史与提醒](#zh-sessions)
@@ -222,9 +223,30 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 重绘帧上、真正完成的行寥寥无几，重新启动 controller 之后仍有足够的历史可以翻。回滚时以及
 打开文件浏览器时都可以选择并复制内容。
 
-鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。Machine 单击只选择；只有在 `[x]`
+鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。点击在松开时生效，因此按下之后
+移动再松开算滑动而不是点击。Machine 单击只选择；只有在 `[x]`
 范围内双击才会启用或禁用。可以拖动所有布局分隔线；
 直接拖选 Terminal 文本会在松开时复制，`Alt+拖拽` 则转发给启用 Mouse Reporting 的程序。
+
+<a id="zh-touch"></a>
+
+### 触摸屏
+
+用 Termius、Terminus 这类手机终端连上来时，手指的操作走的是和鼠标一样的 SGR 上报，
+因此可以直接用：
+
+| 手势 | 行为 |
+| --- | --- |
+| 在列表、Help、搜索结果上滑动 | 划过一行滚动一行 |
+| 轻点 | 选中手指落点处的行、按钮或 Pane |
+| 在 Terminal 或 Preview 上滑动 | 翻阅 scrollback 或文件 |
+| 长按后拖动 | 选择 Terminal 或 Preview 文本 |
+| 横向滑动 | 单 Pane 布局下切换到相邻 Pane，一次滑动一格 |
+
+列表、弹窗和文件浏览器永远跟随手指；只有 Terminal Pane 和 Preview 需要在滚动和选择文本
+之间二选一，由配置项 `touch` 决定：`"auto"`（默认）先按鼠标处理，直到某次上报的跳变超出
+鼠标可能的幅度，就认定是触摸屏；`"on"` 从一开始就按触摸屏处理；`"off"` 则所有拖拽都是
+选择文本。
 
 <a id="zh-configuration"></a>
 
@@ -242,6 +264,7 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 - 全局和每台机器独立的 `NAME=value` 环境变量；
 - 每台机器独立的 `REMOTE_PORT:LOCAL_HOST:LOCAL_PORT` Reverse Tunnel；
 - companion 命令和可选 Controller 本地 binary 路径；
+- `touch`：Terminal 和 Preview 上的拖拽是滚动还是选择文本（`auto`/`on`/`off`）；
 - `[hosts.<alias>]` 下对某台机器的 Runtime 覆盖。
 
 `command` 是单个可执行文件名或路径，参数作为结构化数组传输。Pipe、Redirect 或复杂初始化

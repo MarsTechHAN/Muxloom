@@ -374,10 +374,31 @@ first and last item, and each mouse-wheel event moves exactly one item.
 | `Esc` | Close Preview, then clear a query, then close Files |
 
 Clicking a pane focuses it; machine and session rows, Archive, Back, and the
-attention banner are clickable. A machine only toggles when the double-click
-lands directly on its `[x]`; clicks elsewhere only select it. When the embedded
-program enables mouse reporting, Muxloom forwards encoded mouse events unless
-the gesture is reserved for text selection.
+attention banner are clickable. A click acts on release, so a press that moves
+before it lifts is a swipe rather than a click. A machine only toggles when the
+double-click lands directly on its `[x]`; clicks elsewhere only select it. When
+the embedded program enables mouse reporting, Muxloom forwards encoded mouse
+events unless the gesture is reserved for text selection.
+
+### Touch screens
+
+Muxloom is usable with a finger from a mobile terminal such as Termius or
+Terminus, over the same SGR mouse reports a mouse sends.
+
+| Gesture | Action |
+| --- | --- |
+| Swipe a list, help, or search results | Scroll it one row per row of travel |
+| Tap | Select the row, button, or pane under the finger |
+| Swipe the terminal or a preview | Walk through the scrollback or the file |
+| Long-press, then drag | Select terminal or file preview text |
+| Swipe sideways | Move one pane, where the layout shows only one |
+
+Lists, modals, and the file browser always follow the finger. Only the terminal
+pane and the file preview have to choose between scrolling and selecting text,
+and `touch` in the configuration decides for them: `"auto"` (the default) keeps
+mouse behavior until a pointer jumps further between two reports than a mouse
+can, `"on"` assumes a touch screen from the start, and `"off"` keeps every drag
+a text selection.
 
 ## Configuration
 
@@ -413,6 +434,10 @@ auto_update = true
 # What the startup check does with a newer release: "ask" (prompt), "auto"
 # (apply silently), or "never".
 update_prompt = "ask"
+# How a press-drag-release reads in the terminal pane and the file preview:
+# "on" swipes to scroll and selects after a long press, "off" always selects,
+# "auto" selects until a pointer jump no mouse produces reveals a touch screen.
+touch = "auto"
 
 [agents.codex]
 command = "codex"
