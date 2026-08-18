@@ -1421,7 +1421,7 @@ impl ControllerControl {
         let path = required_str(arguments, "path")?;
         let mut candidates = Vec::new();
         let mut warnings = Vec::new();
-        for kind in [AgentKind::Codex, AgentKind::Claude] {
+        for kind in AgentKind::agents().filter(|kind| kind.has_native_history()) {
             match self.runtime.scan_resumes(&target, kind, path) {
                 Ok(found) => candidates.extend(found),
                 Err(error) => warnings.push(format!("{kind}: {error:#}")),

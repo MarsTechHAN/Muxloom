@@ -137,6 +137,8 @@ impl Default for BackupConfig {
 pub struct AgentCommands {
     pub codex: CommandConfig,
     pub claude: CommandConfig,
+    pub opencode: CommandConfig,
+    pub pi: CommandConfig,
     pub terminal: CommandConfig,
 }
 
@@ -155,6 +157,28 @@ impl Default for AgentCommands {
                 install: String::new(),
                 sync_files: vec!["~/.claude/settings.json".into()],
             },
+            // OpenCode ships no release muxloom can hand a machine itself, so
+            // the install command is the runtime's own installer. npm first
+            // because it is the one that works without reaching GitHub, and
+            // its platform binary lives behind an install script recent npm
+            // blocks unless it is named.
+            opencode: CommandConfig {
+                command: "opencode".into(),
+                args: Vec::new(),
+                install: "npm install -g --allow-scripts=opencode-ai opencode-ai \
+                          || curl -fsSL https://opencode.ai/install | bash"
+                    .into(),
+                sync_files: vec![
+                    "~/.config/opencode/opencode.json".into(),
+                    "~/.local/share/opencode/auth.json".into(),
+                ],
+            },
+            pi: CommandConfig {
+                command: "pi".into(),
+                args: Vec::new(),
+                install: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent".into(),
+                sync_files: vec!["~/.pi/agent/auth.json".into()],
+            },
             terminal: CommandConfig::default(),
         }
     }
@@ -165,7 +189,19 @@ impl AgentCommands {
         match kind {
             AgentKind::Codex => &self.codex,
             AgentKind::Claude => &self.claude,
+            AgentKind::OpenCode => &self.opencode,
+            AgentKind::Pi => &self.pi,
             AgentKind::Terminal => &self.terminal,
+        }
+    }
+
+    pub fn get_mut(&mut self, kind: AgentKind) -> &mut CommandConfig {
+        match kind {
+            AgentKind::Codex => &mut self.codex,
+            AgentKind::Claude => &mut self.claude,
+            AgentKind::OpenCode => &mut self.opencode,
+            AgentKind::Pi => &mut self.pi,
+            AgentKind::Terminal => &mut self.terminal,
         }
     }
 }
@@ -184,12 +220,27 @@ pub struct CommandConfig {
 pub struct HostConfig {
     pub codex: Option<CommandConfig>,
     pub claude: Option<CommandConfig>,
+    pub opencode: Option<CommandConfig>,
+    pub pi: Option<CommandConfig>,
     pub terminal: Option<CommandConfig>,
     pub environment: Option<String>,
     pub reverse_tunnel: Option<String>,
     pub companion_command: Option<String>,
     pub companion_binary: Option<String>,
     pub attention_patterns: Option<Vec<String>>,
+}
+
+impl HostConfig {
+    /// The per-runtime override slot, so a caller can set one by kind.
+    pub fn slot_mut(&mut self, kind: AgentKind) -> &mut Option<CommandConfig> {
+        match kind {
+            AgentKind::Codex => &mut self.codex,
+            AgentKind::Claude => &mut self.claude,
+            AgentKind::OpenCode => &mut self.opencode,
+            AgentKind::Pi => &mut self.pi,
+            AgentKind::Terminal => &mut self.terminal,
+        }
+    }
 }
 
 impl Config {
@@ -242,6 +293,8 @@ impl Config {
         let override_command = self.hosts.get(host).and_then(|host| match kind {
             AgentKind::Codex => host.codex.as_ref(),
             AgentKind::Claude => host.claude.as_ref(),
+            AgentKind::OpenCode => host.opencode.as_ref(),
+            AgentKind::Pi => host.pi.as_ref(),
             AgentKind::Terminal => host.terminal.as_ref(),
         });
         override_command.unwrap_or_else(|| self.agents.get(kind))
@@ -514,6 +567,21 @@ args = []
 install = ""
 sync_files = ["~/.claude/settings.json"]
 
+# Codex and Claude Code are installed from their published releases, which
+# muxloom hands the machine itself. The runtimes below have none, so `install`
+# is the shell command the settings panel runs to put them on a machine.
+[agents.opencode]
+command = "opencode"
+args = []
+install = "npm install -g --allow-scripts=opencode-ai opencode-ai || curl -fsSL https://opencode.ai/install | bash"
+sync_files = ["~/.config/opencode/opencode.json", "~/.local/share/opencode/auth.json"]
+
+[agents.pi]
+command = "pi"
+args = []
+install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+sync_files = ["~/.pi/agent/auth.json"]
+
 # Empty command means the user's SHELL (or /bin/sh).
 [agents.terminal]
 command = ""
@@ -558,9 +626,29 @@ mod tests {
     #[test]
     fn built_in_agent_installers_do_not_require_system_download_tools() {
         let config = Config::default();
-        assert!(config.agents.codex.install.is_empty());
-        assert!(config.agents.claude.install.is_empty());
-        assert!(!EXAMPLE_CONFIG.contains("curl"));
+        // Codex and Claude Code arrive as published releases muxloom fetches
+        // and hands over itself, so the machine downloads nothing.
+        for kind in AgentKind::agents().filter(|kind| kind.has_release_download()) {
+            assert!(
+                config.agents.get(kind).install.is_empty(),
+                "{kind} is provisioned by muxloom and needs no installer"
+            );
+        }
+        // The rest publish no release muxloom can fetch, so each one must name
+        // the installer the settings panel runs in its place.
+        for kind in AgentKind::agents().filter(|kind| !kind.has_release_download()) {
+            assert!(
+                !config.agents.get(kind).install.trim().is_empty(),
+                "{kind} has no release to fetch and no installer to fall back on"
+            );
+        }
+        // A download tool may only appear inside such a vendor installer.
+        for line in EXAMPLE_CONFIG.lines().filter(|line| line.contains("curl")) {
+            assert!(
+                line.starts_with("install ="),
+                "the example config reaches for curl outside an installer: {line}"
+            );
+        }
     }
 
     #[test]
@@ -575,6 +663,8 @@ mod tests {
                     ..CommandConfig::default()
                 }),
                 claude: None,
+                opencode: None,
+                pi: None,
                 terminal: None,
                 environment: None,
                 reverse_tunnel: None,

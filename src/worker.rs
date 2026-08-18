@@ -21,8 +21,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ScanRequest {
     pub target: Target,
-    pub codex_command: String,
-    pub claude_command: String,
+    /// The executable to look for per runtime, so a machine only offers what
+    /// it actually has.
+    pub commands: Vec<(AgentKind, String)>,
     pub environment: Vec<(String, String)>,
     pub attention_patterns: Vec<String>,
 }
@@ -366,8 +367,7 @@ impl Worker {
                         let mut result = runtime
                             .probe_and_discover_with_progress(
                                 &request.target,
-                                &request.codex_command,
-                                &request.claude_command,
+                                &request.commands,
                                 &request.environment,
                                 move |progress| {
                                     let _ = progress_events.send(Event::TaskProgress {
@@ -707,42 +707,53 @@ impl Worker {
                     }
                     Request::ScanResumes { target, kind, path } => {
                         let target_id = target.id.clone();
-                        let codex = runtime
-                            .scan_resumes(&target, AgentKind::Codex, &path)
-                            .map_err(|error| error.to_string());
-                        let claude = runtime
-                            .scan_resumes(&target, AgentKind::Claude, &path)
-                            .map_err(|error| error.to_string());
+                        // Only the runtimes that keep a transcript of their own
+                        // have a history to resume from. One of them failing
+                        // must not hide what the others did find, so the
+                        // candidates are pooled and the failures reported apart.
+                        let mut candidates = Vec::new();
+                        let mut failures: Vec<(AgentKind, String)> = Vec::new();
+                        let mut scanned = 0usize;
+                        for source in AgentKind::agents().filter(|kind| kind.has_native_history()) {
+                            scanned += 1;
+                            match runtime.scan_resumes(&target, source, &path) {
+                                Ok(found) => candidates.extend(found),
+                                Err(error) => {
+                                    debug::log(
+                                        "resume",
+                                        format!(
+                                            "{source} history scan failed target={target_id}: {error:#}"
+                                        ),
+                                    );
+                                    failures.push((source, format!("{error:#}")));
+                                }
+                            }
+                        }
                         let mut warning = None;
-                        let result = match (codex, claude) {
-                            (Ok(mut codex), Ok(claude)) => {
-                                codex.extend(claude);
-                                Ok(codex)
-                            }
-                            (Ok(candidates), Err(error)) => {
-                                debug::log(
-                                    "resume",
-                                    format!(
-                                        "Claude history scan failed target={target_id}: {error}"
-                                    ),
+                        let result = if failures.len() == scanned {
+                            Err(failures
+                                .iter()
+                                .map(|(source, error)| {
+                                    format!("{source} history scan failed: {error}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; "))
+                        } else {
+                            if !failures.is_empty() {
+                                warning = Some(
+                                    failures
+                                        .iter()
+                                        .map(|(source, error)| {
+                                            format!(
+                                                "Could not scan {} history: {error}",
+                                                source.as_str()
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("; "),
                                 );
-                                warning =
-                                    Some(format!("Could not scan claude history: {error}"));
-                                Ok(candidates)
                             }
-                            (Err(error), Ok(candidates)) => {
-                                debug::log(
-                                    "resume",
-                                    format!(
-                                        "Codex history scan failed target={target_id}: {error}"
-                                    ),
-                                );
-                                warning = Some(format!("Could not scan codex history: {error}"));
-                                Ok(candidates)
-                            }
-                            (Err(codex), Err(claude)) => Err(format!(
-                                "Codex history scan failed: {codex}; Claude history scan failed: {claude}"
-                            )),
+                            Ok(candidates)
                         }
                         .map(|mut candidates| {
                             candidates

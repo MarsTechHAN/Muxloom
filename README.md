@@ -2,7 +2,7 @@
 
 # Muxloom
 
-**A terminal-native workspace for persistent Codex, Claude Code, and shell sessions across local and SSH machines.**
+**A terminal-native workspace for persistent Codex, Claude Code, OpenCode, Pi, and shell sessions across local and SSH machines.**
 
 [English](./README.md) · [中文](./README.zh-CN.md) · [Releases](https://github.com/MarsTechHAN/Muxloom/releases) · [CI](https://github.com/MarsTechHAN/Muxloom/actions/workflows/regression.yml)
 
@@ -21,7 +21,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 ```
 
 > [!IMPORTANT]
-> Muxloom manages terminal sessions; it does not replace Codex or Claude Code.
+> Muxloom manages terminal sessions; it does not replace the agent CLIs.
 > Those CLIs run normally on the selected target. A detached `muxloomd` process
 > owns each managed PTY, so closing the dashboard or losing SSH never stops the
 > agent.
@@ -54,7 +54,8 @@ all backed by a daemon that owns the real PTYs.
 It brings together:
 
 - SSH targets from `~/.ssh/config` plus the local machine;
-- persistent **Codex**, **Claude Code**, and ordinary **shell** sessions;
+- persistent **Codex**, **Claude Code**, **OpenCode**, **Pi**, and ordinary
+  **shell** sessions, offered per machine according to what is installed there;
 - resumable histories, recaps, archive, global search, and attention alerts;
 - a remote file browser with syntax-highlighted text, image, and video previews;
 - responsive landscape, portrait, and compact layouts with persistent splits.
@@ -103,16 +104,21 @@ machine remembers its last selected agent while you move between targets.
 
 `n` opens the New/Resume flow. Pick a runtime and a working directory with the
 fuzzy path picker, then start fresh or resume a history discovered in that exact
-folder. Every scan includes both Codex (`~/.codex/sessions`) and Claude Code
+folder. The runtime row lists what the selected machine actually has — a
+machine without OpenCode never offers it — and falls back to the full list for
+a machine Muxloom has not reached yet, so the install prompt stays reachable.
+Every scan includes both Codex (`~/.codex/sessions`) and Claude Code
 (`~/.claude/projects`) histories, marks each candidate with its runtime icon,
 and expands to show a recap. A matching runtime resumes natively. Selecting the
 other runtime shows a type-mismatch confirmation and can start a fresh agent
-with the source history file referenced in its initial prompt.
+with the source history file referenced in its initial prompt. OpenCode and Pi
+keep no transcript Muxloom can read, so they start fresh and are backed up from
+their terminal capture alone.
 
 **Keys** — `n` open · type to fuzzy-match a folder · `Left`/`Right` navigate ·
 `Enter` confirm.
 
-From the Agents pane, `t` opens a Codex/Claude chooser for a **Temporal Chat** in
+From the Agents pane, `t` opens the same runtime chooser for a **Temporal Chat** in
 the selected agent's folder, then the machine's last launch folder, then that
 user's home folder. Type a name in the same form to tell several of them apart;
 left blank they are all called Temporal Chat. Temporal Chat stores no Muxloom
@@ -145,12 +151,13 @@ jump to a pane · `f` grouped/flat · drag any divider to resize.
 
 ### ✦ Working status and attention
 
-Codex and Claude sessions animate **only** while classified as working — cyan
-braille dots for Codex, an orange sparkle for Claude, both on a constant
-wall-clock cadence — and only on the agent row itself. Folder group rows carry
-their children's state as a steady colour (yellow when one waits for input,
-green when one works) and machine rows show static capability icons, so
-exactly one thing on screen blinks per busy agent. Working means the CLI's
+Agent sessions animate **only** while classified as working — cyan braille dots
+for Codex, an orange sparkle for Claude, a violet lozenge for OpenCode, a
+rotating π for Pi, all on a constant wall-clock cadence — and only on the agent
+row itself. Folder group rows carry their children's state as a steady colour
+(yellow when one waits for input, green when one works) and machine rows show a
+static capability icon for each runtime that machine has, so exactly one thing
+on screen blinks per busy agent. Working means the CLI's
 interrupt marker is on screen *and* the PTY produced output in the last
 seconds; a leftover spinner over a quiet session goes back to idle. Codex
 activity additionally follows its OSC title spinner, so status survives the
@@ -289,8 +296,8 @@ in the background by default; set `auto_update = false` to disable it.
 1. Start `muxloom`. The local target is enabled by default; SSH aliases appear
    in Machines.
 2. Select an SSH target and press `Space`, or double-click it, to enable it.
-3. Press `n`, choose Codex / Claude / Terminal, a working directory, and an
-   optional label.
+3. Press `n`, choose one of the runtimes that machine has, a working directory,
+   and an optional label.
 4. Choose **New session**, or resume a history discovered in that exact folder.
 5. Press `Enter` or click the terminal to interact; move focus with the platform
    modifier plus an arrow, or click **Back**.
@@ -310,6 +317,11 @@ first to uploading a matching binary already on the controller, then to the
 controller downloading and pushing it, then to any `install` command configured
 for that runtime. If all of them fail, the error names each attempt.
 
+OpenCode and Pi publish no release Muxloom can hand over, so they skip straight
+to their `install` command. Press `,` on a machine and its settings panel shows
+an **Install …** action under every runtime that machine is missing; `Enter`
+runs it and closes the panel so the footer gauge can report the progress.
+
 ## Controls
 
 The footer shows the most useful actions for the current context. Press `?` for
@@ -325,7 +337,7 @@ the full categorized help inside the TUI.
 | `Up` / `Down`, `j` / `k` | Move the current selection |
 | `Space` in Machines | Enable or disable a target; mouse double-click must land on `[x]` |
 | `n`, `Ctrl-n` | Start the New/Resume flow on the selected target |
-| `t` in Agents | Choose Codex or Claude for a no-history Temporal Chat, and optionally name it |
+| `t` in Agents | Choose a runtime for a no-history Temporal Chat, and optionally name it |
 | `p` in Agents | Configure local port forwarding for the selected machine |
 | `Enter` | Open the selected terminal or confirm the current form |
 | `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
@@ -451,6 +463,21 @@ args = []
 install = ""
 sync_files = ["~/.claude/settings.json"]
 
+# Codex and Claude Code come from published releases Muxloom hands over itself,
+# so their `install` is empty. The runtimes below have none, so `install` is the
+# shell command the settings panel runs to put them on a machine.
+[agents.opencode]
+command = "opencode"
+args = []
+install = "npm install -g --allow-scripts=opencode-ai opencode-ai || curl -fsSL https://opencode.ai/install | bash"
+sync_files = ["~/.config/opencode/opencode.json", "~/.local/share/opencode/auth.json"]
+
+[agents.pi]
+command = "pi"
+args = []
+install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+sync_files = ["~/.pi/agent/auth.json"]
+
 # Empty means the target user's SHELL, then /bin/sh.
 [agents.terminal]
 command = ""
@@ -478,10 +505,11 @@ args = ["--full-auto"]
   target paths, backing up existing files. Histories are never synced.
 - Edit these live: `,` for the selected machine, `Ctrl-,` for global defaults.
   Settings fields use shell-word syntax rather than JSON. The in-app form
-  covers the common fields — refresh, environment, agent commands, the update
-  prompt — grouped under headings; everything else (tunnels, companion
-  overrides, install commands, sync files, attention patterns, history
-  bounds) lives in this file only.
+  covers the common fields — refresh, environment, each runtime's command and
+  arguments, the update prompt — grouped under one heading per runtime; a
+  machine's panel adds an install action under any runtime it lacks. Everything
+  else (tunnels, companion overrides, install commands, sync files, attention
+  patterns, history bounds) lives in this file only.
 
 ## MCP
 
@@ -556,7 +584,7 @@ flowchart LR
     Daemon[muxloomd]
     Keeper[Session keeper<br/>one per session]
     PTY[portable-pty]
-    CLI[Codex / Claude / shell]
+    CLI[Agent CLI / shell]
     State[History + metadata]
 
     UI <--> Worker
@@ -672,12 +700,14 @@ muxloom --debug-log /tmp/muxloom-debug.log
 
 ## Limitations and security
 
-- Codex and Claude private history formats differ. Cross-runtime Reference
-  starts a fresh session whose initial prompt points at the source history file;
-  it is not a native resume or a private-format conversion.
+- Codex and Claude private history formats differ, and OpenCode and Pi expose
+  none Muxloom reads. Cross-runtime Reference starts a fresh session whose
+  initial prompt points at the source history file; it is not a native resume
+  or a private-format conversion.
 - Windows controls remote targets but does not host local managed sessions.
 - Audio playback and interactive video seek/volume controls are not implemented.
-- Resume discovery depends on the current Codex and Claude Code metadata formats.
+- Resume discovery depends on the current Codex and Claude Code metadata
+  formats; OpenCode and Pi sessions always start fresh.
 - Attention detection is heuristic; keep machine-specific patterns narrow.
 - Enabling a target authorizes periodic BatchMode SSH access and companion
   management for that alias. Target history and search results can contain

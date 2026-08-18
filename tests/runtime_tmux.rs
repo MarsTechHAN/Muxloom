@@ -17,6 +17,13 @@ struct SessionGuard<'a> {
 }
 
 static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
+/// The runtime probe now takes one command per agent runtime. The tests only
+/// care that the probe runs, so every runtime looks for `sh`.
+fn probe_commands() -> Vec<(AgentKind, String)> {
+    AgentKind::agents()
+        .map(|kind| (kind, "sh".into()))
+        .collect()
+}
 
 impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
@@ -64,7 +71,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
     let mut found = None;
     for _ in 0..20 {
         let (_, sessions) = runtime
-            .probe_and_discover(&target, "sh", "definitely-not-an-agent-command", &[])
+            .probe_and_discover(&target, &probe_commands(), &[])
             .unwrap();
         found = sessions
             .into_iter()
@@ -125,7 +132,7 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
     }
 
     let (_, sessions) = runtime
-        .probe_and_discover(&target, "sh", "sh", &[])
+        .probe_and_discover(&target, &probe_commands(), &[])
         .unwrap();
     let session = sessions
         .iter()
@@ -268,7 +275,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
     };
     thread::sleep(Duration::from_millis(150));
     let (_, sessions) = runtime
-        .probe_and_discover(&target, "sh", "sh", &[])
+        .probe_and_discover(&target, &probe_commands(), &[])
         .unwrap();
     let session = sessions
         .iter()
@@ -308,7 +315,7 @@ fn exited_terminal_is_removed_instead_of_archived() {
     let mut removed = false;
     for _ in 0..20 {
         let (_, sessions) = runtime
-            .probe_and_discover(&target, "sh", "sh", &[])
+            .probe_and_discover(&target, &probe_commands(), &[])
             .unwrap();
         if !sessions.iter().any(|session| session.id == session_id) {
             removed = true;
@@ -350,7 +357,7 @@ fn live_agent_can_be_archived_before_permanent_removal() {
     let mut archived = None;
     for _ in 0..20 {
         let (_, sessions) = runtime
-            .probe_and_discover(&target, "sh", "sh", &[])
+            .probe_and_discover(&target, &probe_commands(), &[])
             .unwrap();
         archived = sessions
             .into_iter()

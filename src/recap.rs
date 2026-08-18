@@ -54,6 +54,12 @@ fn assistant_line(kind: AgentKind, line: &str) -> Option<&str> {
     let content = match kind {
         AgentKind::Codex => line.strip_prefix('•').or_else(|| line.strip_prefix('●'))?,
         AgentKind::Claude => line.strip_prefix('⏺').or_else(|| line.strip_prefix('●'))?,
+        // OpenCode and Pi mark a turn with a bullet too, so take any of the
+        // three rather than guess which; a wrong guess only costs a recap.
+        AgentKind::OpenCode | AgentKind::Pi => line
+            .strip_prefix('•')
+            .or_else(|| line.strip_prefix('●'))
+            .or_else(|| line.strip_prefix('⏺'))?,
         AgentKind::Terminal => return None,
     }
     .trim_start();
@@ -103,6 +109,14 @@ fn is_tool_or_status(kind: AgentKind, content: &str) -> bool {
                 ]
                 .iter()
                 .any(|prefix| lowercase.starts_with(prefix))
+        }
+        // The shared prefixes above already cover the status lines these two
+        // print; a tool call reads as `name(argument)` in both.
+        AgentKind::OpenCode | AgentKind::Pi => {
+            let first = content.split_whitespace().next().unwrap_or_default();
+            first
+                .split_once('(')
+                .is_some_and(|(name, _)| name.chars().all(|character| character.is_alphanumeric()))
         }
         AgentKind::Terminal => true,
     }

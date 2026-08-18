@@ -770,8 +770,10 @@ pub fn sync_target(
             }
         }
 
+        // Only a runtime that keeps its own transcript on disk has something
+        // for the backup to mirror; the rest live entirely in their capture.
         if let Ok(kind) = session.kind.parse::<AgentKind>()
-            && kind != AgentKind::Terminal
+            && kind.has_native_history()
             && let Err(error) = sync_transcript(
                 runtime,
                 store,
@@ -1037,7 +1039,7 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                     push_message(&mut messages, role, body, string_field(&value, "timestamp"));
                 }
             }
-            AgentKind::Terminal => {}
+            AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => {}
         }
     }
     if title.is_none() {

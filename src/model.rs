@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,21 +24,57 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Codex,
     Claude,
+    OpenCode,
+    Pi,
     Terminal,
 }
 
 impl AgentKind {
+    /// Every runtime the dashboard knows, in the order it offers them. A
+    /// machine shows the subset it actually has installed, but this order is
+    /// what the picker, the settings panel, and the machine row all follow.
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::Claude,
+        Self::OpenCode,
+        Self::Pi,
+        Self::Terminal,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
             Self::Terminal => "terminal",
         }
+    }
+
+    /// The runtimes an install can provide, in offer order. A terminal is
+    /// whatever shell the machine already has, so it is never one of them.
+    pub fn agents() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter().filter(|kind| *kind != Self::Terminal)
+    }
+
+    /// Whether the CLI keeps its own transcripts on the machine, which is what
+    /// makes a session resumable by its own id and worth mirroring into the
+    /// local backup. The others are still archived and searched through
+    /// muxloom's own history.
+    pub fn has_native_history(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+    }
+
+    /// Whether muxloom can resolve a published release for this runtime and
+    /// have the machine fetch it. The rest install through their own
+    /// installer, which is what the `install` command in the config runs.
+    pub fn has_release_download(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
     }
 
     pub fn toggle(self) -> Self {
@@ -46,19 +82,13 @@ impl AgentKind {
     }
 
     pub fn next(self) -> Self {
-        match self {
-            Self::Codex => Self::Claude,
-            Self::Claude => Self::Terminal,
-            Self::Terminal => Self::Codex,
-        }
+        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
     }
 
     pub fn previous(self) -> Self {
-        match self {
-            Self::Codex => Self::Terminal,
-            Self::Claude => Self::Codex,
-            Self::Terminal => Self::Claude,
-        }
+        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 }
 
@@ -72,12 +102,10 @@ impl std::str::FromStr for AgentKind {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::Claude),
-            "terminal" => Ok(Self::Terminal),
-            other => Err(format!("unsupported agent kind: {other}")),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| format!("unsupported agent kind: {value}"))
     }
 }
 
@@ -152,8 +180,32 @@ pub enum Transport {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probe {
     pub tmux: bool,
-    pub codex: bool,
-    pub claude: bool,
+    /// The agent runtimes whose executable answered on the machine. A terminal
+    /// needs nothing installed, so it never appears here.
+    pub runtimes: BTreeSet<AgentKind>,
+}
+
+impl Probe {
+    pub fn has(&self, kind: AgentKind) -> bool {
+        kind == AgentKind::Terminal || self.runtimes.contains(&kind)
+    }
+
+    pub fn set(&mut self, kind: AgentKind, present: bool) {
+        if present && kind != AgentKind::Terminal {
+            self.runtimes.insert(kind);
+        } else {
+            self.runtimes.remove(&kind);
+        }
+    }
+
+    /// The runtimes to offer on this machine: everything installed, plus the
+    /// terminal, in offer order.
+    pub fn available(&self) -> Vec<AgentKind> {
+        AgentKind::ALL
+            .into_iter()
+            .filter(|kind| self.has(*kind))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]

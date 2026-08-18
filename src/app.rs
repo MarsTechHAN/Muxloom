@@ -426,6 +426,9 @@ pub struct SettingsForm {
     pub values: Vec<String>,
     /// Text for the read-only [`SettingsRow::Note`] rows, in row order.
     pub notes: Vec<String>,
+    /// The runtimes this machine does not have, filled when the panel opens.
+    /// Each one gets an install action in its own section.
+    pub missing: Vec<AgentKind>,
     pub selected: usize,
     pub error: Option<String>,
 }
@@ -458,66 +461,104 @@ pub enum SettingsRow {
     Field(&'static str),
     /// Read-only text the app fills in when the form opens.
     Note(&'static str),
-    /// Runs when the selection is on it and Enter is pressed.
-    Action(&'static str),
+    /// Runs when the selection is on it and Enter is pressed, with the hint
+    /// shown beside it.
+    Action(&'static str, &'static str),
 }
-
-/// The settings the dashboard edits. Everything else — tunnels, companion
-/// overrides, install commands, sync files, attention patterns, history
-/// bounds — stays in `config.toml`, where the rare edit belongs.
-pub const GLOBAL_SETTINGS: [SettingsRow; 17] = [
-    SettingsRow::Section("General"),
-    SettingsRow::Field("Refresh interval (ms)"),
-    SettingsRow::Field("SSH config path"),
-    SettingsRow::Section("Environment"),
-    SettingsRow::Field("Environment (A=x B=y)"),
-    SettingsRow::Section("Codex"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Field("Args"),
-    SettingsRow::Section("Claude"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Field("Args"),
-    SettingsRow::Section("Terminal"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Section("Updates"),
-    SettingsRow::Field("Update prompt (ask/auto/never)"),
-    SettingsRow::Section("Input"),
-    SettingsRow::Field("Touch gestures (auto/on/off)"),
-];
-
-pub const HOST_SETTINGS: [SettingsRow; 13] = [
-    SettingsRow::Section("Environment"),
-    SettingsRow::Field("Environment (A=x B=y)"),
-    SettingsRow::Section("Codex"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Field("Args"),
-    SettingsRow::Section("Claude"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Field("Args"),
-    SettingsRow::Section("Terminal"),
-    SettingsRow::Field("Command"),
-    SettingsRow::Section("Daemon"),
-    SettingsRow::Note("Version"),
-    SettingsRow::Action("Force update"),
-];
 
 /// The action label the daemon row carries, matched when Enter fires.
 pub const FORCE_UPDATE_ACTION: &str = "Force update";
 
+/// The section title a runtime's settings live under.
+pub const fn agent_section(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Codex => "Codex",
+        AgentKind::Claude => "Claude",
+        AgentKind::OpenCode => "OpenCode",
+        AgentKind::Pi => "Pi",
+        AgentKind::Terminal => "Terminal",
+    }
+}
+
+/// The action label that installs a runtime on the machine the panel is for.
+pub const fn install_action(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Codex => "Install Codex",
+        AgentKind::Claude => "Install Claude",
+        AgentKind::OpenCode => "Install OpenCode",
+        AgentKind::Pi => "Install Pi",
+        AgentKind::Terminal => "Install Terminal",
+    }
+}
+
+/// Which runtime an install action names, if it is one.
+pub fn install_action_kind(label: &str) -> Option<AgentKind> {
+    AgentKind::agents().find(|kind| install_action(*kind) == label)
+}
+
 impl SettingsForm {
-    pub fn rows(&self) -> &'static [SettingsRow] {
-        match &self.scope {
-            SettingsScope::Global => &GLOBAL_SETTINGS,
-            SettingsScope::Host(_) => &HOST_SETTINGS,
+    /// The settings the dashboard edits. Everything else — tunnels, companion
+    /// overrides, install commands, sync files, attention patterns, history
+    /// bounds — stays in `config.toml`, where the rare edit belongs.
+    ///
+    /// The runtime sections are generated, so a machine that is missing one
+    /// carries the action that installs it and a machine that has them all
+    /// carries none.
+    pub fn rows(&self) -> Vec<SettingsRow> {
+        let mut rows = Vec::new();
+        let host = matches!(self.scope, SettingsScope::Host(_));
+        if host {
+            rows.extend([
+                SettingsRow::Section("Environment"),
+                SettingsRow::Field("Environment (A=x B=y)"),
+            ]);
+        } else {
+            rows.extend([
+                SettingsRow::Section("General"),
+                SettingsRow::Field("Refresh interval (ms)"),
+                SettingsRow::Field("SSH config path"),
+                SettingsRow::Section("Environment"),
+                SettingsRow::Field("Environment (A=x B=y)"),
+            ]);
         }
+        for kind in AgentKind::agents() {
+            rows.push(SettingsRow::Section(agent_section(kind)));
+            rows.push(SettingsRow::Field("Command"));
+            rows.push(SettingsRow::Field("Args"));
+            if host && self.missing.contains(&kind) {
+                rows.push(SettingsRow::Action(
+                    install_action(kind),
+                    "Enter: install it on this machine",
+                ));
+            }
+        }
+        rows.extend([
+            SettingsRow::Section("Terminal"),
+            SettingsRow::Field("Command"),
+        ]);
+        if host {
+            rows.extend([
+                SettingsRow::Section("Daemon"),
+                SettingsRow::Note("Version"),
+                SettingsRow::Action(FORCE_UPDATE_ACTION, "Enter: archive, hand over, resume"),
+            ]);
+        } else {
+            rows.extend([
+                SettingsRow::Section("Updates"),
+                SettingsRow::Field("Update prompt (ask/auto/never)"),
+                SettingsRow::Section("Input"),
+                SettingsRow::Field("Touch gestures (auto/on/off)"),
+            ]);
+        }
+        rows
     }
 
     /// The editable field labels in `values` order.
     pub fn field_labels(&self) -> Vec<&'static str> {
         self.rows()
-            .iter()
+            .into_iter()
             .filter_map(|row| match row {
-                SettingsRow::Field(label) => Some(*label),
+                SettingsRow::Field(label) => Some(label),
                 _ => None,
             })
             .collect()
@@ -526,9 +567,8 @@ impl SettingsForm {
     /// The rows the selection can land on, in display order.
     fn focusable(&self) -> Vec<SettingsRow> {
         self.rows()
-            .iter()
-            .copied()
-            .filter(|row| matches!(row, SettingsRow::Field(_) | SettingsRow::Action(_)))
+            .into_iter()
+            .filter(|row| matches!(row, SettingsRow::Field(_) | SettingsRow::Action(..)))
             .collect()
     }
 
@@ -554,7 +594,7 @@ impl SettingsForm {
     /// The action under the selection, when the selection is on one.
     pub fn selected_action(&self) -> Option<&'static str> {
         match self.focusable().get(self.selected) {
-            Some(SettingsRow::Action(label)) => Some(label),
+            Some(SettingsRow::Action(label, _)) => Some(label),
             _ => None,
         }
     }
@@ -4017,12 +4057,7 @@ impl App {
                 // One runtime's history can fail while the other's succeeds. The
                 // candidates that were found are still worth showing, but an
                 // empty list must not be reported as a settled "nothing here".
-                let unread = warning.filter(|warning| {
-                    warning.contains(match kind {
-                        AgentKind::Claude => "claude",
-                        _ => "codex",
-                    })
-                });
+                let unread = warning.filter(|warning| warning.contains(kind.as_str()));
                 if let Some(Modal::Resume(form)) = self.modal.as_mut()
                     && form.launch.target.id == target_id
                     && form.launch.kind == kind
@@ -4832,16 +4867,9 @@ impl App {
         }
         let request = ScanRequest {
             target: status.target.clone(),
-            codex_command: self
-                .config
-                .command_for(id, AgentKind::Codex)
-                .command
-                .clone(),
-            claude_command: self
-                .config
-                .command_for(id, AgentKind::Claude)
-                .command
-                .clone(),
+            commands: AgentKind::agents()
+                .map(|kind| (kind, self.config.command_for(id, kind).command.clone()))
+                .collect(),
             environment: self.config.environment_for(id).unwrap_or_default(),
             attention_patterns: self.config.attention_patterns_for(id).to_vec(),
         };
@@ -5624,14 +5652,63 @@ impl App {
                     ".".into()
                 }
             });
+        let kind = self.default_kind(&target.id, false);
         self.modal = Some(Modal::Launch(LaunchForm {
             target,
-            kind: AgentKind::Codex,
+            kind,
             path,
             label: String::new(),
             temporary: false,
             field: LaunchField::Kind,
         }));
+    }
+
+    /// The runtimes a machine offers: the ones its probe found installed, plus
+    /// a terminal, which needs nothing installed. A machine muxloom has not
+    /// reached yet, or one with no agent at all, offers every runtime instead
+    /// of dead-ending — picking a missing one there still opens the install
+    /// prompt.
+    pub fn offered_kinds(&self, target_id: &str) -> Vec<AgentKind> {
+        let installed = self
+            .targets
+            .iter()
+            .find(|status| status.target.id == target_id)
+            .filter(|status| status.state == ConnectionState::Online)
+            .map(|status| status.probe.available())
+            .unwrap_or_else(|| AgentKind::ALL.to_vec());
+        if installed.iter().any(|kind| *kind != AgentKind::Terminal) {
+            installed
+        } else {
+            AgentKind::ALL.to_vec()
+        }
+    }
+
+    /// The same list without the terminal: a temporal chat is a conversation
+    /// with an agent.
+    pub fn offered_agent_kinds(&self, target_id: &str) -> Vec<AgentKind> {
+        self.offered_kinds(target_id)
+            .into_iter()
+            .filter(|kind| *kind != AgentKind::Terminal)
+            .collect()
+    }
+
+    /// What a fresh launch form starts on: the first runtime the machine
+    /// offers.
+    fn default_kind(&self, target_id: &str, agents_only: bool) -> AgentKind {
+        let kinds = if agents_only {
+            self.offered_agent_kinds(target_id)
+        } else {
+            self.offered_kinds(target_id)
+        };
+        kinds.first().copied().unwrap_or(AgentKind::Codex)
+    }
+
+    fn step_kind(&self, target_id: &str, current: AgentKind, forward: bool) -> AgentKind {
+        step_within(&self.offered_kinds(target_id), current, forward)
+    }
+
+    fn step_agent_kind(&self, target_id: &str, current: AgentKind, forward: bool) -> AgentKind {
+        step_within(&self.offered_agent_kinds(target_id), current, forward)
     }
 
     fn launch_target(&self) -> Option<Target> {
@@ -5686,9 +5763,10 @@ impl App {
         let path = selected_path
             .or_else(|| self.state.last_launch_dirs.get(&target.id).cloned())
             .unwrap_or_else(|| self.user_folder(&target));
+        let kind = self.default_kind(&target.id, true);
         self.modal = Some(Modal::Temporal(TemporalForm {
             target,
-            kind: AgentKind::Codex,
+            kind,
             path,
             label: String::new(),
         }));
@@ -5885,21 +5963,24 @@ impl App {
     }
 
     fn open_global_settings(&mut self) {
+        let mut values = vec![
+            self.config.refresh_interval_ms.to_string(),
+            self.config.ssh_config.clone(),
+            self.config.environment.clone(),
+        ];
+        for kind in AgentKind::agents() {
+            let command = self.config.agents.get(kind);
+            values.push(command.command.clone());
+            values.push(format_shell_list(&command.args));
+        }
+        values.push(self.config.agents.terminal.command.clone());
+        values.push(self.config.update_prompt.clone());
+        values.push(self.config.touch.clone());
         self.modal = Some(Modal::Settings(SettingsForm {
             scope: SettingsScope::Global,
-            values: vec![
-                self.config.refresh_interval_ms.to_string(),
-                self.config.ssh_config.clone(),
-                self.config.environment.clone(),
-                self.config.agents.codex.command.clone(),
-                format_shell_list(&self.config.agents.codex.args),
-                self.config.agents.claude.command.clone(),
-                format_shell_list(&self.config.agents.claude.args),
-                self.config.agents.terminal.command.clone(),
-                self.config.update_prompt.clone(),
-                self.config.touch.clone(),
-            ],
+            values,
             notes: Vec::new(),
+            missing: Vec::new(),
             selected: 0,
             error: None,
         }));
@@ -5931,33 +6012,43 @@ impl App {
             self.status_message = "Select a machine before editing its configuration".into();
             return;
         };
-        let codex = self
-            .config
-            .command_for(&target_id, AgentKind::Codex)
-            .clone();
-        let claude = self
-            .config
-            .command_for(&target_id, AgentKind::Claude)
-            .clone();
-        let terminal = self
-            .config
-            .command_for(&target_id, AgentKind::Terminal)
-            .clone();
+        let mut values = vec![
+            self.config
+                .hosts
+                .get(&target_id)
+                .and_then(|host| host.environment.clone())
+                .unwrap_or_else(|| self.config.environment.clone()),
+        ];
+        for kind in AgentKind::agents() {
+            let command = self.config.command_for(&target_id, kind).clone();
+            values.push(command.command);
+            values.push(format_shell_list(&command.args));
+        }
+        values.push(
+            self.config
+                .command_for(&target_id, AgentKind::Terminal)
+                .command
+                .clone(),
+        );
+        // Only a machine muxloom has actually reached can say what it is
+        // missing; an offline one gets no install actions rather than a panel
+        // full of them.
+        let missing = self
+            .targets
+            .iter()
+            .find(|status| status.target.id == target_id)
+            .filter(|status| status.state == ConnectionState::Online)
+            .map(|status| {
+                AgentKind::agents()
+                    .filter(|kind| !status.probe.has(*kind))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.modal = Some(Modal::Settings(SettingsForm {
             scope: SettingsScope::Host(target_id.clone()),
-            values: vec![
-                self.config
-                    .hosts
-                    .get(&target_id)
-                    .and_then(|host| host.environment.clone())
-                    .unwrap_or_else(|| self.config.environment.clone()),
-                codex.command,
-                format_shell_list(&codex.args),
-                claude.command,
-                format_shell_list(&claude.args),
-                terminal.command,
-            ],
+            values,
             notes: vec![self.daemon_version_note(&target_id)],
+            missing,
             selected: 0,
             error: None,
         }));
@@ -6853,6 +6944,12 @@ impl App {
                         (Some(FORCE_UPDATE_ACTION), SettingsScope::Host(target_id)) => {
                             self.force_update_machine(&target_id);
                         }
+                        (Some(action), SettingsScope::Host(target_id)) => {
+                            match install_action_kind(action) {
+                                Some(kind) => self.install_runtime(&target_id, kind),
+                                None => self.apply_settings(form),
+                            }
+                        }
                         _ => self.apply_settings(form),
                     }
                 }
@@ -7183,11 +7280,11 @@ impl App {
                     self.modal = Some(Modal::Launch(form));
                 }
                 KeyCode::Left if form.field == LaunchField::Kind => {
-                    form.kind = form.kind.previous();
+                    form.kind = self.step_kind(&form.target.id, form.kind, false);
                     self.modal = Some(Modal::Launch(form));
                 }
                 KeyCode::Right | KeyCode::Char(' ') if form.field == LaunchField::Kind => {
-                    form.kind = form.kind.next();
+                    form.kind = self.step_kind(&form.target.id, form.kind, true);
                     self.modal = Some(Modal::Launch(form));
                 }
                 KeyCode::Enter => match form.field {
@@ -7225,11 +7322,12 @@ impl App {
             // letters it used to answer to and onto the arrows alone.
             Modal::Temporal(mut form) => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                    form.kind = match form.kind {
-                        AgentKind::Codex => AgentKind::Claude,
-                        AgentKind::Claude | AgentKind::Terminal => AgentKind::Codex,
-                    };
+                KeyCode::Left | KeyCode::BackTab => {
+                    form.kind = self.step_agent_kind(&form.target.id, form.kind, false);
+                    self.modal = Some(Modal::Temporal(form));
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    form.kind = self.step_agent_kind(&form.target.id, form.kind, true);
                     self.modal = Some(Modal::Temporal(form));
                 }
                 KeyCode::Backspace => {
@@ -7352,13 +7450,21 @@ impl App {
                     }
                     config.ssh_config = form.values[1].clone();
                     config.environment = form.values[2].clone();
-                    config.agents.codex.command = form.values[3].clone();
-                    config.agents.codex.args = parse_shell_list(&form.values[4], "Codex args")?;
-                    config.agents.claude.command = form.values[5].clone();
-                    config.agents.claude.args = parse_shell_list(&form.values[6], "Claude args")?;
-                    config.agents.terminal.command = form.values[7].clone();
-                    config.update_prompt = form.values[8].trim().to_string();
-                    config.touch = form.values[9].trim().to_string();
+                    let mut index = 3;
+                    for kind in AgentKind::agents() {
+                        let command = form.values[index].clone();
+                        let args = parse_shell_list(
+                            &form.values[index + 1],
+                            &format!("{} args", agent_section(kind)),
+                        )?;
+                        let entry = config.agents.get_mut(kind);
+                        entry.command = command;
+                        entry.args = args;
+                        index += 2;
+                    }
+                    config.agents.terminal.command = form.values[index].clone();
+                    config.update_prompt = form.values[index + 1].trim().to_string();
+                    config.touch = form.values[index + 2].trim().to_string();
                 }
                 SettingsScope::Host(target_id) => {
                     // The form edits the common fields; everything it no
@@ -7369,16 +7475,19 @@ impl App {
                     // ride along unchanged.
                     let mut host = config.hosts.get(target_id).cloned().unwrap_or_default();
                     host.environment = Some(form.values[0].clone());
-                    let mut codex = config.command_for(target_id, AgentKind::Codex).clone();
-                    codex.command = form.values[1].clone();
-                    codex.args = parse_shell_list(&form.values[2], "Codex args")?;
-                    host.codex = Some(codex);
-                    let mut claude = config.command_for(target_id, AgentKind::Claude).clone();
-                    claude.command = form.values[3].clone();
-                    claude.args = parse_shell_list(&form.values[4], "Claude args")?;
-                    host.claude = Some(claude);
+                    let mut index = 1;
+                    for kind in AgentKind::agents() {
+                        let mut entry = config.command_for(target_id, kind).clone();
+                        entry.command = form.values[index].clone();
+                        entry.args = parse_shell_list(
+                            &form.values[index + 1],
+                            &format!("{} args", agent_section(kind)),
+                        )?;
+                        *host.slot_mut(kind) = Some(entry);
+                        index += 2;
+                    }
                     let mut terminal = config.command_for(target_id, AgentKind::Terminal).clone();
-                    terminal.command = form.values[5].clone();
+                    terminal.command = form.values[index].clone();
                     host.terminal = Some(terminal);
                     config.hosts.insert(target_id.clone(), host);
                 }
@@ -7394,20 +7503,19 @@ impl App {
                 SettingsScope::Global => None,
                 SettingsScope::Host(target_id) => Some(target_id.as_str()),
             };
-            let codex_empty = effective_host
-                .map(|host| config.command_for(host, AgentKind::Codex))
-                .unwrap_or(&config.agents.codex)
-                .command
-                .trim()
-                .is_empty();
-            let claude_empty = effective_host
-                .map(|host| config.command_for(host, AgentKind::Claude))
-                .unwrap_or(&config.agents.claude)
-                .command
-                .trim()
-                .is_empty();
-            if codex_empty || claude_empty {
-                return Err("Codex and Claude commands cannot be empty".into());
+            // A runtime with no command has nothing to probe for and nothing
+            // to launch; only the terminal may be blank, where it means the
+            // user's own shell.
+            for kind in AgentKind::agents() {
+                let empty = effective_host
+                    .map(|host| config.command_for(host, kind))
+                    .unwrap_or(config.agents.get(kind))
+                    .command
+                    .trim()
+                    .is_empty();
+                if empty {
+                    return Err(format!("{} command cannot be empty", agent_section(kind)));
+                }
             }
             Ok(config)
         })();
@@ -7549,11 +7657,7 @@ impl App {
             .targets
             .iter()
             .find(|target| target.target.id == form.target.id)
-            .is_some_and(|target| match form.kind {
-                AgentKind::Codex => target.probe.codex,
-                AgentKind::Claude => target.probe.claude,
-                AgentKind::Terminal => true,
-            });
+            .is_some_and(|target| target.probe.has(form.kind));
         if available || form.kind == AgentKind::Terminal {
             self.submit_launch(form, resume_id, initial_prompt, remove_archive_session_id);
         } else {
@@ -7563,6 +7667,35 @@ impl App {
                 initial_prompt,
                 remove_archive_session_id,
             });
+        }
+    }
+
+    /// Put one runtime on a machine from its settings panel. The panel closes
+    /// so the footer gauge, which every install already reports into, is
+    /// visible; when it lands the machine is rescanned and the runtime joins
+    /// the launch picker.
+    fn install_runtime(&mut self, target_id: &str, kind: AgentKind) {
+        let Some(target) = self.target(target_id).cloned() else {
+            return;
+        };
+        let command = self.config.command_for(target_id, kind).clone();
+        if !kind.has_release_download() && command.install.trim().is_empty() {
+            self.set_error(format!(
+                "No install command configured for {kind} - set agents.{}.install",
+                kind.as_str()
+            ));
+            return;
+        }
+        let environment = self.config.environment_for(target_id).unwrap_or_default();
+        let request = Request::Install {
+            target: target.clone(),
+            kind,
+            command,
+            environment,
+        };
+        if self.worker.requests.send(request).is_ok() {
+            self.busy_operations += 1;
+            self.status_message = format!("Installing {kind} on {}...", target.label);
         }
     }
 
@@ -8313,6 +8446,19 @@ fn materialize_history_page(
         rendered: source.rendered,
         more_history: source.more_history,
     })
+}
+
+/// Step one runtime along the list a machine offers, wrapping at both ends. A
+/// current runtime the machine no longer offers lands on the first one.
+fn step_within(kinds: &[AgentKind], current: AgentKind, forward: bool) -> AgentKind {
+    let Some(first) = kinds.first().copied() else {
+        return current;
+    };
+    let Some(index) = kinds.iter().position(|kind| *kind == current) else {
+        return first;
+    };
+    let step = if forward { 1 } else { kinds.len() - 1 };
+    kinds[(index + step) % kinds.len()]
 }
 
 fn next_field(field: LaunchField) -> LaunchField {
@@ -10604,7 +10750,10 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        form.values[7] = "/bin/zsh".into();
+        // The terminal's command sits behind the three general fields and the
+        // command/args pair each agent runtime contributes.
+        let terminal_command = 3 + AgentKind::agents().count() * 2;
+        form.values[terminal_command] = "/bin/zsh".into();
         app.apply_settings(form);
 
         assert_eq!(app.config.refresh_interval_ms, 1500);
@@ -10712,7 +10861,7 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        app.targets[0].probe.codex = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
         app.sessions.push(AgentSession {
             id: "muxloom-codex-dead".into(),
             target_id: "local".into(),
@@ -10818,7 +10967,7 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        app.targets[0].probe.codex = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
         app.modal = Some(Modal::ConfirmArchivedResume {
             source_session_id: "old-archive".into(),
             launch: LaunchForm {
@@ -12439,8 +12588,8 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        app.targets[0].probe.codex = true;
-        app.targets[0].probe.claude = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
+        app.targets[0].probe.set(AgentKind::Claude, true);
         app.sessions.push(AgentSession {
             id: "muxloomd-codex-current".into(),
             target_id: "local".into(),
@@ -12686,6 +12835,150 @@ mod tests {
         assert_eq!(form.path, "/work/remembered");
     }
 
+    /// A runtime a machine does not have is not a choice worth showing, so the
+    /// picker lists what the probe found and nothing else.
+    #[test]
+    fn the_launch_picker_offers_only_the_runtimes_a_machine_has() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        // A machine muxloom has not reached yet says nothing about what it
+        // holds; everything stays on offer so the install prompt is reachable.
+        assert_eq!(app.offered_kinds("local"), AgentKind::ALL);
+
+        app.targets[0].state = ConnectionState::Online;
+        app.targets[0].probe.set(AgentKind::Claude, true);
+        app.targets[0].probe.set(AgentKind::Pi, true);
+        assert_eq!(
+            app.offered_kinds("local"),
+            [AgentKind::Claude, AgentKind::Pi, AgentKind::Terminal]
+        );
+        assert_eq!(
+            app.offered_agent_kinds("local"),
+            [AgentKind::Claude, AgentKind::Pi]
+        );
+
+        app.open_launch();
+        let Some(Modal::Launch(form)) = &app.modal else {
+            panic!("expected launch modal");
+        };
+        assert_eq!(
+            form.kind,
+            AgentKind::Claude,
+            "the form must not start on a runtime the machine lacks"
+        );
+        // Stepping walks the offered runtimes only, and wraps within them.
+        for expected in [AgentKind::Pi, AgentKind::Terminal, AgentKind::Claude] {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            let Some(Modal::Launch(form)) = &app.modal else {
+                panic!("expected launch modal");
+            };
+            assert_eq!(form.kind, expected);
+        }
+
+        // A machine with no agent at all would otherwise offer a bare terminal
+        // and no way to install anything.
+        app.targets[0].probe = crate::model::Probe {
+            tmux: true,
+            ..Default::default()
+        };
+        assert_eq!(app.offered_kinds("local"), AgentKind::ALL);
+    }
+
+    /// The machine panel carries a one-click install for exactly the runtimes
+    /// that machine is missing, and Enter on one sends the install off.
+    #[test]
+    fn machine_settings_offer_an_install_for_a_missing_runtime() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].state = ConnectionState::Online;
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi] {
+            app.targets[0].probe.set(kind, true);
+        }
+
+        app.open_machine_settings();
+        let Some(Modal::Settings(form)) = &app.modal else {
+            panic!("machine settings modal did not open");
+        };
+        assert_eq!(form.missing, [AgentKind::OpenCode]);
+        let rows = form.rows();
+        assert!(
+            rows.contains(&SettingsRow::Action(
+                install_action(AgentKind::OpenCode),
+                "Enter: install it on this machine"
+            )),
+            "the missing runtime has no install action: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| matches!(
+                row,
+                SettingsRow::Action(label, _) if install_action_kind(label) == Some(AgentKind::Pi)
+            )),
+            "an installed runtime must not offer to install itself: {rows:?}"
+        );
+        let selected = form
+            .focusable()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    SettingsRow::Action(label, _)
+                        if install_action_kind(label) == Some(AgentKind::OpenCode)
+                )
+            })
+            .expect("the install action must be selectable");
+
+        let Some(Modal::Settings(form)) = app.modal.as_mut() else {
+            unreachable!("the panel is open");
+        };
+        form.selected = selected;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Request::Install { target, kind, .. } = receive_request(&request_rx) else {
+            panic!("Enter on the install action did not request an install");
+        };
+        assert_eq!(kind, AgentKind::OpenCode);
+        assert_eq!(target.id, "local");
+        assert!(
+            app.modal.is_none(),
+            "the panel must close so the install gauge is visible"
+        );
+    }
+
+    /// The global panel is not about one machine, so it never offers installs
+    /// however the form was built.
+    #[test]
+    fn global_settings_never_offer_an_install() {
+        let form = SettingsForm {
+            scope: SettingsScope::Global,
+            values: Vec::new(),
+            notes: Vec::new(),
+            missing: AgentKind::agents().collect(),
+            selected: 0,
+            error: None,
+        };
+        assert!(
+            !form
+                .rows()
+                .iter()
+                .any(|row| matches!(row, SettingsRow::Action(label, _)
+                    if install_action_kind(label).is_some())),
+            "the global panel must not install onto a machine it does not name"
+        );
+    }
+
     #[test]
     fn renaming_an_agent_sets_applies_and_clears_its_display_name() {
         let mut app = ux_test_app(vec![Target::local()]);
@@ -12835,7 +13128,7 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        app.targets[0].probe.codex = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
         let launch = LaunchForm {
             target: Target::local(),
             kind: AgentKind::Codex,
@@ -13069,7 +13362,7 @@ mod tests {
             worker,
         );
         app.backup_root = root.clone();
-        app.targets[0].probe.codex = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
 
         // The machine answers the scan with nothing at all.
         app.handle_worker_event(Event::Scanned {
@@ -13223,7 +13516,7 @@ mod tests {
             worker,
         );
         app.backup_root = root.clone();
-        app.targets[0].probe.claude = true;
+        app.targets[0].probe.set(AgentKind::Claude, true);
         app.handle_worker_event(Event::Scanned {
             target_id: "local".into(),
             result: Ok((Probe::default(), Vec::new())),

@@ -1,7 +1,7 @@
 # Muxloom · 中文指南
 
 <p align="center">
-  跨本地与 SSH 机器、可持续存活的 Codex、Claude Code 与 Shell 会话终端工作台。
+  跨本地与 SSH 机器、可持续存活的 Codex、Claude Code、OpenCode、Pi 与 Shell 会话终端工作台。
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew inst
 ### 项目概览
 
 Muxloom 是一个用 Rust 实现的终端工作台，用于从一个 TUI 管理分布在多台机器、多个
-目录中的 Codex、Claude Code 和普通 Shell 会话。它提供：
+目录中的 Codex、Claude Code、OpenCode、Pi 和普通 Shell 会话。它提供：
 
 - 从 `~/.ssh/config` 加载 SSH 目标，并同时管理本机；
 - 按机器、目录分组或 Flat 模式浏览会话；
@@ -127,7 +127,7 @@ config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行�
 1. 启动 `muxloom`。本机默认启用，具体 SSH Alias 会显示在 Machines。
 2. 单击选择远端机器，按 `Space` 或在 `[x]` 上双击启用；未启用的机器不会探测。
 3. 按 `n`，启动目标就是当前选中的机器。
-4. 选择 Codex、Claude 或 Terminal，选择工作目录，并可填写 Label。
+4. 在该机器已安装的 Runtime 中选择一个，选择工作目录，并可填写 Label。
 5. 选择 `New session`，或从当前精确目录下同时扫描出的 Codex/Claude 历史中 Resume/Reference。
 6. 按 `Enter` 或点击 Terminal 开始输入。
 7. 使用平台组合键加方向键，或点击 Back 返回导航。
@@ -136,10 +136,14 @@ config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行�
 路径选择器支持直接输入文本，排序依次为前缀、子串、前向子序列匹配。`Left` 返回父目录，
 `Right` 进入子目录，`Enter` 确认当前目录。Resume 页面也支持 `Left` 返回启动表单。
 
+Runtime 一行只列出该机器实际装有的 Runtime：没装 OpenCode 的机器就不会出现 OpenCode。
+Muxloom 尚未连上的机器无从判断，仍列出全部，安装提示因此不会被挡住。
+
 Codex Resume 来源是 `~/.codex/sessions` 和 `~/.codex/session_index.jsonl`；Claude
 来源是 `~/.claude/projects`。每次都会扫描两者并用 Runtime 图标标记。相同 Runtime 原生
 Resume；交叉选择会先提示类型不匹配，确认 Reference 后新建目标 Agent，并在首条 Prompt 中
 给出源 History 文件。候选项优先显示 Recap，没有 Recap 时显示第一条和最后一条用户消息。
+OpenCode 和 Pi 没有 Muxloom 能读的 Transcript，因此始终新建，备份只保留终端画面。
 Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 Agent。
 
 <a id="zh-interface"></a>
@@ -150,7 +154,7 @@ Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 A
 
 ```text
 ┌──── Machines ────┬──── Agents by folder ────┬──────── Live terminal ────────┐
-│ 机器与 Runtime   │ 会话、目录、Recap、状态  │ Codex、Claude、Shell 或预览  │
+│ 机器与 Runtime   │ 会话、目录、Recap、状态  │ Agent CLI、Shell 或预览      │
 └──────────────────┴───────────────────────────┴───────────────────────────────┘
 ```
 
@@ -173,15 +177,16 @@ Terminal 始终新建。切换机器时，每台机器会恢复上次选中的 A
 
 | 状态 | 含义 |
 | --- | --- |
-| Working | 当前可见 Codex/Claude 终端被启发式识别为正在推理或执行工具 |
+| Working | 当前可见 Agent 终端被启发式识别为正在推理或执行工具 |
 | Waiting | 当前可见屏幕正在等待确认或输入 |
 | Idle | 进程存活并停在普通输入提示 |
 | Archived | Agent 已退出或被停止，元数据和历史仍保留 |
 
 Working 动画**只出现在对应 agent 行**：Codex 使用青色旋转盲文 spinner（`⠋⠙⠹…`），
-Claude 使用橙色 sparkle（`✻✽✶✳`），均按墙钟时间推进。Folder 分组行不再闪烁，改为整
-行静态变色标示子会话状态——有等待输入的子会话时变黄，有工作中的变绿；Machines 行只显
-示静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）可见 **且** PTY 最
+Claude 使用橙色 sparkle（`✻✽✶✳`），OpenCode 使用紫色菱形（`◈◇◆`），Pi 使用旋转的
+`π`，均按墙钟时间推进。Folder 分组行不再闪烁，改为整行静态变色标示子会话状态——有等待
+输入的子会话时变黄，有工作中的变绿；Machines 行为该机器实际装有的每个 Runtime 显示一
+个静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）可见 **且** PTY 最
 近数秒内有输出，残留在屏幕上的旧 spinner 会自动回到 Idle；subagent 并行阶段、无 token
 计数的早期阶段都能正确识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
 示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
@@ -200,7 +205,7 @@ Claude 使用橙色 sparkle（`✻✽✶✳`），均按墙钟时间推进。Fol
 | `Alt-1` / `Alt-2` / `Alt-3` | 跳到 Machines / Agents / Terminal |
 | `Space`（Machines） | 启用或禁用机器 |
 | `n` / `Ctrl-n` | 在当前机器进入 New/Resume 流程 |
-| `t`（Agents） | 选择 Codex 或 Claude，在当前目录启动无历史的 Temporal Chat，可选填别名 |
+| `t`（Agents） | 选择一个 Runtime，在当前目录启动无历史的 Temporal Chat，可选填别名 |
 | `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
@@ -260,7 +265,7 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 
 - `refresh_interval_ms`、SSH Timeout、History 大小和分段行数；
 - SSH Config 路径、全局 Attention Patterns；
-- Codex、Claude、Terminal 的 `command`、`args`、安装命令与 `sync_files`；
+- Codex、Claude、OpenCode、Pi、Terminal 的 `command`、`args`、安装命令与 `sync_files`；
 - 全局和每台机器独立的 `NAME=value` 环境变量；
 - 每台机器独立的 `REMOTE_PORT:LOCAL_HOST:LOCAL_PORT` Reverse Tunnel；
 - companion 命令和可选 Controller 本地 binary 路径；
@@ -276,7 +281,9 @@ HTTP_PROXY=http://proxy:8118 HTTPS_PROXY=http://proxy:8118 TOKEN='two words'
 ```
 
 选择机器按 `,` 编辑该机器的有效配置；按 `Ctrl-,` 编辑全局默认值。Args、Sync Files 和
-Attention Patterns 使用 Shell Word 语法。
+Attention Patterns 使用 Shell Word 语法。每个 Runtime 各占一个小节；机器面板会在该机器
+缺少的 Runtime 下方多出一行 `Install …`，按 `Enter` 即开始安装并关闭面板，由页脚进度条
+汇报进度。
 
 当 New 发现 Codex/Claude 不存在时，Muxloom 会先询问。无论哪条路径，都先让目标自己下载：
 Controller 只解析发布元数据——版本、URL、SHA-256——由目标机器走自己的网络取回产物，并在
@@ -284,7 +291,8 @@ Controller 只解析发布元数据——版本、URL、SHA-256——由目标�
 所以取不到发布的机器会在几秒内快速失败并回退，而不是把安装挂住：先尝试上传 Controller
 上已有的同版 binary，再由 Controller 下载并校验后推给目标，最后才执行该机器配置的用户态
 安装命令（默认 Installer 需要目标直连或通过 Reverse Tunnel 访问网络）。全部失败时，错误
-信息会逐条列出尝试过的方式。`sync_files` 会复制到目标用户 Home
+信息会逐条列出尝试过的方式。OpenCode 和 Pi 没有 Muxloom 能分发的 Release，直接执行各自
+配置的安装命令。`sync_files` 会复制到目标用户 Home
 下相同的相对路径，已有文件先备份，历史目录不会作为配置同步。
 
 <a id="zh-mcp"></a>
@@ -347,18 +355,18 @@ ID 恢复订阅。daemon 在目标端追加保存 ANSI History；旧页面按需
 历史渲染保留基础色、256 色、Truecolor 前景/背景以及 Bold、Dim、Italic、Underline、
 Reverse 和 Crossed-out 属性。
 
-Recap 先取最后一个 `※ recap:`（也支持全角冒号）；否则取最后一条能识别的 Codex/Claude
+Recap 先取最后一个 `※ recap:`（也支持全角冒号）；否则取最后一条能识别的 Agent
 Assistant 行并排除工具/状态行；仍无法识别时，回退到最后一条非界面文本。结果会归一化
 控制字符和空白，并限制在 180 字符。按 `/` 或 `Ctrl-p` 搜索 Live/Archived、本地/远端
 全部会话，排序优先级是 Label/名称/路径、当前 Recap 与 Recap History、其他 History。
 
-Codex/Claude 退出或第一次按 `x` 后进入 Archived，仍可查看和搜索。打开 Archived 会按
+Agent 退出或第一次按 `x` 后进入 Archived，仍可查看和搜索。打开 Archived 会按
 原机器、Runtime 和目录尝试 Resume 最新历史。确认框默认勾选在新 Agent 成功启动后移除旧
 Archived 条目，按 `Space` 可选择保留，该选择会持久记忆；启动或清理失败时旧归档保持不变。
 再次按 `x` 才永久删除 daemon 元数据与历史。
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
-在 Agents 面板按 `t` 会先选择 Codex 或 Claude，再启动 `Temporal Chat`。目录依次取当前选中
+在 Agents 面板按 `t` 会先在该机器已装的 Runtime 中选一个，再启动 `Temporal Chat`。目录依次取当前选中
 Agent 的目录、该机器上次启动目录、目标用户 Home；同一个表单里可以填一个别名区分多个临时
 会话，留空则统一叫 Temporal Chat。该会话不写 Muxloom ANSI History，也不进入搜索或备份；
 Codex 还会用单次配置关闭 Transcript 持久化。按 `x` 会直接停止并删除，不进入 Archived。
@@ -502,11 +510,12 @@ Debug Log 可能包含少量当前 Agent 可见文本，应按敏感信息处理
 
 ### 限制与安全
 
-- Codex 与 Claude 私有 History 格式不同；跨 Runtime Reference 会新建会话并在首条 Prompt
-  中引用源 History 文件，不会伪装成原生 Resume 或转换私有格式；
+- Codex 与 Claude 私有 History 格式不同，OpenCode 和 Pi 则没有 Muxloom 能读的格式；跨
+  Runtime Reference 会新建会话并在首条 Prompt 中引用源 History 文件，不会伪装成原生
+  Resume 或转换私有格式；
 - Windows 暂时只能作为远程 Controller；
 - Audio Playback、Video Seek 和音量控制暂未实现；
-- Resume 依赖 Codex/Claude 当前的本地元数据格式；
+- Resume 依赖 Codex/Claude 当前的本地元数据格式，OpenCode 和 Pi 只能新建；
 - Attention 是启发式检测，每台机器的 Pattern 应尽量具体；
 - 启用机器意味着允许周期性 BatchMode SSH 和 companion 管理；
 - 目标 History、Debug Snippet 和搜索结果都可能包含敏感内容；

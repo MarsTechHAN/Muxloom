@@ -30,6 +30,8 @@ use crate::{
 const ACCENT: Color = Color::Rgb(112, 184, 255);
 const CODEX: Color = Color::Cyan;
 const CLAUDE: Color = Color::Rgb(215, 119, 87);
+const OPENCODE: Color = Color::Rgb(168, 148, 255);
+const PI: Color = Color::Rgb(240, 196, 96);
 const TERMINAL: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
 /// The stripe behind a folder row, so the folders read as separate blocks.
@@ -100,8 +102,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_content(frame, app, vertical[1], portrait, compact);
     draw_footer(frame, app, vertical[2]);
 
+    // Which runtimes the machine offers is the app's knowledge, not the
+    // form's, and the modal is drawn from a mutable borrow of it.
+    let kinds = match app.modal.as_ref() {
+        Some(Modal::Launch(form)) => app.offered_kinds(&form.target.id),
+        Some(Modal::Temporal(form)) => app.offered_agent_kinds(&form.target.id),
+        _ => Vec::new(),
+    };
     if let Some(modal) = app.modal.as_mut() {
-        draw_modal(frame, modal, area);
+        draw_modal(frame, modal, area, &kinds);
     }
 }
 
@@ -465,18 +474,28 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut rows = Vec::new();
     for target_index in &visible {
         let status = &app.targets[*target_index];
-        let codex_working = app.sessions.iter().any(|session| {
-            session.target_id == status.target.id
-                && session.kind == AgentKind::Codex
-                && session.working
-                && !session.dead
-        });
-        let claude_working = app.sessions.iter().any(|session| {
-            session.target_id == status.target.id
-                && session.kind == AgentKind::Claude
-                && session.working
-                && !session.dead
-        });
+        // One capability glyph per agent runtime the machine has, plus any
+        // runtime that is busy right now even though the probe missed it.
+        let working = |kind: AgentKind| {
+            app.sessions.iter().any(|session| {
+                session.target_id == status.target.id
+                    && session.kind == kind
+                    && session.working
+                    && !session.dead
+            })
+        };
+        let mut runtimes: Vec<_> = AgentKind::agents()
+            .map(|kind| (kind, status.probe.has(kind), working(kind)))
+            .filter(|(_, installed, busy)| *installed || *busy)
+            .collect();
+        // A machine with nothing installed still says so, with the two
+        // runtimes muxloom can hand it itself greyed out.
+        if runtimes.is_empty() {
+            runtimes = vec![
+                (AgentKind::Codex, false, false),
+                (AgentKind::Claude, false, false),
+            ];
+        }
         let (marker, marker_color) = match status.state {
             ConnectionState::Disabled => (" ", MUTED),
             ConnectionState::Scanning => ("~", Color::Yellow),
@@ -515,22 +534,18 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Red),
             )
         } else if status.enabled {
-            let mut spans = vec![
-                Span::raw("    "),
-                runtime_capability(
-                    AgentKind::Codex,
-                    status.probe.codex,
-                    codex_working,
+            let mut spans = vec![Span::raw("    ")];
+            for (index, (kind, installed, busy)) in runtimes.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(runtime_capability(
+                    *kind,
+                    *installed,
+                    *busy,
                     app.animation_frame,
-                ),
-                Span::raw(" "),
-                runtime_capability(
-                    AgentKind::Claude,
-                    status.probe.claude,
-                    claude_working,
-                    app.animation_frame,
-                ),
-            ];
+                ));
+            }
             // A lagging daemon gets a marker, not a version: the exact
             // versions live in the machine's settings panel, next to the
             // action that updates them.
@@ -706,10 +721,8 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Style::default()
                         .fg(if session.needs_attention {
                             Color::Yellow
-                        } else if session.kind == AgentKind::Claude {
-                            CLAUDE
                         } else {
-                            CODEX
+                            agent_visual(session.kind).2
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -1276,10 +1289,10 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect) {
+fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[AgentKind]) {
     match modal {
-        Modal::Launch(form) => draw_launch_modal(frame, form, outer),
-        Modal::Temporal(form) => draw_temporal_modal(frame, form, outer),
+        Modal::Launch(form) => draw_launch_modal(frame, form, outer, kinds),
+        Modal::Temporal(form) => draw_temporal_modal(frame, form, outer, kinds),
         Modal::PortForward(form) => draw_port_forward_modal(frame, form, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
@@ -2846,9 +2859,12 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("n / Ctrl-n", "Start the runtime and path flow"),
         help_row(
             "t in Agents",
-            "Choose Codex or Claude for a no-history Temporal Chat",
+            "Choose a runtime for a no-history Temporal Chat",
         ),
-        help_row("Left / Right", "Choose Codex, Claude, or Terminal"),
+        help_row(
+            "Left / Right",
+            "Choose one of the runtimes this machine has",
+        ),
         help_row("Tab", "Move between launch fields"),
         help_row("Enter on path", "Open the local or remote folder picker"),
         help_row("Enter in picker", "Confirm folder; choose New or Resume"),
@@ -3139,7 +3155,7 @@ fn draw_resume_modal(frame: &mut Frame<'_>, form: &ResumeForm, outer: Rect) {
         );
     }
     let status = if form.loading {
-        "Scanning Codex and Claude history... Enter starts New immediately"
+        "Scanning agent history... Enter starts New immediately"
     } else if let Some(error) = &form.error {
         error
     } else if form.candidates.is_empty() {
@@ -3499,7 +3515,7 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
                 ));
                 note_index += 1;
             }
-            SettingsRow::Action(label) => {
+            SettingsRow::Action(label, hint) => {
                 let active = focus_index == form.selected;
                 if active {
                     selected_row = lines.len();
@@ -3517,7 +3533,7 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
                         ),
                         Span::raw(" "),
                         Span::styled(
-                            truncate("Enter: archive, hand over, resume", value_width),
+                            truncate(hint, value_width),
                             Style::default().fg(if active { Color::White } else { MUTED }),
                         ),
                     ]),
@@ -3613,22 +3629,35 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     }
 }
 
-/// The runtime row, with the hint that Left/Right change it.
-fn launch_kind_line(form: &LaunchForm) -> Line<'static> {
-    Line::from(vec![
-        segment(" CODEX ", form.kind == AgentKind::Codex, CODEX),
-        Span::raw("  "),
-        segment(" CLAUDE ", form.kind == AgentKind::Claude, CLAUDE),
-        Span::raw("  "),
-        segment(" TERMINAL ", form.kind == AgentKind::Terminal, TERMINAL),
-        Span::styled("  Left/Right", Style::default().fg(MUTED)),
-    ])
+/// The runtime row, with the hint that Left/Right change it. Only the
+/// runtimes the machine offers are on it, so the row is as short as the
+/// machine is bare.
+fn kind_line(kinds: &[AgentKind], current: AgentKind) -> Line<'static> {
+    let mut spans = Vec::with_capacity(kinds.len() * 2 + 1);
+    for kind in kinds {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let (_, _, color) = agent_visual(*kind);
+        spans.push(segment(
+            format!(" {} ", kind.as_str().to_uppercase()),
+            *kind == current,
+            color,
+        ));
+    }
+    spans.push(Span::styled("  Left/Right", Style::default().fg(MUTED)));
+    Line::from(spans)
 }
 
 /// The launch form as one row per field, for a terminal too short to hold the
 /// captioned layout. Without this the captions win the row budget and the path
 /// and label the user is typing into simply stop being drawn.
-fn draw_launch_modal_compact(frame: &mut Frame<'_>, form: &LaunchForm, content: Rect) {
+fn draw_launch_modal_compact(
+    frame: &mut Frame<'_>,
+    form: &LaunchForm,
+    content: Rect,
+    kinds: &[AgentKind],
+) {
     const FIELDS: usize = 3;
     let focused = match form.field {
         LaunchField::Kind => 0usize,
@@ -3646,7 +3675,7 @@ fn draw_launch_modal_compact(frame: &mut Frame<'_>, form: &LaunchForm, content: 
         let (prefix, value, focused_field) = match index {
             0 => {
                 frame.render_widget(
-                    Paragraph::new(launch_kind_line(form))
+                    Paragraph::new(kind_line(kinds, form.kind))
                         .style(field_style(form.field == LaunchField::Kind)),
                     row,
                 );
@@ -3683,7 +3712,7 @@ fn draw_launch_modal_compact(frame: &mut Frame<'_>, form: &LaunchForm, content: 
     }
 }
 
-fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
+fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect, kinds: &[AgentKind]) {
     let area = centered_rect(70, 13, outer);
     frame.render_widget(Clear, area);
     let inner = Block::default()
@@ -3698,7 +3727,7 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
     // The captioned layout below needs its ten rows; anything less and the
     // later constraints resolve to nothing and the fields vanish silently.
     if content.height < 10 {
-        draw_launch_modal_compact(frame, form, content);
+        draw_launch_modal_compact(frame, form, content, kinds);
         return;
     }
 
@@ -3716,7 +3745,8 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
         .split(content);
     frame.render_widget(Paragraph::new("Agent runtime"), rows[0]);
     frame.render_widget(
-        Paragraph::new(launch_kind_line(form)).style(field_style(form.field == LaunchField::Kind)),
+        Paragraph::new(kind_line(kinds, form.kind))
+            .style(field_style(form.field == LaunchField::Kind)),
         rows[1],
     );
     frame.render_widget(
@@ -3753,7 +3783,12 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect) {
     frame.set_cursor_position((x, row.y));
 }
 
-fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, outer: Rect) {
+fn draw_temporal_modal(
+    frame: &mut Frame<'_>,
+    form: &crate::app::TemporalForm,
+    outer: Rect,
+    kinds: &[AgentKind],
+) {
     let area = centered_rect(62, 11, outer);
     frame.render_widget(Clear, area);
     let block = panel(" Temporal Chat ", true);
@@ -3774,15 +3809,7 @@ fn draw_temporal_modal(frame: &mut Frame<'_>, form: &crate::app::TemporalForm, o
         ])
         .split(inner);
     frame.render_widget(Paragraph::new("Choose agent runtime"), rows[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            segment(" CODEX ", form.kind == AgentKind::Codex, CODEX),
-            Span::raw("  "),
-            segment(" CLAUDE ", form.kind == AgentKind::Claude, CLAUDE),
-            Span::styled("  Left/Right", Style::default().fg(MUTED)),
-        ])),
-        rows[1],
-    );
+    frame.render_widget(Paragraph::new(kind_line(kinds, form.kind)), rows[1]);
     let mut name = vec![
         Span::styled("Name: ", Style::default().fg(MUTED)),
         Span::styled(
@@ -4012,10 +4039,12 @@ fn runtime_capability(
     )
 }
 
-fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
+pub fn agent_visual(kind: AgentKind) -> (&'static str, &'static str, Color) {
     match kind {
         AgentKind::Codex => ("◉", "Codex", CODEX),
         AgentKind::Claude => ("✻", "Claude Code", CLAUDE),
+        AgentKind::OpenCode => ("◈", "OpenCode", OPENCODE),
+        AgentKind::Pi => ("π", "Pi", PI),
         AgentKind::Terminal => ("▣", "Terminal", TERMINAL),
     }
 }
@@ -4026,16 +4055,23 @@ fn running_agent_effect(kind: AgentKind, frame: u64) -> &'static str {
     // asterisk glyphs Claude Code itself cycles through. Both advance one frame
     // per `frame`, so with a time-based counter they animate at a constant rate
     // regardless of how often the UI redraws.
+    // The newer runtimes borrow the same idea: a single-column glyph cycle in
+    // their own shape, so a busy row reads as movement whichever agent it is.
     const CODEX_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
     const CLAUDE_FRAMES: [&str; 6] = ["✻", "✽", "✶", "✳", "✶", "✽"];
+    const OPENCODE_FRAMES: [&str; 4] = ["◈", "◇", "◆", "◇"];
+    const PI_FRAMES: [&str; 4] = ["π", "ᴨ", "π", "∏"];
     match kind {
         AgentKind::Codex => CODEX_FRAMES[(frame % CODEX_FRAMES.len() as u64) as usize],
         AgentKind::Claude => CLAUDE_FRAMES[(frame % CLAUDE_FRAMES.len() as u64) as usize],
+        AgentKind::OpenCode => OPENCODE_FRAMES[(frame % OPENCODE_FRAMES.len() as u64) as usize],
+        AgentKind::Pi => PI_FRAMES[(frame % PI_FRAMES.len() as u64) as usize],
         AgentKind::Terminal => "▣",
     }
 }
 
-fn segment(label: &'static str, selected: bool, color: Color) -> Span<'static> {
+fn segment(label: impl Into<String>, selected: bool, color: Color) -> Span<'static> {
+    let label = label.into();
     if selected {
         Span::styled(
             label,
@@ -4266,8 +4302,8 @@ mod tests {
                 recap: None,
             });
         }
-        app.targets[0].probe.codex = true;
-        app.targets[0].probe.claude = true;
+        app.targets[0].probe.set(AgentKind::Codex, true);
+        app.targets[0].probe.set(AgentKind::Claude, true);
 
         // Each row as its text plus the colour at a given marker substring.
         let rows = |terminal: &Terminal<TestBackend>| -> Vec<String> {

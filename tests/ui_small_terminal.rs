@@ -169,16 +169,25 @@ fn search_modal_never_panics() {
 #[test]
 fn settings_modal_never_panics() {
     for (w, h) in SIZES {
-        for (scope, rows) in [
-            (
-                muxloom::app::SettingsScope::Global,
-                &muxloom::app::GLOBAL_SETTINGS[..],
-            ),
+        // The host panel carries an install action per runtime the machine
+        // lacks, so both the bare and the fully equipped machine are drawn.
+        for (scope, missing) in [
+            (muxloom::app::SettingsScope::Global, Vec::new()),
+            (muxloom::app::SettingsScope::Host("gpu".into()), Vec::new()),
             (
                 muxloom::app::SettingsScope::Host("gpu".into()),
-                &muxloom::app::HOST_SETTINGS[..],
+                AgentKind::agents().collect(),
             ),
         ] {
+            let template = SettingsForm {
+                scope: scope.clone(),
+                selected: 0,
+                values: Vec::new(),
+                notes: Vec::new(),
+                missing: missing.clone(),
+                error: None,
+            };
+            let rows = template.rows();
             let values: Vec<String> = rows
                 .iter()
                 .filter_map(|row| match row {
@@ -198,7 +207,7 @@ fn settings_modal_never_panics() {
                 .filter(|row| {
                     matches!(
                         row,
-                        muxloom::app::SettingsRow::Field(_) | muxloom::app::SettingsRow::Action(_)
+                        muxloom::app::SettingsRow::Field(_) | muxloom::app::SettingsRow::Action(..)
                     )
                 })
                 .count();
@@ -208,6 +217,7 @@ fn settings_modal_never_panics() {
                     selected: selected.min(focusable - 1),
                     values: values.clone(),
                     notes: notes.clone(),
+                    missing: missing.clone(),
                     error: Some("bad value".into()),
                 };
                 draw_with(Some(Modal::Settings(form)), *w, *h);

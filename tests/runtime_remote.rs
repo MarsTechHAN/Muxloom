@@ -6,6 +6,14 @@ use muxloom::{
     runtime::Runtime,
 };
 
+/// The runtime probe now takes one command per agent runtime. The tests only
+/// care that the probe runs, so every runtime looks for `sh`.
+fn probe_commands() -> Vec<(AgentKind, String)> {
+    AgentKind::agents()
+        .map(|kind| (kind, "sh".into()))
+        .collect()
+}
+
 fn remote_runtime(alias: &str) -> Runtime {
     let mut hosts = BTreeMap::new();
     hosts.insert(
@@ -87,7 +95,7 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
     let mut working_seen = false;
     for _ in 0..40 {
         (_, sessions) = runtime
-            .probe_and_discover(&target, "sh", "sh", &[])
+            .probe_and_discover(&target, &probe_commands(), &[])
             .unwrap();
         working_seen = sessions
             .iter()

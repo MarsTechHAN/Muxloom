@@ -216,31 +216,26 @@ impl Runtime {
     pub fn probe_and_discover(
         &self,
         target: &Target,
-        codex_command: &str,
-        claude_command: &str,
+        commands: &[(AgentKind, String)],
         environment: &[(String, String)],
     ) -> Result<(Probe, Vec<AgentSession>)> {
-        self.probe_and_discover_with_progress(
-            target,
-            codex_command,
-            claude_command,
-            environment,
-            |_| {},
-        )
+        self.probe_and_discover_with_progress(target, commands, environment, |_| {})
     }
 
     pub fn probe_and_discover_with_progress(
         &self,
         target: &Target,
-        codex_command: &str,
-        claude_command: &str,
+        commands: &[(AgentKind, String)],
         environment: &[(String, String)],
         progress: impl FnMut(TaskProgress),
     ) -> Result<(Probe, Vec<AgentSession>)> {
         debug::log("runtime", format!("probe start target={}", target.id));
         if let Ok(available) = self.bridges.probe_executables_with_progress(
             target,
-            vec![codex_command.into(), claude_command.into()],
+            commands
+                .iter()
+                .map(|(_, command)| command.clone())
+                .collect(),
             progress,
         ) {
             let mut sessions = self
@@ -266,13 +261,16 @@ impl Runtime {
             for session_id in disposable {
                 let _ = self.bridges.delete(target, session_id);
             }
+            let mut probe = Probe::default();
+            for (kind, command) in commands {
+                probe.set(*kind, available.iter().any(|item| item == command));
+            }
             debug::log(
                 "runtime",
                 format!(
-                    "probe done target={} backend=muxloomd codex={} claude={} sessions={}",
+                    "probe done target={} backend=muxloomd runtimes={} sessions={}",
                     target.id,
-                    available.iter().any(|item| item == codex_command),
-                    available.iter().any(|item| item == claude_command),
+                    describe_runtimes(&probe),
                     sessions.len()
                 ),
             );
@@ -289,32 +287,26 @@ impl Runtime {
                     ),
                 );
             }
-            return Ok((
-                Probe {
-                    tmux: false,
-                    codex: available.iter().any(|item| item == codex_command),
-                    claude: available.iter().any(|item| item == claude_command),
-                },
-                sessions,
-            ));
+            return Ok((probe, sessions));
         }
         self.bridge_failures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(target.id.clone(), Instant::now());
         let exports = environment_exports(environment);
-        let codex_probe = login_shell_command(&format!(
-            "{exports} command -v {} >/dev/null 2>&1",
-            shell_quote(codex_command)
-        ));
-        let claude_probe = login_shell_command(&format!(
-            "{exports} command -v {} >/dev/null 2>&1",
-            shell_quote(claude_command)
-        ));
-        let probe = format!(
-            "if {codex_probe} >/dev/null 2>&1; then printf 'codex=1\\n'; else printf 'codex=0\\n'; fi; \
-             if {claude_probe} >/dev/null 2>&1; then printf 'claude=1\\n'; else printf 'claude=0\\n'; fi; \
-             if command -v tmux >/dev/null 2>&1; then printf 'tmux=1\\n'; else printf 'tmux=0\\n'; fi",
+        let mut probe = String::new();
+        for (kind, command) in commands {
+            let lookup = login_shell_command(&format!(
+                "{exports} command -v {} >/dev/null 2>&1",
+                shell_quote(command)
+            ));
+            let name = kind.as_str();
+            probe.push_str(&format!(
+                "if {lookup} >/dev/null 2>&1; then printf '{name}=1\\n'; else printf '{name}=0\\n'; fi; "
+            ));
+        }
+        probe.push_str(
+            "if command -v tmux >/dev/null 2>&1; then printf 'tmux=1\\n'; else printf 'tmux=0\\n'; fi",
         );
         let managed_panes = shell_join(&[
             "tmux",
@@ -371,11 +363,10 @@ impl Runtime {
         debug::log(
             "runtime",
             format!(
-                "probe done target={} tmux={} codex={} claude={} sessions={} disposable_sessions_cleaned={}",
+                "probe done target={} tmux={} runtimes={} sessions={} disposable_sessions_cleaned={}",
                 target.id,
                 probe.tmux,
-                probe.codex,
-                probe.claude,
+                describe_runtimes(&probe),
                 sessions.len(),
                 disposable.len()
             ),
@@ -653,8 +644,11 @@ impl Runtime {
         let mut attempts: Vec<String> = Vec::new();
         // A configured command that names something else — a wrapper script, an
         // absolute path — is the operator's business, not a release we know how
-        // to fetch.
-        let built_in = !command.command.contains('/') && command.command == executable_name;
+        // to fetch. Neither is a runtime muxloom has no release for: OpenCode
+        // and Pi go straight to their own installer.
+        let built_in = kind.has_release_download()
+            && !command.command.contains('/')
+            && command.command == executable_name;
         let remote = matches!(target.transport, Transport::Ssh { .. });
 
         // The target fetches its own runtime first. The payload then never
@@ -840,7 +834,7 @@ impl Runtime {
                 progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
                 self.upload_runtime_binary(target, &executable, "codex")?;
             }
-            (AgentKind::Terminal, _) => bail!("terminal has no downloadable agent runtime"),
+            (kind, _) => bail!("{kind} has no downloadable agent runtime"),
         }
         Ok(format!(
             "controller-downloaded {kind} {version} ({})",
@@ -950,7 +944,9 @@ impl Runtime {
                     platform_name,
                 })
             }
-            AgentKind::Terminal => bail!("terminal has no downloadable agent runtime"),
+            // OpenCode and Pi publish no release muxloom can hand a machine
+            // itself; their `install` command runs their own installer.
+            kind => bail!("{kind} has no downloadable agent runtime"),
         }
     }
 
@@ -2084,13 +2080,13 @@ END {
         kind: AgentKind,
         path: &str,
     ) -> Result<Vec<ResumeCandidate>> {
-        if kind == AgentKind::Terminal {
+        if !kind.has_native_history() {
             return Ok(Vec::new());
         }
         let root = match kind {
             AgentKind::Codex => "$HOME/.codex/sessions",
             AgentKind::Claude => "$HOME/.claude/projects",
-            AgentKind::Terminal => unreachable!(),
+            _ => unreachable!("only a runtime with native history is scanned"),
         };
         let index = if kind == AgentKind::Codex {
             r#"printf '\036INDEX\n'; if [ -f "$HOME/.codex/session_index.jsonl" ]; then cat "$HOME/.codex/session_index.jsonl"; fi;"#
@@ -2862,7 +2858,9 @@ pub(crate) fn attention_reason(
                 ],
             ),
         ],
-        AgentKind::Terminal => &[],
+        // OpenCode and Pi have no wording of their own here yet; the generic
+        // choice detection below still catches the menus they open.
+        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => &[],
     };
     for (reason, markers) in builtins {
         if markers.iter().any(|marker| screen.contains(marker)) && has_choice {
@@ -3254,7 +3252,7 @@ fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<Res
         let candidate = match kind {
             AgentKind::Codex => parse_codex_resume(session, &normalized_path, source_path, &titles),
             AgentKind::Claude => parse_claude_resume(session, &normalized_path, source_path),
-            AgentKind::Terminal => None,
+            _ => None,
         };
         if let Some(candidate) = candidate {
             candidates
@@ -3527,7 +3525,8 @@ pub(crate) fn launch_arguments(
         match kind {
             AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
             AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
-            AgentKind::Terminal => {}
+            // Only a runtime with native history hands back a resume id.
+            AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => {}
         }
     }
     if resume_id.is_none()
@@ -3639,15 +3638,35 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
     })
 }
 
+/// The installed runtimes as a comma-separated list, for the debug log.
+fn describe_runtimes(probe: &Probe) -> String {
+    probe
+        .runtimes
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSession>)> {
     let mut probe = Probe::default();
     let mut sessions = Vec::new();
     for line in output.lines() {
+        // `<runtime>=0|1` lines answer the executable probe; everything else
+        // is a tab-separated pane record.
+        if !line.contains('\t')
+            && let Some((name, flag)) = line.split_once('=')
+            && matches!(flag, "0" | "1")
+        {
+            let present = flag == "1";
+            if name == "tmux" {
+                probe.tmux = present;
+            } else if let Ok(kind) = AgentKind::from_str(name) {
+                probe.set(kind, present);
+            }
+            continue;
+        }
         match line {
-            "tmux=1" => probe.tmux = true,
-            "codex=1" => probe.codex = true,
-            "claude=1" => probe.claude = true,
-            "tmux=0" | "codex=0" | "claude=0" => {}
             line if is_managed_session_id(line.split('\t').next().unwrap_or_default()) => {
                 let fields: Vec<_> = line.split('\t').collect();
                 if fields.len() < 11 {
@@ -4125,11 +4144,18 @@ mod tests {
             "tmux=1\n",
             "codex=1\n",
             "claude=0\n",
+            "pi=1\n",
+            "opencode=0\n",
             "muxloom-codex-10-2\tcodex\t/work/a b\talpha\t10\t\t\t\t\t0\t123\n",
             "ad-claude-11-2\t\t\t\t\tclaude\t/work/remote\tdone\t11\t1\t456\n"
         );
         let (probe, sessions) = parse_discovery("gpu", output).unwrap();
-        assert!(probe.tmux && probe.codex && !probe.claude);
+        assert!(
+            probe.tmux
+                && probe.has(AgentKind::Codex)
+                && !probe.has(AgentKind::Claude)
+                && probe.has(AgentKind::Pi)
+        );
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].path, "/work/a b");
         assert!(sessions[0].id.starts_with("muxloom-"));
