@@ -31,8 +31,9 @@ use crate::{
     runtime::Runtime,
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
     talk::{
-        MAX_TEXT, TalkDraft, TalkFilter, TalkKind, TalkMessage, TalkPage, TalkScope, TalkSelector,
-        TalkVoice, decode_cursor,
+        MAX_TEXT, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind,
+        TalkMessage, TalkPage, TalkScope, TalkSelector, TalkState, TalkVoice, decode_cursor,
+        hostname,
     },
 };
 
@@ -90,6 +91,7 @@ const TALK_POLL: Duration = Duration::from_secs(2);
 /// the day it exists.
 const WRITE_TOOLS: &[&str] = &[
     "send_input",
+    "message_agent",
     "launch_session",
     "archive_session",
     "delete_session",
@@ -170,8 +172,9 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
          be watching any of them right now.\n\n\
          Work through the sessions rather than around them:\n\
-         - To get work done on a machine, talk to the agent session that lives there: send_input \
-         (with submit) to say something, then read_screen to read the reply. Treat a session as a \
+         - To get work done on a machine, talk to the agent session that lives there: \
+         message_agent to say something to another agent, send_input for raw keystrokes and for \
+         plain shells, then wait_for or read_screen to see what came of it. Treat a session as a \
          colleague you are messaging, not as a subprocess you drive.\n\
          - run_shell is a last resort. Reach for it only for a short, non-interactive, ideally \
          read-only query that no other tool covers. Never start long-running or interactive work \
@@ -179,6 +182,16 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          session you could talk to would do better.\n\
          - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
          search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\n\
+         Work with the others out in the open:\n\
+         - talk_read before you start and after you have been away: the board carries what every \
+         other agent and every person at a dashboard is doing, on every machine. talk_post what \
+         you are about to change before you change it, and post what you worked out as kind \
+         \"note\" so whoever comes next finds it instead of working it out again.\n\
+         - message_agent is how you ask one agent for something: it lands in that session's \
+         prompt in an envelope that names you. Its answer comes back as a direct message — wait \
+         for it with talk_read {{ scope: \"direct\", wait_seconds }}.\n\
+         - Nobody here is in charge of anyone else, and nothing you send has to be obeyed. Ask, \
+         say why, and leave the other agent to judge it against what it is already doing.\n\n\
          Boundaries that are not negotiable:\n\
          - Machines the user has not enabled are unreachable. Naming one is an error, not a \
          workaround to route around.\n\
@@ -324,6 +337,33 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "submit": { "type": "boolean", "description": "Press Enter at the end." },
             }),
             &["session_id"],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "message_agent",
+        description: "Say something to another agent: muxloom types your message into that \
+                      session's prompt inside an envelope naming you, so the agent there knows it \
+                      is hearing from an agent and how to answer. Use this to ask for work, hand \
+                      something over, answer a question you were asked, or warn someone off a file \
+                      you are changing — and use send_input instead only when you need raw \
+                      keystrokes rather than a message. The target must be a codex or claude \
+                      session; a terminal has nobody in it to read. Every message is also filed on \
+                      the talk board, so read your own with talk_read { scope: \"direct\" } — that \
+                      is where replies arrive if the other agent is not sure how to reach you. \
+                      Delivery interrupts whoever is working there, so one message says everything \
+                      you have to say; there is a rate limit per session and it will tell you. \
+                      \"auto\" waits for a busy session to finish, up to a minute; \"when_idle\" \
+                      waits as long as it takes; \"now\" types it in mid-turn."
+            .into(),
+        input_schema: schema(
+            multi,
+            json!({
+                "session_id": { "type": "string", "description": "Session id from list_sessions: who to tell." },
+                "text": { "type": "string", "description": "What to say. Say it as you would to a colleague: what you want, and what you already know." },
+                "deliver": { "type": "string", "enum": ["auto", "now", "when_idle"], "description": "When to put it in front of them. Default auto." },
+                "reply_expected": { "type": "boolean", "description": "Say that you are waiting on an answer. Then wait for it with talk_read { scope: \"direct\", wait_seconds }." },
+            }),
+            &["session_id", "text"],
         ),
     });
     tools.push(ToolSpec {
@@ -1043,12 +1083,94 @@ fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
     };
     Ok(TalkDraft {
         scope,
-        voice: session_voice(),
+        author: TalkAuthor::default(),
         kind,
         to: None,
         reply_to: optional_str(arguments, "reply_to").map(Into::into),
         text: text.into(),
     })
+}
+
+/// Who a direct message is from.
+///
+/// A board post can leave this out — the machine that files it is the machine
+/// it was said on. A direct message is filed on the *target's* board, so a
+/// sender that says nothing about where it is would be recorded as speaking
+/// from the machine it reached.
+fn direct_author(local: impl FnOnce() -> Result<TalkState>) -> TalkAuthor {
+    let mut author = TalkAuthor {
+        machine: session_env("MUXLOOM_MACHINE").unwrap_or_default(),
+        machine_label: session_env("MUXLOOM_MACHINE_LABEL").unwrap_or_default(),
+        voice: session_voice(),
+    };
+    if author.machine.is_empty() {
+        // Not running inside a muxloom session: ask the board here what this
+        // machine is called. Failing that, a host name is still a name, and
+        // it is not worth refusing to carry a message over.
+        let (machine, label) = local()
+            .map(|state| (state.origin, state.label))
+            .unwrap_or_else(|_| (hostname(), hostname()));
+        author.machine = machine;
+        author.machine_label = label;
+    }
+    author
+}
+
+/// What a `message_agent` call describes: the message, when it may be typed
+/// in, and whether the sender is waiting on an answer.
+///
+/// The target's machine is left empty for the same reason a post's scope is:
+/// the daemon that takes delivery is the one that knows what it is called, and
+/// a message addressed to a machine by a name only the sender uses would be
+/// filed under a board nobody reads.
+fn direct_draft(arguments: &Value, author: TalkAuthor) -> Result<(TalkDraft, TalkDeliver, bool)> {
+    let text = required_str(arguments, "text")?;
+    if text.len() > MAX_TEXT {
+        bail!(
+            "text must be shorter than {MAX_TEXT} bytes: say what the other agent has to know and \
+             leave the rest where it can read it"
+        );
+    }
+    let draft = TalkDraft {
+        // Where it happened, for whoever reads the board later. Who may see it
+        // is decided by its two ends, not by this.
+        scope: TalkScope::Machine {
+            machine: String::new(),
+        },
+        author,
+        kind: TalkKind::Direct,
+        to: Some(TalkAddress {
+            machine: String::new(),
+            session_id: required_str(arguments, "session_id")?.into(),
+        }),
+        reply_to: optional_str(arguments, "reply_to").map(Into::into),
+        text: text.into(),
+    };
+    Ok((
+        draft,
+        TalkDeliver::parse(optional_str(arguments, "deliver").unwrap_or("auto"))?,
+        arguments
+            .get("reply_expected")
+            .and_then(Value::as_bool)
+            .unwrap_or_default(),
+    ))
+}
+
+/// What became of a direct message, in the words the sender needs: whether it
+/// was typed in, and where to look for an answer.
+fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) -> String {
+    pretty(&json!({
+        "message_id": message.id,
+        "delivery": delivery,
+        "reason": reason,
+        "note": match delivery {
+            "delivered" => "it is in that agent's prompt now; any answer comes back as a direct \
+                            message, so read it with talk_read { scope: \"direct\", wait_seconds }",
+            "queued" => "that session is working; muxloom types it in when it stops. Do not send \
+                         it again — watch for the answer with talk_read { scope: \"direct\" }",
+            _ => "the message is on the board, but nothing was typed into that session",
+        },
+    }))
 }
 
 /// What a `talk_read` call asks for. The reader's own identity is filled in
@@ -1673,6 +1795,16 @@ impl ControllerControl {
         })
     }
 
+    fn message_agent(&self, arguments: &Value) -> Result<String> {
+        let target = self.target(arguments)?;
+        let pool = self.runtime.bridge_pool();
+        let author = direct_author(|| pool.talk_status(&Target::local(), None));
+        let (draft, deliver, reply_expected) = direct_draft(arguments, author)?;
+        let (message, delivery, reason) =
+            pool.talk_deliver(&target, draft, deliver, reply_expected)?;
+        Ok(delivery_json(&message, &delivery, reason))
+    }
+
     fn launch_session(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let kind = agent_kind(arguments)?;
@@ -1816,6 +1948,7 @@ impl ControlSurface for ControllerControl {
             "trigger" => self.trigger(arguments),
             "talk_read" => self.talk_read(arguments),
             "talk_post" => self.talk_post(arguments),
+            "message_agent" => self.message_agent(arguments),
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
@@ -1884,10 +2017,10 @@ mod daemon_surface {
 
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
-        allowed_specs, build_input, enforce_policy, instructions, optional_bool, optional_str,
-        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page,
-        session_json, shell_report, talk_draft, talk_filter, talk_json, talk_wait, trigger_json,
-        trigger_spec, wait_loop,
+        allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
+        instructions, optional_bool, optional_str, optional_usize, plain_screen, pretty,
+        preview_text, required_str, screen_page, session_json, shell_report, talk_draft,
+        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -2111,6 +2244,34 @@ mod daemon_surface {
             })
         }
 
+        fn message_agent(&self, arguments: &Value) -> Result<String> {
+            // The board here is the one the message will be filed on, so an
+            // author with no machine on it would be right anyway; asking keeps
+            // the record the same shape as one that crossed a machine.
+            let author = direct_author(|| {
+                match self.transact(&DaemonRequest::TalkStatus { label: None })?.0 {
+                    DaemonResponse::TalkBoard { state } => Ok(state),
+                    response => bail!("unexpected talk response: {response:?}"),
+                }
+            });
+            let (draft, deliver, reply_expected) = direct_draft(arguments, author)?;
+            match self
+                .transact(&DaemonRequest::TalkDeliver {
+                    draft,
+                    deliver,
+                    reply_expected,
+                })?
+                .0
+            {
+                DaemonResponse::TalkDelivery {
+                    message,
+                    delivery,
+                    reason,
+                } => Ok(delivery_json(&message, &delivery, reason)),
+                response => bail!("unexpected talk response: {response:?}"),
+            }
+        }
+
         fn launch_session(&self, arguments: &Value) -> Result<String> {
             let kind = agent_kind(arguments)?;
             let path = required_str(arguments, "path")?;
@@ -2242,6 +2403,7 @@ mod daemon_surface {
                 "trigger" => self.trigger(arguments),
                 "talk_read" => self.talk_read(arguments),
                 "talk_post" => self.talk_post(arguments),
+                "message_agent" => self.message_agent(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
                     let bytes = build_input(arguments)?;
@@ -2690,6 +2852,13 @@ mod tests {
         /// One serve() loop on a temporary state directory, reached the same
         /// way a real `muxloomd mcp` reaches the real daemon.
         fn surface(name: &str) -> DaemonControl {
+            surface_with(name, Config::default())
+        }
+
+        /// The same, with the commands the adapter would launch agents by —
+        /// tests that need a session the daemon reads as an agent's point
+        /// `claude` at a shell.
+        fn surface_with(name: &str, config: Config) -> DaemonControl {
             // A short, fixed prefix: the state dir carries daemon and keeper
             // sockets, whose paths must stay under the ~104-byte sockaddr_un
             // limit that macOS's deep per-user temp dir nearly exhausts.
@@ -2713,7 +2882,7 @@ mod tests {
                 assert!(Instant::now() < deadline, "daemon socket never came up");
                 thread::sleep(Duration::from_millis(20));
             }
-            DaemonControl::with_paths(paths, Config::default())
+            DaemonControl::with_paths(paths, config)
         }
 
         fn call(surface: &mut DaemonControl, name: &str, arguments: Value) -> String {
@@ -3009,6 +3178,152 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(refused.contains("message_agent"), "{refused}");
+        }
+
+        #[test]
+        fn a_message_waits_for_a_working_agent_and_the_board_keeps_the_receipt() {
+            // A shell standing in for an agent: what makes a session an
+            // agent's here is its kind, and what makes it look busy is the
+            // marker both CLIs keep on screen while they work.
+            let mut config = Config::default();
+            config.agents.claude.command = "sh".into();
+            config.agents.claude.args = Vec::new();
+            let mut surface = surface_with("msg", config);
+            let workdir = std::env::temp_dir().to_str().unwrap().to_string();
+
+            let launch = |surface: &mut DaemonControl, kind: &str| -> String {
+                let launched: Value = serde_json::from_str(&call(
+                    surface,
+                    "launch_session",
+                    json!({ "kind": kind, "path": workdir }),
+                ))
+                .unwrap();
+                launched["session_id"].as_str().unwrap().to_string()
+            };
+            let until = |surface: &mut DaemonControl, session: &str, marker: &str| -> String {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let screen = call(
+                        surface,
+                        "read_screen",
+                        json!({ "session_id": session, "lines": 60 }),
+                    );
+                    if screen.contains(marker) {
+                        return screen;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "no {marker:?} on screen: {screen}"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+            };
+
+            // Nobody is reading a shell, so nothing is typed into one.
+            let shell = launch(&mut surface, "terminal");
+            let refused = surface
+                .call(
+                    "message_agent",
+                    &json!({ "session_id": shell, "text": "are you there" }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("send_input"), "{refused}");
+
+            // A session that is not working gets it straight away.
+            let idle = launch(&mut surface, "claude");
+            let sent: Value = serde_json::from_str(&call(
+                &mut surface,
+                "message_agent",
+                json!({
+                    "session_id": idle,
+                    "text": "the parser is yours, I am on the lexer",
+                    "reply_expected": true,
+                }),
+            ))
+            .unwrap();
+            assert_eq!(sent["delivery"], "delivered", "{sent:#}");
+            until(&mut surface, &idle, "Message from");
+
+            // A working session is left alone until it stops.
+            let busy = launch(&mut surface, "claude");
+            call(
+                &mut surface,
+                "send_input",
+                json!({
+                    "session_id": busy,
+                    "text": "printf 'esc to interrupt\\n'",
+                    "submit": true,
+                }),
+            );
+            until(&mut surface, &busy, "esc to interrupt");
+            let queued: Value = serde_json::from_str(&call(
+                &mut surface,
+                "message_agent",
+                json!({
+                    "session_id": busy,
+                    "text": "when you surface, the lexer needs a second pair of eyes",
+                    "deliver": "when_idle",
+                }),
+            ))
+            .unwrap();
+            assert_eq!(queued["delivery"], "queued", "{queued:#}");
+
+            // Sending again immediately is how one agent drowns another.
+            let too_soon = surface
+                .call(
+                    "message_agent",
+                    &json!({ "session_id": busy, "text": "and also" }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(too_soon.contains("wait"), "{too_soon}");
+
+            // Enough output to push the marker off the bottom of the screen is
+            // the session going quiet, and the queue notices within a second.
+            call(
+                &mut surface,
+                "send_input",
+                json!({
+                    "session_id": busy,
+                    "text": "for i in $(seq 30); do echo settled-$i; done",
+                    "submit": true,
+                }),
+            );
+            until(&mut surface, &busy, "Message from");
+
+            // Both messages are on the board, so what the agents said to each
+            // other can be read by anyone who was not in the room.
+            let board: Value = serde_json::from_str(&call(
+                &mut surface,
+                "talk_read",
+                json!({ "scope": "direct" }),
+            ))
+            .unwrap();
+            let texts: Vec<&str> = board["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                texts,
+                [
+                    "the parser is yours, I am on the lexer",
+                    "when you surface, the lexer needs a second pair of eyes",
+                ],
+                "{board:#}"
+            );
+            assert_eq!(board["messages"][0]["kind"], "direct");
+            assert_eq!(board["messages"][0]["to"]["session_id"], idle);
+
+            for session in [shell, idle, busy] {
+                call(
+                    &mut surface,
+                    "delete_session",
+                    json!({ "session_id": session }),
+                );
+            }
         }
     }
 }

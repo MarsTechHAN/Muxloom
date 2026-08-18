@@ -38,7 +38,10 @@ mod platform {
         runtime::{
             DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, is_temporary_session_id,
         },
-        talk::{TALK_CAPABILITY, TalkPage, TalkStore},
+        talk::{
+            DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkKind, TalkMessage,
+            TalkPage, TalkQueued, TalkStore, folded, paste_bytes, render_delivery,
+        },
         terminal_session::{
             CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
         },
@@ -71,6 +74,16 @@ mod platform {
     /// The shortest gap a trigger may ask for between two firings.
     const TRIGGER_MIN_COOLDOWN_MS: u64 = 250;
     static TRIGGER_COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// How long one sender waits before it may interrupt the same session
+    /// again. Typing into a session costs whoever works there their attention,
+    /// and two agents answering each other would spend it in a loop.
+    const DIRECT_INTERVAL_MS: u64 = 10_000;
+    /// The most messages that may be waiting for sessions to be free. Past
+    /// this something is queueing faster than the machine can read, and the
+    /// oldest of them are already stale.
+    const OUTBOX_LIMIT: usize = 128;
+    /// How often a queued message looks at whether its session has finished.
+    const OUTBOX_POLL: Duration = Duration::from_secs(1);
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -84,6 +97,7 @@ mod platform {
         pub keepers: PathBuf,
         pub triggers: PathBuf,
         pub talk: PathBuf,
+        pub outbox: PathBuf,
     }
 
     impl DaemonPaths {
@@ -110,6 +124,7 @@ mod platform {
                 sessions: root.join("sessions"),
                 keepers: root.join("keepers"),
                 triggers: root.join("triggers.json"),
+                outbox: root.join("talk/outbox.json"),
                 talk: root.join("talk"),
                 root,
             }
@@ -153,6 +168,17 @@ mod platform {
         /// This machine's talk board, opened the first time anything asks for
         /// it: a daemon nobody collaborates through never writes one.
         talk: OnceLock<Arc<TalkStore>>,
+        /// Direct messages waiting for the sessions they are addressed to to
+        /// be free, oldest first.
+        outbox: Mutex<Vec<TalkQueued>>,
+        /// How many of those there are, so the drainer knows whether it still
+        /// has anything to do without taking the lock.
+        pending: AtomicUsize,
+        /// Whether a thread is already watching the outbox.
+        draining_outbox: AtomicBool,
+        /// When each sender last reached each session, for the rate limit that
+        /// keeps one agent from typing into another in a loop.
+        directs: Mutex<HashMap<String, u64>>,
     }
 
     /// A stored trigger plus the edge state that decides when it fires.
@@ -301,6 +327,8 @@ mod platform {
             let persisted_sessions = recover_persisted_sessions(&paths);
             let triggers = load_triggers(&paths.triggers);
             let armed = AtomicUsize::new(triggers.len());
+            let outbox = load_outbox(&paths.outbox);
+            let pending = AtomicUsize::new(outbox.len());
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
@@ -316,6 +344,10 @@ mod platform {
                 triggers: Mutex::new(triggers),
                 armed,
                 talk: OnceLock::new(),
+                outbox: Mutex::new(outbox),
+                pending,
+                draining_outbox: AtomicBool::new(false),
+                directs: Mutex::new(HashMap::new()),
             }
         }
 
@@ -328,6 +360,16 @@ mod platform {
             }
             let store = Arc::new(TalkStore::open(self.paths.talk.clone())?);
             Ok(self.talk.get_or_init(|| store).clone())
+        }
+
+        /// Write the outbox out. Called while holding the outbox lock, for the
+        /// same reason the triggers are: a message the file still claims is
+        /// waiting would be delivered twice by the next generation.
+        fn save_outbox(&self, queue: &[TalkQueued]) {
+            self.pending.store(queue.len(), Ordering::Relaxed);
+            if let Err(error) = write_outbox(&self.paths.outbox, queue) {
+                eprintln!("muxloomd could not persist its message queue: {error:#}");
+            }
         }
 
         /// Write the triggers out. Called while holding the trigger lock, so
@@ -534,6 +576,264 @@ mod platform {
                 TriggerAction::Notify { text } => session.set_notice(text),
             }
         }
+    }
+
+    /// Put a direct message in front of a session on this machine, or queue it
+    /// until that session is free enough to read one.
+    ///
+    /// The message is filed on the board whichever way it goes, and before it
+    /// is typed anywhere: a direct message is something that was said, and the
+    /// board is where the other agents — and the person watching them — find
+    /// out what they have been telling each other.
+    fn deliver_direct(
+        state: &Arc<DaemonState>,
+        mut draft: TalkDraft,
+        deliver: TalkDeliver,
+        reply_expected: bool,
+    ) -> Result<(TalkMessage, String, Option<String>)> {
+        let to = draft
+            .to
+            .clone()
+            .context("a direct message needs the session it is for")?;
+        let session = daemon_session(state, &to.session_id)?;
+        let snapshot = session.snapshot();
+        let kind = snapshot.kind.parse::<AgentKind>().ok();
+        let Some(kind) = kind.filter(|kind| *kind != AgentKind::Terminal) else {
+            bail!(
+                "session {} is a terminal, and there is nobody in it to read a message: type into \
+                 a shell with send_input",
+                to.session_id
+            );
+        };
+        if snapshot.dead || snapshot.archived {
+            bail!(
+                "session {} has ended, so nothing there can be told",
+                to.session_id
+            );
+        }
+        rate_limit_direct(state, &draft, &to.session_id)?;
+        draft.kind = TalkKind::Direct;
+        let message = state.talk()?.post(draft)?;
+        let body = render_delivery(&message, reply_expected);
+        // A session waiting on a prompt is not free: the paste would be typed
+        // into whatever question is on the screen and answer it with this.
+        let free = !snapshot.working && !snapshot.needs_attention;
+        if deliver == TalkDeliver::Now || free {
+            return Ok(match type_message(&session, kind, &body) {
+                Ok(()) => (message, "delivered".into(), None),
+                Err(error) => (message, "failed".into(), Some(format!("{error:#}"))),
+            });
+        }
+        {
+            let mut outbox = state
+                .outbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if outbox.len() >= OUTBOX_LIMIT {
+                bail!(
+                    "this machine already holds {OUTBOX_LIMIT} undelivered messages; the sessions \
+                     here are not reading them"
+                );
+            }
+            outbox.push(TalkQueued {
+                message_id: message.id.clone(),
+                session_id: to.session_id,
+                body,
+                queued_at: now_ms(),
+                deliver,
+            });
+            state.save_outbox(&outbox);
+        }
+        spawn_outbox_drainer(state);
+        let reason = match deliver {
+            TalkDeliver::WhenIdle => "the session is busy; the message goes in when it is free",
+            _ => "the session is busy; the message goes in when it is free, or in a minute anyway",
+        };
+        Ok((message, "queued".into(), Some(reason.into())))
+    }
+
+    /// Refuse a sender that just reached this session.
+    ///
+    /// The key is the sender rather than its machine: two agents on one
+    /// machine are two voices, and one of them being noisy is no reason to
+    /// silence the other.
+    fn rate_limit_direct(state: &DaemonState, draft: &TalkDraft, session_id: &str) -> Result<()> {
+        let sender = format!(
+            "{}/{} -> {session_id}",
+            draft.author.machine,
+            draft.author.voice.session_id.as_deref().unwrap_or("-")
+        );
+        let now = now_ms();
+        let mut directs = state
+            .directs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = directs.get(&sender) {
+            let waited = now.saturating_sub(*last);
+            if waited < DIRECT_INTERVAL_MS {
+                bail!(
+                    "you sent this session a message {}s ago: wait {}s, or say the rest of it in \
+                     one message — every one of them interrupts whatever it is doing",
+                    waited / 1000,
+                    (DIRECT_INTERVAL_MS - waited).div_ceil(1000)
+                );
+            }
+        }
+        // Nothing here is worth remembering once it can no longer refuse
+        // anything, and a daemon that runs for weeks would otherwise hold a
+        // row per pair forever.
+        directs.retain(|_, last| now.saturating_sub(*last) < DIRECT_INTERVAL_MS * 60);
+        directs.insert(sender, now);
+        Ok(())
+    }
+
+    /// Type a rendered message into a session as one submission.
+    ///
+    /// Codex and Claude Code both understand bracketed paste, which is what
+    /// gets a multi-line envelope into the prompt whole; typed as bytes, every
+    /// newline in it would submit what came before. The other runtimes are not
+    /// known to, so they are told the same thing folded onto one line: uglier,
+    /// and still one message rather than eight.
+    fn type_message(session: &ManagedSession, kind: AgentKind, body: &str) -> Result<()> {
+        let bytes = if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
+            paste_bytes(body, true)
+        } else {
+            let mut folded = folded(body).into_bytes();
+            folded.push(b'\r');
+            folded
+        };
+        session.write_input(&bytes)
+    }
+
+    /// Deliver what the outbox holds to the sessions that have become free
+    /// enough to read it, and drop what has waited too long to be worth
+    /// delivering at all.
+    fn drain_outbox(state: &DaemonState) {
+        if state.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        // The session map is taken first and let go of again: the outbox lock
+        // is held while messages are picked, and a lock over both in one order
+        // here and the other in `deliver_direct` is how a daemon stops.
+        let sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let now = now_ms();
+        let mut due = Vec::new();
+        {
+            let mut outbox = state
+                .outbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = outbox.len();
+            outbox.retain(|queued| {
+                let Some(session) = sessions.get(&queued.session_id) else {
+                    eprintln!(
+                        "muxloomd dropped message {}: session {} is gone",
+                        queued.message_id, queued.session_id
+                    );
+                    return false;
+                };
+                let snapshot = session.snapshot();
+                let kind = snapshot.kind.parse::<AgentKind>().ok();
+                let Some(kind) = kind.filter(|_| !snapshot.dead && !snapshot.archived) else {
+                    eprintln!(
+                        "muxloomd dropped message {}: session {} has ended",
+                        queued.message_id, queued.session_id
+                    );
+                    return false;
+                };
+                if queued.due(!snapshot.working && !snapshot.needs_attention, now) {
+                    due.push((Arc::clone(session), kind, queued.clone()));
+                    return false;
+                }
+                if queued.expired(now) {
+                    eprintln!(
+                        "muxloomd gave up on message {}: session {} stayed busy",
+                        queued.message_id, queued.session_id
+                    );
+                    return false;
+                }
+                true
+            });
+            if outbox.len() != before {
+                state.save_outbox(&outbox);
+            }
+        }
+        // Outside the lock: writing to a session reaches its keeper, and the
+        // queue must never be held across that.
+        for (session, kind, queued) in due {
+            if let Err(error) = type_message(&session, kind, &queued.body) {
+                eprintln!(
+                    "muxloomd could not deliver message {}: {error:#}",
+                    queued.message_id
+                );
+            }
+        }
+    }
+
+    /// Keep an eye on the outbox for as long as it holds anything.
+    ///
+    /// A queued message waits for a session to stop working, and that is not
+    /// something anything here can be woken by: the reader thread sees output,
+    /// and an agent finishing is precisely the absence of it. So the wait is a
+    /// poll — one that exists only while a message is actually waiting.
+    fn spawn_outbox_drainer(state: &Arc<DaemonState>) {
+        if state.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if state.draining_outbox.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let state = Arc::clone(state);
+        thread::spawn(move || {
+            while state.pending.load(Ordering::Relaxed) > 0
+                && !state.shutdown.load(Ordering::Acquire)
+                && !state.draining.load(Ordering::Acquire)
+            {
+                thread::sleep(OUTBOX_POLL);
+                drain_outbox(&state);
+            }
+            state.draining_outbox.store(false, Ordering::Release);
+            // Something may have queued a message between the last look and
+            // the flag coming down, and seen a drainer that was already on its
+            // way out.
+            if state.pending.load(Ordering::Relaxed) > 0
+                && !state.shutdown.load(Ordering::Acquire)
+                && !state.draining.load(Ordering::Acquire)
+            {
+                spawn_outbox_drainer(&state);
+            }
+        });
+    }
+
+    /// The messages a previous daemon was still holding. Like the triggers, a
+    /// file that cannot be read is not worth refusing to serve over.
+    fn load_outbox(path: &Path) -> Vec<TalkQueued> {
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<TalkQueued>>(&text).unwrap_or_else(|error| {
+            eprintln!("muxloomd could not read {}: {error}", path.display());
+            Vec::new()
+        })
+    }
+
+    fn write_outbox(path: &Path, queue: &[TalkQueued]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let text = serde_json::to_string_pretty(queue)?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, text)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        Ok(())
     }
 
     /// Load what a previous daemon left in the state directory, recovering the
@@ -870,6 +1170,9 @@ mod platform {
         };
         let state = Arc::new(DaemonState::new(paths.clone(), keeper_mode));
         adopt_keeper_sessions(&state);
+        // Messages the last generation was still holding for a busy session
+        // are this one's to deliver now that it owns the sessions.
+        spawn_outbox_drainer(&state);
         // Tell this machine's agents where the control surface is, so one
         // launched here — or on a remote the user never configures by hand —
         // can drive the sessions around it. Nothing here is worth refusing to
@@ -1409,6 +1712,7 @@ mod platform {
                             "handover-drain-v1".into(),
                             "triggers-v1".into(),
                             TALK_CAPABILITY.into(),
+                            DIRECT_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -1623,6 +1927,23 @@ mod platform {
                     added: 0,
                 },
             ),
+            DaemonRequest::TalkDeliver {
+                draft,
+                deliver,
+                reply_expected,
+            } => {
+                let (message, delivery, reason) =
+                    deliver_direct(state, draft, deliver, reply_expected)?;
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::TalkDelivery {
+                        message: Box::new(message),
+                        delivery,
+                        reason,
+                    },
+                )
+            }
             DaemonRequest::TalkAppend { messages } => {
                 let added = state.talk()?.merge(messages)?;
                 write_response(

@@ -36,6 +36,9 @@ use crate::{
 
 /// Capability that says a daemon carries a talk board.
 pub const TALK_CAPABILITY: &str = "talk-v1";
+/// Capability that says a daemon will put a message in front of one of its
+/// agent sessions.
+pub const DIRECT_CAPABILITY: &str = "direct-v1";
 /// The longest a single message may be. A board is for saying things to each
 /// other, not for shipping files around.
 pub const MAX_TEXT: usize = 8 * 1024;
@@ -218,10 +221,18 @@ impl TalkMessage {
 }
 
 /// What a poster hands to the store. The store mints the rest.
+///
+/// Every machine field may be left empty, and the daemon that takes the draft
+/// fills it in with its own: a poster on this machine does not have to know
+/// what this machine is called, and a message sent to a session here is
+/// addressed here whatever the sender believes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkDraft {
     pub scope: TalkScope,
-    pub voice: TalkVoice,
+    /// Who is speaking. An author from another machine carries its own machine
+    /// with it; one from this machine leaves it empty.
+    #[serde(default)]
+    pub author: TalkAuthor,
     pub kind: TalkKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<TalkAddress>,
@@ -451,6 +462,15 @@ impl TalkStore {
             (inner.identity.origin.clone(), inner.identity.label.clone())
         };
         draft.scope.anchor(&origin);
+        if draft.author.machine.trim().is_empty() {
+            draft.author.machine = origin.clone();
+            draft.author.machine_label = label;
+        }
+        if let Some(to) = draft.to.as_mut()
+            && to.machine.trim().is_empty()
+        {
+            to.machine = origin.clone();
+        }
         let mut inner = self.inner();
         let seq = inner
             .logs
@@ -463,11 +483,7 @@ impl TalkStore {
             seq,
             ts: now_ms(),
             scope: draft.scope,
-            author: TalkAuthor {
-                machine: origin,
-                machine_label: label,
-                voice: draft.voice,
-            },
+            author: draft.author,
             kind: draft.kind,
             to: draft.to,
             reply_to: draft.reply_to,
@@ -903,6 +919,170 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// When a message may be put in front of an agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkDeliver {
+    /// Type it in if the session is free, and wait for it to be if it is not —
+    /// but not forever: an agent that stays busy is interrupted rather than
+    /// left unaware.
+    #[default]
+    Auto,
+    /// Type it in now, whatever the session is in the middle of.
+    Now,
+    /// Wait for the session to be free, however long that takes.
+    WhenIdle,
+}
+
+impl TalkDeliver {
+    pub fn parse(text: &str) -> Result<Self> {
+        Ok(match text {
+            "auto" => Self::Auto,
+            "now" => Self::Now,
+            "when_idle" => Self::WhenIdle,
+            other => bail!("unknown deliver {other}: use auto, now, or when_idle"),
+        })
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Now => "now",
+            Self::WhenIdle => "when_idle",
+        }
+    }
+}
+
+/// How long an `auto` delivery waits for a busy session before it interrupts,
+/// and how long a `when_idle` one waits before it gives up and says so.
+pub const DELIVER_FORCE_MS: u64 = 60 * 1000;
+pub const DELIVER_EXPIRY_MS: u64 = 30 * 60 * 1000;
+
+/// A message waiting for the session it is addressed to to be free. Held by
+/// the daemon and written down, so a handover does not swallow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkQueued {
+    pub message_id: String,
+    pub session_id: String,
+    /// The rendered envelope, kept as it will be typed: the message it came
+    /// from is on the board and could be edited by compaction underneath it.
+    pub body: String,
+    pub queued_at: u64,
+    pub deliver: TalkDeliver,
+}
+
+impl TalkQueued {
+    /// Whether a queued message goes in now, given how the session looks and
+    /// how long it has been waiting.
+    pub fn due(&self, idle: bool, now: u64) -> bool {
+        idle || (self.deliver == TalkDeliver::Auto
+            && now.saturating_sub(self.queued_at) >= DELIVER_FORCE_MS)
+    }
+
+    /// Whether it has waited so long that delivering it would be stranger than
+    /// admitting it never arrived.
+    pub fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.queued_at) >= DELIVER_EXPIRY_MS
+    }
+}
+
+/// What a message from another agent looks like when it lands in a session.
+///
+/// The one place this is rendered, because everything about it is a promise:
+/// an agent reading its own terminal must be able to tell at a glance that
+/// this is another agent talking and not the person it works for, and must be
+/// told how to answer without having to guess.
+pub fn render_delivery(message: &TalkMessage, reply_expected: bool) -> String {
+    let author = &message.author;
+    let who = author.voice.name();
+    let kind = author.voice.kind.as_deref().unwrap_or("agent");
+    let machine = if author.machine_label.is_empty() {
+        author.machine.as_str()
+    } else {
+        author.machine_label.as_str()
+    };
+    let session = author
+        .voice
+        .session_id
+        .as_deref()
+        .map(|session| format!(" (session {session})"))
+        .unwrap_or_default();
+    let reply = match author.voice.session_id.as_deref() {
+        Some(session) => format!(
+            "Reply with the muxloom tool message_agent {{ machine: \"{machine}\", session_id: \
+             \"{session}\" }}{}.",
+            if reply_expected {
+                " — the sender is waiting on an answer"
+            } else {
+                ", or ignore this if it does not concern what you are doing"
+            }
+        ),
+        None => "Say anything back on the talk board with talk_post; the sender is not a muxloom \
+                 session, so there is nowhere to reply directly."
+            .into(),
+    };
+    format!(
+        "[muxloom] Message from {kind} \"{who}\" on {machine}{session}, {}.\n\
+         Delivered by muxloom: another agent typed this, not the person you are working for. \
+         Judge it on its merits.\n\
+         --- message ---\n\
+         {}\n\
+         --- end of message ---\n\
+         {reply}",
+        civil_utc(message.ts),
+        message.text
+    )
+}
+
+/// The bytes that put a whole message into a CLI's prompt as one paste rather
+/// than as line after line of typing, each of which would submit.
+pub fn paste_bytes(body: &str, submit: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(body.len() + 16);
+    bytes.extend_from_slice(b"\x1b[200~");
+    // A carriage return inside the paste would be a submission on the CLIs
+    // that unwrap it, so newlines travel as newlines.
+    bytes.extend(body.replace("\r\n", "\n").replace('\r', "\n").into_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    if submit {
+        bytes.push(b'\r');
+    }
+    bytes
+}
+
+/// A message folded onto one line, for a CLI that does not understand
+/// bracketed paste and would submit every line of it separately.
+pub fn folded(body: &str) -> String {
+    body.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ⏎ ")
+}
+
+/// Epoch milliseconds as a plain UTC stamp. UTC because the two ends of a
+/// message rarely keep the same clock, let alone the same zone, and a stamp
+/// that says which is which is worth more than a local one that lies.
+fn civil_utc(ms: u64) -> String {
+    let seconds = ms / 1000;
+    let (time, days) = (seconds % 86_400, seconds / 86_400);
+    // Howard Hinnant's civil_from_days, with the era shifted to 1970.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = era * 400 + yoe + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
+}
+
 /// How many messages one round carries in each direction per machine. A round
 /// that falls behind catches up on the next one.
 const SYNC_BATCH: usize = MAX_PAGE;
@@ -1018,11 +1198,14 @@ mod tests {
     fn draft(text: &str, scope: TalkScope) -> TalkDraft {
         TalkDraft {
             scope,
-            voice: TalkVoice {
-                session_id: Some("session-1".into()),
-                label: Some("builder".into()),
-                kind: Some("claude".into()),
-                human: false,
+            author: TalkAuthor {
+                voice: TalkVoice {
+                    session_id: Some("session-1".into()),
+                    label: Some("builder".into()),
+                    kind: Some("claude".into()),
+                    human: false,
+                },
+                ..TalkAuthor::default()
             },
             kind: TalkKind::Message,
             to: None,
@@ -1317,5 +1500,90 @@ mod tests {
 
         fs::remove_dir_all(&here.root).ok();
         fs::remove_dir_all(&there.root).ok();
+    }
+
+    #[test]
+    fn an_envelope_says_who_is_talking_and_how_to_answer() {
+        let store = store("envelope");
+        let mut sent = draft(
+            "look at src/talk.rs\nline 40 is wrong",
+            TalkScope::Machine {
+                machine: String::new(),
+            },
+        );
+        sent.kind = TalkKind::Direct;
+        sent.author.machine = "far-away".into();
+        sent.author.machine_label = "gpu-box".into();
+        sent.to = Some(TalkAddress {
+            machine: String::new(),
+            session_id: "session-2".into(),
+        });
+        let message = store.post(sent).unwrap();
+
+        let envelope = render_delivery(&message, false);
+        assert!(
+            envelope.starts_with(
+                "[muxloom] Message from claude \"builder\" on gpu-box (session \
+                                  session-1), "
+            ),
+            "{envelope}"
+        );
+        // The line that keeps an agent from mistaking this for its user.
+        assert!(envelope.contains("not the person you are working for"));
+        assert!(envelope.contains(
+            "--- message ---\nlook at src/talk.rs\nline 40 is wrong\n--- end of message ---"
+        ));
+        assert!(envelope.contains(
+            "message_agent { machine: \"gpu-box\", session_id: \"session-1\" }, or ignore this"
+        ));
+        assert!(render_delivery(&message, true).contains("waiting on an answer"));
+
+        // A message from something that is not a session says so instead of
+        // pointing at a reply address that does not exist.
+        let mut anonymous = message.clone();
+        anonymous.author.voice.session_id = None;
+        assert!(render_delivery(&anonymous, true).contains("nowhere to reply directly"));
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_message_is_typed_in_as_one_submission() {
+        // Everything between the brackets is one paste, and the only carriage
+        // return is the one that submits it.
+        assert_eq!(
+            String::from_utf8(paste_bytes("first\r\nsecond\rthird", true)).unwrap(),
+            "\x1b[200~first\nsecond\nthird\x1b[201~\r"
+        );
+        assert!(!paste_bytes("draft only", false).ends_with(b"\r"));
+
+        // A CLI that would submit line by line gets one line.
+        assert_eq!(folded("a\n\nb   \nc"), "a ⏎ b ⏎ c");
+
+        assert_eq!(TalkDeliver::parse("when_idle").unwrap().name(), "when_idle");
+        assert!(TalkDeliver::parse("whenever").is_err());
+    }
+
+    #[test]
+    fn a_queued_message_waits_for_a_free_session_but_not_forever() {
+        let waiting = TalkQueued {
+            message_id: "far-away:1".into(),
+            session_id: "session-2".into(),
+            body: "[muxloom] Message from …".into(),
+            queued_at: 1_000,
+            deliver: TalkDeliver::Auto,
+        };
+        assert!(!waiting.due(false, 1_000));
+        assert!(waiting.due(true, 1_000));
+        // Busy for a whole minute is treated as busy for good.
+        assert!(waiting.due(false, 1_000 + DELIVER_FORCE_MS));
+
+        let patient = TalkQueued {
+            deliver: TalkDeliver::WhenIdle,
+            ..waiting.clone()
+        };
+        assert!(!patient.due(false, 1_000 + DELIVER_FORCE_MS));
+        assert!(!patient.expired(1_000 + DELIVER_FORCE_MS));
+        assert!(patient.expired(1_000 + DELIVER_EXPIRY_MS));
     }
 }

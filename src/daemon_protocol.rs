@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     model::{DirectoryListing, FileListing, FilePreview},
-    talk::{TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
+    talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -330,6 +330,18 @@ pub enum DaemonRequest {
     TalkAppend {
         messages: Vec<TalkMessage>,
     },
+    /// Put a message in front of an agent session on this machine. The draft
+    /// says who is speaking and `to` says which session; the daemon renders
+    /// the envelope, decides whether the session is free enough to be typed
+    /// into, and files the message on its board either way.
+    TalkDeliver {
+        draft: TalkDraft,
+        #[serde(default)]
+        deliver: TalkDeliver,
+        /// Whether the envelope should say the sender is waiting on an answer.
+        #[serde(default)]
+        reply_expected: bool,
+    },
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -456,6 +468,17 @@ pub enum DaemonResponse {
         messages: Vec<TalkMessage>,
         #[serde(default)]
         added: usize,
+    },
+    /// Answers `TalkDeliver`: the message as it was filed, and whether it went
+    /// into the session or is waiting for it to be free.
+    TalkDelivery {
+        /// Boxed only to keep one message from setting the size of every
+        /// response that crosses the socket.
+        message: Box<TalkMessage>,
+        /// `delivered` or `queued`.
+        delivery: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Error {
         message: String,

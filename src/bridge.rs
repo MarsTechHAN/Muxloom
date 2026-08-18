@@ -23,7 +23,10 @@ use crate::{
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
-    talk::{TALK_CAPABILITY, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
+    talk::{
+        DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
+        TalkPage, TalkState, TalkVector,
+    },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -831,6 +834,34 @@ impl BridgeConnection {
             .response
         {
             DaemonResponse::TalkCarry { added, .. } => Ok(added),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
+    /// Hand a direct message to the machine the target session lives on. That
+    /// daemon renders the envelope and decides whether the session is free
+    /// enough to be typed into; what comes back is the message as it was
+    /// filed, and what became of it.
+    pub fn talk_deliver(
+        &self,
+        draft: TalkDraft,
+        deliver: TalkDeliver,
+        reply_expected: bool,
+    ) -> Result<(TalkMessage, String, Option<String>)> {
+        self.require_capability(DIRECT_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::TalkDeliver {
+                draft,
+                deliver,
+                reply_expected,
+            })?
+            .response
+        {
+            DaemonResponse::TalkDelivery {
+                message,
+                delivery,
+                reason,
+            } => Ok((*message, delivery, reason)),
             response => bail!("unexpected talk response: {response:?}"),
         }
     }
@@ -2112,6 +2143,17 @@ impl BridgePool {
         limit: usize,
     ) -> Result<Vec<TalkMessage>> {
         self.connection_for_target(target)?.talk_fetch(from, limit)
+    }
+
+    pub fn talk_deliver(
+        &self,
+        target: &Target,
+        draft: TalkDraft,
+        deliver: TalkDeliver,
+        reply_expected: bool,
+    ) -> Result<(TalkMessage, String, Option<String>)> {
+        self.connection_for_target(target)?
+            .talk_deliver(draft, deliver, reply_expected)
     }
 
     pub fn talk_append(&self, target: &Target, messages: Vec<TalkMessage>) -> Result<usize> {
