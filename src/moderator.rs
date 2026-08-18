@@ -94,12 +94,32 @@ pub fn root(state_dir: &Path) -> PathBuf {
 /// the path arrives from the daemon as a string, and the folder may not exist
 /// any more by the time an archived session is listed.
 pub fn is_moderator_path(state_dir: &Path, path: &str) -> bool {
-    let root = root(state_dir);
-    let root = root.to_string_lossy();
-    let root = root.trim_end_matches('/');
-    let path = path.trim_end_matches('/');
-    path.strip_prefix(root)
+    under(&root(state_dir).to_string_lossy(), path, cfg!(windows))
+}
+
+/// Whether `path` names `root` itself or something inside it. `windows` picks
+/// the spelling rules rather than the platform, so both sets are testable
+/// wherever the tests run.
+fn under(root: &str, path: &str, windows: bool) -> bool {
+    let root = comparable(root, windows);
+    let path = comparable(path, windows);
+    path.strip_prefix(&root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Reduce a path to a spelling that two names for the same place agree on.
+/// Windows writes the separator either way and does not care about case, and
+/// the state directory and a path reported by a session need not have been
+/// built the same way — `Path::join` there leaves a backslash in the middle of
+/// a path spelled with slashes. On Unix a backslash is an ordinary character
+/// in a name and case is meaningful, so there both are left alone.
+fn comparable(path: &str, windows: bool) -> String {
+    let path = if windows {
+        path.replace('\\', "/").to_lowercase()
+    } else {
+        path.to_string()
+    };
+    path.trim_end_matches('/').to_string()
 }
 
 /// Create this moderator's folder and leave the briefing in it, returning the
@@ -306,5 +326,44 @@ mod tests {
             state,
             "/home/me/.local/state/muxloom/projects-old/lead"
         ));
+    }
+
+    /// On Windows the same folder has several spellings, and the two sides of
+    /// this comparison are built differently: the root comes from `Path::join`
+    /// and the path from whatever the session reported. Checked here rather
+    /// than only on a Windows runner, or it is only ever checked in CI.
+    #[test]
+    fn windows_matches_a_folder_through_either_separator_and_either_case() {
+        let root = r"C:\Users\Me\AppData\Roaming\muxloom\projects";
+        assert!(under(
+            root,
+            r"C:\Users\Me\AppData\Roaming\muxloom\projects\lead",
+            true
+        ));
+        assert!(under(
+            root,
+            "C:/Users/me/AppData/Roaming/muxloom/projects/lead",
+            true
+        ));
+        assert!(under(
+            root,
+            r"C:\Users\Me\AppData\Roaming\muxloom\projects",
+            true
+        ));
+        assert!(!under(root, r"C:\Works\Terminal", true));
+        assert!(!under(
+            root,
+            r"C:\Users\Me\AppData\Roaming\muxloom\projects-old\lead",
+            true
+        ));
+        // A root that Path::join left with a mixed separator still matches.
+        assert!(under(
+            r"/home/me/.local/state/muxloom\projects",
+            "/home/me/.local/state/muxloom/projects/lead",
+            true
+        ));
+        // Unix keeps both: a backslash is part of the name, and case counts.
+        assert!(!under("/home/me/projects", "/home/me/Projects/lead", false));
+        assert!(!under(r"C:\me\projects", r"C:\me\projects\lead", false));
     }
 }
