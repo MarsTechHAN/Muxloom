@@ -73,6 +73,10 @@ pub struct LaunchForm {
 pub struct ScopeItem {
     /// What the moderator's briefing calls it.
     pub label: String,
+    /// The machine it is on, by target id. A machine names itself; an agent
+    /// names where it runs, which is what lets the agent list follow the
+    /// machines that are still checked.
+    pub machine: String,
     pub selected: bool,
 }
 
@@ -111,7 +115,7 @@ impl ModeratorForm {
         ];
         rows.extend((0..self.machines.len()).map(ModeratorRow::Machine));
         rows.push(ModeratorRow::AgentsHeader);
-        rows.extend((0..self.agents.len()).map(ModeratorRow::Agent));
+        rows.extend(self.visible_agents().into_iter().map(ModeratorRow::Agent));
         rows
     }
 
@@ -122,9 +126,29 @@ impl ModeratorForm {
             .unwrap_or(ModeratorRow::Kind)
     }
 
+    /// The agents worth choosing between: the ones on machines that are still
+    /// checked. Unchecking a machine takes its agents out of the list rather
+    /// than leaving them there to be handed to a moderator that was told not
+    /// to look at that machine at all.
+    pub fn visible_agents(&self) -> Vec<usize> {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| self.machine_chosen(&agent.machine))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn machine_chosen(&self, machine: &str) -> bool {
+        self.machines
+            .iter()
+            .any(|item| item.machine == machine && item.selected)
+    }
+
     /// The checked labels, or an empty list when everything is checked — the
     /// briefing says "every machine" rather than listing the fleet back.
-    fn chosen(items: &[ScopeItem]) -> Vec<String> {
+    fn chosen<'a>(items: impl IntoIterator<Item = &'a ScopeItem>) -> Vec<String> {
+        let items: Vec<&ScopeItem> = items.into_iter().collect();
         if items.iter().all(|item| item.selected) {
             return Vec::new();
         }
@@ -139,8 +163,14 @@ impl ModeratorForm {
         Self::chosen(&self.machines)
     }
 
+    /// Only the agents still on show: one on a machine the moderator was told
+    /// to leave alone is out of scope whether or not its box was ever cleared.
     pub fn chosen_agents(&self) -> Vec<String> {
-        Self::chosen(&self.agents)
+        Self::chosen(
+            self.visible_agents()
+                .into_iter()
+                .map(|index| &self.agents[index]),
+        )
     }
 }
 
@@ -6492,22 +6522,38 @@ impl App {
             .filter(|status| status.enabled)
             .map(|status| ScopeItem {
                 label: status.target.label.clone(),
+                machine: status.target.id.clone(),
                 selected: true,
             })
             .collect::<Vec<_>>();
-        let agents = self
+        // Every agent the fleet has, not this machine's: a moderator that can
+        // only hand work to what happens to be running beside it is no use on
+        // a fleet. They are grouped by machine in the order the machines are
+        // listed, so the column reads the way the one above it does.
+        let mut agents = self
             .sessions
             .iter()
             .filter(|session| {
                 !session.dead
                     && session.kind != AgentKind::Terminal
                     && !self.is_moderator_session(session)
+                    && machines
+                        .iter()
+                        .any(|machine| machine.machine == session.target_id)
             })
             .map(|session| ScopeItem {
                 label: self.scope_line(session),
+                machine: session.target_id.clone(),
                 selected: true,
             })
             .collect::<Vec<_>>();
+        agents.sort_by_cached_key(|agent| {
+            let machine = machines
+                .iter()
+                .position(|item| item.machine == agent.machine)
+                .unwrap_or(usize::MAX);
+            (machine, agent.label.to_lowercase())
+        });
         let kinds = self.moderator_kinds();
         let kind = self
             .state
@@ -8200,9 +8246,19 @@ impl App {
                             form.agents[index].selected = !form.agents[index].selected;
                         }
                         ModeratorRow::MachinesHeader => toggle_all(&mut form.machines),
-                        ModeratorRow::AgentsHeader => toggle_all(&mut form.agents),
+                        ModeratorRow::AgentsHeader => {
+                            let visible = form.visible_agents();
+                            let all = visible.iter().all(|&index| form.agents[index].selected);
+                            for index in visible {
+                                form.agents[index].selected = !all;
+                            }
+                        }
                         ModeratorRow::Kind | ModeratorRow::Name => {}
                     }
+                    // A machine that just went out of scope took its agents
+                    // off the column with it, so the cursor may be past the
+                    // end of a list that is shorter than it was a key ago.
+                    form.selected = form.selected.min(form.rows().len().saturating_sub(1));
                     self.modal = Some(Modal::Moderator(form));
                 }
                 KeyCode::Enter => self.launch_moderator(form),
@@ -13870,6 +13926,58 @@ mod tests {
         // person who reads the brief back.
         form.machines[1].selected = false;
         assert_eq!(form.chosen_machines(), vec!["This machine".to_string()]);
+    }
+
+    /// A moderator hands work to the fleet, so the agents it can be pointed at
+    /// are the fleet's — and unchecking a machine takes that machine's agents
+    /// out of the question rather than leaving them on the list.
+    #[test]
+    fn the_agents_on_offer_are_every_machines_and_follow_the_machines_chosen() {
+        let mut app = ux_test_app(vec![Target::local(), Target::ssh("gpu")]);
+        let session = |id: &str, machine: &str| AgentSession {
+            id: id.into(),
+            target_id: machine.into(),
+            kind: AgentKind::Claude,
+            path: "/work".into(),
+            label: id.into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+        };
+        app.sessions = vec![session("far", "gpu"), session("near", "local")];
+        app.select_machine_row(MachineRow::Moderators);
+        app.open_launch();
+        let Some(Modal::Moderator(mut form)) = app.modal.clone() else {
+            panic!("the moderators row starts a moderator");
+        };
+
+        // Both machines' agents, checked, and grouped the way the machines are
+        // listed rather than in whatever order the scans came back.
+        assert_eq!(form.agents.len(), 2);
+        assert!(form.agents[0].label.contains("near"), "{:?}", form.agents);
+        assert!(form.agents[1].label.contains("far"), "{:?}", form.agents);
+        assert!(form.chosen_agents().is_empty(), "all checked is 'every'");
+
+        // Dropping the remote drops its agent from the column and from the
+        // brief, and what is left still reads as "all of them".
+        form.machines[1].selected = false;
+        assert_eq!(form.visible_agents(), vec![0]);
+        assert!(
+            !form
+                .rows()
+                .contains(&ModeratorRow::Agent(form.agents.len() - 1))
+        );
+        assert!(form.chosen_agents().is_empty(), "every agent still there");
+
+        // And with the remote back, clearing one box names the rest.
+        form.machines[1].selected = true;
+        form.agents[0].selected = false;
+        assert_eq!(form.chosen_agents().len(), 1);
+        assert!(form.chosen_agents()[0].contains("far"));
     }
 
     #[test]

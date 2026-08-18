@@ -4334,11 +4334,20 @@ fn draw_moderator_modal(
         let active = index == form.selected;
         let (text, style) = match *row {
             ModeratorRow::MachinesHeader => (
-                moderator_group_line("Machines", &form.machines),
+                moderator_group_line("Machines", &form.machines.iter().collect::<Vec<_>>()),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
+            // Counted over what is on show: agents on unchecked machines are
+            // not "unchosen", they are not on offer.
             ModeratorRow::AgentsHeader => (
-                moderator_group_line("Agents", &form.agents),
+                moderator_group_line(
+                    "Agents",
+                    &form
+                        .visible_agents()
+                        .into_iter()
+                        .map(|item| &form.agents[item])
+                        .collect::<Vec<_>>(),
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             ModeratorRow::Machine(item) => (
@@ -4379,7 +4388,7 @@ fn draw_moderator_modal(
 /// A group header, carrying what its checkboxes currently add up to. "All"
 /// matters because it is the one answer the briefing writes as "every machine",
 /// including the ones that appear after the moderator starts.
-fn moderator_group_line(title: &str, items: &[crate::app::ScopeItem]) -> String {
+fn moderator_group_line(title: &str, items: &[&crate::app::ScopeItem]) -> String {
     let chosen = items.iter().filter(|item| item.selected).count();
     let summary = if items.is_empty() {
         "none to choose from".into()
