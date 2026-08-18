@@ -19,13 +19,15 @@ use sha2::{Digest, Sha256};
 use crate::{
     daemon_protocol::{
         DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
-        OpenStream, PROTOCOL_VERSION, stream,
+        OpenStream, PROTOCOL_VERSION, Trigger, stream,
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+/// Keeping standing watches on session screens.
+const TRIGGERS_CAPABILITY: &str = "triggers-v1";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Bytes the outbound frame queue may hold before producers wait. Large enough
 /// that an upload keeps several 64 KiB chunks in flight, small enough that a
@@ -747,6 +749,36 @@ impl BridgeConnection {
 
     fn set_attention_patterns(&self, patterns: Vec<String>) -> Result<()> {
         self.expect_ack(DaemonRequest::SetAttentionPatterns { patterns })
+    }
+
+    pub fn set_trigger(&self, trigger: Trigger) -> Result<Trigger> {
+        self.require_capability(TRIGGERS_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::SetTrigger { trigger })?
+            .response
+        {
+            DaemonResponse::Triggers { triggers } => triggers
+                .into_iter()
+                .next()
+                .context("muxloomd stored the trigger but did not report it back"),
+            response => bail!("unexpected trigger response: {response:?}"),
+        }
+    }
+
+    pub fn list_triggers(&self, session_id: Option<String>) -> Result<Vec<Trigger>> {
+        self.require_capability(TRIGGERS_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::ListTriggers { session_id })?
+            .response
+        {
+            DaemonResponse::Triggers { triggers } => Ok(triggers),
+            response => bail!("unexpected trigger response: {response:?}"),
+        }
+    }
+
+    pub fn delete_trigger(&self, id: String) -> Result<()> {
+        self.require_capability(TRIGGERS_CAPABILITY)?;
+        self.expect_ack(DaemonRequest::DeleteTrigger { id })
     }
 
     fn has_capability(&self, capability: &str) -> bool {
@@ -1988,6 +2020,23 @@ impl BridgePool {
     pub fn send_input(&self, target: &Target, session_id: String, bytes: Vec<u8>) -> Result<()> {
         self.connection_for_target(target)?
             .send_input(session_id, bytes)
+    }
+
+    pub fn set_trigger(&self, target: &Target, trigger: Trigger) -> Result<Trigger> {
+        self.connection_for_target(target)?.set_trigger(trigger)
+    }
+
+    pub fn list_triggers(
+        &self,
+        target: &Target,
+        session_id: Option<String>,
+    ) -> Result<Vec<Trigger>> {
+        self.connection_for_target(target)?
+            .list_triggers(session_id)
+    }
+
+    pub fn delete_trigger(&self, target: &Target, id: String) -> Result<()> {
+        self.connection_for_target(target)?.delete_trigger(id)
     }
 
     /// The serving daemon's pid and client count.

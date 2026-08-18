@@ -27,7 +27,7 @@ mod platform {
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession,
             Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PROTOCOL_VERSION, StreamOpened,
-            stream,
+            Trigger, TriggerAction, stream,
         },
         keeper,
         model::{
@@ -63,6 +63,13 @@ mod platform {
     const FORWARD_CAPABILITY: &str = "tcp-forward-v1";
     /// Reporting which TCP ports the far end is listening on.
     const LISTENERS_CAPABILITY: &str = "tcp-listeners-v1";
+    /// The most triggers one daemon keeps at a time. Each one costs a screen
+    /// render per output frame on the session it watches; a set this long is a
+    /// client that stopped cleaning up after itself.
+    const TRIGGER_LIMIT: usize = 64;
+    /// The shortest gap a trigger may ask for between two firings.
+    const TRIGGER_MIN_COOLDOWN_MS: u64 = 250;
+    static TRIGGER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -74,6 +81,7 @@ mod platform {
         pub history: PathBuf,
         pub sessions: PathBuf,
         pub keepers: PathBuf,
+        pub triggers: PathBuf,
     }
 
     impl DaemonPaths {
@@ -99,6 +107,7 @@ mod platform {
                 history: root.join("history"),
                 sessions: root.join("sessions"),
                 keepers: root.join("keepers"),
+                triggers: root.join("triggers.json"),
                 root,
             }
         }
@@ -132,6 +141,21 @@ mod platform {
         /// the built-in classification on every snapshot. Shared with every
         /// session so an update reaches sessions launched before it arrived.
         attention_patterns: Arc<Mutex<Vec<String>>>,
+        /// Standing watches on session screens, kept for whoever armed them.
+        triggers: Mutex<Vec<ArmedTrigger>>,
+        /// How many triggers exist at all. Session readers see every byte a
+        /// PTY produces, so the common case — a daemon with no triggers —
+        /// must cost one relaxed load and nothing else.
+        armed: AtomicUsize,
+    }
+
+    /// A stored trigger plus the edge state that decides when it fires.
+    struct ArmedTrigger {
+        spec: Trigger,
+        /// Whether the pattern was on screen the last time this was looked at.
+        /// A match fires on the way in, so a pattern that simply stays there —
+        /// a prompt nobody answered — fires once rather than forever.
+        matched: bool,
     }
 
     /// How a launch obtains its keeper. Real daemons spawn the detached
@@ -172,6 +196,10 @@ mod platform {
         screen: Mutex<vt100::Parser>,
         codex_activity: Mutex<CodexActivity>,
         recent_output: Mutex<Vec<u8>>,
+        /// What a `notify` trigger left for whoever looks next. It reads as an
+        /// attention reason until someone types into the session, which is the
+        /// one signal that the message was seen.
+        notice: Mutex<Option<String>>,
         history_path: PathBuf,
         metadata_path: PathBuf,
         archived: AtomicBool,
@@ -265,6 +293,8 @@ mod platform {
     impl DaemonState {
         fn new(paths: DaemonPaths, keeper_mode: KeeperMode) -> Self {
             let persisted_sessions = recover_persisted_sessions(&paths);
+            let triggers = load_triggers(&paths.triggers);
+            let armed = AtomicUsize::new(triggers.len());
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
@@ -277,6 +307,213 @@ mod platform {
                 paths,
                 keeper_mode,
                 attention_patterns: Arc::new(Mutex::new(Vec::new())),
+                triggers: Mutex::new(triggers),
+                armed,
+            }
+        }
+
+        /// Write the triggers out. Called while holding the trigger lock, so
+        /// the file never records a set the daemon does not hold.
+        fn save_triggers(&self, triggers: &[ArmedTrigger]) {
+            let specs: Vec<&Trigger> = triggers.iter().map(|armed| &armed.spec).collect();
+            if let Err(error) = write_triggers(&self.paths.triggers, &specs) {
+                eprintln!("muxloomd could not persist its triggers: {error:#}");
+            }
+        }
+
+        /// Drop every trigger armed on a session that no longer exists. A
+        /// pattern can never reach a screen that is gone, so keeping them
+        /// would only leave the file growing across restarts.
+        fn drop_triggers_for(&self, session_id: &str) {
+            let mut triggers = self
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = triggers.len();
+            triggers.retain(|armed| armed.spec.session_id != session_id);
+            if triggers.len() == before {
+                return;
+            }
+            self.armed.store(triggers.len(), Ordering::Relaxed);
+            self.save_triggers(&triggers);
+        }
+    }
+
+    /// The triggers a previous daemon left behind. A file that cannot be read
+    /// is not worth refusing to serve over: the sessions matter more, and the
+    /// next write replaces it.
+    fn load_triggers(path: &Path) -> Vec<ArmedTrigger> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => return Vec::new(),
+        };
+        match serde_json::from_str::<Vec<Trigger>>(&text) {
+            Ok(triggers) => triggers
+                .into_iter()
+                .map(|spec| ArmedTrigger {
+                    spec,
+                    // Nothing has been looked at yet, and the screens are
+                    // whatever the sessions were left showing. Starting
+                    // unmatched would fire every trigger whose pattern is
+                    // still on screen the moment output resumes; starting
+                    // matched waits for the pattern to arrive again.
+                    matched: true,
+                })
+                .collect(),
+            Err(error) => {
+                eprintln!("muxloomd could not read {}: {error}", path.display());
+                Vec::new()
+            }
+        }
+    }
+
+    fn write_triggers(path: &Path, triggers: &[&Trigger]) -> Result<()> {
+        let text = serde_json::to_string_pretty(triggers)?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, text)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Arm a trigger, replacing one with the same id. The session has to
+    /// exist: a watch on a name nothing answers to would sit in the file
+    /// forever, and the client that asked would never learn why.
+    fn set_trigger(state: &DaemonState, mut trigger: Trigger) -> Result<Trigger> {
+        if trigger.pattern.trim().is_empty() {
+            bail!("a trigger needs a pattern to watch for");
+        }
+        let session = daemon_session(state, &trigger.session_id)?;
+        if trigger.id.trim().is_empty() {
+            trigger.id = format!(
+                "trg-{:x}-{:x}",
+                now_ms(),
+                TRIGGER_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+        }
+        trigger.created_at = now_ms();
+        trigger.cooldown_ms = trigger.cooldown_ms.max(TRIGGER_MIN_COOLDOWN_MS);
+        trigger.last_fired_at = None;
+        trigger.fires = 0;
+        // What is on screen already is what the client just read. A trigger
+        // waits for its pattern to arrive, so text that is there when it is
+        // armed counts as seen rather than as an immediate match.
+        let matched = session
+            .screen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .screen()
+            .contents()
+            .to_lowercase()
+            .contains(&trigger.pattern.to_lowercase());
+        let mut triggers = state
+            .triggers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let armed = ArmedTrigger {
+            spec: trigger.clone(),
+            matched,
+        };
+        match triggers
+            .iter_mut()
+            .find(|existing| existing.spec.id == trigger.id)
+        {
+            Some(existing) => *existing = armed,
+            None => {
+                if triggers.len() >= TRIGGER_LIMIT {
+                    bail!(
+                        "this machine already holds {TRIGGER_LIMIT} triggers; delete one before \
+                         arming another"
+                    );
+                }
+                triggers.push(armed);
+            }
+        }
+        state.armed.store(triggers.len(), Ordering::Relaxed);
+        state.save_triggers(&triggers);
+        Ok(trigger)
+    }
+
+    /// Whether an armed trigger fires on a frame whose screen does (`hit`) or
+    /// does not carry its pattern.
+    ///
+    /// A trigger fires on the way *into* a match: text already on the screen
+    /// when it was armed never counts, and a screen that goes on showing the
+    /// match does not fire it again. The cooldown then debounces a pattern
+    /// that flickers in and out — a shell prompt scrolling past, say.
+    fn trigger_fires(armed: &ArmedTrigger, hit: bool, now: u64) -> bool {
+        hit && !armed.matched
+            && !armed
+                .spec
+                .last_fired_at
+                .is_some_and(|last| now.saturating_sub(last) < armed.spec.cooldown_ms)
+    }
+
+    /// Look at one session's screen for the triggers armed on it, and run what
+    /// matched. Runs on that session's reader thread, after the bytes have
+    /// reached the screen, so a trigger sees exactly the text the attention
+    /// classification and `read_screen` see.
+    fn fire_triggers(state: &DaemonState, session: &ManagedSession, session_id: &str) {
+        let mut fired = Vec::new();
+        {
+            let mut triggers = state
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !triggers
+                .iter()
+                .any(|armed| armed.spec.session_id == session_id)
+            {
+                return;
+            }
+            // Only now, with a trigger known to be watching, is rendering the
+            // screen worth it.
+            let screen = session
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .screen()
+                .contents()
+                .to_lowercase();
+            let now = now_ms();
+            let mut changed = false;
+            triggers.retain_mut(|armed| {
+                if armed.spec.session_id != session_id {
+                    return true;
+                }
+                let hit = screen.contains(&armed.spec.pattern.to_lowercase());
+                let fires = trigger_fires(armed, hit, now);
+                armed.matched = hit;
+                if !fires {
+                    return true;
+                }
+                armed.spec.last_fired_at = Some(now);
+                armed.spec.fires += 1;
+                changed = true;
+                fired.push(armed.spec.clone());
+                !armed.spec.once
+            });
+            if changed {
+                state.armed.store(triggers.len(), Ordering::Relaxed);
+                state.save_triggers(&triggers);
+            }
+        }
+        // Outside the lock: an action writes to the keeper, and a trigger set
+        // must never be held across a write to a session.
+        for spec in fired {
+            match spec.action {
+                TriggerAction::SendInput { text, submit } => {
+                    let mut bytes = text.into_bytes();
+                    if submit {
+                        bytes.push(b'\r');
+                    }
+                    if let Err(error) = session.write_input(&bytes) {
+                        eprintln!("muxloomd trigger {} could not type: {error:#}", spec.id);
+                    }
+                }
+                TriggerAction::Notify { text } => session.set_notice(text),
             }
         }
     }
@@ -1152,6 +1389,7 @@ mod platform {
                             FORWARD_CAPABILITY.into(),
                             LISTENERS_CAPABILITY.into(),
                             "handover-drain-v1".into(),
+                            "triggers-v1".into(),
                         ],
                     },
                 )
@@ -1284,6 +1522,47 @@ mod platform {
             }
             DaemonRequest::SendInput { session_id, bytes } => {
                 daemon_session(state, &session_id)?.write_input(&bytes)?;
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::SetTrigger { trigger } => {
+                let stored = set_trigger(state, trigger)?;
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::Triggers {
+                        triggers: vec![stored],
+                    },
+                )
+            }
+            DaemonRequest::ListTriggers { session_id } => {
+                let triggers = state
+                    .triggers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .filter(|armed| {
+                        session_id
+                            .as_ref()
+                            .is_none_or(|wanted| &armed.spec.session_id == wanted)
+                    })
+                    .map(|armed| armed.spec.clone())
+                    .collect();
+                write_response(writer, request_id, &DaemonResponse::Triggers { triggers })
+            }
+            DaemonRequest::DeleteTrigger { id } => {
+                {
+                    let mut triggers = state
+                        .triggers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let before = triggers.len();
+                    triggers.retain(|armed| armed.spec.id != id);
+                    if triggers.len() == before {
+                        bail!("no trigger {id}");
+                    }
+                    state.armed.store(triggers.len(), Ordering::Relaxed);
+                    state.save_triggers(&triggers);
+                }
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::SetAttentionPatterns { patterns } => {
@@ -1627,6 +1906,7 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            notice: Mutex::new(None),
             history_path,
             metadata_path,
             archived: AtomicBool::new(false),
@@ -1682,12 +1962,18 @@ mod platform {
     ) {
         let state = Arc::clone(state);
         thread::spawn(move || {
+            let watched = session.session_id();
             let exited = loop {
                 match keeper::read_frame(&mut stream) {
                     Ok(Some((keeper::frame::DATA, payload))) => {
                         session.last_output.store(now_ms(), Ordering::Relaxed);
                         session.record_output(&payload);
                         session.broadcast(&payload);
+                        // Every byte this session produces passes here, so a
+                        // daemon nobody armed pays one relaxed load for it.
+                        if state.armed.load(Ordering::Relaxed) > 0 {
+                            fire_triggers(&state, &session, &watched);
+                        }
                     }
                     Ok(Some((keeper::frame::EXITED, _))) => break true,
                     Ok(Some(_)) => {}
@@ -1720,6 +2006,7 @@ mod platform {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&session.session_id());
                 }
+                state.drop_triggers_for(&watched);
                 session.send_quit();
                 return;
             }
@@ -1727,18 +2014,20 @@ mod platform {
                 if still_tracked {
                     session.mark_dead();
                 }
+                state.drop_triggers_for(&watched);
                 session.send_quit();
                 return;
             }
             // The stream ended without an exit: the keeper crashed, or a newer
             // daemon adopted the session out from under a draining one. Only
             // the crash is a death — a drain leaves the record alone for the
-            // generation that took over.
+            // generation that took over, and so do the triggers armed on it.
             if still_tracked
                 && !state.draining.load(Ordering::Acquire)
                 && !state.shutdown.load(Ordering::Acquire)
             {
                 session.mark_dead();
+                state.drop_triggers_for(&watched);
             }
         });
     }
@@ -1981,6 +2270,7 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            notice: Mutex::new(None),
             history_path,
             metadata_path,
             archived: AtomicBool::new(archived),
@@ -2409,6 +2699,18 @@ mod platform {
                         } else {
                             agent_is_working(kind, &visible_screen)
                         };
+                    // A trigger that fired asked for someone: it outranks the
+                    // classification, which only knows what is on screen.
+                    if let Some(notice) = self
+                        .notice
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                    {
+                        snapshot.attention_reason = Some(notice);
+                        snapshot.needs_attention = true;
+                        snapshot.working = false;
+                    }
                 }
             }
             snapshot
@@ -2445,7 +2747,21 @@ mod platform {
         }
 
         fn write_input(&self, bytes: &[u8]) -> Result<()> {
+            // Someone is typing here, so whatever a trigger wanted looked at
+            // has been looked at.
+            self.notice
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             self.keeper_frame(keeper::frame::DATA, bytes)
+        }
+
+        fn set_notice(&self, text: String) {
+            *self
+                .notice
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(text);
+            let _ = self.persist_metadata();
         }
 
         fn archive(&self) -> Result<()> {
@@ -3712,6 +4028,75 @@ mod platform {
             let paths = DaemonPaths::under(root);
             paths.prepare().unwrap();
             Arc::new(DaemonState::new(paths, KeeperMode::InProcess))
+        }
+
+        fn armed_trigger(
+            matched: bool,
+            cooldown_ms: u64,
+            last_fired_at: Option<u64>,
+        ) -> ArmedTrigger {
+            ArmedTrigger {
+                spec: Trigger {
+                    id: "trg-1".into(),
+                    session_id: "session-1".into(),
+                    pattern: "Ready".into(),
+                    action: TriggerAction::Notify {
+                        text: "it said ready".into(),
+                    },
+                    once: false,
+                    cooldown_ms,
+                    created_at: 100,
+                    last_fired_at,
+                    fires: 0,
+                },
+                matched,
+            }
+        }
+
+        #[test]
+        fn a_trigger_fires_on_arrival_and_not_while_its_pattern_sits_there() {
+            // The pattern arrives.
+            assert!(trigger_fires(&armed_trigger(false, 0, None), true, 1_000));
+            // It is still there on the next frame, and on every frame after.
+            assert!(!trigger_fires(&armed_trigger(true, 0, None), true, 1_000));
+            // It goes away without firing anything.
+            assert!(!trigger_fires(&armed_trigger(true, 0, None), false, 1_000));
+            // A pattern that flickers back inside the cooldown is one event.
+            assert!(!trigger_fires(
+                &armed_trigger(false, 5_000, Some(1_000)),
+                true,
+                3_000
+            ));
+            // Past the cooldown it is a new one.
+            assert!(trigger_fires(
+                &armed_trigger(false, 5_000, Some(1_000)),
+                true,
+                6_000
+            ));
+        }
+
+        #[test]
+        fn a_trigger_outlives_the_daemon_that_took_it() {
+            let state = test_state("triggers-reload");
+            state.save_triggers(&[armed_trigger(false, 5_000, Some(400))]);
+
+            // What a handover leaves behind is a file, so the next generation
+            // is the one that has to make sense of it.
+            let restarted = DaemonState::new(state.paths.clone(), KeeperMode::InProcess);
+            let triggers = restarted
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(triggers.len(), 1);
+            assert_eq!(restarted.armed.load(Ordering::Relaxed), 1);
+            assert_eq!(triggers[0].spec.pattern, "Ready");
+            assert_eq!(triggers[0].spec.last_fired_at, Some(400));
+            // A restored screen is not a new arrival: whatever is on it when
+            // the daemon comes back counts as already seen.
+            assert!(triggers[0].matched);
+            drop(triggers);
+
+            fs::remove_dir_all(&state.paths.root).ok();
         }
 
         #[test]

@@ -289,6 +289,60 @@ pub enum DaemonRequest {
         script: String,
         environment: Vec<(String, String)>,
     },
+    /// Arm a standing watch on a session's screen. The daemon keeps it after
+    /// the client that asked for it is gone, which is the whole point: an
+    /// agent that has finished its turn is not there to look.
+    SetTrigger {
+        trigger: Trigger,
+    },
+    ListTriggers {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    DeleteTrigger {
+        id: String,
+    },
+}
+
+/// What a [`Trigger`] does when its pattern reaches a session's screen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerAction {
+    /// Type back into the session that matched.
+    SendInput {
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
+    /// Flag the session as waiting for someone, with this as the reason. It
+    /// reads exactly like the built-in classification, so it reaches every
+    /// dashboard and every `list_sessions` without another channel.
+    Notify { text: String },
+}
+
+/// A pattern the daemon watches one session's screen for, and what it does
+/// when it appears. Triggers are persisted, so they outlive the daemon that
+/// took them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Trigger {
+    /// Assigned by the daemon when a client leaves it empty.
+    #[serde(default)]
+    pub id: String,
+    pub session_id: String,
+    pub pattern: String,
+    pub action: TriggerAction,
+    /// Whether the trigger is removed once it has fired.
+    #[serde(default)]
+    pub once: bool,
+    /// The shortest gap between two firings of the same trigger.
+    #[serde(default)]
+    pub cooldown_ms: u64,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_fired_at: Option<u64>,
+    #[serde(default)]
+    pub fires: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,6 +408,11 @@ pub enum DaemonResponse {
     },
     ShellComplete {
         exit_code: i32,
+    },
+    /// Answers both `SetTrigger` (the one stored, with the id it was given)
+    /// and `ListTriggers`.
+    Triggers {
+        triggers: Vec<Trigger>,
     },
     Error {
         message: String,

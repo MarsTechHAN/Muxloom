@@ -14,13 +14,18 @@
 //! (used by `muxloom mcp`). The daemon surface omits the `machine` parameter
 //! and the discovery tools that need a controller's view.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
     config::{Config, McpConfig, State, default_state_path},
+    daemon_protocol::{DaemonSession, Trigger, TriggerAction},
     model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Target},
     runtime::Runtime,
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
@@ -56,6 +61,19 @@ const SCREEN_COLUMNS_LIMIT: usize = 1_000;
 const SEARCH_MAX_MATCHES: usize = 12;
 /// The most bytes of one shell stream a tool answer carries.
 const SHELL_OUTPUT_LIMIT: usize = 128 * 1024;
+/// How many rendered rows one round of a wait looks at.
+const WAIT_SCREEN_LINES: usize = 80;
+/// How many of those rows the answer carries back.
+const WAIT_TAIL_LINES: usize = 30;
+/// How long a wait runs when the caller does not say, and the most it may ask
+/// for. The ceiling is under every MCP client's own call timeout: a wait that
+/// ends saying "not yet" is answerable, one the transport gives up on is not.
+const WAIT_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const WAIT_MAX_TIMEOUT_SECONDS: u64 = 900;
+/// Consecutive failed looks a wait rides out before reporting them. A daemon
+/// handing over to a new generation is unreachable for a moment, and a wait
+/// that outlives conversations must outlive that too.
+const WAIT_ERROR_TOLERANCE: usize = 3;
 
 /// Every tool that changes something rather than reporting it. `read_only`
 /// denies exactly this set, so a tool added here is denied by that switch from
@@ -68,6 +86,7 @@ const WRITE_TOOLS: &[&str] = &[
     "run_shell",
     "set_machine_enabled",
     "ssh_host",
+    "trigger",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,6 +316,66 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         ),
     });
     tools.push(ToolSpec {
+        name: "wait_for",
+        description: format!(
+            "Wait for a session to reach a state, instead of calling read_screen in a loop. \
+             `until` is one of: idle (not working and not waiting on anything), attention (it is \
+             waiting for a human — a prompt, a permission question), output_matches (`pattern` \
+             appears on the screen, matched case-insensitively), silence (the screen stops \
+             changing for `quiet_seconds`), exit (the session ends). Returns the moment it \
+             happens, or with outcome \"timeout\" after `timeout_seconds` (default \
+             {WAIT_DEFAULT_TIMEOUT_SECONDS}, max {WAIT_MAX_TIMEOUT_SECONDS}) — a timeout is not a \
+             failure, call it again to keep waiting. This is the tool to reach for after \
+             send_input; to be told about something you will not be here for, use trigger."
+        ),
+        input_schema: schema(
+            multi,
+            json!({
+                "session_id": { "type": "string", "description": "Session id from list_sessions." },
+                "until": {
+                    "type": "string",
+                    "enum": ["idle", "attention", "output_matches", "silence", "exit"],
+                },
+                "pattern": { "type": "string", "description": "Text to wait for; required by until=output_matches." },
+                "timeout_seconds": { "type": "integer", "description": "How long to wait before answering \"timeout\"." },
+                "poll_ms": { "type": "integer", "description": "How often to look, 200-5000. Default 800." },
+                "quiet_seconds": { "type": "integer", "description": "For until=silence: how long the screen must stay unchanged. Default 5." },
+            }),
+            &["session_id", "until"],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "trigger",
+        description: "Leave a standing watch on a session with muxloom, for what you will not be \
+                      around to see: when `pattern` appears on that session's screen, muxloom \
+                      runs `action_kind` even though this conversation is over. `set` arms one \
+                      and returns its id, `list` reports them, `delete` removes one. \
+                      action_kind \"send_input\" types `text` back into the session (with Enter \
+                      unless submit is false); \"notify\" marks the session as needing attention \
+                      with `text` as the reason, which is what list_sessions and the dashboard \
+                      show. A trigger fires on the way into a match — text already on the screen \
+                      when it is armed does not count — at most once per cooldown_ms, and by \
+                      default is removed once it has fired. Triggers outlive the daemon that \
+                      took them and are dropped when their session dies. Use wait_for instead \
+                      when you are going to sit and wait for it yourself."
+            .into(),
+        input_schema: schema(
+            multi,
+            json!({
+                "action": { "type": "string", "enum": ["set", "list", "delete"] },
+                "session_id": { "type": "string", "description": "Session to watch (set), or to list watches for." },
+                "pattern": { "type": "string", "description": "Text to watch the screen for, matched case-insensitively." },
+                "action_kind": { "type": "string", "enum": ["send_input", "notify"], "description": "What to do on a match. Default notify." },
+                "text": { "type": "string", "description": "Text to type (send_input) or the attention reason to show (notify)." },
+                "submit": { "type": "boolean", "description": "For send_input: press Enter after the text. Default true." },
+                "once": { "type": "boolean", "description": "Remove the trigger after it fires. Default true." },
+                "cooldown_ms": { "type": "integer", "description": "Shortest gap between two firings. Default 5000." },
+                "id": { "type": "string", "description": "Trigger id: required by delete, and replaces that trigger on set." },
+            }),
+            &["action"],
+        ),
+    });
+    tools.push(ToolSpec {
         name: "launch_session",
         description: "Start a persistent codex, claude, or terminal session in a working \
                       directory. Use this for anything long-running or interactive instead of \
@@ -486,6 +565,13 @@ fn optional_bool(arguments: &Value, key: &str) -> bool {
     arguments.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn optional_u64(arguments: &Value, key: &str, default: u64) -> u64 {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+}
+
 fn optional_usize(arguments: &Value, key: &str, default: usize) -> usize {
     arguments
         .get(key)
@@ -624,6 +710,207 @@ fn build_input(arguments: &Value) -> Result<Vec<u8>> {
         bail!("send_input needs text, keys, or submit");
     }
     Ok(bytes)
+}
+
+/// The trigger a `set` call describes. The daemon stamps the id, the clock,
+/// and the counters; everything here comes from the caller.
+fn trigger_spec(arguments: &Value) -> Result<Trigger> {
+    let pattern = required_str(arguments, "pattern")?;
+    if pattern.len() > 256 {
+        bail!("pattern must be shorter than 256 characters: watch for one line, not a screen");
+    }
+    let action = match optional_str(arguments, "action_kind").unwrap_or("notify") {
+        "send_input" => TriggerAction::SendInput {
+            text: required_str(arguments, "text")?.into(),
+            submit: arguments
+                .get("submit")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        },
+        "notify" => TriggerAction::Notify {
+            text: optional_str(arguments, "text")
+                .unwrap_or("a muxloom trigger matched this session")
+                .into(),
+        },
+        other => bail!("unknown action_kind {other}: use send_input or notify"),
+    };
+    Ok(Trigger {
+        id: optional_str(arguments, "id").unwrap_or_default().into(),
+        session_id: required_str(arguments, "session_id")?.into(),
+        pattern: pattern.into(),
+        action,
+        once: arguments
+            .get("once")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        cooldown_ms: optional_u64(arguments, "cooldown_ms", 5_000),
+        created_at: 0,
+        last_fired_at: None,
+        fires: 0,
+    })
+}
+
+fn trigger_json(machine: &str, trigger: &Trigger) -> Value {
+    let (action_kind, text, submit) = match &trigger.action {
+        TriggerAction::SendInput { text, submit } => ("send_input", text, Some(*submit)),
+        TriggerAction::Notify { text } => ("notify", text, None),
+    };
+    json!({
+        "id": trigger.id,
+        "machine": machine,
+        "session_id": trigger.session_id,
+        "pattern": trigger.pattern,
+        "action_kind": action_kind,
+        "text": text,
+        "submit": submit,
+        "once": trigger.once,
+        "cooldown_ms": trigger.cooldown_ms,
+        "created_at": trigger.created_at,
+        "last_fired_at": trigger.last_fired_at,
+        "fires": trigger.fires,
+    })
+}
+
+/// The last rows of a screen, for an answer that reports what it saw without
+/// carrying a whole terminal back.
+fn screen_tail(screen: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    lines[lines.len().saturating_sub(WAIT_TAIL_LINES)..].join("\n")
+}
+
+/// Poll a session until it reaches the state the caller is waiting for.
+///
+/// Both surfaces share this loop, and both drive it from the adapter side:
+/// waiting inside the daemon would need a client that sits on the connection,
+/// and a resident client holds generation handover open for as long as an
+/// agent cares to wait. `look` reports the session as the daemon sees it —
+/// `None` once it is gone — and `read` renders its screen, which is only
+/// asked for when the wait is about the screen.
+fn wait_loop(
+    arguments: &Value,
+    machine: &str,
+    mut look: impl FnMut() -> Result<Option<DaemonSession>>,
+    mut read: impl FnMut() -> Result<String>,
+) -> Result<String> {
+    let until = required_str(arguments, "until")?.to_string();
+    let pattern = optional_str(arguments, "pattern").map(str::to_lowercase);
+    if until == "output_matches" && pattern.is_none() {
+        bail!("until=output_matches needs a pattern to look for");
+    }
+    if !["idle", "attention", "output_matches", "silence", "exit"].contains(&until.as_str()) {
+        bail!("unknown until {until}: use idle, attention, output_matches, silence, or exit");
+    }
+    let timeout = Duration::from_secs(
+        optional_u64(arguments, "timeout_seconds", WAIT_DEFAULT_TIMEOUT_SECONDS)
+            .clamp(1, WAIT_MAX_TIMEOUT_SECONDS),
+    );
+    let poll = Duration::from_millis(optional_u64(arguments, "poll_ms", 800).clamp(200, 5_000));
+    let quiet = Duration::from_secs(optional_u64(arguments, "quiet_seconds", 5).clamp(1, 300));
+    let watches_screen = until == "output_matches" || until == "silence";
+
+    let started = Instant::now();
+    let mut session = None;
+    let mut screen = String::new();
+    let mut last_change = started;
+    let mut matched = None;
+    let mut failures = 0;
+    let mut outcome = "timeout";
+    loop {
+        match look() {
+            Ok(Some(observed)) => {
+                failures = 0;
+                let alive = !observed.dead;
+                let idle = !observed.working && !observed.needs_attention;
+                let attention = observed.needs_attention;
+                session = Some(observed);
+                if !alive {
+                    outcome = "exit";
+                    break;
+                }
+                if watches_screen {
+                    let observed = read()?;
+                    if observed != screen {
+                        screen = observed;
+                        last_change = Instant::now();
+                    }
+                }
+                match until.as_str() {
+                    "idle" if idle => {
+                        outcome = "idle";
+                        break;
+                    }
+                    "attention" if attention => {
+                        outcome = "attention";
+                        break;
+                    }
+                    "output_matches" => {
+                        let wanted = pattern.as_deref().unwrap_or_default();
+                        if let Some(line) = screen
+                            .lines()
+                            .find(|line| line.to_lowercase().contains(wanted))
+                        {
+                            matched = Some(line.trim().to_string());
+                            outcome = "matched";
+                            break;
+                        }
+                    }
+                    "silence" if last_change.elapsed() >= quiet => {
+                        outcome = "silence";
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // A session that is no longer listed is over, whichever way the
+            // caller was waiting for it to end.
+            Ok(None) => {
+                outcome = "exit";
+                break;
+            }
+            Err(error) => {
+                failures += 1;
+                if failures > WAIT_ERROR_TOLERANCE {
+                    return Err(error);
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            break;
+        }
+        thread::sleep(poll.min(timeout - elapsed));
+    }
+
+    // What the session was showing when the wait ended is the context the
+    // caller needs next, and it is cheap enough to fetch once.
+    if !watches_screen {
+        screen = read().unwrap_or_default();
+    }
+    let satisfied = match outcome {
+        "timeout" => false,
+        "exit" => until == "exit",
+        _ => true,
+    };
+    let note = match outcome {
+        "timeout" => Some(
+            "the wait ran out, which is not a failure: nothing has happened yet, so call \
+             wait_for again to keep waiting",
+        ),
+        "exit" if until != "exit" => {
+            Some("the session ended before what you were waiting for happened")
+        }
+        _ => None,
+    };
+    Ok(pretty(&json!({
+        "outcome": outcome,
+        "satisfied": satisfied,
+        "until": until,
+        "waited_ms": started.elapsed().as_millis() as u64,
+        "matched": matched,
+        "session": session.as_ref().map(|session| session_json(machine, session)),
+        "screen_tail": screen_tail(&screen),
+        "note": note,
+    })))
 }
 
 fn pretty(value: &Value) -> String {
@@ -1055,6 +1342,57 @@ impl ControllerControl {
         ))
     }
 
+    fn wait_for(&self, arguments: &Value) -> Result<String> {
+        let target = self.target(arguments)?;
+        let session_id = required_str(arguments, "session_id")?.to_string();
+        let pool = self.runtime.bridge_pool();
+        wait_loop(
+            arguments,
+            &target.id,
+            || {
+                Ok(pool
+                    .list_sessions(&target)?
+                    .into_iter()
+                    .find(|session| session.id == session_id))
+            },
+            || {
+                let page =
+                    self.runtime
+                        .capture_page(&target, &session_id, 0, WAIT_SCREEN_LINES, 0, 0)?;
+                Ok(plain_screen(&page.text))
+            },
+        )
+    }
+
+    fn trigger(&self, arguments: &Value) -> Result<String> {
+        let target = self.target(arguments)?;
+        let pool = self.runtime.bridge_pool();
+        match required_str(arguments, "action")? {
+            "set" => {
+                let stored = pool.set_trigger(&target, trigger_spec(arguments)?)?;
+                Ok(pretty(&trigger_json(&target.id, &stored)))
+            }
+            "list" => {
+                let triggers = pool.list_triggers(
+                    &target,
+                    optional_str(arguments, "session_id").map(Into::into),
+                )?;
+                Ok(pretty(&Value::Array(
+                    triggers
+                        .iter()
+                        .map(|trigger| trigger_json(&target.id, trigger))
+                        .collect(),
+                )))
+            }
+            "delete" => {
+                let id = required_str(arguments, "id")?;
+                pool.delete_trigger(&target, id.into())?;
+                Ok(format!("deleted trigger {id}"))
+            }
+            other => bail!("unknown trigger action {other}: use set, list, or delete"),
+        }
+    }
+
     fn launch_session(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let kind = agent_kind(arguments)?;
@@ -1194,6 +1532,8 @@ impl ControlSurface for ControllerControl {
             "ssh_host" => self.ssh_host(arguments),
             "list_sessions" => self.list_sessions(arguments),
             "read_screen" => self.read_screen(arguments),
+            "wait_for" => self.wait_for(arguments),
+            "trigger" => self.trigger(arguments),
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
@@ -1261,14 +1601,17 @@ mod daemon_surface {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, agent_kind, allowed_specs, build_input,
-        enforce_policy, instructions, optional_bool, optional_str, optional_usize, pretty,
-        preview_text, required_str, screen_page, session_json, shell_report,
+        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
+        allowed_specs, build_input, enforce_policy, instructions, optional_bool, optional_str,
+        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page,
+        session_json, shell_report, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         config::{Config, default_config_path},
         daemon::{DaemonPaths, connect_or_start},
-        daemon_protocol::{DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, stream},
+        daemon_protocol::{
+            DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, Trigger, stream,
+        },
         model::LOCAL_TARGET_ID,
         runtime::{launch_arguments, new_daemon_session_id},
     };
@@ -1349,10 +1692,15 @@ mod daemon_surface {
             }
         }
 
-        fn read_screen(&self, arguments: &Value) -> Result<String> {
-            let session_id = required_str(arguments, "session_id")?;
-            let lines = optional_usize(arguments, "lines", DEFAULT_SCREEN_LINES);
-            let offset = optional_usize(arguments, "offset_from_bottom", 0);
+        /// One page of a session's screen as the daemon renders it: the rows
+        /// themselves, where they end, the pane height, and whether there is
+        /// older history above them.
+        fn screen_rows(
+            &self,
+            session_id: &str,
+            offset: usize,
+            lines: usize,
+        ) -> Result<(String, usize, usize, bool)> {
             let (response, data) = self.transact(&DaemonRequest::ReadHistory {
                 session_id: session_id.into(),
                 offset_from_bottom: offset,
@@ -1370,15 +1718,84 @@ mod daemon_surface {
                     let text = String::from_utf8_lossy(
                         data.get(&stream::HISTORY).map_or(&[][..], Vec::as_slice),
                     );
-                    let older = rendered && !reached_start && offset_from_bottom >= offset;
-                    Ok(screen_page(
-                        text.trim_end(),
+                    Ok((
+                        text.trim_end().to_string(),
                         offset_from_bottom,
                         usize::from(rows),
-                        older,
+                        rendered && !reached_start && offset_from_bottom >= offset,
                     ))
                 }
                 response => bail!("unexpected history response: {response:?}"),
+            }
+        }
+
+        fn read_screen(&self, arguments: &Value) -> Result<String> {
+            let session_id = required_str(arguments, "session_id")?;
+            let lines = optional_usize(arguments, "lines", DEFAULT_SCREEN_LINES);
+            let offset = optional_usize(arguments, "offset_from_bottom", 0);
+            let (text, offset_from_bottom, rows, older) =
+                self.screen_rows(session_id, offset, lines)?;
+            Ok(screen_page(&text, offset_from_bottom, rows, older))
+        }
+
+        fn wait_for(&self, arguments: &Value) -> Result<String> {
+            let session_id = required_str(arguments, "session_id")?.to_string();
+            wait_loop(
+                arguments,
+                LOCAL_TARGET_ID,
+                || {
+                    Ok(self
+                        .sessions()?
+                        .into_iter()
+                        .find(|session| session.id == session_id))
+                },
+                || {
+                    let (text, ..) = self.screen_rows(&session_id, 0, WAIT_SCREEN_LINES)?;
+                    Ok(plain_screen(&text))
+                },
+            )
+        }
+
+        fn trigger(&self, arguments: &Value) -> Result<String> {
+            match required_str(arguments, "action")? {
+                "set" => {
+                    let stored = match self
+                        .transact(&DaemonRequest::SetTrigger {
+                            trigger: trigger_spec(arguments)?,
+                        })?
+                        .0
+                    {
+                        DaemonResponse::Triggers { triggers } => triggers
+                            .into_iter()
+                            .next()
+                            .context("muxloomd stored the trigger but did not report it back")?,
+                        response => bail!("unexpected trigger response: {response:?}"),
+                    };
+                    Ok(pretty(&trigger_json(LOCAL_TARGET_ID, &stored)))
+                }
+                "list" => {
+                    let triggers: Vec<Trigger> = match self
+                        .transact(&DaemonRequest::ListTriggers {
+                            session_id: optional_str(arguments, "session_id").map(Into::into),
+                        })?
+                        .0
+                    {
+                        DaemonResponse::Triggers { triggers } => triggers,
+                        response => bail!("unexpected trigger response: {response:?}"),
+                    };
+                    Ok(pretty(&Value::Array(
+                        triggers
+                            .iter()
+                            .map(|trigger| trigger_json(LOCAL_TARGET_ID, trigger))
+                            .collect(),
+                    )))
+                }
+                "delete" => {
+                    let id = required_str(arguments, "id")?;
+                    self.expect_ack(&DaemonRequest::DeleteTrigger { id: id.into() })?;
+                    Ok(format!("deleted trigger {id}"))
+                }
+                other => bail!("unknown trigger action {other}: use set, list, or delete"),
             }
         }
 
@@ -1509,6 +1926,8 @@ mod daemon_surface {
                     Ok(pretty(&Value::Array(rendered)))
                 }
                 "read_screen" => self.read_screen(arguments),
+                "wait_for" => self.wait_for(arguments),
+                "trigger" => self.trigger(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
                     let bytes = build_input(arguments)?;
@@ -1713,6 +2132,9 @@ mod tests {
             [
                 "list_sessions",
                 "read_screen",
+                // Waiting only watches; arming a trigger acts, so `trigger`
+                // is not here.
+                "wait_for",
                 "search_history",
                 "list_directory",
                 "list_files",
@@ -2054,6 +2476,122 @@ mod tests {
                 json!({ "include_archived": true }),
             );
             assert!(!listed.contains(&session_id));
+        }
+
+        #[test]
+        fn a_trigger_fires_once_and_wait_for_sees_what_it_did() {
+            let mut surface = surface("trg");
+            let launched: Value = serde_json::from_str(&call(
+                &mut surface,
+                "launch_session",
+                json!({
+                    "kind": "terminal",
+                    "path": std::env::temp_dir().to_str().unwrap(),
+                }),
+            ))
+            .unwrap();
+            let session_id = launched["session_id"].as_str().unwrap().to_string();
+
+            let armed: Value = serde_json::from_str(&call(
+                &mut surface,
+                "trigger",
+                json!({
+                    "action": "set",
+                    "session_id": session_id,
+                    "pattern": "muxloom-trigger-probe",
+                    "action_kind": "notify",
+                    "text": "the probe printed",
+                }),
+            ))
+            .unwrap();
+            let trigger_id = armed["id"].as_str().unwrap().to_string();
+            assert_eq!(armed["fires"], 0);
+            assert!(
+                call(&mut surface, "trigger", json!({ "action": "list" })).contains(&trigger_id)
+            );
+
+            // Printing the marker is what the trigger is watching for, and
+            // waiting for it is what an agent that stays does instead.
+            call(
+                &mut surface,
+                "send_input",
+                json!({
+                    "session_id": session_id,
+                    // Split so that typing the command does not itself put the
+                    // pattern on screen: the trigger fires on arrival, and the
+                    // echo of the command line would be an arrival.
+                    "text": "printf 'muxloom-%s-probe\\n' trigger",
+                    "submit": true,
+                }),
+            );
+            let waited: Value = serde_json::from_str(&call(
+                &mut surface,
+                "wait_for",
+                json!({
+                    "session_id": session_id,
+                    "until": "output_matches",
+                    "pattern": "muxloom-trigger-probe",
+                    "timeout_seconds": 10,
+                    "poll_ms": 200,
+                }),
+            ))
+            .unwrap();
+            assert_eq!(waited["outcome"], "matched", "{waited:#}");
+            assert_eq!(waited["satisfied"], true);
+            assert!(
+                waited["matched"]
+                    .as_str()
+                    .unwrap()
+                    .contains("muxloom-trigger-probe")
+            );
+
+            // The trigger sees the same screen, so by now it has fired: its
+            // notice is what list_sessions reports as the reason.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut listed = String::new();
+            while Instant::now() < deadline {
+                listed = call(&mut surface, "list_sessions", json!({}));
+                if listed.contains("the probe printed") {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                listed.contains("the probe printed"),
+                "a fired trigger must show up as attention: {listed}"
+            );
+            // once defaults to true, so it is gone rather than armed again.
+            assert!(
+                !call(&mut surface, "trigger", json!({ "action": "list" })).contains(&trigger_id)
+            );
+
+            // Typing is the human being there, which retires the notice.
+            call(
+                &mut surface,
+                "send_input",
+                json!({ "session_id": session_id, "keys": ["enter"] }),
+            );
+            assert!(!call(&mut surface, "list_sessions", json!({})).contains("the probe printed"));
+
+            let waited: Value = serde_json::from_str(&call(
+                &mut surface,
+                "wait_for",
+                json!({
+                    "session_id": session_id,
+                    "until": "attention",
+                    "timeout_seconds": 1,
+                    "poll_ms": 200,
+                }),
+            ))
+            .unwrap();
+            assert_eq!(waited["outcome"], "timeout", "{waited:#}");
+            assert_eq!(waited["satisfied"], false);
+
+            call(
+                &mut surface,
+                "delete_session",
+                json!({ "session_id": session_id }),
+            );
         }
     }
 }
