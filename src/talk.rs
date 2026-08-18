@@ -1,0 +1,1168 @@
+//! The talk board: what agents and humans say to one another, kept where
+//! everyone can read it.
+//!
+//! Every machine muxloom reaches holds the same log, and the log is
+//! append-only: a message is minted once, by the machine it was written on,
+//! and every other machine only ever adds it. Nothing is a queue and nothing
+//! is a master copy, which is what makes replication safe in a star topology
+//! where two machines never speak to each other directly — the controller can
+//! carry entries in any order, twice, or late, and every machine still ends up
+//! with the same board.
+//!
+//! A machine tracks what it has with a version vector: the highest run of
+//! sequence numbers it holds unbroken for each origin. Two machines diff their
+//! vectors to work out what to send. Clocks are only ever used for display and
+//! ordering, never for deciding what is missing.
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+/// Capability that says a daemon carries a talk board.
+pub const TALK_CAPABILITY: &str = "talk-v1";
+/// The longest a single message may be. A board is for saying things to each
+/// other, not for shipping files around.
+pub const MAX_TEXT: usize = 8 * 1024;
+/// How many messages one origin keeps before the oldest are compacted away.
+const RETAIN_PER_ORIGIN: usize = 20_000;
+/// How long a message is kept regardless of how few there are.
+const RETAIN_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// How far past the retention limit a log may run before it is rewritten.
+/// Compaction rewrites a whole file, so it must not happen on every post.
+const COMPACT_SLACK: usize = 512;
+/// The most messages one read or one replication fetch carries.
+pub const MAX_PAGE: usize = 500;
+
+/// Where a message belongs. `machine` is an origin key, not a display name, so
+/// a machine that gets renamed keeps its board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum TalkScope {
+    /// Everyone, everywhere.
+    Global,
+    /// Everyone working on one machine.
+    Machine { machine: String },
+    /// Everyone working in one directory on one machine — the default, and the
+    /// one that behaves like a project channel.
+    Path { machine: String, path: String },
+}
+
+impl TalkScope {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Machine { .. } => "machine",
+            Self::Path { .. } => "path",
+        }
+    }
+
+    pub fn machine(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::Machine { machine } | Self::Path { machine, .. } => Some(machine),
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Path { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Fill in the machine a scope was posted from. A poster names the scope it
+    /// wants and leaves the machine empty; the daemon that mints the message is
+    /// the one that knows its own origin key.
+    fn anchor(&mut self, origin: &str) {
+        match self {
+            Self::Global => {}
+            Self::Machine { machine } | Self::Path { machine, .. } => {
+                if machine.trim().is_empty() {
+                    *machine = origin.to_string();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkKind {
+    /// Something said to whoever is reading the scope.
+    Message,
+    /// Something written down to be found later: the board doubles as the
+    /// memory a session cannot keep.
+    Note,
+    /// A message delivered straight into one session, recorded here so the
+    /// board shows what agents said to each other and delivery can be audited.
+    Direct,
+}
+
+impl TalkKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Note => "note",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        Ok(match text {
+            "message" => Self::Message,
+            "note" => Self::Note,
+            "direct" => Self::Direct,
+            other => bail!("unknown talk kind {other}: use message, note, or direct"),
+        })
+    }
+}
+
+/// Who is speaking, as far as the board can tell. Everything but the machine
+/// comes from the session the poster runs in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkVoice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// `codex`, `claude`, `terminal`, or nothing when the poster is not a
+    /// muxloom session at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Whether a person wrote this rather than an agent. Posting as a human is
+    /// the dashboard's privilege; the MCP surface never sets it.
+    #[serde(default)]
+    pub human: bool,
+}
+
+impl TalkVoice {
+    /// How this voice reads on a board: the label if it has one, else the
+    /// session it speaks from, else what kind of thing it is.
+    pub fn name(&self) -> String {
+        if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
+            return label.clone();
+        }
+        if let Some(session) = self.session_id.as_ref() {
+            return session.clone();
+        }
+        self.kind.clone().unwrap_or_else(|| "someone".into())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkAuthor {
+    /// Origin key of the machine that minted the message.
+    pub machine: String,
+    /// What that machine was called at the time, for reading.
+    #[serde(default)]
+    pub machine_label: String,
+    #[serde(flatten)]
+    pub voice: TalkVoice,
+}
+
+/// One session, anywhere: who a direct message is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkAddress {
+    pub machine: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkMessage {
+    /// `<origin>:<seq>` — unique everywhere, and the key that makes a replayed
+    /// message a no-op rather than a duplicate.
+    pub id: String,
+    pub origin: String,
+    pub seq: u64,
+    /// Epoch milliseconds on the minting machine. Display and ordering only:
+    /// two machines' clocks disagree, and nothing here depends on them.
+    pub ts: u64,
+    pub scope: TalkScope,
+    pub author: TalkAuthor,
+    pub kind: TalkKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<TalkAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    pub text: String,
+}
+
+impl TalkMessage {
+    /// Whether a message that arrived from another machine can be filed.
+    ///
+    /// The origin becomes a file name and the id is the identity everything
+    /// else keys on, so both are checked before anything is written.
+    fn acceptable(&self) -> bool {
+        valid_origin(&self.origin)
+            && self.seq > 0
+            && self.id == format!("{}:{}", self.origin, self.seq)
+            && self.text.len() <= MAX_TEXT
+            && self.author.machine.len() <= 128
+    }
+}
+
+/// What a poster hands to the store. The store mints the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkDraft {
+    pub scope: TalkScope,
+    pub voice: TalkVoice,
+    pub kind: TalkKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<TalkAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    pub text: String,
+}
+
+/// The highest unbroken sequence number held for each origin.
+pub type TalkVector = BTreeMap<String, u64>;
+
+/// What one machine holds, as told to another.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkState {
+    pub origin: String,
+    pub label: String,
+    pub vector: TalkVector,
+    /// The oldest sequence number still held per origin. A peer whose vector
+    /// sits below this has missed messages for good, and saying so is kinder
+    /// than pretending the gap can be filled.
+    #[serde(default)]
+    pub low_water: TalkVector,
+}
+
+/// Which machines or paths a read reaches over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "select", rename_all = "snake_case")]
+pub enum TalkSelector {
+    /// Only where the reader is: the point of scopes.
+    #[default]
+    Mine,
+    /// Everywhere, which is how the board is searched.
+    All,
+    /// A named few, matched against origin keys, machine labels, or paths.
+    Only { names: Vec<String> },
+}
+
+impl TalkSelector {
+    fn admits(&self, mine: Option<&str>, candidate: &str, label: Option<&str>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Mine => mine.is_some_and(|mine| mine.eq_ignore_ascii_case(candidate)),
+            Self::Only { names } => names.iter().any(|name| {
+                name.eq_ignore_ascii_case(candidate)
+                    || label.is_some_and(|label| name.eq_ignore_ascii_case(label))
+            }),
+        }
+    }
+}
+
+/// What to read off the board. Everything defaults to "what is in front of
+/// me": the reader's own machine, its own directory, and whatever was said to
+/// everyone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkFilter {
+    /// Only messages past this vector, which is how a caller polls for new
+    /// ones without seeing the board again.
+    #[serde(default)]
+    pub since: TalkVector,
+    /// Restrict to one scope: `global`, `machine`, `path`, or `direct`.
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Match against an author's session id or label.
+    #[serde(default)]
+    pub authors: Vec<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub machines: TalkSelector,
+    #[serde(default)]
+    pub paths: TalkSelector,
+    /// Who is reading, so `Mine` and direct messages mean something. Filled in
+    /// from the reader's session; the machine is always the daemon's own.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Read backwards from here, for paging into the past.
+    #[serde(default)]
+    pub before: Option<u64>,
+    #[serde(default)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkPage {
+    pub messages: Vec<TalkMessage>,
+    /// Everything the board held when this was read. Hand it back as `since`
+    /// to be told only what has happened since.
+    pub cursor: String,
+    /// Whether older messages matched than fit in this page.
+    pub truncated: bool,
+}
+
+/// The board on one machine.
+pub struct TalkStore {
+    root: PathBuf,
+    inner: Mutex<TalkInner>,
+}
+
+struct TalkInner {
+    identity: TalkIdentity,
+    logs: BTreeMap<String, OriginLog>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TalkIdentity {
+    origin: String,
+    label: String,
+}
+
+#[derive(Default)]
+struct OriginLog {
+    /// Sorted by seq, gaps allowed: a message can arrive before the one in
+    /// front of it and must still be filed.
+    messages: Vec<TalkMessage>,
+    /// The highest seq compacted away, so a hole left by retention is not
+    /// mistaken for one replication can still fill.
+    low_water: u64,
+}
+
+impl OriginLog {
+    /// The highest seq held with nothing missing below it.
+    fn contiguous(&self) -> u64 {
+        let mut reached = self.low_water;
+        for message in &self.messages {
+            if message.seq == reached + 1 {
+                reached = message.seq;
+            } else if message.seq > reached + 1 {
+                break;
+            }
+        }
+        reached
+    }
+
+    fn highest(&self) -> u64 {
+        self.messages
+            .last()
+            .map_or(self.low_water, |message| message.seq)
+    }
+}
+
+impl TalkStore {
+    /// Open the board under a state directory, minting this machine's identity
+    /// the first time.
+    pub fn open(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(root.join("log")).with_context(|| {
+            format!("failed to create the talk directory at {}", root.display())
+        })?;
+        let identity = load_identity(&root)?;
+        let logs = load_logs(&root.join("log"));
+        let store = Self {
+            root,
+            inner: Mutex::new(TalkInner { identity, logs }),
+        };
+        store.compact()?;
+        Ok(store)
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, TalkInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn origin(&self) -> String {
+        self.inner().identity.origin.clone()
+    }
+
+    pub fn label(&self) -> String {
+        self.inner().identity.label.clone()
+    }
+
+    /// Record what this machine is called. The controller is the only thing
+    /// that knows the name a human uses for a machine, so it sinks it down and
+    /// posts made afterwards carry it.
+    pub fn set_label(&self, label: &str) -> Result<()> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner();
+        if inner.identity.label == label {
+            return Ok(());
+        }
+        inner.identity.label = label.to_string();
+        let identity = inner.identity.clone();
+        drop(inner);
+        save_identity(&self.root, &identity)
+    }
+
+    pub fn state(&self) -> TalkState {
+        let inner = self.inner();
+        TalkState {
+            origin: inner.identity.origin.clone(),
+            label: inner.identity.label.clone(),
+            vector: inner
+                .logs
+                .iter()
+                .map(|(origin, log)| (origin.clone(), log.contiguous()))
+                .collect(),
+            low_water: inner
+                .logs
+                .iter()
+                .filter(|(_, log)| log.low_water > 0)
+                .map(|(origin, log)| (origin.clone(), log.low_water))
+                .collect(),
+        }
+    }
+
+    /// Mint a message on this machine and file it.
+    pub fn post(&self, mut draft: TalkDraft) -> Result<TalkMessage> {
+        let text = draft.text.trim();
+        if text.is_empty() {
+            bail!("a talk message needs something to say");
+        }
+        if text.len() > MAX_TEXT {
+            bail!(
+                "a talk message must be shorter than {MAX_TEXT} bytes; post a summary and leave \
+                 the rest where it is"
+            );
+        }
+        let (origin, label) = {
+            let inner = self.inner();
+            (inner.identity.origin.clone(), inner.identity.label.clone())
+        };
+        draft.scope.anchor(&origin);
+        let mut inner = self.inner();
+        let seq = inner
+            .logs
+            .get(&origin)
+            .map_or(0, OriginLog::highest)
+            .saturating_add(1);
+        let message = TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.clone(),
+            seq,
+            ts: now_ms(),
+            scope: draft.scope,
+            author: TalkAuthor {
+                machine: origin,
+                machine_label: label,
+                voice: draft.voice,
+            },
+            kind: draft.kind,
+            to: draft.to,
+            reply_to: draft.reply_to,
+            text: text.to_string(),
+        };
+        self.file(&mut inner, message.clone())?;
+        Ok(message)
+    }
+
+    /// File messages that came from somewhere else. Returns how many were new;
+    /// filing the same message twice is a no-op, which is what lets the
+    /// controller push and pull without tracking what it has already carried.
+    pub fn merge(&self, messages: Vec<TalkMessage>) -> Result<usize> {
+        let mut inner = self.inner();
+        let mut added = 0;
+        for message in messages {
+            if !message.acceptable() {
+                continue;
+            }
+            if self.file(&mut inner, message)? {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Everything held past a peer's vector, oldest first, so a peer that is
+    /// far behind catches up over several fetches rather than one huge one.
+    pub fn since(&self, from: &TalkVector, limit: usize) -> Vec<TalkMessage> {
+        let inner = self.inner();
+        let mut out = Vec::new();
+        for (origin, log) in &inner.logs {
+            let held = from.get(origin).copied().unwrap_or(0);
+            out.extend(
+                log.messages
+                    .iter()
+                    .filter(|message| message.seq > held)
+                    .cloned(),
+            );
+        }
+        out.sort_by(|left, right| {
+            (left.ts, &left.origin, left.seq).cmp(&(right.ts, &right.origin, right.seq))
+        });
+        out.truncate(limit.clamp(1, MAX_PAGE));
+        out
+    }
+
+    /// Read the board as someone standing on this machine sees it.
+    pub fn read(&self, filter: &TalkFilter) -> TalkPage {
+        let inner = self.inner();
+        let mine = inner.identity.origin.clone();
+        let label = inner.identity.label.clone();
+        let query = filter.query.as_ref().map(|query| query.to_lowercase());
+        let mut matched: Vec<TalkMessage> = inner
+            .logs
+            .values()
+            .flat_map(|log| log.messages.iter())
+            .filter(|message| {
+                message.seq > filter.since.get(&message.origin).copied().unwrap_or(0)
+                    && filter.before.is_none_or(|before| message.ts < before)
+                    && visible(message, filter, &mine, &label)
+                    && (filter.kinds.is_empty()
+                        || filter.kinds.iter().any(|kind| kind == message.kind.name()))
+                    && (filter.authors.is_empty()
+                        || filter.authors.iter().any(|author| {
+                            message
+                                .author
+                                .voice
+                                .session_id
+                                .as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(author))
+                                || message
+                                    .author
+                                    .voice
+                                    .label
+                                    .as_deref()
+                                    .is_some_and(|label| label.eq_ignore_ascii_case(author))
+                        }))
+                    && query
+                        .as_ref()
+                        .is_none_or(|query| message.text.to_lowercase().contains(query))
+            })
+            .cloned()
+            .collect();
+        matched.sort_by(|left, right| {
+            (left.ts, &left.origin, left.seq).cmp(&(right.ts, &right.origin, right.seq))
+        });
+        let limit = if filter.limit == 0 {
+            50
+        } else {
+            filter.limit.min(MAX_PAGE)
+        };
+        let truncated = matched.len() > limit;
+        if truncated {
+            // The newest are the ones worth having; the cursor and `before`
+            // are how a caller reaches the rest.
+            matched.drain(..matched.len() - limit);
+        }
+        let cursor = encode_cursor(
+            &inner
+                .logs
+                .iter()
+                .map(|(origin, log)| (origin.clone(), log.highest()))
+                .collect(),
+        );
+        TalkPage {
+            messages: matched,
+            cursor,
+            truncated,
+        }
+    }
+
+    /// Add one message to memory and to its origin's log file.
+    fn file(&self, inner: &mut TalkInner, message: TalkMessage) -> Result<bool> {
+        let log = inner.logs.entry(message.origin.clone()).or_default();
+        if message.seq <= log.low_water {
+            return Ok(false);
+        }
+        let at = match log
+            .messages
+            .binary_search_by(|held| held.seq.cmp(&message.seq))
+        {
+            Ok(_) => return Ok(false),
+            Err(at) => at,
+        };
+        let path = self
+            .root
+            .join("log")
+            .join(format!("{}.jsonl", message.origin));
+        append_line(&path, &message)?;
+        log.messages.insert(at, message);
+        if log.messages.len() > RETAIN_PER_ORIGIN + COMPACT_SLACK {
+            let cut = log.messages.len() - RETAIN_PER_ORIGIN;
+            log.low_water = log.messages[cut - 1].seq;
+            log.messages.drain(..cut);
+            rewrite_log(&path, &log.messages)?;
+        }
+        Ok(true)
+    }
+
+    /// Drop what has aged out. Called when the board is opened rather than on
+    /// a timer: a daemon that nobody talks to should not be doing work.
+    pub fn compact(&self) -> Result<()> {
+        let mut inner = self.inner();
+        let cutoff = now_ms().saturating_sub(RETAIN_MS);
+        let root = self.root.join("log");
+        for (origin, log) in inner.logs.iter_mut() {
+            let keep = log
+                .messages
+                .iter()
+                .position(|message| message.ts >= cutoff)
+                .unwrap_or(log.messages.len());
+            if keep == 0 {
+                continue;
+            }
+            log.low_water = log.messages[keep - 1].seq;
+            log.messages.drain(..keep);
+            rewrite_log(&root.join(format!("{origin}.jsonl")), &log.messages)?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether one message is in front of the reader the filter describes.
+fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) -> bool {
+    if let Some(wanted) = filter.scope.as_deref() {
+        let name = match message.kind {
+            TalkKind::Direct => "direct",
+            _ => message.scope.name(),
+        };
+        if wanted != name {
+            return false;
+        }
+    }
+    // A direct message is between two sessions. It is on the board so the
+    // machine it happened on can be read later, not so anyone can be part of
+    // it: only its two ends see it unless someone asks for directs by name.
+    if message.kind == TalkKind::Direct {
+        let addressed = message.to.as_ref().is_some_and(|to| {
+            to.machine == mine
+                && filter
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|session| session == to.session_id)
+        });
+        let sent = message.author.machine == mine
+            && message.author.voice.session_id == filter.session_id
+            && filter.session_id.is_some();
+        return addressed || sent || filter.scope.as_deref() == Some("direct");
+    }
+    match &message.scope {
+        TalkScope::Global => true,
+        TalkScope::Machine { machine } => filter.machines.admits(
+            Some(mine),
+            machine,
+            machine_label(message, machine, mine, label),
+        ),
+        TalkScope::Path { machine, path } => {
+            filter.machines.admits(
+                Some(mine),
+                machine,
+                machine_label(message, machine, mine, label),
+            ) && match &filter.paths {
+                // Standing in no particular directory, every directory on
+                // an admitted machine is as relevant as any other.
+                TalkSelector::Mine if filter.path.is_none() => true,
+                selector => selector.admits(filter.path.as_deref(), path, None),
+            }
+        }
+    }
+}
+
+/// What a human calls the machine a message's board belongs to, so a reader
+/// can name another machine the way they know it rather than by its origin
+/// key. This machine's own label is authoritative and current; another's is
+/// whatever it called itself when it posted.
+fn machine_label<'a>(
+    message: &'a TalkMessage,
+    machine: &str,
+    mine: &str,
+    label: &'a str,
+) -> Option<&'a str> {
+    if machine == mine {
+        return Some(label);
+    }
+    Some(message.author.machine_label.as_str())
+        .filter(|label| !label.is_empty() && message.author.machine == machine)
+}
+
+pub fn encode_cursor(vector: &TalkVector) -> String {
+    vector
+        .iter()
+        .map(|(origin, seq)| format!("{origin}:{seq}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn decode_cursor(text: &str) -> TalkVector {
+    text.split(',')
+        .filter_map(|entry| {
+            let (origin, seq) = entry.trim().rsplit_once(':')?;
+            Some((origin.to_string(), seq.parse().ok()?))
+        })
+        .collect()
+}
+
+fn valid_origin(origin: &str) -> bool {
+    !origin.is_empty()
+        && origin.len() <= 64
+        && origin
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn append_line(path: &Path, message: &TalkMessage) -> Result<()> {
+    let mut line = serde_json::to_vec(message).context("failed to encode a talk message")?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open the talk log at {}", path.display()))?;
+    restrict(&file);
+    file.write_all(&line)
+        .with_context(|| format!("failed to write to the talk log at {}", path.display()))
+}
+
+fn rewrite_log(path: &Path, messages: &[TalkMessage]) -> Result<()> {
+    let temporary = path.with_extension("jsonl.tmp");
+    let mut file = File::create(&temporary)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    restrict(&file);
+    for message in messages {
+        let mut line = serde_json::to_vec(message).context("failed to encode a talk message")?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+    }
+    file.flush()?;
+    drop(file);
+    fs::rename(&temporary, path)
+        .with_context(|| format!("failed to replace the talk log at {}", path.display()))
+}
+
+fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
+    let mut logs: BTreeMap<String, OriginLog> = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return logs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+        {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut log = OriginLog::default();
+        // A half-written line is what a crash leaves behind, and the rest of
+        // the log is still perfectly good: skip it rather than lose the file.
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(message) = serde_json::from_str::<TalkMessage>(&line) else {
+                continue;
+            };
+            if !message.acceptable() {
+                continue;
+            }
+            if let Err(at) = log
+                .messages
+                .binary_search_by(|held| held.seq.cmp(&message.seq))
+            {
+                log.messages.insert(at, message);
+            }
+        }
+        if let Some(origin) = log.messages.first().map(|message| message.origin.clone()) {
+            log.low_water = log.messages.first().map_or(0, |message| message.seq - 1);
+            logs.insert(origin, log);
+        }
+    }
+    logs
+}
+
+fn load_identity(root: &Path) -> Result<TalkIdentity> {
+    let path = root.join("identity.json");
+    if let Ok(text) = fs::read_to_string(&path)
+        && let Ok(identity) = serde_json::from_str::<TalkIdentity>(&text)
+        && valid_origin(&identity.origin)
+    {
+        return Ok(identity);
+    }
+    let host = hostname();
+    let identity = TalkIdentity {
+        // Readable enough to recognise in a file name, unique enough that two
+        // machines with the same hostname never share a log.
+        origin: format!("{}-{}", sanitize(&host), fingerprint(root, &host)),
+        label: host,
+    };
+    save_identity(root, &identity)?;
+    Ok(identity)
+}
+
+fn save_identity(root: &Path, identity: &TalkIdentity) -> Result<()> {
+    let path = root.join("identity.json");
+    let temporary = path.with_extension("tmp");
+    let text = serde_json::to_string_pretty(identity)?;
+    fs::write(&temporary, text)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    if let Ok(file) = File::open(&temporary) {
+        restrict(&file);
+    }
+    fs::rename(&temporary, &path).with_context(|| format!("failed to replace {}", path.display()))
+}
+
+fn sanitize(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "machine".into()
+    } else {
+        trimmed.chars().take(40).collect()
+    }
+}
+
+/// Eight hex characters that no other machine will mint: the state directory
+/// this daemon owns, its host name, and the moment it first needed an origin.
+fn fingerprint(root: &Path, host: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(root.as_os_str().as_encoded_bytes());
+    hasher.update(host.as_bytes());
+    hasher.update(now_ms().to_be_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buffer = [0_i8; 256];
+        // SAFETY: the buffer outlives the call and is one byte longer than the
+        // length handed to it, so the result is always terminated.
+        if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
+            let bytes: Vec<u8> = buffer
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8)
+                .collect();
+            if let Ok(host) = String::from_utf8(bytes)
+                && !host.is_empty()
+            {
+                // A `.local` suffix is Bonjour's, not the machine's name.
+                return host.trim_end_matches(".local").to_string();
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "machine".into())
+}
+
+fn restrict(file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(name: &str) -> TalkStore {
+        let root = std::env::temp_dir().join(format!(
+            "mxl-talk-{name}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        TalkStore::open(root).unwrap()
+    }
+
+    fn draft(text: &str, scope: TalkScope) -> TalkDraft {
+        TalkDraft {
+            scope,
+            voice: TalkVoice {
+                session_id: Some("session-1".into()),
+                label: Some("builder".into()),
+                kind: Some("claude".into()),
+                human: false,
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_post_is_minted_once_and_reads_back_after_a_restart() {
+        let store = store("restart");
+        let root = store.root.clone();
+        let posted = store
+            .post(draft(
+                "the build is green",
+                TalkScope::Path {
+                    machine: String::new(),
+                    path: "/work".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(posted.seq, 1);
+        assert_eq!(posted.id, format!("{}:1", store.origin()));
+        // An empty machine in the scope means "here", and only the daemon
+        // knows what "here" is called.
+        assert_eq!(posted.scope.machine(), Some(store.origin().as_str()));
+
+        let reopened = TalkStore::open(root.clone()).unwrap();
+        assert_eq!(reopened.origin(), store.origin());
+        let page = reopened.read(&TalkFilter {
+            path: Some("/work".into()),
+            ..TalkFilter::default()
+        });
+        assert_eq!(page.messages, vec![posted.clone()]);
+        // The next post continues the run rather than colliding with it.
+        assert_eq!(
+            reopened
+                .post(draft("and deployed", posted.scope))
+                .unwrap()
+                .seq,
+            2
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn messages_from_elsewhere_merge_out_of_order_and_only_once() {
+        let store = store("merge");
+        let far = |seq: u64, ts: u64| TalkMessage {
+            id: format!("other-1234abcd:{seq}"),
+            origin: "other-1234abcd".into(),
+            seq,
+            ts,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: "other-1234abcd".into(),
+                machine_label: "gpu-box".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("message {seq}"),
+        };
+
+        assert_eq!(store.merge(vec![far(3, 300), far(1, 100)]).unwrap(), 2);
+        // What is held is not yet what can be claimed: 2 is missing, so the
+        // vector stops at 1 and replication asks for the hole again.
+        assert_eq!(store.state().vector["other-1234abcd"], 1);
+        assert_eq!(store.merge(vec![far(1, 100), far(3, 300)]).unwrap(), 0);
+        assert_eq!(store.merge(vec![far(2, 200)]).unwrap(), 1);
+        assert_eq!(store.state().vector["other-1234abcd"], 3);
+
+        // A message whose id does not match its origin is not filed at all.
+        let mut forged = far(4, 400);
+        forged.id = "other-1234abcd:9".into();
+        assert_eq!(store.merge(vec![forged]).unwrap(), 0);
+
+        let held = store.since(&TalkVector::new(), 10);
+        assert_eq!(held.len(), 3);
+        let from_two: Vec<u64> = store
+            .since(&TalkVector::from([("other-1234abcd".into(), 2)]), 10)
+            .iter()
+            .map(|message| message.seq)
+            .collect();
+        assert_eq!(from_two, vec![3]);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn scopes_decide_who_sees_a_post_and_include_widens_it() {
+        let store = store("scopes");
+        let mine = store.origin();
+        store.post(draft("everyone", TalkScope::Global)).unwrap();
+        store
+            .post(draft(
+                "this machine",
+                TalkScope::Machine {
+                    machine: String::new(),
+                },
+            ))
+            .unwrap();
+        store
+            .post(draft(
+                "this project",
+                TalkScope::Path {
+                    machine: String::new(),
+                    path: "/work".into(),
+                },
+            ))
+            .unwrap();
+        store
+            .merge(vec![TalkMessage {
+                id: "other-1234abcd:1".into(),
+                origin: "other-1234abcd".into(),
+                seq: 1,
+                ts: 10,
+                scope: TalkScope::Machine {
+                    machine: "other-1234abcd".into(),
+                },
+                author: TalkAuthor {
+                    machine: "other-1234abcd".into(),
+                    machine_label: "gpu-box".into(),
+                    voice: TalkVoice::default(),
+                },
+                kind: TalkKind::Message,
+                to: None,
+                reply_to: None,
+                text: "far away".into(),
+            }])
+            .unwrap();
+
+        let texts = |filter: &TalkFilter| -> Vec<String> {
+            store
+                .read(filter)
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        // Standing in /work on this machine: everything here, nothing there.
+        assert_eq!(
+            texts(&TalkFilter {
+                path: Some("/work".into()),
+                ..TalkFilter::default()
+            }),
+            ["everyone", "this machine", "this project"]
+        );
+        // Standing in another directory, the project channel is not mine.
+        assert_eq!(
+            texts(&TalkFilter {
+                path: Some("/elsewhere".into()),
+                ..TalkFilter::default()
+            }),
+            ["everyone", "this machine"]
+        );
+        // Reaching for another machine by the name a human uses for it.
+        assert_eq!(
+            texts(&TalkFilter {
+                path: Some("/work".into()),
+                machines: TalkSelector::Only {
+                    names: vec!["gpu-box".into()],
+                },
+                ..TalkFilter::default()
+            }),
+            ["far away", "everyone"]
+        );
+        assert_eq!(
+            texts(&TalkFilter {
+                path: Some("/work".into()),
+                machines: TalkSelector::All,
+                paths: TalkSelector::All,
+                scope: Some("machine".into()),
+                ..TalkFilter::default()
+            }),
+            ["far away", "this machine"]
+        );
+        assert_eq!(
+            texts(&TalkFilter {
+                query: Some("PROJECT".into()),
+                path: Some("/work".into()),
+                ..TalkFilter::default()
+            }),
+            ["this project"]
+        );
+
+        // A cursor answers with what arrived after it, and nothing else.
+        let page = store.read(&TalkFilter {
+            path: Some("/work".into()),
+            ..TalkFilter::default()
+        });
+        let cursor = decode_cursor(&page.cursor);
+        assert_eq!(cursor[&mine], 3);
+        store.post(draft("later", TalkScope::Global)).unwrap();
+        assert_eq!(
+            texts(&TalkFilter {
+                since: cursor,
+                path: Some("/work".into()),
+                ..TalkFilter::default()
+            }),
+            ["later"]
+        );
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_direct_message_is_only_between_its_two_ends() {
+        let store = store("direct");
+        let mine = store.origin();
+        let mut sent = draft("look at line 40", TalkScope::Global);
+        sent.kind = TalkKind::Direct;
+        sent.to = Some(TalkAddress {
+            machine: mine.clone(),
+            session_id: "session-2".into(),
+        });
+        store.post(sent).unwrap();
+
+        let texts = |session: &str| -> Vec<String> {
+            store
+                .read(&TalkFilter {
+                    session_id: Some(session.into()),
+                    ..TalkFilter::default()
+                })
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        assert_eq!(texts("session-2"), ["look at line 40"]);
+        assert_eq!(texts("session-1"), ["look at line 40"]);
+        assert!(texts("session-3").is_empty());
+        // Asking for directs by name is how the board is audited.
+        assert_eq!(
+            store
+                .read(&TalkFilter {
+                    session_id: Some("session-3".into()),
+                    scope: Some("direct".into()),
+                    ..TalkFilter::default()
+                })
+                .messages
+                .len(),
+            1
+        );
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+}

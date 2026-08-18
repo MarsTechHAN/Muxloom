@@ -38,6 +38,7 @@ mod platform {
         runtime::{
             DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, is_temporary_session_id,
         },
+        talk::{TALK_CAPABILITY, TalkPage, TalkStore},
         terminal_session::{
             CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
         },
@@ -82,6 +83,7 @@ mod platform {
         pub sessions: PathBuf,
         pub keepers: PathBuf,
         pub triggers: PathBuf,
+        pub talk: PathBuf,
     }
 
     impl DaemonPaths {
@@ -108,6 +110,7 @@ mod platform {
                 sessions: root.join("sessions"),
                 keepers: root.join("keepers"),
                 triggers: root.join("triggers.json"),
+                talk: root.join("talk"),
                 root,
             }
         }
@@ -147,6 +150,9 @@ mod platform {
         /// PTY produces, so the common case — a daemon with no triggers —
         /// must cost one relaxed load and nothing else.
         armed: AtomicUsize,
+        /// This machine's talk board, opened the first time anything asks for
+        /// it: a daemon nobody collaborates through never writes one.
+        talk: OnceLock<Arc<TalkStore>>,
     }
 
     /// A stored trigger plus the edge state that decides when it fires.
@@ -309,7 +315,19 @@ mod platform {
                 attention_patterns: Arc::new(Mutex::new(Vec::new())),
                 triggers: Mutex::new(triggers),
                 armed,
+                talk: OnceLock::new(),
             }
+        }
+
+        /// The talk board, opening it if this is the first time. A failure is
+        /// worth reporting to whoever asked rather than at startup: everything
+        /// else the daemon does works without a board.
+        fn talk(&self) -> Result<Arc<TalkStore>> {
+            if let Some(store) = self.talk.get() {
+                return Ok(store.clone());
+            }
+            let store = Arc::new(TalkStore::open(self.paths.talk.clone())?);
+            Ok(self.talk.get_or_init(|| store).clone())
         }
 
         /// Write the triggers out. Called while holding the trigger lock, so
@@ -1390,6 +1408,7 @@ mod platform {
                             LISTENERS_CAPABILITY.into(),
                             "handover-drain-v1".into(),
                             "triggers-v1".into(),
+                            TALK_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -1564,6 +1583,56 @@ mod platform {
                     state.save_triggers(&triggers);
                 }
                 write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::TalkPost { draft } => {
+                let message = state.talk()?.post(draft)?;
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::Talk {
+                        page: TalkPage {
+                            messages: vec![message],
+                            cursor: String::new(),
+                            truncated: false,
+                        },
+                    },
+                )
+            }
+            DaemonRequest::TalkRead { filter } => {
+                let page = state.talk()?.read(&filter);
+                write_response(writer, request_id, &DaemonResponse::Talk { page })
+            }
+            DaemonRequest::TalkStatus { label } => {
+                let talk = state.talk()?;
+                if let Some(label) = label {
+                    talk.set_label(&label)?;
+                }
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::TalkBoard {
+                        state: talk.state(),
+                    },
+                )
+            }
+            DaemonRequest::TalkFetch { from, limit } => write_response(
+                writer,
+                request_id,
+                &DaemonResponse::TalkCarry {
+                    messages: state.talk()?.since(&from, limit),
+                    added: 0,
+                },
+            ),
+            DaemonRequest::TalkAppend { messages } => {
+                let added = state.talk()?.merge(messages)?;
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::TalkCarry {
+                        messages: Vec::new(),
+                        added,
+                    },
+                )
             }
             DaemonRequest::SetAttentionPatterns { patterns } => {
                 *state
@@ -1845,6 +1914,20 @@ mod platform {
         keeper_environment.push(("TERM".into(), "xterm-256color".into()));
         keeper_environment.push(("COLORTERM".into(), "truecolor".into()));
         keeper_environment.push(("TERM_PROGRAM".into(), "muxloom".into()));
+        // Who and where this session is. An agent running in it inherits these
+        // when it starts its own MCP client, so posting to the board or being
+        // written to by name needs nothing from the agent itself — and an
+        // agent that guessed would guess wrong.
+        if let Ok(talk) = state.talk() {
+            keeper_environment.push(("MUXLOOM_MACHINE".into(), talk.origin()));
+            keeper_environment.push(("MUXLOOM_MACHINE_LABEL".into(), talk.label()));
+        }
+        keeper_environment.push(("MUXLOOM_SESSION_ID".into(), session_id.clone()));
+        keeper_environment.push(("MUXLOOM_SESSION_PATH".into(), path.clone()));
+        keeper_environment.push(("MUXLOOM_SESSION_KIND".into(), kind.clone()));
+        if !label.trim().is_empty() {
+            keeper_environment.push(("MUXLOOM_SESSION_LABEL".into(), label.clone()));
+        }
         let history_path = state.paths.history.join(format!("{session_id}.ansi"));
         let metadata_path = state.paths.sessions.join(format!("{session_id}.json"));
         if !temporary {

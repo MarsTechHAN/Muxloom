@@ -15,6 +15,7 @@
 //! and the discovery tools that need a controller's view.
 
 use std::{
+    env,
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -29,6 +30,10 @@ use crate::{
     model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Target},
     runtime::Runtime,
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
+    talk::{
+        MAX_TEXT, TalkDraft, TalkFilter, TalkKind, TalkMessage, TalkPage, TalkScope, TalkSelector,
+        TalkVoice, decode_cursor,
+    },
 };
 
 /// One tool an adapter can offer on behalf of a surface. `input_schema` is a
@@ -74,6 +79,11 @@ const WAIT_MAX_TIMEOUT_SECONDS: u64 = 900;
 /// handing over to a new generation is unreachable for a moment, and a wait
 /// that outlives conversations must outlive that too.
 const WAIT_ERROR_TOLERANCE: usize = 3;
+/// The longest a `talk_read` may sit waiting for someone to say something, and
+/// how often it looks while it waits. Same reasoning as the wait ceiling: an
+/// answer of "nothing yet, here is your cursor" beats a dropped call.
+const TALK_MAX_WAIT_SECONDS: u64 = 120;
+const TALK_POLL: Duration = Duration::from_secs(2);
 
 /// Every tool that changes something rather than reporting it. `read_only`
 /// denies exactly this set, so a tool added here is denied by that switch from
@@ -87,6 +97,7 @@ const WRITE_TOOLS: &[&str] = &[
     "set_machine_enabled",
     "ssh_host",
     "trigger",
+    "talk_post",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -373,6 +384,63 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "id": { "type": "string", "description": "Trigger id: required by delete, and replaces that trigger on set." },
             }),
             &["action"],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "talk_read",
+        description: format!(
+            "Read the talk board: the shared, cross-machine log every muxloom agent and every \
+             person at a dashboard writes to. Read it before starting work to find out what the \
+             others are doing, and after being idle to catch up. By default it shows what is in \
+             front of you — this machine's board, this directory's board, what was said to \
+             everyone, and messages addressed to you. `include_machines` and `include_paths` \
+             widen that to named machines and directories, or to \"all\" to search everywhere. \
+             `since_cursor` takes the `cursor` from a previous read and returns only what has \
+             happened since, so polling never repeats itself; `wait_seconds` (up to \
+             {TALK_MAX_WAIT_SECONDS}) holds the call open until something new is said, which is \
+             how you wait to be answered. `before` pages into the past."
+        ),
+        input_schema: schema(
+            multi,
+            json!({
+                "scope": { "type": "string", "enum": ["path", "machine", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
+                "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
+                "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
+                "limit": { "type": "integer", "description": "Newest N messages. Default 50." },
+                "before": { "type": "integer", "description": "Epoch ms: read backwards from here, for paging into the past." },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["message", "note", "direct"] } },
+                "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
+                "query": { "type": "string", "description": "Only messages containing this text." },
+                "include_machines": { "type": "array", "items": { "type": "string" }, "description": "Also read these machines' boards, or [\"all\"] for every machine." },
+                "include_paths": { "type": "array", "items": { "type": "string" }, "description": "Also read these directories' boards, or [\"all\"] for every directory." },
+                "path": { "type": "string", "description": "Which directory's board counts as yours. Defaults to the session's own." },
+            }),
+            &[],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "talk_post",
+        description: "Say something on the talk board, where every machine and every dashboard \
+                      will see it. Use it to tell the others what you are working on, what you \
+                      found, and what you are about to change — this is how agents avoid \
+                      colliding, and nobody is in charge of anyone else here. `scope` decides who \
+                      it is for: \"path\" (default) is the board for one directory on one machine, \
+                      the project channel; \"machine\" is everyone on this machine; \"global\" is \
+                      everyone, everywhere — keep that one for things that genuinely travel. \
+                      kind \"note\" is the same thing meant to be kept and found later: decisions, \
+                      gotchas, where a thing lives. Posting does not interrupt anyone; to put a \
+                      message in front of one agent, use message_agent."
+            .into(),
+        input_schema: schema(
+            multi,
+            json!({
+                "text": { "type": "string", "description": "What to say." },
+                "scope": { "type": "string", "enum": ["path", "machine", "global"], "description": "Who it is for. Default path." },
+                "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
+                "kind": { "type": "string", "enum": ["message", "note"], "description": "\"note\" is meant to be kept and searched later. Default message." },
+                "reply_to": { "type": "string", "description": "Message id this answers." },
+            }),
+            &["text"],
         ),
     });
     tools.push(ToolSpec {
@@ -913,6 +981,201 @@ fn wait_loop(
     })))
 }
 
+/// What muxloom told this process about the session it is running in.
+///
+/// `launch_session` puts these in a session's environment, so an agent that
+/// lives in one never has to be told — or to guess — who and where it is.
+/// Outside a muxloom session they are simply absent, and the board says so
+/// rather than inventing an identity.
+fn session_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn session_voice() -> TalkVoice {
+    TalkVoice {
+        session_id: session_env("MUXLOOM_SESSION_ID"),
+        label: session_env("MUXLOOM_SESSION_LABEL"),
+        kind: session_env("MUXLOOM_SESSION_KIND"),
+        // Speaking as a person is the dashboard's privilege; anything reaching
+        // the board through a tool call is an agent, whoever asked for it.
+        human: false,
+    }
+}
+
+/// The post a `talk_post` call describes. The scope's machine is left empty on
+/// purpose: the daemon that mints the message is the one that knows its own
+/// origin key, and a caller naming someone else's machine would be filing
+/// under a board it does not own.
+fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
+    let text = required_str(arguments, "text")?;
+    if text.len() > MAX_TEXT {
+        bail!(
+            "text must be shorter than {MAX_TEXT} bytes: post what the others need to know, not \
+             the transcript"
+        );
+    }
+    let kind = TalkKind::parse(optional_str(arguments, "kind").unwrap_or("message"))?;
+    if kind == TalkKind::Direct {
+        bail!(
+            "talk_post writes to a board, and a direct message goes to one session: use \
+             message_agent instead"
+        );
+    }
+    let scope = match optional_str(arguments, "scope").unwrap_or("path") {
+        "global" => TalkScope::Global,
+        "machine" => TalkScope::Machine {
+            machine: String::new(),
+        },
+        "path" => TalkScope::Path {
+            machine: String::new(),
+            path: optional_str(arguments, "path")
+                .map(str::to_string)
+                .or_else(|| session_env("MUXLOOM_SESSION_PATH"))
+                .context(
+                    "scope \"path\" needs a path, and this process is not running inside a \
+                     muxloom session that could name one",
+                )?,
+        },
+        other => bail!("unknown scope {other}: use path, machine, or global"),
+    };
+    Ok(TalkDraft {
+        scope,
+        voice: session_voice(),
+        kind,
+        to: None,
+        reply_to: optional_str(arguments, "reply_to").map(Into::into),
+        text: text.into(),
+    })
+}
+
+/// What a `talk_read` call asks for. The reader's own identity is filled in
+/// here rather than taken from the caller: whose messages count as "mine" is
+/// not something an agent should be able to claim.
+fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
+    let scope = match optional_str(arguments, "scope") {
+        None => None,
+        Some(scope @ ("global" | "machine" | "path" | "direct")) => Some(scope.to_string()),
+        Some(other) => bail!("unknown scope {other}: use path, machine, global, or direct"),
+    };
+    Ok(TalkFilter {
+        since: optional_str(arguments, "since_cursor")
+            .map(decode_cursor)
+            .unwrap_or_default(),
+        scope,
+        kinds: string_list(arguments, "kinds")?,
+        authors: string_list(arguments, "authors")?,
+        query: optional_str(arguments, "query").map(Into::into),
+        machines: talk_selector(arguments, "include_machines")?,
+        paths: talk_selector(arguments, "include_paths")?,
+        session_id: session_env("MUXLOOM_SESSION_ID"),
+        path: optional_str(arguments, "path")
+            .map(Into::into)
+            .or_else(|| session_env("MUXLOOM_SESSION_PATH")),
+        before: arguments.get("before").and_then(Value::as_u64),
+        limit: optional_usize(arguments, "limit", 50),
+    })
+}
+
+/// A list of names, however the caller wrote it: an array, or the one string
+/// they meant.
+fn string_list(arguments: &Value, key: &str) -> Result<Vec<String>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(one)) => Ok(vec![one.clone()]),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("{key} must be an array of strings"))
+            })
+            .collect(),
+        Some(_) => bail!("{key} must be an array of strings"),
+    }
+}
+
+/// How far a read reaches. Saying nothing means "where I am"; `"all"`, alone
+/// or among names, means everywhere.
+fn talk_selector(arguments: &Value, key: &str) -> Result<TalkSelector> {
+    let names = string_list(arguments, key)?;
+    Ok(if names.is_empty() {
+        TalkSelector::Mine
+    } else if names.iter().any(|name| name == "all") {
+        TalkSelector::All
+    } else {
+        TalkSelector::Only { names }
+    })
+}
+
+fn talk_json(message: &TalkMessage) -> Value {
+    let machine = if message.author.machine_label.is_empty() {
+        &message.author.machine
+    } else {
+        &message.author.machine_label
+    };
+    json!({
+        "id": message.id,
+        "ts": message.ts,
+        "scope": message.scope.name(),
+        "scope_machine": message.scope.machine(),
+        "scope_path": message.scope.path(),
+        "kind": message.kind.name(),
+        "from": {
+            "name": message.author.voice.name(),
+            "machine": machine,
+            "session_id": &message.author.voice.session_id,
+            "kind": &message.author.voice.kind,
+            "human": message.author.voice.human,
+        },
+        "to": message.to.as_ref().map(|to| json!({
+            "machine": to.machine,
+            "session_id": to.session_id,
+        })),
+        "reply_to": &message.reply_to,
+        "text": message.text,
+    })
+}
+
+/// Read the board, and if the caller asked to wait, keep reading until someone
+/// says something or the wait runs out.
+///
+/// Polled from the adapter side for the same reason `wait_loop` is: a client
+/// that sits on a daemon connection waiting to be spoken to holds generation
+/// handover open for as long as it waits.
+fn talk_wait(
+    arguments: &Value,
+    mut filter: TalkFilter,
+    mut read: impl FnMut(&TalkFilter) -> Result<TalkPage>,
+) -> Result<String> {
+    let wait =
+        Duration::from_secs(optional_u64(arguments, "wait_seconds", 0).min(TALK_MAX_WAIT_SECONDS));
+    let started = Instant::now();
+    loop {
+        let page = read(&filter)?;
+        let elapsed = started.elapsed();
+        if !page.messages.is_empty() || elapsed >= wait {
+            return Ok(pretty(&json!({
+                "messages": page.messages.iter().map(talk_json).collect::<Vec<_>>(),
+                "cursor": page.cursor,
+                "truncated": page.truncated,
+                "waited_ms": elapsed.as_millis() as u64,
+                "note": page.truncated.then_some(
+                    "more messages matched than fit: read again with `before` set to the oldest \
+                     ts you got to page further back",
+                ),
+            })));
+        }
+        // Only what arrives from here on is news, and paging into the past is
+        // not what a wait is for.
+        filter.since = decode_cursor(&page.cursor);
+        filter.before = None;
+        thread::sleep(TALK_POLL.min(wait - elapsed));
+    }
+}
+
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
@@ -1393,6 +1656,23 @@ impl ControllerControl {
         }
     }
 
+    fn talk_post(&self, arguments: &Value) -> Result<String> {
+        let target = self.target(arguments)?;
+        let message = self
+            .runtime
+            .bridge_pool()
+            .talk_post(&target, talk_draft(arguments)?)?;
+        Ok(pretty(&talk_json(&message)))
+    }
+
+    fn talk_read(&self, arguments: &Value) -> Result<String> {
+        let target = self.target(arguments)?;
+        let pool = self.runtime.bridge_pool();
+        talk_wait(arguments, talk_filter(arguments)?, |filter| {
+            pool.talk_read(&target, filter.clone())
+        })
+    }
+
     fn launch_session(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let kind = agent_kind(arguments)?;
@@ -1534,6 +1814,8 @@ impl ControlSurface for ControllerControl {
             "read_screen" => self.read_screen(arguments),
             "wait_for" => self.wait_for(arguments),
             "trigger" => self.trigger(arguments),
+            "talk_read" => self.talk_read(arguments),
+            "talk_post" => self.talk_post(arguments),
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
@@ -1604,7 +1886,8 @@ mod daemon_surface {
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
         allowed_specs, build_input, enforce_policy, instructions, optional_bool, optional_str,
         optional_usize, plain_screen, pretty, preview_text, required_str, screen_page,
-        session_json, shell_report, trigger_json, trigger_spec, wait_loop,
+        session_json, shell_report, talk_draft, talk_filter, talk_json, talk_wait, trigger_json,
+        trigger_spec, wait_loop,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -1799,6 +2082,35 @@ mod daemon_surface {
             }
         }
 
+        fn talk_post(&self, arguments: &Value) -> Result<String> {
+            let draft = talk_draft(arguments)?;
+            match self.transact(&DaemonRequest::TalkPost { draft })?.0 {
+                DaemonResponse::Talk { page } => {
+                    let message = page
+                        .messages
+                        .into_iter()
+                        .next()
+                        .context("muxloomd took the post but did not report it back")?;
+                    Ok(pretty(&talk_json(&message)))
+                }
+                response => bail!("unexpected talk response: {response:?}"),
+            }
+        }
+
+        fn talk_read(&self, arguments: &Value) -> Result<String> {
+            talk_wait(arguments, talk_filter(arguments)?, |filter| {
+                match self
+                    .transact(&DaemonRequest::TalkRead {
+                        filter: filter.clone(),
+                    })?
+                    .0
+                {
+                    DaemonResponse::Talk { page } => Ok(page),
+                    response => bail!("unexpected talk response: {response:?}"),
+                }
+            })
+        }
+
         fn launch_session(&self, arguments: &Value) -> Result<String> {
             let kind = agent_kind(arguments)?;
             let path = required_str(arguments, "path")?;
@@ -1928,6 +2240,8 @@ mod daemon_surface {
                 "read_screen" => self.read_screen(arguments),
                 "wait_for" => self.wait_for(arguments),
                 "trigger" => self.trigger(arguments),
+                "talk_read" => self.talk_read(arguments),
+                "talk_post" => self.talk_post(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
                     let bytes = build_input(arguments)?;
@@ -2133,8 +2447,10 @@ mod tests {
                 "list_sessions",
                 "read_screen",
                 // Waiting only watches; arming a trigger acts, so `trigger`
-                // is not here.
+                // is not here. Reading the board is watching too — saying
+                // something on it is not.
                 "wait_for",
+                "talk_read",
                 "search_history",
                 "list_directory",
                 "list_files",
@@ -2592,6 +2908,107 @@ mod tests {
                 "delete_session",
                 json!({ "session_id": session_id }),
             );
+        }
+
+        #[test]
+        fn a_post_lands_on_the_board_the_reader_is_standing_on() {
+            let mut surface = surface("talk");
+            let here = "/tmp/muxloom-talk-here";
+            let elsewhere = "/tmp/muxloom-talk-elsewhere";
+
+            let posted: Value = serde_json::from_str(&call(
+                &mut surface,
+                "talk_post",
+                json!({ "text": "the kettle is on", "path": here }),
+            ))
+            .unwrap();
+            assert_eq!(posted["scope"], "path");
+            assert_eq!(posted["scope_path"], here);
+            assert_eq!(posted["kind"], "message");
+            // A poster names the board; the daemon that mints the message is
+            // the one that knows which machine it is.
+            assert!(
+                posted["scope_machine"]
+                    .as_str()
+                    .is_some_and(|machine| !machine.is_empty()),
+                "{posted:#}"
+            );
+
+            call(
+                &mut surface,
+                "talk_post",
+                json!({
+                    "text": "the flour is in the second drawer",
+                    "scope": "global",
+                    "kind": "note",
+                }),
+            );
+
+            let texts = |page: &Value| -> Vec<String> {
+                page["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message["text"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let read = |surface: &mut DaemonControl, arguments: Value| -> Value {
+                serde_json::from_str(&call(surface, "talk_read", arguments)).unwrap()
+            };
+
+            let page = read(&mut surface, json!({ "path": here }));
+            assert_eq!(
+                texts(&page),
+                ["the kettle is on", "the flour is in the second drawer"],
+                "{page:#}"
+            );
+
+            // Standing somewhere else, that project's board is not yours —
+            // what was said to everyone still is.
+            let page_elsewhere = read(&mut surface, json!({ "path": elsewhere }));
+            assert_eq!(
+                texts(&page_elsewhere),
+                ["the flour is in the second drawer"]
+            );
+            // Unless you ask for it by name, which is how a board is looked
+            // into from outside.
+            let widened = read(
+                &mut surface,
+                json!({ "path": elsewhere, "include_paths": [here] }),
+            );
+            assert_eq!(texts(&widened).len(), 2, "{widened:#}");
+
+            let global_only = read(&mut surface, json!({ "path": here, "scope": "global" }));
+            assert_eq!(texts(&global_only), ["the flour is in the second drawer"]);
+
+            // A cursor is how an agent polls without reading the board twice,
+            // and waiting on one that has nothing new answers rather than
+            // hanging on.
+            let cursor = page["cursor"].as_str().unwrap().to_string();
+            let waited = read(
+                &mut surface,
+                json!({ "path": here, "since_cursor": cursor, "wait_seconds": 1 }),
+            );
+            assert!(texts(&waited).is_empty(), "{waited:#}");
+            assert!(waited["waited_ms"].as_u64().unwrap() >= 900, "{waited:#}");
+
+            call(
+                &mut surface,
+                "talk_post",
+                json!({ "text": "the kettle boiled", "path": here }),
+            );
+            let after = read(
+                &mut surface,
+                json!({ "path": here, "since_cursor": cursor }),
+            );
+            assert_eq!(texts(&after), ["the kettle boiled"]);
+
+            // A direct message goes to a session, not to a board.
+            let refused = surface
+                .call("talk_post", &json!({ "text": "psst", "kind": "direct" }))
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("message_agent"), "{refused}");
         }
     }
 }

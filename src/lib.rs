@@ -19,6 +19,7 @@ pub mod port_forward;
 pub mod recap;
 pub mod runtime;
 pub mod ssh_config;
+pub mod talk;
 pub mod terminal_session;
 pub mod ui;
 #[cfg(feature = "controller")]

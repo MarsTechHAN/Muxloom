@@ -23,6 +23,7 @@ use crate::{
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
+    talk::{TALK_CAPABILITY, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -779,6 +780,59 @@ impl BridgeConnection {
     pub fn delete_trigger(&self, id: String) -> Result<()> {
         self.require_capability(TRIGGERS_CAPABILITY)?;
         self.expect_ack(DaemonRequest::DeleteTrigger { id })
+    }
+
+    pub fn talk_post(&self, draft: TalkDraft) -> Result<TalkMessage> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self.request(DaemonRequest::TalkPost { draft })?.response {
+            DaemonResponse::Talk { page } => page
+                .messages
+                .into_iter()
+                .next()
+                .context("muxloomd filed the message but did not report it back"),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
+    pub fn talk_read(&self, filter: TalkFilter) -> Result<TalkPage> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self.request(DaemonRequest::TalkRead { filter })?.response {
+            DaemonResponse::Talk { page } => Ok(page),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
+    /// What the board on this machine holds, telling it the name a human uses
+    /// for the machine while we are here: the controller is the only thing
+    /// that knows it, and a message carries it for reading later.
+    pub fn talk_status(&self, label: Option<String>) -> Result<TalkState> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self.request(DaemonRequest::TalkStatus { label })?.response {
+            DaemonResponse::TalkBoard { state } => Ok(state),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
+    pub fn talk_fetch(&self, from: TalkVector, limit: usize) -> Result<Vec<TalkMessage>> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::TalkFetch { from, limit })?
+            .response
+        {
+            DaemonResponse::TalkCarry { messages, .. } => Ok(messages),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
+    pub fn talk_append(&self, messages: Vec<TalkMessage>) -> Result<usize> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::TalkAppend { messages })?
+            .response
+        {
+            DaemonResponse::TalkCarry { added, .. } => Ok(added),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
     }
 
     fn has_capability(&self, capability: &str) -> bool {
@@ -2037,6 +2091,31 @@ impl BridgePool {
 
     pub fn delete_trigger(&self, target: &Target, id: String) -> Result<()> {
         self.connection_for_target(target)?.delete_trigger(id)
+    }
+
+    pub fn talk_post(&self, target: &Target, draft: TalkDraft) -> Result<TalkMessage> {
+        self.connection_for_target(target)?.talk_post(draft)
+    }
+
+    pub fn talk_read(&self, target: &Target, filter: TalkFilter) -> Result<TalkPage> {
+        self.connection_for_target(target)?.talk_read(filter)
+    }
+
+    pub fn talk_status(&self, target: &Target, label: Option<String>) -> Result<TalkState> {
+        self.connection_for_target(target)?.talk_status(label)
+    }
+
+    pub fn talk_fetch(
+        &self,
+        target: &Target,
+        from: TalkVector,
+        limit: usize,
+    ) -> Result<Vec<TalkMessage>> {
+        self.connection_for_target(target)?.talk_fetch(from, limit)
+    }
+
+    pub fn talk_append(&self, target: &Target, messages: Vec<TalkMessage>) -> Result<usize> {
+        self.connection_for_target(target)?.talk_append(messages)
     }
 
     /// The serving daemon's pid and client count.

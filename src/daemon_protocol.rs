@@ -3,7 +3,10 @@ use std::io::{self, Read, Write};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::model::{DirectoryListing, FileListing, FilePreview};
+use crate::{
+    model::{DirectoryListing, FileListing, FilePreview},
+    talk::{TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 28;
@@ -302,6 +305,31 @@ pub enum DaemonRequest {
     DeleteTrigger {
         id: String,
     },
+    /// Write one message to this machine's talk board.
+    TalkPost {
+        draft: TalkDraft,
+    },
+    /// Read the board as someone standing on this machine sees it.
+    TalkRead {
+        filter: TalkFilter,
+    },
+    /// What this machine's board holds, so a peer can work out the difference.
+    /// A controller sends down the name a human uses for the machine at the
+    /// same time: it is the only thing that knows it.
+    TalkStatus {
+        #[serde(default)]
+        label: Option<String>,
+    },
+    /// Everything held past a peer's version vector.
+    TalkFetch {
+        from: TalkVector,
+        limit: usize,
+    },
+    /// File messages minted elsewhere. Idempotent, so a carrier never has to
+    /// remember what it has already delivered.
+    TalkAppend {
+        messages: Vec<TalkMessage>,
+    },
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -413,6 +441,21 @@ pub enum DaemonResponse {
     /// and `ListTriggers`.
     Triggers {
         triggers: Vec<Trigger>,
+    },
+    /// Answers `TalkRead`, and `TalkPost` with the one message it minted.
+    Talk {
+        page: TalkPage,
+    },
+    /// Answers `TalkStatus`.
+    TalkBoard {
+        state: TalkState,
+    },
+    /// Answers `TalkFetch`, and `TalkAppend` with how many were new.
+    TalkCarry {
+        #[serde(default)]
+        messages: Vec<TalkMessage>,
+        #[serde(default)]
+        added: usize,
     },
     Error {
         message: String,
