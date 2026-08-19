@@ -189,11 +189,12 @@ collapsing into a linearized log. Attaching starts with thousands of rows of
 history: the daemon renders them from the session's log, so a redraw-heavy
 agent that spends its retained output on frames rather than finished lines is
 still deep to page through after the controller is relaunched. Drag to select
-and copy — while scrolled back, and while the file browser is open.
+— while scrolled back, and while the file browser is open — then right-click to
+copy. Right-clicking with nothing selected pastes the clipboard instead.
 
 **Keys** — `Enter` attach · `PageUp`/`PageDown` or wheel scroll · drag to select
-· `Cmd+C`/`Ctrl+Shift+C` copy (plain `Ctrl-c` goes to the agent) ·
-`Shift`/`Option+Enter` newline.
+· right-click copy, or paste · `Cmd+C`/`Ctrl+Shift+C` copy (plain `Ctrl-c` goes
+to the agent) · `Shift`/`Option+Enter` newline.
 
 ### 📁 File browser and previews
 
@@ -217,8 +218,8 @@ Files over 4 MiB are not re-read on their own — press `r` or `F5` to pull the
 current bytes.
 
 **Keys** — `Ctrl-f` open/close · type to match · `Enter`/`Right` open · `Left`
-up · `Ctrl-d` download · `Ctrl-y` copy path · drag preview text to copy · drag
-local files in to upload.
+up · `Ctrl-d` download · `Ctrl-y` copy path · drag preview text and right-click
+to copy · drag local files in to upload.
 
 ### 🔍 Search, recap, and archive
 
@@ -373,8 +374,9 @@ first and last item, and each mouse-wheel event moves exactly one item.
 | `Ctrl-c`, `Ctrl-d` | Forward to the agent or shell |
 | `PageUp`, `PageDown` | Move through terminal scrollback by a viewport |
 | Mouse wheel over terminal | Move scrollback continuously in one-line steps |
-| Drag over terminal text | Copy the selection on mouse release |
-| `Alt` + drag | Forward mouse drag to a terminal application |
+| Drag over terminal text | Select it; the selection stays until you copy or clear it |
+| Right-click the terminal | Copy the selection, or paste the clipboard when nothing is selected |
+| `Alt` + drag, `Alt` + right-click | Forward the gesture to a terminal application |
 
 ### File browser
 
@@ -385,10 +387,11 @@ first and last item, and each mouse-wheel event moves exactly one item.
 | `/pattern` | Search filenames recursively below the current directory; supports `*` and `**` |
 | `Right`, `Enter`, double-click | Enter a directory or toggle Preview |
 | `Left`, right-click | Go to the parent directory |
+| Right-click selected preview text | Copy it; with nothing selected the click still goes to the parent |
 | Arrows, `PageUp` / `PageDown` | Page an opened preview, stopping at its start and end |
 | `g` / `G`, `Home` / `End` | Jump to preview start or end; the end follows the file as it grows |
 | `Ctrl-y` | Copy the selected target-side full path |
-| Drag over preview text | Copy the selected preview text on release |
+| Drag over preview text | Select it; right-click copies |
 | `Ctrl-d` | Download the selected file to `~/Downloads` |
 | Drag local files in | Upload them to the browsed directory |
 | `Ctrl-r`, `F5` | Re-read the open preview, or refresh the current directory |

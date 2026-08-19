@@ -224,6 +224,9 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
                 Err(error) => app.status_message = format!("Clipboard copy failed: {error}"),
             }
         }
+        if app.take_clipboard_paste_request() {
+            app.deliver_clipboard_paste(read_native_clipboard());
+        }
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
@@ -409,6 +412,57 @@ fn copy_native_clipboard(text: &str) -> bool {
     tools
         .into_iter()
         .any(|(program, arguments)| write_clipboard_command(program, arguments, text))
+}
+
+/// Read the clipboard back, for the right-click that pastes.
+///
+/// Only a native tool can answer this. OSC 52 has a read form, but terminals
+/// refuse it almost universally — letting a remote program read the clipboard
+/// is a hole nobody wants — so a machine without a clipboard tool simply has
+/// no clipboard to offer, and the user pastes with their own terminal instead.
+#[cfg(target_os = "macos")]
+fn read_native_clipboard() -> Option<String> {
+    read_clipboard_command("pbpaste", &[])
+}
+
+/// `Get-Clipboard` prints the clipboard as lines, so it hands back a trailing
+/// newline that was never copied. Left on, it would submit whatever it pasted.
+#[cfg(target_os = "windows")]
+fn read_native_clipboard() -> Option<String> {
+    let text = read_clipboard_command("powershell", &["-NoProfile", "-Command", "Get-Clipboard"])?;
+    Some(text.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn read_native_clipboard() -> Option<String> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut tools: Vec<(&str, &[&str])> = vec![
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    if wayland {
+        tools.insert(0, ("wl-paste", &["--no-newline"]));
+    } else {
+        tools.push(("wl-paste", &["--no-newline"]));
+    }
+    tools
+        .into_iter()
+        .find_map(|(program, arguments)| read_clipboard_command(program, arguments))
+}
+
+fn read_clipboard_command(program: &str, arguments: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 fn write_clipboard_command(program: &str, arguments: &[&str], text: &str) -> bool {

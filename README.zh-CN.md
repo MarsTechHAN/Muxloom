@@ -237,7 +237,9 @@ scrollback，因此 Codex、Claude Code 等实时重绘 TUI 显示真实行而�
 鼠标支持点击 Focus/选择、Archive、Back 和提醒 Banner。点击在松开时生效，因此按下之后
 移动再松开算滑动而不是点击。Machine 单击只选择；只有在 `[x]`
 范围内双击才会启用或禁用。可以拖动所有布局分隔线；
-直接拖选 Terminal 文本会在松开时复制，`Alt+拖拽` 则转发给启用 Mouse Reporting 的程序。
+直接拖选 Terminal 文本只是选中，松开不会复制，选区一直留在屏幕上；在 Terminal 上单击右键
+复制选区，没有选区时右键则把剪贴板粘贴进会话。`Alt+拖拽`、`Alt+右键` 转发给启用 Mouse
+Reporting 的程序。
 
 <a id="zh-touch"></a>
 
@@ -506,10 +508,11 @@ Pane（Pane-focus 快捷键或点击）即可在那里输入或操作，Files �
 | `/pattern` | 递归搜索当前目录下的文件名，支持 `*` 和 `**` 通配符 |
 | `Right`、`Enter`、双击 | 进入目录或展开/收起 Preview |
 | `Left`、右键 | 返回父目录 |
+| 在选中的 Preview 文本上单击右键 | 复制选区；没有选区时右键仍然返回父目录 |
 | 方向键、`PageUp` / `PageDown` | 对打开内容翻页，并停在开头或末尾 |
 | `g` / `G`、`Home` / `End` | 跳到 Preview 开头或末尾；停在末尾时会随文件增长自动跟随 |
 | `c` | 复制目标机器上的完整路径 |
-| 在 Preview 上拖拽 | 松开鼠标时复制选中的 Preview 文本 |
+| 在 Preview 上拖拽 | 选中 Preview 文本；右键复制 |
 | `d` | 下载到 Controller 的 `~/Downloads` |
 | 拖入本地文件 | 上传到当前浏览目录 |
 | `r` / `F5` | 重新读取打开的 Preview；未打开时刷新目录 |

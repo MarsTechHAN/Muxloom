@@ -510,7 +510,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 75;
+pub const HELP_CONTENT_ROWS: usize = 77;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1156,6 +1156,10 @@ pub struct App {
     pending_terminal_has_output: bool,
     pending_terminal_take_input: bool,
     clipboard_request: Option<String>,
+    /// Set when a right-click found nothing to copy: the clipboard is the
+    /// outer terminal's, so the loop that owns it reads it and hands the text
+    /// back.
+    clipboard_paste: bool,
     pending_install_launch: Option<PendingInstallLaunch>,
     pending_archived_resume: Option<ArchivedResume>,
     /// A successful launch is not selectable until the next daemon scan returns
@@ -1294,6 +1298,7 @@ impl App {
             pending_terminal_has_output: false,
             pending_terminal_take_input: false,
             clipboard_request: None,
+            clipboard_paste: false,
             pending_install_launch: None,
             pending_archived_resume: None,
             pending_launch_selection: None,
@@ -2325,6 +2330,17 @@ impl App {
                     self.open_board();
                     return Action::Continue;
                 }
+                // Right-click is the clipboard button over the terminal:
+                // copy what is selected, paste when nothing is. Alt-right-click
+                // stays the way through to an application that wants the
+                // button for itself.
+                if button == MouseButton::Right
+                    && !mouse.modifiers.contains(KeyModifiers::ALT)
+                    && self.terminal_cell_at(mouse.column, mouse.row).is_some()
+                {
+                    self.right_click_terminal();
+                    return Action::Continue;
+                }
                 if button == MouseButton::Left {
                     self.terminal_selection = None;
                 }
@@ -2829,6 +2845,19 @@ impl App {
         };
         if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
             self.last_file_click = None;
+            // Right-click is the copy button over selected preview text, the
+            // same as over the terminal; with nothing selected it still walks
+            // up a directory.
+            if in_preview {
+                self.file_manager = Some(form);
+                if self.copy_preview_selection() {
+                    if let Some(form) = self.file_manager.as_mut() {
+                        form.preview_selection = None;
+                    }
+                    return true;
+                }
+                form = self.file_manager.take().expect("file form disappeared");
+            }
             let child = form.path.clone();
             let parent = parent_path(&child);
             if parent == child {
@@ -2908,10 +2937,9 @@ impl App {
                 if let Some(selection) = form.preview_selection.as_mut() {
                     selection.dragging = false;
                 }
-                if let Some(text) = Self::selected_preview_text(&form) {
-                    let characters = text.chars().count();
-                    self.clipboard_request = Some(text);
-                    self.status_message = format!("Copied {characters} characters to clipboard");
+                // Held, not taken: the click that copies is the right one.
+                if Self::selected_preview_text(&form).is_some() {
+                    self.status_message = "Selected; right-click to copy".into();
                 }
                 self.file_manager = Some(form);
                 return true;
@@ -3144,6 +3172,32 @@ impl App {
 
     pub fn take_clipboard_request(&mut self) -> Option<String> {
         self.clipboard_request.take()
+    }
+
+    /// Whether a right-click asked for the clipboard's contents. The clipboard
+    /// belongs to the terminal muxloom is drawn in, so only the loop that owns
+    /// that terminal can answer.
+    pub fn take_clipboard_paste_request(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_paste)
+    }
+
+    /// Hand back what the clipboard held. `None` means nothing on this machine
+    /// could read it, which is worth saying: the click did nothing, and the
+    /// user is owed the reason rather than left to wonder.
+    pub fn deliver_clipboard_paste(&mut self, text: Option<String>) {
+        match text {
+            Some(text) if !text.is_empty() => {
+                let characters = text.chars().count();
+                self.status_message = format!("Pasted {characters} characters");
+                // After the note, so a paste that fails replaces it with why.
+                self.handle_paste(text);
+            }
+            Some(_) => self.status_message = "The clipboard is empty".into(),
+            None => {
+                self.status_message =
+                    "No clipboard tool here; paste with the terminal's own shortcut".into();
+            }
+        }
     }
 
     /// Temper the "copied" message when nothing confirmed the copy. Without a
@@ -9100,7 +9154,14 @@ impl App {
         if let Some(selection) = self.terminal_selection.as_mut() {
             selection.dragging = false;
         }
-        if self.copy_terminal_selection() {
+        // Lifting the button ends the selection, not the copy. Copying here
+        // meant a selection could never be looked at before it was taken, and
+        // every stray drag overwrote whatever the clipboard was holding.
+        if self
+            .terminal_selection
+            .is_some_and(|selection| selection.anchor != selection.cursor)
+        {
+            self.status_message = "Selected; right-click to copy, again to paste".into();
             return;
         }
         if self.status_message == "Selecting terminal text..." {
@@ -9117,6 +9178,20 @@ impl App {
         if !forwarded && !released {
             self.click_pane(mouse.column, mouse.row);
         }
+    }
+
+    /// What a right-click over the terminal means. One button carries both
+    /// halves of the clipboard, the way a Windows console does, and which half
+    /// it took is never in doubt: text on screen is highlighted or it is not.
+    /// The copy clears the highlight, so the click after it pastes.
+    fn right_click_terminal(&mut self) {
+        self.focus = Focus::Recap;
+        if self.copy_terminal_selection() {
+            self.terminal_selection = None;
+            return;
+        }
+        self.terminal_selection = None;
+        self.clipboard_paste = true;
     }
 
     fn copy_terminal_selection(&mut self) -> bool {
@@ -11101,6 +11176,16 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         });
+        assert!(
+            app.take_clipboard_request().is_none(),
+            "letting go holds the selection rather than taking it"
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
         assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
     }
 
@@ -11193,11 +11278,37 @@ mod tests {
 
         assert!(!app.touch_detected, "a mouse crosses cells one at a time");
         assert_eq!(app.history_offset, 3, "selecting never scrolls");
+        assert!(app.terminal_selection.is_some(), "the selection is held");
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
         assert_eq!(
             app.take_clipboard_request().as_deref(),
             Some("one\ntwo"),
-            "the drag copied the rows it covered"
+            "the right-click copied the rows the drag covered"
         );
+    }
+
+    #[test]
+    fn a_right_click_copies_a_selection_and_pastes_without_one() {
+        let mut app = touch_test_app();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert!(app.take_clipboard_request().is_none(), "nothing to copy");
+        assert!(app.take_clipboard_paste_request(), "so it pastes instead");
+        assert!(
+            !app.take_clipboard_paste_request(),
+            "and the request is drained once"
+        );
+
+        // The click that copies also clears the highlight, so the click after
+        // it pastes rather than taking the same text twice.
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one\ntwo"));
+        assert!(!app.take_clipboard_paste_request());
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert!(app.take_clipboard_paste_request());
     }
 
     #[test]
@@ -11213,6 +11324,7 @@ mod tests {
         app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 1));
 
         assert_eq!(app.history_offset, 3, "a held press never scrolls");
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 1));
         assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
     }
 
@@ -11227,6 +11339,7 @@ mod tests {
 
         assert!(!app.touch_gestures_active());
         assert_eq!(app.history_offset, 3);
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
         assert_eq!(app.take_clipboard_request().as_deref(), Some("one\ntwo"));
     }
 

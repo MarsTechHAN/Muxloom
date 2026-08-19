@@ -2984,9 +2984,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Insert a newline without submitting",
         ),
         help_row("Ctrl-c / Ctrl-d", "Forward directly to the focused session"),
+        help_row("Mouse drag", "Select terminal text; Alt-drag forwards"),
         help_row(
-            "Mouse drag",
-            "Select and copy terminal text; Alt-drag forwards",
+            "Right-click terminal",
+            "Copy the selection, or paste when there is none",
         ),
         help_row(
             "Cmd-c / Ctrl-Shift-c",
@@ -3047,6 +3048,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_row("Type text", "Filter the entries in the browsed directory"),
         help_row("Ctrl-d", "Download the selected file to Downloads"),
         help_row("Ctrl-y", "Copy the selected target path to the clipboard"),
+        help_row(
+            "Right-click preview",
+            "Copy selected preview text, else go to the parent",
+        ),
         help_row("Drop local files", "Upload them into the visible directory"),
         Line::raw(""),
         help_header("Touch Screens"),

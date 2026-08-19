@@ -128,6 +128,10 @@ preserve.
   dimensions. Preserve wide-cell invariants across shrink, reflow, and erase.
 - Mouse reporting, direct text selection, bracketed paste, modifier keys, and
   IME input must keep working in attached sessions.
+- The clipboard gets a button of its own: right-click over the terminal copies
+  the selection and pastes when there is none, and `Alt` is the way through to
+  an application that wants the button. A selection is never taken on
+  button-up — a release the user did not aim must not overwrite the clipboard.
 - Normal exit, errors, panics, and handled signals must restore raw mode, the
   alternate screen, mouse capture, cursor visibility, and the outer terminal's
   attributes.
