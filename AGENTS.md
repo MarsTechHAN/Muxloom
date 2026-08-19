@@ -132,6 +132,11 @@ preserve.
   the selection and pastes when there is none, and `Alt` is the way through to
   an application that wants the button. A selection is never taken on
   button-up — a release the user did not aim must not overwrite the clipboard.
+- Reading a pointer as a finger takes evidence, and the terminal's own identity
+  outranks how the pointer moved: a desktop emulator never latches touch mode,
+  and one hover — which no touch screen can produce — takes back a guess for
+  the rest of the run. Losing text selection to a misread mouse is worse than
+  any gesture it buys.
 - Normal exit, errors, panics, and handled signals must restore raw mode, the
   alternate screen, mouse capture, cursor visibility, and the outer terminal's
   attributes.

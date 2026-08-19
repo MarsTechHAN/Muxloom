@@ -420,10 +420,18 @@ Terminus, over the same SGR mouse reports a mouse sends.
 
 Lists, modals, and the file browser always follow the finger. Only the terminal
 pane and the file preview have to choose between scrolling and selecting text,
-and `touch` in the configuration decides for them: `"auto"` (the default) keeps
-mouse behavior until a pointer jumps further between two reports than a mouse
-can, `"on"` assumes a touch screen from the start, and `"off"` keeps every drag
-a text selection.
+and `touch` in the configuration decides for them: `"on"` assumes a touch screen
+from the start, `"off"` keeps every drag a text selection, and `"auto"` — the
+default — works it out.
+
+On `"auto"`, the terminal is asked first. Termux is touch-only; a terminal that
+names itself in `TERM_PROGRAM` or `TERM` — iTerm2, Terminal.app, VS Code,
+WezTerm, Ghostty, Kitty, Alacritty, Windows Terminal and their kind — is a
+window on a desktop, and nothing its pointer does is ever read as a finger.
+Where the terminal says nothing, a pointer that jumps further between two
+reports than a mouse can reveals a touch screen — and a pointer that later
+hovers with no button held takes that back for the rest of the run, because
+nothing hovers over a touch screen.
 
 ## Configuration
 
@@ -461,7 +469,7 @@ auto_update = true
 update_prompt = "ask"
 # How a press-drag-release reads in the terminal pane and the file preview:
 # "on" swipes to scroll and selects after a long press, "off" always selects,
-# "auto" selects until a pointer jump no mouse produces reveals a touch screen.
+# "auto" asks the terminal it runs in and falls back to how the pointer moves.
 touch = "auto"
 
 [agents.codex]

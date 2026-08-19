@@ -537,7 +537,7 @@ update_prompt = "ask"
 # Touch screens: lists and modals always follow the finger. This decides the
 # terminal pane and the file preview, where a drag otherwise selects text.
 # "on" swipes to scroll and selects after a long press, "off" always selects,
-# "auto" selects until a pointer jump no mouse produces reveals a touch screen.
+# "auto" asks the terminal it runs in and falls back to how the pointer moves.
 touch = "auto"
 
 # Local backup of every session's conversation history (running + archived)

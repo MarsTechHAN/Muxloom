@@ -923,6 +923,63 @@ const PANE_SWIPE_COLUMNS: u16 = 8;
 /// more than a screen, and a wild report must not walk a list for a second.
 const MAX_SWIPE_STEPS: u16 = 32;
 
+/// Terminals that name themselves in `TERM_PROGRAM`, all of which are windows
+/// on a desktop with a pointing device in front of them.
+const DESKTOP_TERM_PROGRAMS: [&str; 12] = [
+    "apple_terminal",
+    "ghostty",
+    "hyper",
+    "iterm.app",
+    "kitty",
+    "konsole",
+    "rio",
+    "tabby",
+    "vscode",
+    "warpterminal",
+    "wezterm",
+    "windowsterminal",
+];
+/// Terminals that identify themselves in `TERM` instead, which is the one
+/// variable that survives an SSH hop.
+const DESKTOP_TERMS: [&str; 7] = [
+    "alacritty",
+    "contour",
+    "foot",
+    "rio",
+    "wezterm",
+    "xterm-ghostty",
+    "xterm-kitty",
+];
+
+/// What the terminal muxloom is drawn in says about how it is pointed at,
+/// before a single report has arrived.
+///
+/// `Some(true)` is a terminal that can only ever be touched — Termux runs on a
+/// phone and nothing else. `Some(false)` is a desktop terminal emulator, where
+/// every pointer report comes from a mouse or a trackpad however jumpy it
+/// looks, so the motion heuristic must not be allowed to guess otherwise.
+/// `None` is everything else — an unknown `TERM` over SSH, a mobile SSH client
+/// — which only the pointer's own behavior can settle.
+fn terminal_touch_hint() -> Option<bool> {
+    let termux = std::env::var_os("TERMUX_VERSION").is_some()
+        || std::env::var_os("TERMUX_APP_PID").is_some();
+    let term = std::env::var("TERM").unwrap_or_default();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    touch_hint_from(&term, &program, termux)
+}
+
+fn touch_hint_from(term: &str, term_program: &str, termux: bool) -> Option<bool> {
+    if termux {
+        return Some(true);
+    }
+    let program = term_program.trim().to_ascii_lowercase();
+    let term = term.trim().to_ascii_lowercase();
+    if DESKTOP_TERM_PROGRAMS.contains(&program.as_str()) || DESKTOP_TERMS.contains(&term.as_str()) {
+        return Some(false);
+    }
+    None
+}
+
 /// The pane a press landed in. A gesture keeps steering that pane until the
 /// button lifts, even once the pointer has left it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,6 +1008,11 @@ struct PointerGesture {
     /// Set once the pointer left the tap tolerance: the release selects
     /// nothing and clicks nothing.
     swiped: bool,
+    /// When the pointer first left that tolerance. What makes a press a long
+    /// press is how long it sat still before it moved, not how long it has been
+    /// held: a finger that rests and then drags is reaching for text even
+    /// though it is now moving.
+    first_move_at: Option<Instant>,
     /// Set once the press became a text selection, which the selection state
     /// itself then carries.
     selecting: bool,
@@ -967,9 +1029,18 @@ impl PointerGesture {
             last_row: mouse.row,
             pressed_at: Instant::now(),
             swiped: false,
+            first_move_at: None,
             selecting: false,
             switched: false,
         }
+    }
+
+    /// How long the press sat still before it started moving. A press that has
+    /// not moved yet is still being held, so it counts as still now.
+    fn held_still(&self) -> Duration {
+        self.first_move_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.pressed_at)
     }
 
     /// The press position, which is what a tap acts on: the finger landed
@@ -1124,9 +1195,16 @@ pub struct App {
     /// The press being followed from button-down to button-up, and the pane it
     /// belongs to.
     pointer: Option<PointerGesture>,
+    /// What the terminal itself says about the pointer it carries, which
+    /// outranks the motion heuristic in both directions.
+    touch_hint: Option<bool>,
     /// Whether this run has seen a pointer move the way only a finger moves.
     /// Consulted when `touch` is left on "auto".
     touch_detected: bool,
+    /// Whether a pointer has hovered: moved with no button held. Only a mouse
+    /// can do that — nothing hovers over a touch screen — so this is the proof
+    /// that the jumpy reports are a mouse being moved quickly.
+    pointer_hovered: bool,
     last_refresh: Instant,
     last_activity_refresh: Instant,
     last_backup_sync: Option<Instant>,
@@ -1278,7 +1356,9 @@ impl App {
             history_cache_dir,
             dragging: None,
             pointer: None,
-            touch_detected: false,
+            touch_hint: terminal_touch_hint(),
+            touch_detected: terminal_touch_hint() == Some(true),
+            pointer_hovered: false,
             last_refresh: Instant::now(),
             last_activity_refresh: Instant::now(),
             last_backup_sync: None,
@@ -2274,6 +2354,12 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        // Noted wherever the pointer is, and before any pane can consume the
+        // report: hovering is what settles mouse against finger, and a hover
+        // over the file list proves as much as one over the terminal.
+        if mouse.kind == MouseEventKind::Moved {
+            self.note_pointer_hover();
+        }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && !self
                 .pane_layout
@@ -2553,13 +2639,38 @@ impl App {
     /// A pointer that moved the way only a finger moves reveals a touch
     /// screen. Say so once: it changes what a drag means in the terminal pane,
     /// and changing that silently would read as lost text selection.
+    ///
+    /// Motion alone is weak evidence — a mouse flicked across a trackpad
+    /// reports the same jump a flick does — so it only counts where nothing
+    /// better is known. A terminal that names itself as a desktop emulator, and
+    /// a pointer that has hovered over the screen without a button held, both
+    /// settle the question the other way for good.
     fn note_touch_pointer(&mut self) {
-        if self.touch_detected || self.config.touch != "auto" {
+        if self.touch_detected
+            || self.config.touch != "auto"
+            || self.touch_hint == Some(false)
+            || self.pointer_hovered
+        {
             return;
         }
         self.touch_detected = true;
         self.status_message =
             "Touch screen detected: swipe scrolls, long-press starts a selection".into();
+    }
+
+    /// A pointer moved with no button held. Nothing hovers over a touch screen
+    /// — a finger is either on the glass or off it — so this is the one report
+    /// that proves a pointing device, and it takes back a touch screen the
+    /// motion heuristic guessed at.
+    fn note_pointer_hover(&mut self) {
+        if self.pointer_hovered {
+            return;
+        }
+        self.pointer_hovered = true;
+        if self.config.touch == "auto" && self.touch_detected && self.touch_hint != Some(true) {
+            self.touch_detected = false;
+            self.status_message = "Mouse detected: drag selects text again".into();
+        }
     }
 
     fn begin_gesture(&mut self, pane: GesturePane, mouse: MouseEvent) {
@@ -2595,6 +2706,7 @@ impl App {
             || mouse.column.abs_diff(gesture.origin_column) > TAP_SLOP
         {
             gesture.swiped = true;
+            gesture.first_move_at.get_or_insert_with(Instant::now);
         }
         let up = mouse.row > gesture.last_row;
         gesture.last_row = mouse.row;
@@ -2620,7 +2732,7 @@ impl App {
         // The flick that reveals the screen is also the one the user meant to
         // scroll with, so the selection it started is dropped rather than
         // copied.
-        if selecting && revealed && before.pressed_at.elapsed() < LONG_PRESS {
+        if selecting && revealed && before.held_still() < LONG_PRESS {
             self.abandon_selection(before.pane);
             selecting = false;
             if let Some(gesture) = self.pointer.as_mut() {
@@ -2638,14 +2750,16 @@ impl App {
             return;
         }
         // A press that sat still before it moved reaches for text, the way a
-        // long press does on any phone.
+        // long press does on any phone. What counts is how long it rested, not
+        // whether it has moved since: a finger that settles and then drags is
+        // still selecting, and demanding it never move made the selection
+        // unreachable for anyone whose hand is not perfectly steady.
         if touch
-            && !before.swiped
             && matches!(
                 before.pane,
                 GesturePane::Terminal | GesturePane::FilePreview
             )
-            && before.pressed_at.elapsed() >= LONG_PRESS
+            && before.held_still() >= LONG_PRESS
         {
             let (column, row) = before.origin();
             let started = if before.pane == GesturePane::Terminal {
@@ -11207,6 +11321,10 @@ mod tests {
             more_history: false,
         };
         app.history_message.clear();
+        // The terminal these tests run under is whatever the developer happens
+        // to be sitting in, so pin the hint to "unknown" and let each test
+        // exercise the pointer's own behavior.
+        app.touch_hint = None;
         app
     }
 
@@ -11285,6 +11403,93 @@ mod tests {
             Some("one\ntwo"),
             "the right-click copied the rows the drag covered"
         );
+    }
+
+    /// The bug that made a mouse unusable: one fast drag report latched the
+    /// touch heuristic for the rest of the run, and from then on no drag ever
+    /// selected anything again.
+    #[test]
+    fn a_hover_takes_back_the_touch_screen_the_motion_heuristic_guessed() {
+        let mut app = touch_test_app();
+        app.history_offset = 0;
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 6));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 6));
+        assert!(app.touch_detected, "the flick looked like a finger");
+
+        // Nothing hovers over a touch screen.
+        app.handle_mouse(pointer(MouseEventKind::Moved, 4, 2));
+        assert!(!app.touch_detected, "the hover proved a pointing device");
+
+        app.history_offset = 3;
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one\ntwo"));
+
+        // And a later flick cannot latch it again.
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 6));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 6));
+        assert!(!app.touch_detected);
+    }
+
+    /// A desktop terminal names itself, and nothing a pointer does there is a
+    /// finger however far it jumps between two reports.
+    #[test]
+    fn a_desktop_terminal_never_turns_a_fast_drag_into_a_touch_screen() {
+        let mut app = touch_test_app();
+        app.touch_hint = Some(false);
+        app.history_offset = 3;
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 2));
+
+        assert!(!app.touch_detected, "the terminal said it has a pointer");
+        assert_eq!(
+            app.history_offset, 3,
+            "the drag selected, it did not scroll"
+        );
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn the_terminal_a_run_starts_in_decides_what_the_pointer_is() {
+        assert_eq!(touch_hint_from("xterm-256color", "", true), Some(true));
+        assert_eq!(
+            touch_hint_from("xterm-256color", "iTerm.app", false),
+            Some(false)
+        );
+        assert_eq!(touch_hint_from("xterm-kitty", "", false), Some(false));
+        // An unknown terminal, and an SSH hop that forwarded only TERM, are
+        // both left to the pointer to settle.
+        assert_eq!(touch_hint_from("xterm-256color", "", false), None);
+        assert_eq!(touch_hint_from("screen", "tmux", false), None);
+    }
+
+    /// A finger that settles on the text it wants and only then starts to drag
+    /// is selecting, not scrolling — even though it is now moving.
+    #[test]
+    fn a_press_that_rests_before_it_moves_still_selects() {
+        let mut app = touch_test_app();
+        app.config.touch = "on".into();
+
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        // A wobble inside the first moment is not the long press.
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 2, 1));
+        let held = app.pointer.as_mut().expect("press tracked");
+        held.pressed_at = Instant::now() - LONG_PRESS - Duration::from_millis(50);
+        held.first_move_at = Some(Instant::now());
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 3, 1));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 3, 1));
+
+        assert_eq!(app.history_offset, 3, "a rested press never scrolls");
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Right), 3, 1));
+        assert_eq!(app.take_clipboard_request().as_deref(), Some("one"));
     }
 
     #[test]
