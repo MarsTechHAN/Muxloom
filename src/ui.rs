@@ -4261,10 +4261,13 @@ fn draw_temporal_modal(
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(name)), rows[2]);
+    // No folder to choose: a temporal chat runs in a scratch folder muxloom
+    // makes for it and removes with it, so the form says where it goes rather
+    // than offering a project for it to move into.
     frame.render_widget(
-        Paragraph::new(format!(
-            "Folder: {}",
-            truncate(&form.path, inner.width.saturating_sub(8) as usize)
+        Paragraph::new(truncate(
+            "Folder: a scratch folder muxloom makes, removed with the chat",
+            inner.width as usize,
         ))
         .style(Style::default().fg(Color::Gray)),
         rows[3],

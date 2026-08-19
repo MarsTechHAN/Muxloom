@@ -6664,13 +6664,12 @@ impl App {
             self.status_message = "Enable a machine before starting a Temporal Chat".into();
             return;
         };
-        let selected_path = self
-            .selected_session()
-            .filter(|session| session.target_id == target.id)
-            .map(|session| session.path.clone());
-        let path = selected_path
-            .or_else(|| self.state.last_launch_dirs.get(&target.id).cloned())
-            .unwrap_or_else(|| self.user_folder(&target));
+        // A scratch chat gets a scratch folder: the daemon makes one of its own
+        // for every temporary session and runs it there, so this path is only
+        // what a daemon too old to do that falls back to. It must not inherit
+        // whichever project happened to be selected — a throwaway agent left
+        // loose in a repository is exactly what this avoids.
+        let path = self.user_folder(&target);
         let kind = self.default_kind(&target.id, true);
         self.modal = Some(Modal::Temporal(TemporalForm {
             target,
@@ -8746,9 +8745,12 @@ impl App {
             .unwrap_or_default();
         // Remember this directory and runtime as the machine's defaults for the
         // next launch: the pair you used last is the pair you usually want next.
-        // A moderator's folder is muxloom's own and belongs to no workflow, so
-        // starting one must not aim the machine's next ordinary launch at it.
-        if !crate::moderator::is_moderator_path(&self.moderator_state_dir, &form.path) {
+        // A moderator's folder and a temporary chat's scratch folder are
+        // muxloom's own and belong to no workflow, so starting one must not aim
+        // the machine's next ordinary launch at it.
+        if !form.temporary
+            && !crate::moderator::is_moderator_path(&self.moderator_state_dir, &form.path)
+        {
             self.state
                 .last_launch_dirs
                 .insert(form.target.id.clone(), form.path.clone());
@@ -13892,7 +13894,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_chat_chooses_runtime_uses_current_folder_and_is_destroyed_without_history() {
+    fn temporary_chat_chooses_runtime_never_inherits_a_project_and_is_destroyed_without_history() {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
         let worker = Worker {
@@ -13934,6 +13936,11 @@ mod tests {
         app.selected_session_id = Some("muxloomd-codex-current".into());
         app.focus = Focus::Agents;
 
+        // Neither the selected project nor the folder this machine launched
+        // into last: a temporary chat is a scratch pad, and the daemon gives it
+        // a scratch folder of its own. The path in the form is only what a
+        // daemon too old to do that falls back to.
+        let home = app.user_folder(&Target::local());
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert!(matches!(
             app.modal,
@@ -13941,7 +13948,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 ref path,
                 ..
-            })) if path == "/work/current"
+            })) if *path == home
         ));
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert!(matches!(
@@ -13956,30 +13963,15 @@ mod tests {
             panic!("Temporal Chat did not launch after runtime selection");
         };
         assert_eq!(request.kind, AgentKind::Claude);
-        assert_eq!(request.path, "/work/current");
+        assert_eq!(request.path, home);
         assert_eq!(request.label, "Temporal Chat");
         assert!(request.temporary);
         assert!(request.resume_id.is_none() && request.initial_prompt.is_none());
-
-        app.sessions.clear();
-        app.selected_session_id = None;
-        app.state
-            .last_launch_dirs
-            .insert("local".into(), "/work/last".into());
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let Request::Launch { request, .. } = receive_request(&request_rx) else {
-            panic!("Temporal Chat did not use the last launch folder");
-        };
-        assert_eq!(request.path, "/work/last");
-
-        app.state.last_launch_dirs.remove("local");
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let Request::Launch { request, .. } = receive_request(&request_rx) else {
-            panic!("Temporal Chat did not fall back to the user folder");
-        };
-        assert_eq!(request.path, app.user_folder(&Target::local()));
+        assert_eq!(
+            app.state.last_launch_dirs.get("local").map(String::as_str),
+            Some("/work/last"),
+            "a scratch chat must not aim the machine's next ordinary launch"
+        );
 
         // Typing names the chat rather than picking a runtime, which stays on
         // the one the machine launched last.

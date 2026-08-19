@@ -210,7 +210,7 @@ spinner 会自动回到 Idle；压缩对话、subagent 并行阶段、无 token 
 | `Alt-1` / `Alt-2` / `Alt-3` | 跳到 Machines / Agents / Terminal |
 | `Space`（Machines） | 启用或禁用机器 |
 | `n` / `Ctrl-n` | 在当前机器进入 New/Resume 流程 |
-| `t`（Agents） | 选择一个 Runtime，在当前目录启动无历史的 Temporal Chat，可选填别名 |
+| `t`（Agents） | 选择一个 Runtime，在专属临时目录启动无历史的 Temporal Chat，可选填别名 |
 | `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
@@ -471,8 +471,9 @@ Archived 条目，按 `Space` 可选择保留，该选择会持久记忆；启�
 再次按 `x` 才永久删除 daemon 元数据与历史。
 普通 Terminal 不归档，Shell 退出或按 `x` 后直接清理。
 
-在 Agents 面板按 `t` 会先在该机器已装的 Runtime 中选一个，再启动 `Temporal Chat`。目录依次取当前选中
-Agent 的目录、该机器上次启动目录、目标用户 Home；同一个表单里可以填一个别名区分多个临时
+在 Agents 面板按 `t` 会先在该机器已装的 Runtime 中选一个，再启动 `Temporal Chat`。它不会寄生在当前
+选中的项目目录里，而是由 muxloomd 在 `<muxloomd 状态目录>/scratch/<会话 ID>` 下新建一个专属临时目录，
+随会话一起删除，所以草稿 Agent 不会在任何仓库里留下痕迹；同一个表单里可以填一个别名区分多个临时
 会话，留空则统一叫 Temporal Chat。该会话不写 Muxloom ANSI History，也不进入搜索或备份；
 Codex 还会用单次配置关闭 Transcript 持久化。按 `x` 会直接停止并删除，不进入 Archived。
 临时会话永远排在会话列表最顶端、所有文件夹之上——几秒前刚开的草稿窗口就是你要找的那个。

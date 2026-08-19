@@ -125,12 +125,14 @@ their terminal capture alone.
 **Keys** — `n` open · type to fuzzy-match a folder · `Left`/`Right` navigate ·
 `Enter` confirm.
 
-From the Agents pane, `t` opens the same runtime chooser for a **Temporal Chat** in
-the selected agent's folder, then the machine's last launch folder, then that
-user's home folder. Type a name in the same form to tell several of them apart;
-left blank they are all called Temporal Chat. Temporal Chat stores no Muxloom
-ANSI history and is excluded from search and backup; Codex also runs with
-transcript persistence disabled. `x` destroys it instead of archiving it. They
+From the Agents pane, `t` opens the same runtime chooser for a **Temporal Chat**.
+It gets a scratch folder of its own — `<muxloomd state>/scratch/<session id>`,
+made when it launches and removed with it — rather than moving into whichever
+project happened to be selected, so a throwaway agent leaves nothing behind in a
+repository. Type a name in the same form to tell several of them apart; left
+blank they are all called Temporal Chat. Temporal Chat stores no Muxloom ANSI
+history and is excluded from search and backup; Codex also runs with transcript
+persistence disabled. `x` destroys it instead of archiving it. They
 sit at the very top of the session list, above every folder, because a scratch
 chat you opened seconds ago is the one you are looking for.
 

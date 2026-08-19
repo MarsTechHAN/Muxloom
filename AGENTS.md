@@ -17,6 +17,11 @@ preserve.
   older sessions, but it must never be selected silently.
 - Terminal sessions are ephemeral: removing one deletes it. Supported Codex and
   Claude sessions can be archived, searched, and resumed.
+- A temporary session is a scratch pad and gets a scratch folder: the daemon
+  makes one it owns, runs the session there whatever directory the client named,
+  and removes it when the session ends, is deleted, or is found stale. It must
+  never inherit a project directory, and it must never aim the machine's next
+  ordinary launch.
 
 ## Transport and compatibility
 

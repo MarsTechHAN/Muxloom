@@ -96,6 +96,11 @@ mod platform {
         pub history: PathBuf,
         pub sessions: PathBuf,
         pub keepers: PathBuf,
+        /// One working directory per temporary session, made when it launches
+        /// and removed with it. A Temporal Chat is a scratch pad, so it gets a
+        /// scratch folder rather than moving into whichever project happened to
+        /// be selected when it was started.
+        pub scratch: PathBuf,
         pub triggers: PathBuf,
         pub talk: PathBuf,
         pub outbox: PathBuf,
@@ -142,6 +147,7 @@ mod platform {
                 history: root.join("history"),
                 sessions: root.join("sessions"),
                 keepers: root.join("keepers"),
+                scratch: root.join("scratch"),
                 triggers: root.join("triggers.json"),
                 outbox: root.join("talk/outbox.json"),
                 talk: root.join("talk"),
@@ -159,6 +165,8 @@ mod platform {
             fs::set_permissions(&self.sessions, fs::Permissions::from_mode(0o700))?;
             fs::create_dir_all(&self.keepers)?;
             fs::set_permissions(&self.keepers, fs::Permissions::from_mode(0o700))?;
+            fs::create_dir_all(&self.scratch)?;
+            fs::set_permissions(&self.scratch, fs::Permissions::from_mode(0o700))?;
             Ok(())
         }
     }
@@ -932,6 +940,7 @@ mod platform {
         if metadata.temporary {
             let _ = fs::remove_file(&history_path);
             let _ = fs::remove_file(path);
+            remove_scratch_dir(paths, &metadata.id);
             eprintln!("muxloomd discarded stale temporary session {}", metadata.id);
             return Ok(None);
         }
@@ -1195,6 +1204,10 @@ mod platform {
         };
         let state = Arc::new(DaemonState::new(paths.clone(), keeper_mode));
         adopt_keeper_sessions(&state);
+        // Only now does this generation know which sessions it has, so only now
+        // can a leftover scratch folder be told apart from the folder a live
+        // temporary session is sitting in.
+        sweep_scratch_dirs(&state);
         // Messages the last generation was still holding for a busy session
         // are this one's to deliver now that it owns the sessions.
         spawn_outbox_drainer(&state);
@@ -2128,6 +2141,7 @@ mod platform {
                     let _ = fs::remove_file(&session.history_path);
                     let _ = fs::remove_file(&session.metadata_path);
                 }
+                remove_scratch_dir(&state.paths, &session_id);
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::RunShell {
@@ -2215,6 +2229,44 @@ mod platform {
             .unwrap_or(false)
     }
 
+    /// Remove the scratch folder a temporary session ran in. The name comes
+    /// from the session id, which is validated before anything is created
+    /// under it, so this can only ever delete a folder muxloom made — never a
+    /// working directory a client named.
+    fn remove_scratch_dir(paths: &DaemonPaths, session_id: &str) {
+        if validate_session_id(session_id).is_err() {
+            return;
+        }
+        let _ = fs::remove_dir_all(paths.scratch.join(session_id));
+    }
+
+    /// Drop the scratch folders of temporary sessions that no longer exist.
+    /// Called once the generation knows which sessions it has: a daemon killed
+    /// outright cannot clean up after itself, and its folders would otherwise
+    /// stay until the machine is wiped.
+    fn sweep_scratch_dirs(state: &Arc<DaemonState>) {
+        let Ok(entries) = fs::read_dir(&state.paths.scratch) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let live = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&id);
+            if !live {
+                let _ = fs::remove_dir_all(entry.path());
+                eprintln!("muxloomd removed the scratch folder of session {id}");
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_session(
         state: &Arc<DaemonState>,
@@ -2249,6 +2301,20 @@ mod platform {
         {
             bail!("daemon session already exists: {session_id}");
         }
+        // A temporary session runs in a folder of its own that muxloom makes
+        // here and removes with it, whatever directory the client named. A
+        // scratch chat that moves into the project you happened to have
+        // selected leaves its droppings in a repository that never asked for
+        // one, and there is nothing to keep afterwards by definition.
+        let path = if temporary {
+            let scratch = state.paths.scratch.join(&session_id);
+            fs::create_dir_all(&scratch)
+                .with_context(|| format!("failed to create {}", scratch.display()))?;
+            fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700))?;
+            scratch.to_string_lossy().into_owned()
+        } else {
+            path
+        };
         if !Path::new(&path).is_dir() {
             bail!("working directory does not exist: {path}");
         }
@@ -2357,7 +2423,9 @@ mod platform {
             Ok(connection) => connection,
             Err(error) => {
                 let _ = fs::remove_file(&metadata_path);
-                if !temporary {
+                if temporary {
+                    remove_scratch_dir(&state.paths, &session_id);
+                } else {
                     let _ = fs::remove_file(&history_path);
                 }
                 return Err(error);
@@ -2470,6 +2538,7 @@ mod platform {
                 // find a temporary session that was supposed to leave nothing.
                 let _ = fs::remove_file(&session.history_path);
                 let _ = fs::remove_file(&session.metadata_path);
+                remove_scratch_dir(&state.paths, &session.session_id());
                 if still_tracked {
                     state
                         .sessions
@@ -5078,6 +5147,53 @@ mod platform {
             assert!(!state.sessions.lock().unwrap().contains_key(session_id));
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_temporary_session_runs_in_a_scratch_folder_that_dies_with_it() {
+            let state = test_state("scratch");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-temporal-codex-scratch";
+            let scratch = paths.scratch.join(session_id);
+            // A folder the client named, and the folder the session actually
+            // gets: a scratch chat never moves into the project it was started
+            // from.
+            let session = launch_session(
+                &state,
+                session_id.into(),
+                "codex".into(),
+                "/tmp".into(),
+                "Temporal Chat".into(),
+                true,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+            assert_eq!(session.snapshot().path, scratch.to_string_lossy());
+            assert!(scratch.is_dir());
+
+            // A leftover from a daemon that was killed outright is swept once
+            // this generation knows which sessions it has -- and the folder of
+            // a session it does have is not.
+            let stale = paths.scratch.join("muxloomd-temporal-codex-gone");
+            fs::create_dir_all(&stale).unwrap();
+            sweep_scratch_dirs(&state);
+            assert!(!stale.exists());
+            assert!(scratch.is_dir(), "a live session keeps its folder");
+
+            session.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.sessions.lock().unwrap().contains_key(session_id)
+                && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            assert!(!scratch.exists(), "the folder ends with the session");
             fs::remove_dir_all(paths.root).unwrap();
         }
 
