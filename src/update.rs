@@ -148,9 +148,17 @@ impl Channel {
         self.wants_nightly_for(build_channel())
     }
 
-    /// Whether asking for this channel means stepping *off* a nightly. That is
-    /// a channel switch rather than an upgrade, so the newest release counts as
-    /// an update even though a nightly may have run past its version.
+    /// Whether asking for this channel means stepping *onto* a nightly from a
+    /// build that is not one. Crossing streams is not an upgrade, so ordering
+    /// must not veto it: the release someone is on today carries no commit
+    /// count at all, and refusing it a same-version nightly would leave
+    /// `--nightly` with nothing to say but "already up to date".
+    fn joins_nightly_for(self, build: Option<&str>) -> bool {
+        self == Channel::Nightly && build != Some(NIGHTLY_BUILD)
+    }
+
+    /// The same crossing in the other direction: the newest release counts as
+    /// an update even though the nightly being left has run past its version.
     fn leaves_nightly_for(self, build: Option<&str>) -> bool {
         self == Channel::Stable && build == Some(NIGHTLY_BUILD)
     }
@@ -278,14 +286,17 @@ pub fn detect_nightly(environment: &[(String, String)]) -> Result<NightlyBuild> 
 /// one. A nightly install still falls back to the stable check: a nightly no
 /// newer than this build — or a manifest that could not be read at all —
 /// leaves the tagged releases to answer for, and the two streams are ordered
-/// against each other by the same commit height.
+/// against each other by the same commit height. Naming a stream this build
+/// is not on skips the ordering entirely, in both directions: crossing over is
+/// what was asked for, not an upgrade to argue about.
 pub fn detect_update(
     channel: Channel,
     environment: &[(String, String)],
 ) -> Result<Option<Release>> {
+    let crossing_over = channel.joins_nightly_for(build_channel());
     if channel.wants_nightly()
         && let Ok(build) = detect_nightly(environment)
-        && build.is_newer_than_running()
+        && (crossing_over || build.is_newer_than_running())
     {
         return Ok(Some(build.release()));
     }
@@ -593,6 +604,16 @@ mod tests {
         assert!(Channel::Stable.leaves_nightly_for(Some("nightly")));
         assert!(!Channel::Stable.leaves_nightly_for(Some("stable")));
         assert!(!Channel::Auto.leaves_nightly_for(Some("nightly")));
+
+        // And so is stepping on. Every release anyone is running today carries
+        // no commit count, so ordering alone would answer `--nightly` with
+        // "already up to date" and there would be no way onto the stream at all.
+        assert!(Channel::Nightly.joins_nightly_for(Some("stable")));
+        assert!(Channel::Nightly.joins_nightly_for(None));
+        assert!(!Channel::Nightly.joins_nightly_for(Some("nightly")));
+        // Following a stream is never a crossing, in either direction.
+        assert!(!Channel::Auto.joins_nightly_for(Some("stable")));
+        assert!(!Channel::Stable.joins_nightly_for(Some("stable")));
     }
 
     #[test]
