@@ -248,6 +248,16 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
 brew install --cask muxloom
 ```
 
+The cask is the tagged-release line: prebuilt binaries that muxloom updates in
+place. To follow `main` instead, install the nightly formula, which builds the
+controller and its companion here rather than downloading them:
+
+```bash
+brew install --HEAD marstechhan/muxloom/muxloom-nightly
+```
+
+Both provide `muxloom`, so keep one of the two linked.
+
 ### Release bundle
 
 Download the controller archive from
@@ -281,6 +291,18 @@ nightly, and an install follows the stream it came from, so later checks keep
 offering nightlies. `muxloom update --stable` puts you back on tagged releases
 the same way. For a first install, take an archive from the nightly release
 page — the bundle layout is identical to a tagged one.
+
+Homebrew reaches the same stream by building it:
+
+```bash
+brew install --HEAD marstechhan/muxloom/muxloom-nightly
+brew upgrade --fetch-HEAD muxloom-nightly
+```
+
+What runs on this machine is compiled from `main`; what cannot be built here —
+the companions for other architectures — muxloom still fetches from the release
+when a machine first needs one. Those files are Homebrew's, so `muxloom update`
+reports a newer nightly there and leaves installing it to `brew upgrade`.
 
 ### Build from source
 

@@ -72,6 +72,15 @@ brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
 brew install --cask muxloom
 ```
 
+cask 走的是打了 tag 的正式版：预编译好的二进制，muxloom 可以原地自更新。想跟随
+`main` 就装 nightly formula，它在本机现编译 Controller 和配套 daemon，而不是下载：
+
+```bash
+brew install --HEAD marstechhan/muxloom/muxloom-nightly
+```
+
+两者都提供 `muxloom` 命令，同一时间只保留一个链接。
+
 从 [GitHub Releases](https://github.com/MarsTechHAN/Muxloom/releases) 下载对应控制机的
 压缩包。请保留解压后的目录结构，`muxloom` 会相对自身查找 `muxloomd`、其他目标架构
 的 companion 和 FFmpeg。
@@ -99,6 +108,17 @@ muxloom update --nightly
 跟随自己所属的那条线，因此后续检查继续推送 nightly。`muxloom update --stable` 用同样
 的方式回到正式发布。首次安装可以直接从 nightly 页面下载压缩包，目录结构与打了 tag 的
 发布完全一致。
+
+Homebrew 用编译的方式走同一条线：
+
+```bash
+brew install --HEAD marstechhan/muxloom/muxloom-nightly
+brew upgrade --fetch-HEAD muxloom-nightly
+```
+
+在本机运行的东西都从 `main` 现编译；本机编不出来的——其他架构的 companion——仍由
+muxloom 在某台机器第一次需要时从发布页取。这些文件归 Homebrew 所有，因此
+`muxloom update` 只会报告有更新的 nightly，安装交给 `brew upgrade`。
 
 源码构建需要 Rust 1.85 或更高版本；远程目标需要 `ssh`；视频预览需要 `PATH` 中的
 `ffmpeg` 或 `MUXLOOM_FFMPEG`。Controller 已内置 HTTPS 下载、SHA-256 校验和压缩包
