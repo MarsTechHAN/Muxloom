@@ -1562,7 +1562,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
             );
         }
         Modal::UpdatePrompt(prompt) => {
-            let area = centered_rect(64, 10, outer);
+            let area = centered_rect(64, 11, outer);
             frame.render_widget(Clear, area);
             let action = if prompt.can_self_update {
                 "Update the installed bundle now? The change applies on the next launch."
@@ -1576,11 +1576,21 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
                     format!("muxloom {} is available", prompt.latest),
                     Style::default().fg(Color::Yellow).bold(),
                 ),
+                // Two nightlies differ only by a commit count, so the build
+                // being left behind has to be on screen to make sense of it.
+                Line::styled(
+                    format!("this one is {}", prompt.current),
+                    Style::default().fg(MUTED),
+                ),
                 Line::raw(""),
                 Line::raw(action),
                 Line::raw(""),
                 Line::styled(
-                    "Enter/y update    Esc/n not now    (config: update_prompt)",
+                    "Enter/y update    Esc/n not now",
+                    Style::default().fg(MUTED),
+                ),
+                Line::styled(
+                    "(config: update_prompt, update_channel)",
                     Style::default().fg(MUTED),
                 ),
             ];

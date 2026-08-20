@@ -1,11 +1,22 @@
 //! In-place self-update ("OTA") for the muxloom controller bundle.
 //!
-//! Flow: read the newest release tag from the `releases/latest` redirect
-//! (avoids the rate-limited GitHub API), compare it to the compiled-in version,
-//! and — when running from a real installed release bundle — download
-//! `muxloom-<version>-<triple>.tar.gz`, verify its SHA-256, extract it in
-//! process (pure-Rust gzip + tar), and atomically replace the bundle's files so
-//! the next launch runs the new version.
+//! Flow: work out the newest published build on the configured channel,
+//! compare it to the running one, and — when running from a real installed
+//! release bundle — download `muxloom-v<version>-<triple>.tar.gz` from that
+//! release, verify its SHA-256, extract it in process (pure-Rust gzip + tar),
+//! and atomically replace the bundle's files so the next launch runs it.
+//!
+//! Two channels publish builds. Stable is the tagged releases, read from the
+//! `releases/latest` redirect (which avoids the rate-limited GitHub API).
+//! Nightly is a rolling prerelease built from every green commit on `main`; it
+//! carries a `nightly.json` manifest naming the commit it came from, because a
+//! rolling tag cannot say that in its name and every nightly between two
+//! releases carries the same `CARGO_PKG_VERSION`.
+//!
+//! By default an install follows the stream it came from — nightly to nightly,
+//! release to release — so nobody is moved onto a cadence they did not ask
+//! for. `muxloom update --nightly` is the way across, and it needs no
+//! configuration to stick: the build it installs is itself stamped nightly.
 //!
 //! On Unix, renaming a new file over a running executable keeps the running
 //! process's inode alive, so this is safe while muxloom (and any local
@@ -22,6 +33,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -32,6 +44,13 @@ use crate::{
 const REPO_LATEST: &str = "https://github.com/MarsTechHAN/Muxloom/releases/latest";
 const DOWNLOAD_BASE: &str = "https://github.com/MarsTechHAN/Muxloom/releases/download";
 const RELEASES_PAGE: &str = "https://github.com/MarsTechHAN/Muxloom/releases";
+/// The rolling tag every green commit on `main` republishes. It is a
+/// *prerelease*, so `releases/latest` — which the stable check and the remote
+/// companion pull both read — keeps pointing at the newest tagged release.
+pub const NIGHTLY_TAG: &str = "nightly";
+const NIGHTLY_MANIFEST: &str = "nightly.json";
+/// What CI stamps into a build made from the nightly workflow.
+const NIGHTLY_BUILD: &str = "nightly";
 static UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The compiled-in package version, e.g. `"0.4.3"`.
@@ -39,13 +58,178 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The commit CI built this binary from, when CI built it.
+pub fn build_commit() -> Option<&'static str> {
+    option_env!("MUXLOOM_BUILD_ID")
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+}
+
+/// How many commits deep on `main` this build was made. It is the only thing
+/// that orders two builds carrying the same package version, which every
+/// nightly between one release and the next does.
+pub fn build_height() -> Option<u64> {
+    option_env!("MUXLOOM_BUILD_HEIGHT").and_then(|height| height.trim().parse().ok())
+}
+
+/// Which stream CI built this binary for: `"nightly"`, `"stable"`, or nothing
+/// at all for a build made outside CI.
+pub fn build_channel() -> Option<&'static str> {
+    option_env!("MUXLOOM_BUILD_CHANNEL")
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
+}
+
+/// Whether the running binary came off the nightly workflow.
+pub fn running_a_nightly() -> bool {
+    build_channel() == Some(NIGHTLY_BUILD)
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+fn build_label(version: &str, height: Option<u64>, commit: Option<&str>) -> String {
+    let mut label = version.to_string();
+    if let Some(height) = height {
+        label.push_str(&format!("+{height}"));
+    }
+    if let Some(commit) = commit {
+        label.push_str(&format!(" ({})", short_commit(commit)));
+    }
+    label
+}
+
+/// The running build as it should be named: `0.5.4` for a plain build,
+/// `0.5.4+142 (a1b2c3d)` for one CI stamped, and `nightly 0.5.4+142 (a1b2c3d)`
+/// when it came off the nightly workflow.
+pub fn current_build_label() -> String {
+    let label = build_label(current_version(), build_height(), build_commit());
+    if running_a_nightly() {
+        format!("nightly {label}")
+    } else {
+        label
+    }
+}
+
+/// Which stream of builds an install follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Whichever stream this build came from: a nightly is offered nightlies,
+    /// and a tagged release — like a build from source — is offered tagged
+    /// releases. This is the default, and it is what keeps someone who never
+    /// asked for nightlies on the release cadence they installed.
+    Auto,
+    Stable,
+    Nightly,
+}
+
+impl Channel {
+    /// The config field is validated when it loads, so a value that reaches
+    /// here unrecognised came from somewhere that should not silently pick a
+    /// stream for the user: it follows the build, same as the default.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim() {
+            "stable" => Channel::Stable,
+            "nightly" => Channel::Nightly,
+            _ => Channel::Auto,
+        }
+    }
+
+    fn wants_nightly_for(self, build: Option<&str>) -> bool {
+        match self {
+            Channel::Nightly => true,
+            Channel::Stable => false,
+            Channel::Auto => build == Some(NIGHTLY_BUILD),
+        }
+    }
+
+    fn wants_nightly(self) -> bool {
+        self.wants_nightly_for(build_channel())
+    }
+
+    /// Whether asking for this channel means stepping *off* a nightly. That is
+    /// a channel switch rather than an upgrade, so the newest release counts as
+    /// an update even though a nightly may have run past its version.
+    fn leaves_nightly_for(self, build: Option<&str>) -> bool {
+        self == Channel::Stable && build == Some(NIGHTLY_BUILD)
+    }
+}
+
+/// A published build this updater can install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// The release tag its assets hang off: `v0.5.5`, or `nightly`.
+    pub tag: String,
+    /// The package version its asset names carry. A nightly's archives are
+    /// named after the version in `Cargo.toml`, exactly as a release's are.
+    pub version: String,
+    /// How it is named to the user.
+    pub label: String,
+}
+
+fn stable_release(version: &str) -> Release {
+    Release {
+        tag: format!("v{version}"),
+        version: version.to_string(),
+        label: version.to_string(),
+    }
+}
+
+/// What the nightly release says it is, published beside the archives as
+/// `nightly.json` because a rolling tag cannot carry the identity of the
+/// commit it was built from in its name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NightlyBuild {
+    pub version: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub height: u64,
+    #[serde(default)]
+    pub built_at: String,
+}
+
+impl NightlyBuild {
+    fn release(&self) -> Release {
+        let commit = (!self.commit.is_empty()).then_some(self.commit.as_str());
+        Release {
+            tag: NIGHTLY_TAG.to_string(),
+            version: self.version.clone(),
+            label: format!(
+                "nightly {}",
+                build_label(&self.version, Some(self.height), commit)
+            ),
+        }
+    }
+
+    /// Whether this published nightly is ahead of a build of `running_version`
+    /// made `running_height` commits deep. Equal versions are decided by height
+    /// alone; a build with no height was made outside CI, so it cannot be
+    /// ordered against a nightly and is left alone rather than offered an
+    /// update it may already be ahead of.
+    fn is_newer_than(&self, running_version: &str, running_height: Option<u64>) -> bool {
+        if is_newer(&self.version, running_version) {
+            return true;
+        }
+        if is_newer(running_version, &self.version) {
+            return false;
+        }
+        running_height.is_some_and(|running| self.height > running)
+    }
+
+    fn is_newer_than_running(&self) -> bool {
+        self.is_newer_than(current_version(), build_height())
+    }
+}
+
 /// Outcome of a background check.
 #[derive(Debug, Clone)]
 pub struct CheckResult {
     pub current: String,
-    pub latest: String,
-    pub update_available: bool,
-    /// True when a newer bundle was downloaded and staged this run.
+    /// The published build that is ahead of this one, if any.
+    pub release: Option<Release>,
+    /// True when that build was downloaded and staged this run.
     pub applied: bool,
 }
 
@@ -77,6 +261,39 @@ pub fn detect_latest(environment: &[(String, String)]) -> Result<String> {
     Ok(version.to_string())
 }
 
+/// Read what the rolling nightly release currently holds.
+pub fn detect_nightly(environment: &[(String, String)]) -> Result<NightlyBuild> {
+    let url = format!("{DOWNLOAD_BASE}/{NIGHTLY_TAG}/{NIGHTLY_MANIFEST}");
+    let manifest = http::fetch_text(&url, environment)
+        .context("could not reach GitHub to check for a nightly build")?;
+    let build: NightlyBuild =
+        serde_json::from_str(&manifest).context("unexpected nightly manifest")?;
+    if parse_version(&build.version).is_none() {
+        bail!("unexpected nightly version: {:?}", build.version);
+    }
+    Ok(build)
+}
+
+/// The build worth offering on this channel, if any is ahead of the running
+/// one. A nightly install still falls back to the stable check: a nightly no
+/// newer than this build — or a manifest that could not be read at all —
+/// leaves the tagged releases to answer for, and the two streams are ordered
+/// against each other by the same commit height.
+pub fn detect_update(
+    channel: Channel,
+    environment: &[(String, String)],
+) -> Result<Option<Release>> {
+    if channel.wants_nightly()
+        && let Ok(build) = detect_nightly(environment)
+        && build.is_newer_than_running()
+    {
+        return Ok(Some(build.release()));
+    }
+    let latest = detect_latest(environment)?;
+    let switching_back = channel.leaves_nightly_for(build_channel());
+    Ok((switching_back || is_newer(&latest, current_version())).then(|| stable_release(&latest)))
+}
+
 /// Directory containing the running muxloom executable (the bundle root).
 fn bundle_dir() -> Result<PathBuf> {
     let exe = env::current_exe().context("cannot locate the muxloom executable")?;
@@ -105,81 +322,79 @@ pub fn is_installed_bundle() -> bool {
     installed_bundle().is_some()
 }
 
-/// Detect the latest version and, when `auto_apply` is set and we're running
-/// from a real Unix bundle, download and stage it. Safe to call from a worker
-/// thread; returns a result for status/logging rather than panicking.
+/// Detect the newest build on `channel` and, when `auto_apply` is set and we're
+/// running from a real Unix bundle, download and stage it. Safe to call from a
+/// worker thread; returns a result for status/logging rather than panicking.
 pub fn check_and_maybe_apply(
+    channel: Channel,
     auto_apply: bool,
     environment: &[(String, String)],
 ) -> Result<CheckResult> {
-    let current = current_version().to_string();
-    let latest = detect_latest(environment)?;
-    let update_available = is_newer(&latest, &current);
+    let current = current_build_label();
+    let release = detect_update(channel, environment)?;
     let mut applied = false;
-    if update_available && auto_apply && cfg!(unix) && is_installed_bundle() {
-        download_and_apply(&latest, environment, |_, _| {})?;
+    if let Some(release) = &release
+        && auto_apply
+        && cfg!(unix)
+        && is_installed_bundle()
+    {
+        apply(release, environment, |_, _| {})?;
         applied = true;
     }
     Ok(CheckResult {
         current,
-        latest,
-        update_available,
+        release,
         applied,
     })
 }
 
 /// `muxloom update` — synchronous, prints progress to stdout.
-pub fn run_cli(environment: &[(String, String)]) -> Result<()> {
+pub fn run_cli(channel: Channel, environment: &[(String, String)]) -> Result<()> {
     use std::io::Write;
 
-    let current = current_version();
-    println!("muxloom {current}");
+    println!("muxloom {}", current_build_label());
     print!("Checking for updates… ");
     let _ = std::io::stdout().flush();
 
-    let latest = detect_latest(environment)?;
-    if !is_newer(&latest, current) {
+    let Some(release) = detect_update(channel, environment)? else {
         println!("already up to date.");
         return Ok(());
-    }
-    println!("found {latest}.");
+    };
+    let label = release.label.clone();
+    println!("found {label}.");
 
     if !cfg!(unix) {
         println!(
-            "Automatic install is not supported on this platform; download {latest} from {RELEASES_PAGE}"
+            "Automatic install is not supported on this platform; download {label} from {RELEASES_PAGE}"
         );
         return Ok(());
     }
     if !is_installed_bundle() {
         println!(
-            "Running from a development build, not an installed release bundle; download {latest} from {RELEASES_PAGE}"
+            "Running from a development build, not an installed release bundle; download {label} from {RELEASES_PAGE}"
         );
         return Ok(());
     }
 
     let mut last_percent = u8::MAX;
-    download_and_apply(&latest, environment, |done, total| {
+    apply(&release, environment, |done, total| {
         if let Some(total) = total.filter(|total| *total > 0) {
             let percent = ((done * 100) / total).min(100) as u8;
             if percent != last_percent {
                 last_percent = percent;
-                print!("\rDownloading {latest}… {percent}%   ");
+                print!("\rDownloading {label}… {percent}%   ");
                 let _ = std::io::stdout().flush();
             }
         }
     })?;
-    println!("\rInstalled {latest}. Restart muxloom to use it.   ");
+    println!("\rInstalled {label}. Restart muxloom to use it.   ");
     Ok(())
 }
 
-/// Download the versioned bundle, verify it, extract it, and replace the files
+/// Download a release's bundle, verify it, extract it, and replace the files
 /// of the installed bundle in place. `on_progress(downloaded, total)` fires as
 /// the archive downloads.
-fn download_and_apply<F>(
-    version: &str,
-    environment: &[(String, String)],
-    on_progress: F,
-) -> Result<()>
+pub fn apply<F>(release: &Release, environment: &[(String, String)], on_progress: F) -> Result<()>
 where
     F: FnMut(u64, Option<u64>),
 {
@@ -188,8 +403,9 @@ where
     }
     let triple = target_triple().context("no release build is published for this platform")?;
     let bundle = installed_bundle().context("not running from an installed release bundle")?;
+    let version = release.version.as_str();
     let archive_name = release_archive_name(version, triple);
-    let base = format!("{DOWNLOAD_BASE}/v{version}");
+    let base = format!("{DOWNLOAD_BASE}/{}", release.tag);
 
     // Stage inside the bundle dir so the final renames stay on one filesystem.
     let nonce = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -352,6 +568,79 @@ mod tests {
             release_archive_name("0.4.3", "aarch64-apple-darwin"),
             "muxloom-v0.4.3-aarch64-apple-darwin.tar.gz"
         );
+    }
+
+    #[test]
+    fn a_build_follows_the_stream_it_came_from_unless_it_is_told_otherwise() {
+        assert_eq!(Channel::from_config("stable"), Channel::Stable);
+        assert_eq!(Channel::from_config(" nightly\n"), Channel::Nightly);
+        assert_eq!(Channel::from_config("auto"), Channel::Auto);
+        // A value nothing recognises must not pick a stream for the user.
+        assert_eq!(Channel::from_config(""), Channel::Auto);
+        assert_eq!(Channel::from_config("bleeding"), Channel::Auto);
+
+        // The whole point: a release install is never dragged onto nightlies,
+        // and a nightly install keeps getting them.
+        assert!(!Channel::Auto.wants_nightly_for(Some("stable")));
+        assert!(!Channel::Auto.wants_nightly_for(None));
+        assert!(Channel::Auto.wants_nightly_for(Some("nightly")));
+        // Asking outright wins either way.
+        assert!(Channel::Nightly.wants_nightly_for(Some("stable")));
+        assert!(!Channel::Stable.wants_nightly_for(Some("nightly")));
+
+        // Stepping off nightly is a switch, not an upgrade: the newest release
+        // counts even when the nightly ran past its version.
+        assert!(Channel::Stable.leaves_nightly_for(Some("nightly")));
+        assert!(!Channel::Stable.leaves_nightly_for(Some("stable")));
+        assert!(!Channel::Auto.leaves_nightly_for(Some("nightly")));
+    }
+
+    #[test]
+    fn a_nightly_is_ordered_against_the_running_build_by_version_then_commit_count() {
+        let nightly = |version: &str, height: u64| NightlyBuild {
+            version: version.to_string(),
+            commit: "a1b2c3d4e5f6".into(),
+            height,
+            built_at: String::new(),
+        };
+
+        // A newer package version wins outright, whatever the counts say.
+        assert!(nightly("0.5.5", 1).is_newer_than("0.5.4", Some(999)));
+        // A nightly left behind by a release must never be offered as an
+        // upgrade, which is what makes the channel safe to leave on.
+        assert!(!nightly("0.5.4", 999).is_newer_than("0.5.5", Some(1)));
+        // Every nightly between two releases carries the same version, so the
+        // commit count is the only thing that orders them.
+        assert!(nightly("0.5.4", 143).is_newer_than("0.5.4", Some(142)));
+        assert!(!nightly("0.5.4", 142).is_newer_than("0.5.4", Some(142)));
+        assert!(!nightly("0.5.4", 141).is_newer_than("0.5.4", Some(142)));
+        // An unstamped build (a local `cargo build`, or a release made before
+        // the stamp existed) cannot be placed, so a same-version nightly is
+        // never pushed at it.
+        assert!(!nightly("0.5.4", 143).is_newer_than("0.5.4", None));
+        assert!(nightly("0.5.5", 1).is_newer_than("0.5.4", None));
+    }
+
+    #[test]
+    fn a_nightly_manifest_names_the_build_and_points_at_the_rolling_tag() {
+        let manifest = r#"{
+            "version": "0.5.4",
+            "commit": "a1b2c3d4e5f60718",
+            "height": 142,
+            "built_at": "2026-08-19T04:05:06Z"
+        }"#;
+        let build: NightlyBuild = serde_json::from_str(manifest).unwrap();
+        let release = build.release();
+        assert_eq!(release.tag, NIGHTLY_TAG);
+        // The archive is named after the package version exactly as a tagged
+        // release's is; only the tag it hangs off differs.
+        assert_eq!(
+            release_archive_name(&release.version, "aarch64-apple-darwin"),
+            "muxloom-v0.5.4-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(release.label, "nightly 0.5.4+142 (a1b2c3d)");
+        assert_eq!(build_label("0.5.4", None, None), "0.5.4");
+        assert_eq!(build_label("0.5.4", Some(142), None), "0.5.4+142");
     }
 
     #[test]

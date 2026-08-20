@@ -265,6 +265,23 @@ chmod +x muxloom muxloomd ffmpeg companions/*/muxloomd
 On Windows, run `muxloom.exe`; it manages SSH targets. The current Windows
 bundle does not provide a local `muxloomd`.
 
+### Nightly builds
+
+Every commit on `main` that passes the full cross-platform regression suite is
+republished as the rolling [`nightly`
+prerelease](https://github.com/MarsTechHAN/Muxloom/releases/tag/nightly), so a
+fix is installable the day it is written. From any existing install:
+
+```bash
+muxloom update --nightly
+```
+
+That is all it takes to stay there: the build it installs is stamped as a
+nightly, and an install follows the stream it came from, so later checks keep
+offering nightlies. `muxloom update --stable` puts you back on tagged releases
+the same way. For a first install, take an archive from the nightly release
+page — the bundle layout is identical to a tagged one.
+
 ### Build from source
 
 Requires Rust 1.85+, `ssh` for remote targets, and `ffmpeg` on `PATH` (or
@@ -285,21 +302,32 @@ cargo build --release
 ```text
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
-muxloom update [--config PATH]
+muxloom update [--config PATH] [--nightly | --stable]
 muxloom mcp [--config PATH]
 ```
 
 | Option | Purpose |
 | --- | --- |
 | `-h`, `--help` | Show command-line help |
-| `-V`, `--version` | Show the Muxloom version |
+| `-V`, `--version` | Show the version, and the commit and stream a CI build came from |
 | `--config PATH` | Use a custom TOML configuration |
+| `--nightly` / `--stable` | Update from that stream and stay on it (`update` only) |
 | `--debug` | Write detailed logs to the default state directory |
 | `--debug-log PATH` | Write detailed logs to an explicit file |
 
-`muxloom update` checks the latest GitHub Release, verifies its SHA-256, and
+`muxloom update` fetches the newest published build, verifies its SHA-256, and
 updates an installed release bundle in place. Startup auto-update does the same
 in the background by default; set `auto_update = false` to disable it.
+
+Two streams publish builds: tagged releases, and the rolling `nightly`
+prerelease described under [Nightly builds](#nightly-builds). `update_channel`
+decides which one an install watches, and its default — `"auto"` — follows the
+stream the running build came from, so a release install keeps to the release
+cadence and a nightly install keeps getting nightlies. `"nightly"` and
+`"stable"` name a stream outright. A nightly is shown as
+`nightly <version>+<commit count> (<commit>)` beside the build you are on,
+because two nightlies otherwise differ only in that count, and one is offered
+only when it is genuinely ahead of what is running.
 
 `muxloom init` refuses to overwrite an existing configuration.
 
@@ -469,6 +497,11 @@ auto_update = true
 # What the startup check does with a newer release: "ask" (prompt), "auto"
 # (apply silently), or "never".
 update_prompt = "ask"
+# Which builds it looks at. "auto" follows the stream this build came from, so
+# a nightly stays on nightlies and a release stays on releases. "nightly" asks
+# for the rolling build published from every green commit on main; "stable"
+# asks for tagged releases only. `muxloom update --nightly` crosses over.
+update_channel = "auto"
 # How a press-drag-release reads in the terminal pane and the file preview:
 # "on" swipes to scroll and selects after a long press, "off" always selects,
 # "auto" asks the terminal it runs in and falls back to how the pointer moves.
@@ -537,10 +570,10 @@ args = ["--full-auto"]
 - Edit these live: `,` for the selected machine, `Ctrl-,` for global defaults.
   Settings fields use shell-word syntax rather than JSON. The in-app form
   covers the common fields — refresh, environment, each runtime's command and
-  arguments, the update prompt — grouped under one heading per runtime; a
-  machine's panel adds an install action under any runtime it lacks. Everything
-  else (tunnels, companion overrides, install commands, sync files, attention
-  patterns, history bounds) lives in this file only.
+  arguments, the update prompt and channel — grouped under one heading per
+  runtime; a machine's panel adds an install action under any runtime it lacks.
+  Everything else (tunnels, companion overrides, install commands, sync files,
+  attention patterns, history bounds) lives in this file only.
 
 ## MCP
 

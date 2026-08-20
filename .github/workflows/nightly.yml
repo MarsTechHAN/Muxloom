@@ -1,62 +1,44 @@
-name: Build and release
+name: Nightly
+
+# Publishes the newest green commit on main as the rolling `nightly`
+# prerelease, so a fix reaches installs the day it is written instead of
+# waiting for a tag. It is a *prerelease*, which keeps `releases/latest` — what
+# the stable update check and the remote companion pull both read — pointing at
+# the newest tagged release.
+#
+# The trigger is the regression workflow finishing green rather than the push
+# itself: a nightly nobody could install safely is worse than no nightly.
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: ["Cross-platform regression"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: nightly
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_VERSION: "1.97.1"
   FFMPEG_STATIC_RELEASE: "b6.1.1"
-  MUXLOOM_BUILD_ID: ${{ github.sha }}
-  # A build knows which stream it came from, which is how an install keeps
-  # following the one it is already on without being told.
-  MUXLOOM_BUILD_CHANNEL: stable
 
 jobs:
-  check:
-    name: Check, lint, and test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-          rustup component add rustfmt clippy
-
-      - name: Install tmux for integration tests
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes tmux
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Check lean companion build
-        run: cargo clippy --locked --no-default-features --bin muxloomd -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked --all-targets
-
   build:
     name: Compile ${{ matrix.label }}
-    needs: check
+    # A fork's pull request can carry the branch name `main` too, and this job
+    # ends up published under this repository's name, so the source repository
+    # is checked as well as the branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -87,16 +69,25 @@ jobs:
             ffmpeg_arch: x64
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out source
+      - name: Check out the commit that went green
         uses: actions/checkout@v6
         with:
-          # The whole history: the commit count is what tells a release apart
-          # from the nightlies that share its package version.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The whole history: the commit count is what orders two nightlies
+          # that share a package version.
           fetch-depth: 0
 
-      - name: Stamp the build's place in history
+      - name: Stamp the build with the commit it came from
         shell: bash
-        run: echo "MUXLOOM_BUILD_HEIGHT=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+        run: |
+          commit="$(git rev-parse HEAD)"
+          {
+            echo "MUXLOOM_BUILD_ID=$commit"
+            echo "MUXLOOM_BUILD_HEIGHT=$(git rev-list --count HEAD)"
+            # A build knows which stream it came from, which is how an install
+            # keeps following the one it is already on without being told.
+            echo "MUXLOOM_BUILD_CHANNEL=nightly"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust target
         shell: bash
@@ -154,13 +145,18 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  package:
-    name: Assemble controller and companion bundles
+  publish:
+    name: Republish the rolling nightly release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Check out source
+      - name: Check out the commit that went green
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
 
       - name: Download raw binaries
         uses: actions/download-artifact@v8
@@ -172,12 +168,12 @@ jobs:
       - name: Assemble all platform archives
         shell: bash
         run: |
-          ref_name="${GITHUB_REF_NAME//\//-}"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="$ref_name"
-          else
-            version="${ref_name}-${GITHUB_SHA:0:7}"
-          fi
+          set -euo pipefail
+          # Nightly archives are named after the package version, exactly as a
+          # release's are, because that is the name the updater asks for. They
+          # do not collide with the tagged release's assets: the two hang off
+          # different tags.
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p dist
           package_target() {
             target="$1"
@@ -214,19 +210,6 @@ jobs:
           package_target aarch64-apple-darwin muxloom tar.gz
           package_target x86_64-apple-darwin muxloom tar.gz
           package_target x86_64-pc-windows-msvc muxloom.exe zip
-          package_cask() {
-            target="$1"
-            arch="$2"
-            source="dist/muxloom-${version}-${target}"
-            cask_root="cask/${target}/muxloom"
-            asset="muxloom-macos-${arch}.tar.gz"
-            mkdir -p "$cask_root"
-            cp -R "$source/." "$cask_root/"
-            tar -C "cask/$target" -czf "dist/$asset" muxloom
-            (cd dist && sha256sum "$asset" > "$asset.sha256")
-          }
-          package_cask aarch64-apple-darwin aarch64
-          package_cask x86_64-apple-darwin x86_64
           for companion_target in \
             x86_64-unknown-linux-musl \
             aarch64-apple-darwin \
@@ -235,54 +218,48 @@ jobs:
             cp "raw/$companion_target/muxloomd" "dist/$asset"
             (cd dist && sha256sum "$asset" > "$asset.sha256")
           done
+          # Everything in dist/ is uploaded as a release asset, so the staging
+          # trees the archives were built from must not be left lying in it.
+          find dist -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+          ls -l dist
 
-      - name: Upload release packages
-        uses: actions/upload-artifact@v7
-        with:
-          name: muxloom-packages
-          path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/muxloomd-*
-          if-no-files-found: error
-          compression-level: 0
+      - name: Write the manifest that names this build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A rolling tag cannot say which commit it holds, and every nightly
+          # between two releases carries the same package version — so the
+          # manifest carries both, and the commit count orders them.
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          commit="$(git rev-parse HEAD)"
+          height="$(git rev-list --count HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{\n  "version": "%s",\n  "commit": "%s",\n  "height": %s,\n  "built_at": "%s"\n}\n' \
+            "$version" "$commit" "$height" "$built_at" > dist/nightly.json
+          cat dist/nightly.json
+          echo "MUXLOOM_NIGHTLY_LABEL=$version+$height (${commit:0:7})" >> "$GITHUB_ENV"
 
-  release:
-    name: Publish GitHub Release
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: package
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out tagged source
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: muxloom-packages
-          path: dist
-          merge-multiple: true
-
-      - name: Publish release
+      - name: Republish the nightly prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
-          release_args=(
-            "$GITHUB_REF_NAME"
-            dist/*
-            --verify-tag
-            --generate-notes
-            --title "Muxloom $GITHUB_REF_NAME"
-          )
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            release_args+=(--prerelease)
-          fi
-          gh release create "${release_args[@]}"
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          cat > notes.md <<NOTES
+          Rolling build of the newest green commit on \`main\` — $MUXLOOM_NIGHTLY_LABEL, from ${commit}.
+
+          Installs following the nightly channel are offered this build the next
+          time they check. To follow tagged releases only, set
+          \`update_channel = "stable"\` in \`~/.config/muxloom/config.toml\`.
+          NOTES
+          # Replace the release outright rather than uploading over it: that is
+          # the only way to be sure no asset from an older nightly survives
+          # beside the ones this build produced.
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly dist/* \
+            --target "$commit" \
+            --prerelease \
+            --title "Muxloom nightly $MUXLOOM_NIGHTLY_LABEL" \
+            --notes-file notes.md

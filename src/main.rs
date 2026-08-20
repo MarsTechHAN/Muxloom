@@ -62,13 +62,26 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Command::Version => {
+            // The first line stays exactly "muxloom <version>": the bootstrap
+            // script reads a companion's version off the last word of it. The
+            // build a nightly came from goes on a line of its own.
             println!("muxloom {}", env!("CARGO_PKG_VERSION"));
+            if let Some(commit) = muxloom::update::build_commit() {
+                let stream = muxloom::update::build_channel().unwrap_or("untagged");
+                match muxloom::update::build_height() {
+                    Some(height) => println!("build {commit} ({stream}, commit {height} on main)"),
+                    None => println!("build {commit} ({stream})"),
+                }
+            }
             Ok(())
         }
         Command::Update => {
             let config = Config::load(&options.config_path)?;
             let environment = config.environment_for(muxloom::model::LOCAL_TARGET_ID)?;
-            muxloom::update::run_cli(&environment)
+            let channel = options
+                .update_channel
+                .unwrap_or_else(|| muxloom::update::Channel::from_config(&config.update_channel));
+            muxloom::update::run_cli(channel, &environment)
         }
         Command::Init => {
             if !options.config_explicit
@@ -110,53 +123,58 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// Check GitHub for a newer release in the background. With `ask` (the
-/// default) the finding opens a prompt in the UI; with `auto`, a real install
-/// is staged silently the way pre-0.5 releases did. Failures (offline,
-/// rate-limited, etc.) stay silent.
+/// Check GitHub for a newer build in the background, on whichever channel the
+/// configuration follows. With `ask` (the default) the finding opens a prompt
+/// in the UI; with `auto`, a real install is staged silently the way pre-0.5
+/// releases did. Failures (offline, rate-limited, etc.) stay silent.
 fn spawn_update_check(
     slot: muxloom::app::UpdateSlot,
+    channel: muxloom::update::Channel,
     environment: Vec<(String, String)>,
     ask: bool,
 ) {
     std::thread::spawn(move || {
-        let Ok(result) = muxloom::update::check_and_maybe_apply(!ask, &environment) else {
+        let Ok(result) = muxloom::update::check_and_maybe_apply(channel, !ask, &environment) else {
+            return;
+        };
+        let Some(release) = result.release else {
             return;
         };
         let note = if result.applied {
             muxloom::app::UpdateNote {
                 message: Some(format!(
                     "muxloom {} downloaded — restart to apply",
-                    result.latest
+                    release.label
                 )),
-                staged_version: Some(result.latest),
+                staged_version: Some(release.label),
                 available_version: None,
                 prompt: None,
             }
-        } else if result.update_available && ask {
+        } else if ask {
             muxloom::app::UpdateNote {
                 message: None,
                 staged_version: None,
-                available_version: Some(result.latest.clone()),
+                available_version: Some(release.label.clone()),
                 prompt: Some(muxloom::app::UpdatePrompt {
-                    latest: result.latest,
+                    latest: release.label,
+                    current: result.current,
+                    tag: release.tag,
+                    version: release.version,
                     can_self_update: cfg!(unix) && muxloom::update::is_installed_bundle(),
                 }),
             }
-        } else if result.update_available {
+        } else {
             // Nothing was downloaded on this path, so the header must not
             // offer a restart: the user still has to run the update.
             muxloom::app::UpdateNote {
                 message: Some(format!(
                     "muxloom {} available — run `muxloom update`",
-                    result.latest
+                    release.label
                 )),
                 staged_version: None,
-                available_version: Some(result.latest),
+                available_version: Some(release.label),
                 prompt: None,
             }
-        } else {
-            return;
         };
         if let Ok(mut guard) = slot.lock() {
             *guard = Some(note);
@@ -179,6 +197,7 @@ fn run(config_path: PathBuf) -> Result<()> {
 
     let auto_update = config.auto_update && config.update_prompt != "never";
     let ask_before_updating = config.update_prompt != "auto";
+    let update_channel = muxloom::update::Channel::from_config(&config.update_channel);
     let update_environment = config
         .environment_for(muxloom::model::LOCAL_TARGET_ID)
         .unwrap_or_default();
@@ -190,7 +209,12 @@ fn run(config_path: PathBuf) -> Result<()> {
         app.status_message = format!("Debug log: {}", path.display());
     }
     if auto_update {
-        spawn_update_check(app.update_slot(), update_environment, ask_before_updating);
+        spawn_update_check(
+            app.update_slot(),
+            update_channel,
+            update_environment,
+            ask_before_updating,
+        );
     }
     app.start();
 
@@ -636,7 +660,7 @@ fn init_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Run,
     Init,
@@ -651,6 +675,11 @@ struct CliOptions {
     config_path: PathBuf,
     debug_log: Option<PathBuf>,
     config_explicit: bool,
+    /// `--nightly` / `--stable`: which stream this one `update` should take,
+    /// overriding the configuration. Nothing is written back — the build that
+    /// gets installed is stamped with its own stream, so the next check
+    /// follows it on its own.
+    update_channel: Option<muxloom::update::Channel>,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOptions> {
@@ -658,6 +687,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
     let mut config_path = default_config_path();
     let mut debug_log = None;
     let mut config_explicit = false;
+    let mut update_channel = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -666,6 +696,8 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
             "mcp" => command = Command::Mcp,
             "--help" | "-h" => command = Command::Help,
             "--version" | "-V" => command = Command::Version,
+            "--nightly" => update_channel = Some(muxloom::update::Channel::Nightly),
+            "--stable" => update_channel = Some(muxloom::update::Channel::Stable),
             "--debug" => debug_log = Some(default_debug_log_path()),
             "--debug-log" => {
                 index += 1;
@@ -686,17 +718,21 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
         }
         index += 1;
     }
+    if update_channel.is_some() && command != Command::Update {
+        bail!("--nightly and --stable only apply to `muxloom update`");
+    }
     Ok(CliOptions {
         command,
         config_path,
         debug_log,
         config_explicit,
+        update_channel,
     })
 }
 
 fn print_help() {
     println!(
-        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update\n    muxloom mcp [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the latest release, if newer\n    mcp                  Serve muxloom's control surface over MCP stdio\n",
+        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update [--nightly | --stable]\n    muxloom mcp [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --nightly        Update from the rolling nightly build, and stay on it\n        --stable         Update from the tagged releases, and stay on them\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the newest build, if newer\n    mcp                  Serve muxloom's control surface over MCP stdio\n",
         env!("CARGO_PKG_VERSION")
     );
 }

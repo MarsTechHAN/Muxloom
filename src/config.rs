@@ -30,6 +30,11 @@ pub struct Config {
     /// "auto" applies silently (the pre-0.5 behavior), "never" skips the
     /// check. Ignored when `auto_update` is off.
     pub update_prompt: String,
+    /// Which builds the check looks at: "auto" (the default) follows the
+    /// stream this build came from, so a nightly stays on nightlies and a
+    /// release stays on releases. "nightly" asks for the rolling build made
+    /// from every green commit on `main`; "stable" asks for tagged releases.
+    pub update_channel: String,
     /// How a press-drag-release is read. Lists and modals always follow the
     /// finger; this only decides the terminal pane and the file preview, where
     /// a drag otherwise selects text: "on" swipes to scroll and selects after
@@ -66,6 +71,7 @@ impl Default for Config {
             companion_binary: String::new(),
             auto_update: true,
             update_prompt: "ask".into(),
+            update_channel: "auto".into(),
             touch: "auto".into(),
             agents: AgentCommands::default(),
             hosts: BTreeMap::new(),
@@ -265,6 +271,9 @@ impl Config {
         }
         if !matches!(self.update_prompt.as_str(), "ask" | "auto" | "never") {
             anyhow::bail!("update_prompt must be \"ask\", \"auto\", or \"never\"");
+        }
+        if !matches!(self.update_channel.as_str(), "auto" | "nightly" | "stable") {
+            anyhow::bail!("update_channel must be \"auto\", \"nightly\", or \"stable\"");
         }
         if !matches!(self.touch.as_str(), "auto" | "on" | "off") {
             anyhow::bail!("touch must be \"auto\", \"on\", or \"off\"");
@@ -534,6 +543,11 @@ companion_binary = ""
 auto_update = true
 # What the startup check does with what it finds: "ask", "auto", or "never".
 update_prompt = "ask"
+# Which builds it looks at. "auto" follows the stream this build came from, so
+# a nightly stays on nightlies and a release stays on releases. "nightly" asks
+# for the rolling build published from every green commit on main; "stable"
+# asks for tagged releases only. `muxloom update --nightly` crosses over.
+update_channel = "auto"
 # Touch screens: lists and modals always follow the finger. This decides the
 # terminal pane and the file preview, where a drag otherwise selects text.
 # "on" swipes to scroll and selects after a long press, "off" always selects,
@@ -625,6 +639,26 @@ mod tests {
         };
         assert!(config.validate().is_err());
         assert!(EXAMPLE_CONFIG.contains("update_prompt"));
+    }
+
+    #[test]
+    fn the_update_channel_follows_this_build_unless_it_names_a_stream() {
+        // Nobody is moved onto a cadence they did not ask for: the default
+        // keeps a release install on releases and a nightly on nightlies.
+        assert_eq!(Config::default().update_channel, "auto");
+        for channel in ["auto", "nightly", "stable"] {
+            let config = Config {
+                update_channel: channel.into(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_ok(), "{channel} must be accepted");
+        }
+        let config = Config {
+            update_channel: "bleeding".into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(EXAMPLE_CONFIG.contains("update_channel = \"auto\""));
     }
 
     #[test]

@@ -266,10 +266,20 @@ pub struct UpdateNote {
     pub prompt: Option<UpdatePrompt>,
 }
 
-/// What the startup check found and what saying yes would do.
+/// What the startup check found and what saying yes would do. The release is
+/// carried in full rather than looked up again: the build the user agreed to
+/// is the build that gets installed, even if a nightly lands in between.
 #[derive(Debug, Clone)]
 pub struct UpdatePrompt {
+    /// How the build was named to the user: `0.5.5`, or `nightly 0.5.4+142`.
     pub latest: String,
+    /// How the running build is named, so the prompt can say what is being
+    /// left behind — two nightlies otherwise differ only in a commit count.
+    pub current: String,
+    /// The release tag its assets hang off: `v0.5.5`, or `nightly`.
+    pub tag: String,
+    /// The package version its asset names carry.
+    pub version: String,
     /// True on an installed release bundle, where yes replaces the bundle in
     /// place. A source build can only refresh the companion cache.
     pub can_self_update: bool,
@@ -836,6 +846,7 @@ impl SettingsForm {
             rows.extend([
                 SettingsRow::Section("Updates"),
                 SettingsRow::Field("Update prompt (ask/auto/never)"),
+                SettingsRow::Field("Update channel (auto/nightly/stable)"),
                 SettingsRow::Section("Input"),
                 SettingsRow::Field("Touch gestures (auto/on/off)"),
             ]);
@@ -1454,19 +1465,20 @@ impl App {
         });
         std::thread::spawn(move || {
             let note = if prompt.can_self_update {
-                match crate::update::check_and_maybe_apply(true, &environment) {
-                    Ok(result) if result.applied => UpdateNote {
+                // Exactly the build that was offered, not whatever is newest by
+                // the time the thread runs: the user answered about this one.
+                let release = crate::update::Release {
+                    tag: prompt.tag,
+                    version: prompt.version,
+                    label: prompt.latest.clone(),
+                };
+                match crate::update::apply(&release, &environment, |_, _| {}) {
+                    Ok(()) => UpdateNote {
                         message: Some(format!(
                             "muxloom {} downloaded — restart to apply",
-                            result.latest
+                            release.label
                         )),
-                        staged_version: Some(result.latest),
-                        available_version: None,
-                        prompt: None,
-                    },
-                    Ok(result) => UpdateNote {
-                        message: Some(format!("muxloom {} is already current", result.current)),
-                        staged_version: None,
+                        staged_version: Some(release.label),
                         available_version: None,
                         prompt: None,
                     },
@@ -7028,6 +7040,7 @@ impl App {
         }
         values.push(self.config.agents.terminal.command.clone());
         values.push(self.config.update_prompt.clone());
+        values.push(self.config.update_channel.clone());
         values.push(self.config.touch.clone());
         self.modal = Some(Modal::Settings(SettingsForm {
             scope: SettingsScope::Global,
@@ -8600,7 +8613,8 @@ impl App {
                     }
                     config.agents.terminal.command = form.values[index].clone();
                     config.update_prompt = form.values[index + 1].trim().to_string();
-                    config.touch = form.values[index + 2].trim().to_string();
+                    config.update_channel = form.values[index + 2].trim().to_string();
+                    config.touch = form.values[index + 3].trim().to_string();
                 }
                 SettingsScope::Host(target_id) => {
                     // The form edits the common fields; everything it no
@@ -10438,6 +10452,9 @@ mod tests {
                 available_version: Some("9.9.9".into()),
                 prompt: Some(UpdatePrompt {
                     latest: "9.9.9".into(),
+                    current: "0.0.1".into(),
+                    tag: "v9.9.9".into(),
+                    version: "9.9.9".into(),
                     can_self_update: false,
                 }),
             });
@@ -10455,6 +10472,9 @@ mod tests {
                 available_version: None,
                 prompt: Some(UpdatePrompt {
                     latest: "9.9.9".into(),
+                    current: "0.0.1".into(),
+                    tag: "v9.9.9".into(),
+                    version: "9.9.9".into(),
                     can_self_update: false,
                 }),
             });

@@ -198,5 +198,18 @@ preserve.
 - Remote integration tests are opt-in. Use an explicit target, leave no test
   sessions behind, and never include private infrastructure paths in fixtures.
 - A release version must match in `Cargo.toml`, `Cargo.lock`, and the Git tag.
+- Every commit on `main` that passes the full regression suite is republished
+  as the rolling `nightly` prerelease. It must stay a prerelease, because
+  `releases/latest` — which the stable check and the remote companion pull both
+  read — has to keep naming the newest tagged release. A rolling tag cannot say
+  which build it holds and every nightly between two releases shares one package
+  version, so the build must carry the stream, commit, and commit count it was
+  made at, and a build that carries no count is never offered a same-version
+  update.
+- An install follows the stream its own build came from unless it is told
+  otherwise: a release stays on releases, a nightly stays on nightlies. Nobody
+  is moved onto a cadence they did not ask for, and crossing over must not
+  require editing configuration — the build that gets installed is what decides
+  the next check.
 - Pushes, tags, releases, and other externally visible mutations require
   explicit user authorization.

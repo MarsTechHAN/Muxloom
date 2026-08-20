@@ -87,6 +87,19 @@ chmod +x muxloom muxloomd ffmpeg companions/*/muxloomd
 Windows 运行 `muxloom.exe` 管理 SSH 目标。每个压缩包和独立 companion 都带有
 `.sha256` 文件。
 
+**Nightly**：`main` 上每个通过全平台回归的 commit 都会重新发布为滚动预发布
+[`nightly`](https://github.com/MarsTechHAN/Muxloom/releases/tag/nightly)，修复当天即可
+安装。已有安装只需执行：
+
+```bash
+muxloom update --nightly
+```
+
+之后无需任何配置即可留在 nightly：装上的构建本身带着 nightly 标记，而每个安装默认
+跟随自己所属的那条线，因此后续检查继续推送 nightly。`muxloom update --stable` 用同样
+的方式回到正式发布。首次安装可以直接从 nightly 页面下载压缩包，目录结构与打了 tag 的
+发布完全一致。
+
 源码构建需要 Rust 1.85 或更高版本；远程目标需要 `ssh`；视频预览需要 `PATH` 中的
 `ffmpeg` 或 `MUXLOOM_FFMPEG`。Controller 已内置 HTTPS 下载、SHA-256 校验和压缩包
 解压，补取 companion、Agent Package 和自更新都不依赖系统 `curl` 或 `tar`。
@@ -106,7 +119,7 @@ cargo build --release
 ```text
 muxloom [--config PATH] [--debug | --debug-log PATH]
 muxloom init [--config PATH]
-muxloom update [--config PATH]
+muxloom update [--config PATH] [--nightly | --stable]
 muxloom mcp [--config PATH]
 ```
 
@@ -115,11 +128,17 @@ muxloom mcp [--config PATH]
 `muxloom update` 会校验 SHA-256 后原地更新 Release Bundle。启动时默认在后台自动检查并
 更新；配置 `auto_update = false` 可以关闭。默认情况下（`update_prompt = "ask"`）发现
 新版本会先弹窗询问：安装包构建可原地更新，源码构建则把远端机器要用的 muxloomd
-companion 拉进本地缓存；`"auto"` 恢复静默自动更新，`"never"` 跳过启动检查。GitHub
-不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。设置面板
+companion 拉进本地缓存；`"auto"` 恢复静默自动更新，`"never"` 跳过启动检查。
+发布分两条线：打了 tag 的正式版，以及上面说的滚动 `nightly`。`update_channel` 决定
+检查哪一条，默认值 `"auto"` 跟随当前运行的这个构建所属的那条——正式版安装继续按大版本
+走，nightly 安装继续拿 nightly，谁都不会被拖到没要过的节奏上；`"nightly"` 与
+`"stable"` 则直接指定。nightly 在弹窗里显示为 `nightly <版本>+<commit 数> (<commit>)`，
+并列出当前运行的构建，因为两个 nightly 往往只差那个 commit 数；只有确实比当前更新的
+nightly 才会被提示。`-V` 会打印 CI 构建对应的 commit 与所属线。
+GitHub 不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。设置面板
 （`,` 机器级 / `Ctrl-,` 全局）按分组只展示常用项——刷新间隔、环境变量、各 agent 命令、
-更新提示；隧道、companion 覆盖、安装命令、sync files、attention patterns 等低频项仅在
-config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行版本，并带一个
+更新提示与更新通道；隧道、companion 覆盖、安装命令、sync files、attention patterns 等
+低频项仅在 config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行版本，并带一个
 **Force update** 动作，用来强制完成被旧会话拖住的 daemon 升级。
 
 <a id="zh-first-run"></a>
