@@ -313,19 +313,50 @@ fn bundle_dir() -> Result<PathBuf> {
         .context("muxloom executable has no parent directory")
 }
 
-/// The installed bundle directory, if we're actually running from one. A real
-/// bundle keeps the `muxloomd` companion beside `muxloom` and is not inside a
-/// Cargo `target/` tree — this guards against clobbering a `cargo run` build.
+/// The file a package manager drops beside `muxloom` to say the install is
+/// its own. Its first line names the manager, so a notice can point at the
+/// command that will actually work instead of only refusing.
+const MANAGED_MARKER: &str = ".muxloom-managed";
+
+/// The package manager that owns the bundle at `dir`, if one claimed it.
+fn managed_by_at(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(MANAGED_MARKER)).ok()?;
+    let name = text.lines().next().unwrap_or_default().trim();
+    Some(match name {
+        // A marker with nothing in it still means hands off; only the advice
+        // gets vaguer.
+        "" => "a package manager".to_string(),
+        name => name.to_string(),
+    })
+}
+
+/// The package manager that owns the running install, if any.
+pub fn managed_by() -> Option<String> {
+    managed_by_at(&bundle_dir().ok()?)
+}
+
+/// The installed bundle directory, if we're actually running from one *and*
+/// the files are ours to replace. See [`updatable_bundle_at`].
 fn installed_bundle() -> Option<PathBuf> {
-    let dir = bundle_dir().ok()?;
+    updatable_bundle_at(&bundle_dir().ok()?)
+}
+
+/// The bundle at `dir`, if updating it in place would be right. A real bundle
+/// keeps the `muxloomd` companion beside `muxloom` and is not inside a Cargo
+/// `target/` tree — this guards against clobbering a `cargo run` build. A
+/// package manager's marker rules it out for the same reason from the other
+/// side: those files belong to the manager, which would hand back the version
+/// it installed on the next upgrade and undo the update anyway.
+fn updatable_bundle_at(dir: &Path) -> Option<PathBuf> {
     if dir
         .components()
         .any(|component| component.as_os_str() == "target")
+        || managed_by_at(dir).is_some()
     {
         return None;
     }
     let companion = dir.join(format!("muxloomd{}", env::consts::EXE_SUFFIX));
-    companion.is_file().then_some(dir)
+    companion.is_file().then(|| dir.to_path_buf())
 }
 
 /// Whether an auto-update could actually replace files on this install.
@@ -377,6 +408,13 @@ pub fn run_cli(channel: Channel, environment: &[(String, String)]) -> Result<()>
     if !cfg!(unix) {
         println!(
             "Automatic install is not supported on this platform; download {label} from {RELEASES_PAGE}"
+        );
+        return Ok(());
+    }
+    if let Some(manager) = managed_by() {
+        println!(
+            "This install is managed by {manager}; update it there — muxloom will not write \
+             over files it does not own."
         );
         return Ok(());
     }
@@ -662,6 +700,45 @@ mod tests {
         assert_eq!(release.label, "nightly 0.5.4+142 (a1b2c3d)");
         assert_eq!(build_label("0.5.4", None, None), "0.5.4");
         assert_eq!(build_label("0.5.4", Some(142), None), "0.5.4+142");
+    }
+
+    #[test]
+    fn a_package_managed_install_is_reported_but_never_written_over() {
+        let nonce = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "muxloom-managed-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let bundle = root.join("libexec");
+        let companion = format!("muxloomd{}", env::consts::EXE_SUFFIX);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join(&companion), b"companion").unwrap();
+
+        // A bundle nobody claimed is ours to replace in place.
+        assert_eq!(managed_by_at(&bundle), None);
+        assert_eq!(
+            updatable_bundle_at(&bundle).as_deref(),
+            Some(bundle.as_path())
+        );
+
+        // Homebrew's Cellar would hand its own build back on the next upgrade,
+        // so an update there is worth saying and not worth applying.
+        fs::write(bundle.join(MANAGED_MARKER), "homebrew\n").unwrap();
+        assert_eq!(managed_by_at(&bundle).as_deref(), Some("homebrew"));
+        assert_eq!(updatable_bundle_at(&bundle), None);
+
+        // A marker naming nobody still means hands off; only the advice blurs.
+        fs::write(bundle.join(MANAGED_MARKER), "\n").unwrap();
+        assert_eq!(managed_by_at(&bundle).as_deref(), Some("a package manager"));
+        assert_eq!(updatable_bundle_at(&bundle), None);
+
+        // And an unmarked `cargo build` is still not an install.
+        let build = root.join("target/release");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join(&companion), b"companion").unwrap();
+        assert_eq!(updatable_bundle_at(&build), None);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

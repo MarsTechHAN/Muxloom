@@ -1567,8 +1567,9 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
             let action = if prompt.can_self_update {
                 "Update the installed bundle now? The change applies on the next launch."
             } else {
-                "Fetch the release's muxloomd companions into the local cache? A source \
-                 build updates itself with cargo, but the cache is what updates machines."
+                "Fetch the release's muxloomd companions into the local cache? This install \
+                 is updated elsewhere — with cargo, or by the package manager that owns it \
+                 — but the cache is what updates machines."
             };
             let text = vec![
                 Line::raw(""),
