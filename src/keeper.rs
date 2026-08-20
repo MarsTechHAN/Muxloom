@@ -146,9 +146,19 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
 /// Read the greeting a keeper opens every connection with.
 pub fn read_greeting(reader: &mut impl Read) -> Result<KeeperStatus> {
     let mut magic = [0u8; 4];
-    reader
-        .read_exact(&mut magic)
-        .context("keeper closed before greeting")?;
+    if let Err(error) = reader.read_exact(&mut magic) {
+        // A keeper that hung up and one that is merely late are different
+        // problems — a broken launch against a machine too busy to answer yet
+        // — and the connection reports them the same way unless the timeout is
+        // named. Calling both "closed" points every diagnosis after it at the
+        // wrong one.
+        return match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                Err(error).context("keeper did not greet in time")
+            }
+            _ => Err(error).context("keeper closed before greeting"),
+        };
+    }
     if magic != MAGIC {
         bail!("invalid keeper magic");
     }
@@ -545,6 +555,31 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_greeting_is_not_reported_as_a_dead_keeper() {
+        /// A connection that is open but has nothing to say yet, which is what
+        /// a busy machine looks like through a read timeout.
+        struct Silent;
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let late = read_greeting(&mut Silent).unwrap_err();
+        assert!(
+            format!("{late:#}").contains("did not greet in time"),
+            "{late:#}"
+        );
+
+        // A keeper that really hung up still reads as one.
+        let closed = read_greeting(&mut [].as_slice()).unwrap_err();
+        assert!(
+            format!("{closed:#}").contains("closed before greeting"),
+            "{closed:#}"
+        );
+    }
 
     #[test]
     fn frames_round_trip_and_reject_oversized_payloads() {

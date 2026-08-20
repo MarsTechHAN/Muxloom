@@ -2590,7 +2590,41 @@ mod platform {
             }
             KeeperMode::Process => spawn_keeper_process(state, spec)?,
         }
-        connect_keeper(&spec.socket_path, Duration::from_secs(5))
+        connect_keeper(&spec.socket_path, Duration::from_secs(5)).map_err(|error| {
+            // A keeper that dies on its way up says why on its own stderr and
+            // nowhere else: the socket it would have explained itself over is
+            // exactly what it never reached. Left out, the launch failure
+            // surfaces as "muxloomd was unavailable" and blames the daemon for
+            // whatever the keeper actually hit.
+            match keeper_log_tail(&state.paths, &spec.session_id) {
+                Some(tail) => anyhow!("{error:#}; the keeper's own log says: {tail}"),
+                None => error,
+            }
+        })
+    }
+
+    /// The last few lines a keeper wrote before it gave up, bounded so a log
+    /// that grew is still cheap to look at and a notice stays one line.
+    fn keeper_log_tail(paths: &DaemonPaths, session_id: &str) -> Option<String> {
+        const WINDOW: u64 = 8 * 1024;
+        const LIMIT: usize = 300;
+        let path = paths.keepers.join(format!("{session_id}.log"));
+        let text = String::from_utf8_lossy(&history_tail(&path, WINDOW)?).into_owned();
+        let tail: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(3)
+            .collect();
+        if tail.is_empty() {
+            return None;
+        }
+        let mut joined = tail.into_iter().rev().collect::<Vec<_>>().join("; ");
+        if joined.chars().count() > LIMIT {
+            joined = joined.chars().take(LIMIT).collect::<String>() + "…";
+        }
+        Some(joined)
     }
 
     /// Spawn the detached `muxloomd keeper` that owns one session. The spec
@@ -5194,6 +5228,38 @@ mod platform {
                 thread::yield_now();
             }
             assert!(!scratch.exists(), "the folder ends with the session");
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_keeper_that_dies_on_its_way_up_is_reported_in_its_own_words() {
+            let state = test_state("keeper-log");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-codex-stillborn";
+
+            // Nothing to add is the normal case: a keeper that greeted wrote
+            // nothing here, and a launch that failed elsewhere must not have a
+            // stale line pinned to it.
+            assert_eq!(keeper_log_tail(&paths, session_id), None);
+
+            // The keeper's stderr is the only place its dying words land, so
+            // the last of them is what a failed launch has to carry.
+            let log = paths.keepers.join(format!("{session_id}.log"));
+            fs::write(
+                &log,
+                "starting\n\nfailed to spawn '/usr/bin/codex': Resource temporarily unavailable\n",
+            )
+            .unwrap();
+            let tail = keeper_log_tail(&paths, session_id).unwrap();
+            assert!(tail.contains("Resource temporarily unavailable"), "{tail}");
+            assert!(tail.contains("starting"), "{tail}");
+
+            // A log that ran long stays one readable line either way.
+            fs::write(&log, format!("{}\n", "chatter ".repeat(4096))).unwrap();
+            let tail = keeper_log_tail(&paths, session_id).unwrap();
+            assert!(tail.chars().count() <= 301, "{}", tail.chars().count());
+            assert!(tail.ends_with('…'), "{tail}");
+
             fs::remove_dir_all(paths.root).unwrap();
         }
 
