@@ -19,9 +19,15 @@ on:
 permissions:
   contents: read
 
+# One publisher at a time, but never at the cost of a build already running.
+# A regression that ends red still starts a run here — the gate below is a job
+# condition, and GitHub puts the run in this group before it evaluates one — so
+# cancelling would let a commit that publishes nothing kill the nightly of the
+# commit before it. Queued runs collapse to the newest, which is the one that
+# should win the rolling tag anyway.
 concurrency:
   group: nightly
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
