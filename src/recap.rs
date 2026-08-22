@@ -2,7 +2,14 @@ use crate::model::AgentKind;
 
 const MAX_RECAP_CHARS: usize = 180;
 
+/// A shell has no turns to summarise. Whatever scrolled past last is a
+/// command, a prompt, or half a build log, and dressing that up as a recap
+/// only puts a misleading sentence under the session. Say nothing instead -
+/// `read_screen` is how a terminal is read.
 pub fn extract_recap(kind: AgentKind, output: &str) -> Option<String> {
+    if kind == AgentKind::Terminal {
+        return None;
+    }
     let plain = strip_terminal_controls(output);
     let lines: Vec<_> = plain.lines().collect();
 
@@ -277,6 +284,16 @@ mod tests {
             extract_recap(AgentKind::Claude, output).as_deref(),
             Some("The issue comes from reusing stale preview state.")
         );
+    }
+
+    #[test]
+    fn a_shell_never_gets_a_recap() {
+        let output = concat!(
+            "<Trial 368492514 worker_0> tiger $ cargo build\n",
+            "   Compiling muxloom v0.5.4\n",
+            "<Trial 368492514 worker_0> tiger $ \n"
+        );
+        assert_eq!(extract_recap(AgentKind::Terminal, output), None);
     }
 
     #[test]

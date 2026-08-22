@@ -3234,15 +3234,18 @@ mod platform {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .screen()
                 .contents();
-            let recent = {
-                let recent = self
-                    .recent_output
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                String::from_utf8_lossy(&recent).into_owned()
-            };
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
-                snapshot.recap = extract_recap(kind, &recent);
+                // A shell gets no recap, and its scrollback is megabytes: copy
+                // it out only for a runtime that has something to say.
+                snapshot.recap = (kind != AgentKind::Terminal)
+                    .then(|| {
+                        let recent = self
+                            .recent_output
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        extract_recap(kind, &String::from_utf8_lossy(&recent))
+                    })
+                    .flatten();
                 if snapshot.dead || snapshot.archived {
                     snapshot.pid = None;
                     snapshot.working = false;

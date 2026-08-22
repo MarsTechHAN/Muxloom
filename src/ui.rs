@@ -814,13 +814,17 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     agent_style(Style::default().fg(Color::Gray)),
                 ),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("    recap   ", agent_style(Style::default().fg(MUTED))),
-                Span::styled(
-                    truncate(&app.recap_for(&session), value_width),
-                    agent_style(Style::default().fg(Color::White)),
-                ),
-            ]));
+            // A shell has no recap to give, and an empty row under it only
+            // takes a line away from the folder and the status.
+            if session.kind != AgentKind::Terminal {
+                lines.push(Line::from(vec![
+                    Span::styled("    recap   ", agent_style(Style::default().fg(MUTED))),
+                    Span::styled(
+                        truncate(&app.recap_for(&session), value_width),
+                        agent_style(Style::default().fg(Color::White)),
+                    ),
+                ]));
+            }
             lines.push(Line::from(vec![
                 Span::styled("    status  ", agent_style(Style::default().fg(MUTED))),
                 Span::styled(
