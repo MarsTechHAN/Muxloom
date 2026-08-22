@@ -4213,9 +4213,15 @@ fn draw_launch_modal(frame: &mut Frame<'_>, form: &LaunchForm, outer: Rect, kind
             .block(Block::default().borders(Borders::BOTTOM)),
         rows[5],
     );
+    // A shell is never asked about resuming, so promising that step would be a
+    // keypress the folder row does not take.
+    let hint = if form.kind == AgentKind::Terminal {
+        "Enter advances runtime -> folder -> start    Tab edits label"
+    } else {
+        "Enter advances runtime -> folder -> New/Resume    Tab edits label"
+    };
     frame.render_widget(
-        Paragraph::new("Enter advances runtime -> folder -> New/Resume    Tab edits label")
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(hint).style(Style::default().fg(MUTED)),
         rows[6],
     );
 

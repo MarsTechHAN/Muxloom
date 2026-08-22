@@ -7002,6 +7002,13 @@ impl App {
             self.status_message = "Launch cancelled: working directory is required".into();
             return;
         }
+        // A shell has no conversation to resume, so the picker it would open
+        // offers one row - "New" - and a keypress that means nothing. Open the
+        // terminal where the folder was chosen instead.
+        if launch.kind == AgentKind::Terminal {
+            self.confirm_or_submit_launch(launch, None, None);
+            return;
+        }
         let mut form = ResumeForm {
             launch,
             candidates: Vec::new(),
@@ -7014,17 +7021,15 @@ impl App {
             searched_query: String::new(),
             search_edited_at: None,
         };
-        if form.launch.kind != AgentKind::Terminal {
-            form.loading = true;
-            let request = Request::ScanResumes {
-                target: form.launch.target.clone(),
-                kind: form.launch.kind,
-                path: form.launch.path.clone(),
-            };
-            if self.worker.requests.send(request).is_err() {
-                form.loading = false;
-                form.error = Some("Resume scanner is unavailable".into());
-            }
+        form.loading = true;
+        let request = Request::ScanResumes {
+            target: form.launch.target.clone(),
+            kind: form.launch.kind,
+            path: form.launch.path.clone(),
+        };
+        if self.worker.requests.send(request).is_err() {
+            form.loading = false;
+            form.error = Some("Resume scanner is unavailable".into());
         }
         self.modal = Some(Modal::Resume(form));
     }
@@ -13575,46 +13580,74 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A shell has nothing to resume, so choosing its folder is the last
+    /// decision there is to make - an agent still gets asked.
     #[test]
-    fn confirming_a_terminal_folder_advances_to_new_session_choice() {
-        let config = Config::default();
-        let worker = Worker::start(Runtime::new(&config));
+    fn confirming_a_folder_starts_a_terminal_and_asks_an_agent_about_resuming() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
         let mut state = State::default();
         state.enabled_hosts.insert("local".into());
+        let state_path =
+            std::env::temp_dir().join(format!("muxloom-launch-test-{}.json", std::process::id()));
         let mut app = App::new(
-            config,
+            Config::default(),
             PathBuf::from("unused-config.toml"),
             state,
-            PathBuf::from("unused-state.json"),
+            state_path.clone(),
             vec![Target::local()],
             worker,
         );
-        app.modal = Some(Modal::PathPicker(PathPickerForm {
-            launch: LaunchForm {
-                target: Target::local(),
-                kind: AgentKind::Terminal,
-                path: ".".into(),
-                label: String::new(),
-                temporary: false,
-                field: LaunchField::Path,
-            },
-            path: "/tmp/project".into(),
-            directories: vec!["src".into()],
-            query: String::new(),
-            selected: 0,
-            loading: false,
-            error: None,
-        }));
+
+        let picker = |kind| {
+            Modal::PathPicker(PathPickerForm {
+                launch: LaunchForm {
+                    target: Target::local(),
+                    kind,
+                    path: ".".into(),
+                    label: String::new(),
+                    temporary: false,
+                    field: LaunchField::Path,
+                },
+                path: "/tmp/project".into(),
+                directories: vec!["src".into()],
+                query: String::new(),
+                selected: 0,
+                loading: false,
+                error: None,
+            })
+        };
+
+        app.modal = Some(picker(AgentKind::Terminal));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Request::Launch { request, .. } = receive_request(&request_rx) else {
+            panic!("the terminal did not start once its folder was chosen");
+        };
+        assert_eq!(request.kind, AgentKind::Terminal);
+        assert_eq!(request.path, "/tmp/project");
+        assert!(request.resume_id.is_none());
+        assert!(app.modal.is_none(), "no modal is left over the terminal");
+
+        app.modal = Some(picker(AgentKind::Codex));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             app.modal,
             Some(Modal::Resume(ResumeForm {
                 selected: 0,
-                loading: false,
                 ref launch,
                 ..
-            })) if launch.path == "/tmp/project" && launch.kind == AgentKind::Terminal
+            })) if launch.path == "/tmp/project" && launch.kind == AgentKind::Codex
         ));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::ScanResumes { .. }
+        ));
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]
