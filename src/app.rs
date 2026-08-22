@@ -3141,8 +3141,10 @@ impl App {
                 return;
             }
             match modal {
-                Modal::Launch(form) if form.field != LaunchField::Kind => {
-                    active_text(form).push_str(&text);
+                Modal::Launch(form) => {
+                    if let Some(field) = active_text(form) {
+                        field.push_str(&text);
+                    }
                 }
                 Modal::PathPicker(form) => {
                     form.query.push_str(&text);
@@ -8367,14 +8369,15 @@ impl App {
                     LaunchField::Label => self.prepare_launch(form),
                 },
                 KeyCode::Backspace => {
-                    active_text(&mut form).pop();
+                    if let Some(field) = active_text(&mut form) {
+                        field.pop();
+                    }
                     self.modal = Some(Modal::Launch(form));
                 }
-                KeyCode::Char('u')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && form.field != LaunchField::Kind =>
-                {
-                    active_text(&mut form).clear();
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(field) = active_text(&mut form) {
+                        field.clear();
+                    }
                     self.modal = Some(Modal::Launch(form));
                 }
                 KeyCode::Char(character)
@@ -8382,8 +8385,8 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    if form.field != LaunchField::Kind {
-                        active_text(&mut form).push(character);
+                    if let Some(field) = active_text(&mut form) {
+                        field.push(character);
                     }
                     self.modal = Some(Modal::Launch(form));
                 }
@@ -9677,11 +9680,14 @@ fn toggle_all(items: &mut [ScopeItem]) {
     }
 }
 
-fn active_text(form: &mut LaunchForm) -> &mut String {
+/// The field being edited, or `None` when the cursor is parked on the runtime
+/// row - that one is a choice, not text, and every editing key has to be a
+/// no-op there rather than a panic.
+fn active_text(form: &mut LaunchForm) -> Option<&mut String> {
     match form.field {
-        LaunchField::Path => &mut form.path,
-        LaunchField::Label => &mut form.label,
-        LaunchField::Kind => unreachable!("agent kind is not a text field"),
+        LaunchField::Path => Some(&mut form.path),
+        LaunchField::Label => Some(&mut form.label),
+        LaunchField::Kind => None,
     }
 }
 
