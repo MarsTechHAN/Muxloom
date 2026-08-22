@@ -3415,7 +3415,8 @@ fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<R
     let mut updated_at = String::new();
     let mut first_message = None;
     let mut last_message = None;
-    let mut summary = None;
+    let mut title = None;
+    let mut legacy_title = None;
     for value in session.lines().filter_map(parse_json_line) {
         if id.is_none() {
             id = value
@@ -3431,12 +3432,18 @@ fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<R
         {
             updated_at = timestamp.to_string();
         }
-        if summary.is_none() {
-            summary = value
-                .get("summary")
-                .or_else(|| value.get("customTitle"))
-                .and_then(Value::as_str)
-                .map(clean_recap);
+        // The name is rewritten as the conversation goes on, so the last one
+        // in the file is the one that describes it now.
+        if let Some(named) = crate::native_history::claude_ai_title(&value) {
+            let named = clean_recap(named);
+            if !named.is_empty() {
+                title = Some(named);
+            }
+        }
+        if legacy_title.is_none() {
+            legacy_title = crate::native_history::claude_legacy_title(&value)
+                .map(clean_recap)
+                .filter(|title| !title.is_empty());
         }
         if value.get("type").and_then(Value::as_str) == Some("user") {
             let message = value
@@ -3458,7 +3465,7 @@ fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<R
         id: id?,
         kind: AgentKind::Claude,
         source_path: source_path.to_string(),
-        recap: summary.filter(|message| !message.is_empty()),
+        recap: title.or(legacy_title),
         first_message,
         last_message,
         updated_at,
@@ -4496,6 +4503,39 @@ mod tests {
         assert!(
             parse_resume_candidates(AgentKind::Claude, "/other", claude).is_empty(),
             "resume candidates must match the exact working directory"
+        );
+    }
+
+    /// Claude Code renames a session as it goes, and the name it settled on is
+    /// the one worth showing. Transcripts written by older builds name it once,
+    /// under a key those builds no longer write.
+    #[test]
+    fn claude_resume_candidates_carry_the_latest_name_the_session_was_given() {
+        let renamed = concat!(
+            "\u{1e}SESSION\n",
+            "/home/test/.claude/projects/claude-id.jsonl\n",
+            "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T11:00:00Z\",\"message\":{\"content\":\"first claude prompt\"}}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Reading the daemon\",\"sessionId\":\"claude-id\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Recap from the transcript\",\"sessionId\":\"claude-id\"}\n"
+        );
+        let candidates = parse_resume_candidates(AgentKind::Claude, "/work/project", renamed);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].recap.as_deref(),
+            Some("Recap from the transcript")
+        );
+
+        let legacy = concat!(
+            "\u{1e}SESSION\n",
+            "/home/test/.claude/projects/old-id.jsonl\n",
+            "{\"type\":\"summary\",\"summary\":\"Named by an older build\"}\n",
+            "{\"type\":\"user\",\"sessionId\":\"old-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T11:00:00Z\",\"message\":{\"content\":\"first claude prompt\"}}\n"
+        );
+        let candidates = parse_resume_candidates(AgentKind::Claude, "/work/project", legacy);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].recap.as_deref(),
+            Some("Named by an older build")
         );
     }
 

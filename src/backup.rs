@@ -1021,11 +1021,13 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                 _ => {}
             },
             AgentKind::Claude => {
-                if title.is_none()
-                    && let Some(explicit) = value
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .or_else(|| value.get("customTitle").and_then(Value::as_str))
+                // Claude Code renames a session as it learns what it is about,
+                // so the last name in the file wins; an older transcript names
+                // it once, and that only stands if there is no newer form.
+                if let Some(named) = crate::native_history::claude_ai_title(&value) {
+                    title = Some(named.to_string());
+                } else if title.is_none()
+                    && let Some(explicit) = crate::native_history::claude_legacy_title(&value)
                 {
                     title = Some(explicit.to_string());
                 }
@@ -1701,6 +1703,24 @@ mod tests {
         // Text blocks concatenated, tool block skipped.
         assert_eq!(messages[1].text, "hi\nworld");
         assert_eq!(title.as_deref(), Some("scrolling help"));
+    }
+
+    /// The name a current Claude Code writes outranks a summary from an older
+    /// one, and the last of those names is the session as it ended up.
+    #[test]
+    fn the_latest_name_claude_gave_a_session_becomes_its_title() {
+        let jsonl = concat!(
+            r#"{"type":"summary","summary":"named by an older build"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"reading the daemon","sessionId":"claude-1"}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"t1","sessionId":"claude-1","message":{"content":"hello there"}}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"recap from the transcript","sessionId":"claude-1"}"#,
+            "\n",
+        );
+        let (_, title) = extract_messages(AgentKind::Claude, jsonl.as_bytes());
+        assert_eq!(title.as_deref(), Some("recap from the transcript"));
     }
 
     #[test]
