@@ -1170,6 +1170,16 @@ fn best_name_match(session: &AgentSession, query: &str) -> Option<(usize, String
     {
         candidates.push((score, session.label.clone()));
     }
+    // What the runtime called the conversation. A hand-typed label hides it
+    // from the list, but someone looking for it by name should still find it.
+    if let Some(title) = session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        && let Some(score) = search_match_score(title, query)
+    {
+        candidates.push((score.saturating_add(5), title.to_string()));
+    }
     let display = session.display_label();
     if let Some(score) = search_match_score(display, query) {
         candidates.push((score.saturating_add(10), display.to_string()));

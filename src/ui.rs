@@ -4834,6 +4834,7 @@ mod tests {
                 needs_attention: true,
                 attention_reason: Some("approve".into()),
                 recap: None,
+                title: None,
             });
             app.selected_session_id = Some("ad-codex-1-1-1".into());
 
@@ -4914,6 +4915,7 @@ mod tests {
                 needs_attention: false,
                 attention_reason: None,
                 recap: None,
+                title: None,
             });
         }
         app.targets[0].probe.set(AgentKind::Codex, true);
@@ -5012,6 +5014,7 @@ mod tests {
             needs_attention: true,
             attention_reason: Some("command approval".into()),
             recap: Some("approve the command".into()),
+            title: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-waiting".into());
 
@@ -5341,6 +5344,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         let backend = TestBackend::new(150, 30);
         let mut terminal = Terminal::new(backend).unwrap();

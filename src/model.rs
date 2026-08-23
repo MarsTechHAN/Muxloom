@@ -24,7 +24,7 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Codex,
@@ -287,20 +287,32 @@ pub struct AgentSession {
     pub needs_attention: bool,
     pub attention_reason: Option<String>,
     pub recap: Option<String>,
+    /// What the runtime called the conversation, out of the transcript it
+    /// keeps. Absent while it has not named one yet, from runtimes that write
+    /// no transcript, and from daemons too old to read one.
+    pub title: Option<String>,
 }
 
 impl AgentSession {
+    /// What to call this session in a list.
+    ///
+    /// A name typed by hand is what the user meant it to be called and beats
+    /// everything. Failing that, the agent names its own conversation, which
+    /// says what is being worked on rather than merely where; only when there
+    /// is no name at all does the folder have to stand in for one.
     pub fn display_label(&self) -> &str {
-        if self.label.is_empty() {
-            self.path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&self.path)
-        } else {
-            &self.label
+        if !self.label.is_empty() {
+            return &self.label;
         }
+        if let Some(title) = self.title.as_deref().filter(|title| !title.is_empty()) {
+            return title;
+        }
+        self.path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.path)
     }
 }
 

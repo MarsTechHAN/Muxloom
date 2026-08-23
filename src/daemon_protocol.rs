@@ -533,6 +533,15 @@ pub struct DaemonSession {
     pub dead: bool,
     pub archived: bool,
     pub recap: Option<String>,
+    /// The name the runtime gave the conversation, read out of the transcript
+    /// it keeps. Absent from a daemon too old to read one, and from a session
+    /// whose runtime writes no transcript.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The transcript this session was matched to, so a restarted daemon can
+    /// go on reading the same one instead of matching it again from scratch.
+    #[serde(default)]
+    pub thread: Option<String>,
     pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,

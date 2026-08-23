@@ -1390,6 +1390,10 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
         "kind": session.kind,
         "path": session.path,
         "label": session.label,
+        // What the runtime called the conversation, when it keeps a transcript
+        // and has named one. The label is what a human typed; this is what the
+        // session turned out to be about.
+        "title": session.title,
         "temporary": session.temporary,
         "created_at": session.created_at,
         "pid": session.pid,

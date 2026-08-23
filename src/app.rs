@@ -3347,6 +3347,16 @@ impl App {
     }
 
     pub fn recap_for(&self, session: &AgentSession) -> String {
+        // A daemon reads the runtime's own transcript and falls back to the
+        // same screen scrape this would do, so its answer is never the worse
+        // of the two. Only a session reached some other way — a tmux pane,
+        // where the recap was scraped once at scan time — is better served by
+        // looking at the screen again here.
+        if crate::runtime::is_daemon_session_id(&session.id)
+            && let Some(recap) = session.recap.as_ref().filter(|recap| !recap.is_empty())
+        {
+            return recap.clone();
+        }
         let source = if self.terminal_session_id.as_deref() == Some(&session.id) {
             self.terminal.as_ref().map(|_| self.terminal_screen.clone())
         } else if self.selected_session_id.as_deref() == Some(&session.id)
@@ -5107,9 +5117,10 @@ impl App {
                     restorable: record.restorable,
                 },
             );
-            let recap = [record.recap, record.title]
-                .into_iter()
-                .find(|text| !text.trim().is_empty());
+            // The backup keeps both, and they are different things: the name
+            // the agent gave the conversation, and the last thing it said.
+            let recap = Some(record.recap).filter(|text| !text.trim().is_empty());
+            let title = Some(record.title).filter(|text| !text.trim().is_empty());
             self.sessions.push(AgentSession {
                 id: record.session_id,
                 target_id: target_id.to_string(),
@@ -5125,6 +5136,7 @@ impl App {
                 needs_attention: false,
                 attention_reason: None,
                 recap,
+                title,
             });
         }
     }
@@ -5647,6 +5659,9 @@ impl App {
                 .clone_from(&latest.attention_reason);
             if latest.recap.is_some() {
                 session.recap.clone_from(&latest.recap);
+            }
+            if latest.title.is_some() {
+                session.title.clone_from(&latest.title);
             }
             if status_changed {
                 changed += 1;
@@ -10422,6 +10437,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
 
         app.sync_live_agent_activity(
@@ -10516,6 +10532,7 @@ mod tests {
                 needs_attention: false,
                 attention_reason: None,
                 recap: None,
+                title: None,
             },
             AgentSession {
                 id: "muxloomd-terminal-old-2".into(),
@@ -10530,6 +10547,7 @@ mod tests {
                 needs_attention: false,
                 attention_reason: None,
                 recap: None,
+                title: None,
             },
         ];
 
@@ -10774,6 +10792,7 @@ mod tests {
                 needs_attention: false,
                 attention_reason: None,
                 recap: None,
+                title: None,
             },
             AgentSession {
                 id: "muxloomd-claude-background".into(),
@@ -10788,6 +10807,7 @@ mod tests {
                 needs_attention: false,
                 attention_reason: None,
                 recap: None,
+                title: None,
             },
         ];
         app.pending_activity_refreshes.insert("local".into());
@@ -10838,7 +10858,59 @@ mod tests {
             needs_attention: true,
             attention_reason: Some(reason.into()),
             recap: None,
+            title: None,
         }
+    }
+
+    /// A name typed by hand is what the user meant the session to be called.
+    /// Failing that, the agent's own name for the conversation says what is
+    /// going on in it, which the folder never does.
+    #[test]
+    fn a_session_goes_by_its_label_then_its_agents_name_then_its_folder() {
+        let named = AgentSession {
+            label: "deploy".into(),
+            title: Some("rewriting the pty reader".into()),
+            ..waiting_agent("")
+        };
+        assert_eq!(named.display_label(), "deploy");
+        let titled = AgentSession {
+            label: String::new(),
+            ..named.clone()
+        };
+        assert_eq!(titled.display_label(), "rewriting the pty reader");
+        let anonymous = AgentSession {
+            title: None,
+            ..titled.clone()
+        };
+        assert_eq!(anonymous.display_label(), "work");
+        let unnamed = AgentSession {
+            title: Some(String::new()),
+            ..anonymous
+        };
+        assert_eq!(unnamed.display_label(), "work");
+    }
+
+    /// The daemon reads the turn as the runtime recorded it. What the terminal
+    /// happens to be painting is the same thing at best, and half a repaint at
+    /// worst.
+    #[test]
+    fn the_recap_of_a_daemon_session_beats_what_is_on_its_screen() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let session = AgentSession {
+            recap: Some("wrote the fix".into()),
+            ..waiting_agent("")
+        };
+        app.selected_session_id = Some(session.id.clone());
+        app.history.text = "※ recap: scraped off the screen\n".into();
+        assert_eq!(app.recap_for(&session), "wrote the fix");
+        // A session muxloom only reaches through tmux was scraped once, when
+        // the machine was last scanned; the screen in front of us is newer.
+        let pane = AgentSession {
+            id: "pane-1".into(),
+            ..session
+        };
+        app.selected_session_id = Some(pane.id.clone());
+        assert_eq!(app.recap_for(&pane), "scraped off the screen");
     }
 
     #[test]
@@ -10936,6 +11008,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
 
         app.refresh_daemon_activity();
@@ -10974,6 +11047,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("ad-codex-old".into());
         app.selected_target = 1;
@@ -12022,6 +12096,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloomd-claude-long-history".into());
         app.terminal_session_id = Some("muxloomd-claude-long-history".into());
@@ -12162,6 +12237,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.sessions.push(AgentSession {
             id: "muxloom-terminal-dead".into(),
@@ -12176,6 +12252,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         assert!(app.visible_sessions().is_empty());
         assert_eq!(app.archived_count(), 1);
@@ -12235,6 +12312,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloom-codex-dead".into());
         app.focus = Focus::Agents;
@@ -12406,6 +12484,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
 
         app.handle_worker_event(Event::Launched {
@@ -12451,6 +12530,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.handle_worker_event(Event::Launched {
             target_id: "local".into(),
@@ -12498,6 +12578,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloom-codex-live".into());
         app.focus = Focus::Agents;
@@ -12589,6 +12670,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloom-codex-files".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -12772,6 +12854,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloom-codex-modal".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -12840,6 +12923,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloom-codex-nav".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -13488,6 +13572,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         for failure in 1..=2 {
             app.handle_worker_event(Event::Scanned {
@@ -13743,6 +13828,7 @@ mod tests {
             needs_attention: true,
             attention_reason: Some(reason.into()),
             recap: None,
+            title: None,
         }
     }
 
@@ -13928,6 +14014,7 @@ mod tests {
                     needs_attention: false,
                     attention_reason: None,
                     recap: None,
+                    title: None,
                 }],
             )),
         });
@@ -13991,6 +14078,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloomd-codex-current".into());
         app.focus = Focus::Agents;
@@ -14067,6 +14155,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-test".into());
         app.request_history();
@@ -14132,6 +14221,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.selected_session_id = Some("muxloomd-claude-forward".into());
         app.focus = Focus::Agents;
@@ -14263,6 +14353,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         };
         app.sessions = vec![
             session("worker", "/work/Terminal"),
@@ -14329,6 +14420,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         };
         app.sessions = vec![session("far", "gpu"), session("near", "local")];
         app.select_machine_row(MachineRow::Moderators);
@@ -14636,6 +14728,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         });
         app.submit_rename_agent("s1".into(), "  My Bot  ".into());
         assert_eq!(
@@ -14740,6 +14833,7 @@ mod tests {
             needs_attention: false,
             attention_reason: None,
             recap: None,
+            title: None,
         };
         app.sessions = vec![
             session("local-a", "local", 1),

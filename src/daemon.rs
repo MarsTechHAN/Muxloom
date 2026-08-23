@@ -34,6 +34,7 @@ mod platform {
             AgentKind, DirectoryListing, FileEntry, FileEntryKind, FileListing, FilePreview,
             FilePreviewKind,
         },
+        native_history::SessionFacts as NativeFacts,
         recap::extract_recap,
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
@@ -85,6 +86,16 @@ mod platform {
     const OUTBOX_LIMIT: usize = 128;
     /// How often a queued message looks at whether its session has finished.
     const OUTBOX_POLL: Duration = Duration::from_secs(1);
+    /// How often a session's runtime is asked what it has been writing about
+    /// itself. Soon enough that a finished turn shows up under the session
+    /// while whoever asked for it is still looking, rarely enough that the
+    /// reading costs nothing.
+    const NATIVE_POLL: Duration = Duration::from_secs(5);
+    /// How long a session may go on producing output over a transcript that
+    /// has stopped growing before muxloom takes it to be writing somewhere
+    /// else. Clearing a conversation does exactly that: the old transcript is
+    /// closed where it stands and a new one begins.
+    const NATIVE_CLAIM_STALE_MS: u64 = 60_000;
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -264,12 +275,48 @@ mod platform {
         /// attention reason until someone types into the session, which is the
         /// one signal that the message was seen.
         notice: Mutex<Option<String>>,
+        /// The transcript the runtime in this session is writing about itself,
+        /// once the folder has been looked at.
+        native: Mutex<NativeLink>,
         history_path: PathBuf,
         metadata_path: PathBuf,
         archived: AtomicBool,
         line_count: AtomicUsize,
         columns: AtomicU16,
         rows: AtomicU16,
+    }
+
+    /// What a session knows about the transcript its runtime keeps.
+    ///
+    /// The runtime names the conversation and records every turn of it, which
+    /// is a far better account of the session than anything scraped off the
+    /// screen. Finding out *which* transcript is a matching problem - several
+    /// agents can be running in one folder - so a session holds on to its
+    /// answer rather than deciding again every round.
+    #[derive(Default)]
+    struct NativeLink {
+        /// The thread the launch was told to reopen, taken from the command
+        /// line the daemon ran.
+        seed: Option<String>,
+        /// The transcript this session was matched to.
+        claim: Option<NativeClaim>,
+        /// Transcripts it has been moved off - a conversation cleared with
+        /// `/clear` leaves one behind - and must not drift back onto.
+        abandoned: Vec<String>,
+        /// When the folder was last looked through on this session's behalf.
+        /// Listing a directory is the expensive half of this, and a session
+        /// that has said nothing since cannot have begun writing anything.
+        scanned_at: u64,
+    }
+
+    struct NativeClaim {
+        id: String,
+        path: PathBuf,
+        /// The file's modification time when it was last read, so a transcript
+        /// that has not grown is not read again.
+        read_at: u64,
+        title: Option<String>,
+        recap: Option<String>,
     }
 
     #[derive(Clone)]
@@ -1099,6 +1146,10 @@ mod platform {
                 dead: true,
                 archived: true,
                 recap,
+                // Nothing is left to say who the session was talking to: the
+                // metadata that recorded its folder is what went missing.
+                title: None,
+                thread: None,
                 working: false,
                 needs_attention: false,
                 attention_reason: None,
@@ -1211,6 +1262,9 @@ mod platform {
         // Messages the last generation was still holding for a busy session
         // are this one's to deliver now that it owns the sessions.
         spawn_outbox_drainer(&state);
+        // Every session's runtime has been writing an account of itself all
+        // along; this generation starts reading them again.
+        spawn_native_history_reader(&state);
         // Tell this machine's agents where the control surface is and how the
         // fleet works, so one launched here — or on a remote the user never
         // configures by hand — can drive the sessions around it. Only when
@@ -2267,6 +2321,251 @@ mod platform {
         }
     }
 
+    /// The sessions running in one folder, each with when it was launched -
+    /// which is what pairs it off against a transcript.
+    type NativeGroup = Vec<(u64, Arc<ManagedSession>)>;
+
+    /// Keep reading what each session's runtime writes about itself.
+    ///
+    /// Nothing announces a transcript: the files belong to the CLI, live
+    /// outside anything muxloom owns, and grow whenever a turn ends. So this
+    /// looks on a slow round rather than being told — one thread for the whole
+    /// daemon, and within it only the sessions and folders that have moved.
+    fn spawn_native_history_reader(state: &Arc<DaemonState>) {
+        let state = Arc::clone(state);
+        thread::spawn(move || {
+            while !state.shutdown.load(Ordering::Acquire) && !state.draining.load(Ordering::Acquire)
+            {
+                thread::sleep(NATIVE_POLL);
+                refresh_native_history(&state);
+            }
+        });
+    }
+
+    /// One round: every live session whose runtime keeps a transcript, grouped
+    /// by the folder it was started in. The grouping is the point — several
+    /// agents can be running in one directory, and which conversation belongs
+    /// to which of them is a question only the whole group can answer.
+    fn refresh_native_history(state: &Arc<DaemonState>) {
+        let sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        let mut folders: HashMap<(AgentKind, String), NativeGroup> = HashMap::new();
+        for session in sessions {
+            if session.archived.load(Ordering::Relaxed) {
+                continue;
+            }
+            let (kind, path, created_at, dead) = {
+                let metadata = session
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (
+                    metadata.kind.parse::<AgentKind>().ok(),
+                    metadata.path.clone(),
+                    metadata.created_at,
+                    metadata.dead,
+                )
+            };
+            let Some(kind) = kind.filter(|kind| kind.has_native_history() && !dead) else {
+                continue;
+            };
+            folders
+                .entry((kind, path))
+                .or_default()
+                .push((created_at, session));
+        }
+        for ((kind, path), mut group) in folders {
+            // Oldest first, whatever order the map handed them over in: the
+            // matching pairs sessions off against transcripts by when each
+            // began, and it should not depend on a hash order.
+            group.sort_by_key(|(created_at, _)| *created_at);
+            refresh_native_folder(kind, &path, &group);
+        }
+    }
+
+    /// The sessions running in one folder, and the transcripts in it.
+    fn refresh_native_folder(kind: AgentKind, path: &str, group: &[(u64, Arc<ManagedSession>)]) {
+        // A session that knows which file is its own only has to read that
+        // file, and only when it has grown. Listing the folder is what costs,
+        // so it happens only for a session still looking for its conversation.
+        let looking = group
+            .iter()
+            .filter(|(_, session)| refresh_native_claim(kind, session))
+            .map(|(created_at, session)| (*created_at, Arc::clone(session)))
+            .collect::<Vec<_>>();
+        if looking.is_empty() {
+            return;
+        }
+        let since = looking
+            .iter()
+            .map(|(created_at, _)| *created_at)
+            .min()
+            .unwrap_or_default()
+            .saturating_sub(crate::native_history::START_GRACE_MS);
+        let threads = crate::native_history::threads_for(kind, path, since);
+        let now = now_ms();
+        for (_, session) in &looking {
+            session
+                .native
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .scanned_at = now;
+        }
+        if threads.is_empty() {
+            return;
+        }
+        // Every session in the folder, not just the ones looking: a session
+        // that already has its conversation is what keeps the others off it.
+        let facts = group
+            .iter()
+            .map(|(created_at, session)| session_facts(*created_at, session))
+            .collect::<Vec<_>>();
+        let picks = crate::native_history::assign_threads(&facts, &threads);
+        for ((_, session), pick) in group.iter().zip(picks) {
+            let Some(thread) = pick.and_then(|index| threads.get(index)) else {
+                // Nothing here answers to this session. It falls back to what
+                // can be read off its screen, and asks again next round.
+                continue;
+            };
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if native
+                    .claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.id == thread.id)
+                {
+                    continue;
+                }
+                native.claim = Some(NativeClaim {
+                    id: thread.id.clone(),
+                    path: thread.path.clone(),
+                    read_at: thread.updated_at,
+                    title: thread.title.clone(),
+                    recap: thread.last_message.clone(),
+                });
+            }
+            // Outside the lock: persisting takes a snapshot, and a snapshot
+            // reads the claim that was just made.
+            if let Err(error) = session.persist_metadata() {
+                eprintln!("muxloomd could not record what a session is reading: {error:#}");
+            }
+        }
+    }
+
+    /// Bring one session's claimed transcript up to date, and say whether the
+    /// folder still has to be looked through on its behalf.
+    fn refresh_native_claim(kind: AgentKind, session: &Arc<ManagedSession>) -> bool {
+        let claimed = {
+            let native = session
+                .native
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &native.claim {
+                Some(claim) => Ok((claim.id.clone(), claim.path.clone(), claim.read_at)),
+                None => Err(native.scanned_at),
+            }
+        };
+        let last_output = session.last_output.load(Ordering::Relaxed);
+        let (id, path, read_at) = match claimed {
+            Ok(claim) => claim,
+            // Never matched. A session that has produced nothing since the
+            // last look cannot have started writing a transcript either.
+            Err(scanned_at) => return scanned_at == 0 || last_output > scanned_at,
+        };
+        let written = crate::native_history::last_written(&path).unwrap_or_default();
+        if written > read_at {
+            let Some(thread) = crate::native_history::reread(kind, &path) else {
+                return false;
+            };
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(claim) = native.claim.as_mut().filter(|claim| claim.id == id) else {
+                    return false;
+                };
+                claim.read_at = thread.updated_at;
+                // A read that lands mid-turn finds no answer and no name yet;
+                // what the conversation said last is still the truth about it.
+                if thread.title.is_some() {
+                    claim.title = thread.title;
+                }
+                if thread.last_message.is_some() {
+                    claim.recap = thread.last_message;
+                }
+            }
+            if let Err(error) = session.persist_metadata() {
+                eprintln!("muxloomd could not record what a session is reading: {error:#}");
+            }
+            return false;
+        }
+        // The transcript has stopped growing while the session goes on
+        // talking: whatever it is saying is being written somewhere else.
+        // Clearing a conversation does precisely this.
+        if last_output <= written.saturating_add(NATIVE_CLAIM_STALE_MS) {
+            return false;
+        }
+        {
+            let mut native = session
+                .native
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            native.abandoned.push(id);
+            native.claim = None;
+            native.scanned_at = 0;
+        }
+        {
+            // The name and the last answer belonged to that conversation, and
+            // it is over. Better nothing than the wrong one until the session
+            // is matched to whatever it is writing now.
+            let mut metadata = session
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            metadata.thread = None;
+            metadata.title = None;
+        }
+        if let Err(error) = session.persist_metadata() {
+            eprintln!("muxloomd could not record what a session is reading: {error:#}");
+        }
+        true
+    }
+
+    /// What the matching is given to go on about one session.
+    fn session_facts(created_at: u64, session: &Arc<ManagedSession>) -> NativeFacts {
+        let persisted = session
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .thread
+            .clone();
+        let native = session
+            .native
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        NativeFacts {
+            created_at,
+            seed: native.seed.clone(),
+            // A daemon that restarted holds no claim, but the one before it
+            // wrote down which transcript this session was reading.
+            claimed: native
+                .claim
+                .as_ref()
+                .map(|claim| claim.id.clone())
+                .or(persisted),
+            abandoned: native.abandoned.clone(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_session(
         state: &Arc<DaemonState>,
@@ -2390,6 +2689,13 @@ mod platform {
                 .append(true)
                 .open(&history_path)?;
         }
+        // The command line is the one place that says outright which
+        // conversation this launch means to reopen, and it is about to be
+        // handed to the keeper.
+        let seed = kind
+            .parse::<AgentKind>()
+            .ok()
+            .and_then(|kind| crate::native_history::resume_seed(kind, &args));
         let spec = keeper::KeeperSpec {
             session_id: session_id.clone(),
             program: program.to_string_lossy().into_owned(),
@@ -2412,6 +2718,8 @@ mod platform {
             dead: false,
             archived: false,
             recap: None,
+            title: None,
+            thread: None,
             working: false,
             needs_attention: false,
             attention_reason: None,
@@ -2446,6 +2754,10 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             notice: Mutex::new(None),
+            native: Mutex::new(NativeLink {
+                seed,
+                ..NativeLink::default()
+            }),
             history_path,
             metadata_path,
             archived: AtomicBool::new(false),
@@ -2845,6 +3157,11 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             notice: Mutex::new(None),
+            // The command line that started this one belongs to a keeper this
+            // daemon did not spawn. What the last generation had matched it to
+            // is in the metadata, and the first refresh picks it up from
+            // there.
+            native: Mutex::new(NativeLink::default()),
             history_path,
             metadata_path,
             archived: AtomicBool::new(archived),
@@ -3235,17 +3552,41 @@ mod platform {
                 .screen()
                 .contents();
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
+                // What the runtime wrote down about itself beats anything read
+                // off its screen: it is the turn as the agent meant it, not
+                // the frame the terminal happened to be painting.
+                let native = {
+                    let native = self
+                        .native
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    native
+                        .claim
+                        .as_ref()
+                        .map(|claim| (claim.id.clone(), claim.title.clone(), claim.recap.clone()))
+                };
+                let mut native_recap = None;
+                if let Some((id, title, recap)) = native {
+                    snapshot.thread = Some(id);
+                    if title.is_some() {
+                        snapshot.title = title;
+                    }
+                    native_recap = recap;
+                }
                 // A shell gets no recap, and its scrollback is megabytes: copy
-                // it out only for a runtime that has something to say.
-                snapshot.recap = (kind != AgentKind::Terminal)
-                    .then(|| {
-                        let recent = self
-                            .recent_output
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        extract_recap(kind, &String::from_utf8_lossy(&recent))
-                    })
-                    .flatten();
+                // it out only for a runtime that has something to say - and
+                // only when its own account of itself is not to be had.
+                snapshot.recap = native_recap.or_else(|| {
+                    (kind != AgentKind::Terminal)
+                        .then(|| {
+                            let recent = self
+                                .recent_output
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            extract_recap(kind, &String::from_utf8_lossy(&recent))
+                        })
+                        .flatten()
+                });
                 if snapshot.dead || snapshot.archived {
                     snapshot.pid = None;
                     snapshot.working = false;
@@ -5108,6 +5449,164 @@ mod platform {
             fs::remove_dir_all(root).unwrap();
         }
 
+        /// The runtime's own account of the turn is what the session is
+        /// listed by, and it is read again only when it has been added to.
+        #[test]
+        fn a_session_takes_its_name_and_its_recap_from_the_transcript_it_writes() {
+            let state = test_state("native-read");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-read".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+
+            let transcript = root.join("thread-1.jsonl");
+            fs::write(
+                &transcript,
+                concat!(
+                    r#"{"type":"ai-title","aiTitle":"an older name"}"#,
+                    "\n",
+                    r#"{"type":"ai-title","aiTitle":"the pty reader"}"#,
+                    "\n",
+                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done, and the tests pass."}]}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let written = crate::native_history::last_written(&transcript).unwrap();
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                native.claim = Some(NativeClaim {
+                    id: "thread-1".into(),
+                    path: transcript.clone(),
+                    // Older than the file, so this round has something to read.
+                    read_at: written.saturating_sub(1),
+                    title: None,
+                    recap: None,
+                });
+                native.scanned_at = written;
+            }
+            session.last_output.store(written, Ordering::Relaxed);
+
+            assert!(!refresh_native_claim(AgentKind::Claude, &session));
+            let snapshot = session.snapshot();
+            assert_eq!(snapshot.title.as_deref(), Some("the pty reader"));
+            assert_eq!(snapshot.recap.as_deref(), Some("Done, and the tests pass."));
+            assert_eq!(snapshot.thread.as_deref(), Some("thread-1"));
+            // Persisted with it, so a daemon that restarts goes on reading the
+            // same conversation instead of matching it again from scratch.
+            let stored: DaemonSession =
+                serde_json::from_slice(&fs::read(&session.metadata_path).unwrap()).unwrap();
+            assert_eq!(stored.thread.as_deref(), Some("thread-1"));
+            assert_eq!(stored.title.as_deref(), Some("the pty reader"));
+
+            // Nothing has been added to it, so nothing is read.
+            fs::write(&transcript, "").unwrap();
+            assert!(!refresh_native_claim(AgentKind::Claude, &session));
+            assert_eq!(
+                session.snapshot().title.as_deref(),
+                Some("the pty reader"),
+                "a transcript that has not grown is not read again"
+            );
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// A conversation cleared with `/clear` is closed where it stands and
+        /// a new file begins. Nothing says so; the session simply goes on
+        /// talking over a transcript that has stopped growing.
+        #[test]
+        fn a_session_lets_go_of_a_transcript_it_has_talked_past() {
+            let state = test_state("native-stale");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-stale".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+            )
+            .unwrap();
+
+            let transcript = root.join("thread-1.jsonl");
+            fs::write(&transcript, "{}\n").unwrap();
+            let written = crate::native_history::last_written(&transcript).unwrap();
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                native.claim = Some(NativeClaim {
+                    id: "thread-1".into(),
+                    path: transcript.clone(),
+                    read_at: written,
+                    title: Some("the conversation before".into()),
+                    recap: Some("what it said last".into()),
+                });
+                native.scanned_at = written;
+            }
+
+            session.last_output.store(written, Ordering::Relaxed);
+            assert!(
+                !refresh_native_claim(AgentKind::Claude, &session),
+                "a session that has only just spoken is still on its thread"
+            );
+            assert_eq!(
+                session.snapshot().title.as_deref(),
+                Some("the conversation before")
+            );
+
+            session.last_output.store(
+                written
+                    .saturating_add(NATIVE_CLAIM_STALE_MS)
+                    .saturating_add(1),
+                Ordering::Relaxed,
+            );
+            assert!(
+                refresh_native_claim(AgentKind::Claude, &session),
+                "the folder has to be looked through for wherever it went"
+            );
+            {
+                let native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(native.claim.is_none());
+                assert_eq!(native.abandoned, vec!["thread-1".to_string()]);
+            }
+            let snapshot = session.snapshot();
+            assert_eq!(
+                snapshot.title, None,
+                "that name belonged to a conversation that is over"
+            );
+            assert_eq!(snapshot.thread, None);
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
         #[test]
         fn codex_title_spinner_survives_partial_visible_redraws() {
             let state = test_state("title-working");
@@ -5285,6 +5784,8 @@ mod platform {
                     dead: true,
                     archived: true,
                     recap: Some("completed the persistent work".into()),
+                    title: None,
+                    thread: None,
                     working: false,
                     needs_attention: false,
                     attention_reason: None,
@@ -5334,6 +5835,8 @@ mod platform {
                 dead: false,
                 archived: false,
                 recap: None,
+                title: None,
+                thread: None,
                 working: true,
                 needs_attention: false,
                 attention_reason: None,

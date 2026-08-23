@@ -3681,6 +3681,7 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
         needs_attention: session.needs_attention,
         attention_reason: session.attention_reason,
         recap: session.recap,
+        title: session.title,
     })
 }
 
@@ -3739,6 +3740,9 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     needs_attention: false,
                     attention_reason: None,
                     recap: None,
+                    // A pane record carries what tmux was told at launch and
+                    // nothing the runtime has said since.
+                    title: None,
                 });
             }
             _ => {}
