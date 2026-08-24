@@ -194,6 +194,13 @@ mod platform {
         clients: AtomicUsize,
         client_gate: Mutex<()>,
         draining: AtomicBool,
+        /// Whether a newer build has asked for this daemon's place and is
+        /// waiting for a moment when taking it costs nothing.
+        retiring: AtomicBool,
+        /// How many requests are being answered right now. A daemon that stops
+        /// mid-answer leaves whoever asked with an error, so retirement waits
+        /// for this to reach zero.
+        in_flight: AtomicUsize,
         shutdown: AtomicBool,
         next_subscriber: AtomicU64,
         sessions: Mutex<HashMap<String, Arc<ManagedSession>>>,
@@ -424,6 +431,8 @@ mod platform {
                 clients: AtomicUsize::new(0),
                 client_gate: Mutex::new(()),
                 draining: AtomicBool::new(false),
+                retiring: AtomicBool::new(false),
+                in_flight: AtomicUsize::new(0),
                 shutdown: AtomicBool::new(false),
                 next_subscriber: AtomicU64::new(1),
                 sessions: Mutex::new(HashMap::new()),
@@ -1355,6 +1364,15 @@ mod platform {
         }
     }
 
+    /// Counts a request for as long as it is being answered, however it ends.
+    struct RequestGuard(Arc<DaemonState>);
+
+    impl Drop for RequestGuard {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     fn serve_client(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
         {
             let _registration = state
@@ -1398,7 +1416,9 @@ mod platform {
                         };
                         let writer = Arc::clone(&writer);
                         let state = Arc::clone(&state);
+                        state.in_flight.fetch_add(1, Ordering::AcqRel);
                         thread::spawn(move || {
+                            let _in_flight = RequestGuard(Arc::clone(&state));
                             if let Err(error) =
                                 handle_request(&writer, &state, frame.request_id, request)
                             {
@@ -2234,19 +2254,99 @@ mod platform {
         }
     }
 
-    fn prepare_handover(state: &DaemonState) -> bool {
+    /// How often the retirement watch looks, and how long the daemon has to
+    /// have nothing in hand before it stands down.
+    const RETIREMENT_POLL: Duration = Duration::from_millis(500);
+    const RETIREMENT_QUIET: Duration = Duration::from_secs(3);
+    /// How long it holds out for that quiet before standing down regardless. A
+    /// dashboard left attached to a pane overnight would otherwise keep a
+    /// superseded build serving forever, and what waiting saves is one
+    /// reconnect every client here already knows how to make.
+    const RETIREMENT_DEADLINE: Duration = Duration::from_secs(300);
+
+    fn prepare_handover(state: &Arc<DaemonState>) -> bool {
         let _registration = state
             .client_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.draining.load(Ordering::Acquire) || state.clients.load(Ordering::Acquire) != 1 {
+        if state.draining.load(Ordering::Acquire) {
             return false;
         }
-        // Live sessions no longer defer a handover: every session this daemon
-        // serves is owned by its keeper process, which survives the drain and
-        // is adopted by the next generation.
-        state.draining.store(true, Ordering::Release);
-        true
+        if state.clients.load(Ordering::Acquire) == 1 {
+            // Live sessions no longer defer a handover: every session this
+            // daemon serves is owned by its keeper process, which survives the
+            // drain and is adopted by the next generation.
+            state.draining.store(true, Ordering::Release);
+            return true;
+        }
+        // Other clients are attached, and stopping now would take their
+        // connections with it. That used to be a flat refusal, which meant one
+        // client that never lets go kept every later build out for the rest of
+        // this daemon's life — and the MCP server holds its bridge open for as
+        // long as an agent might use it, so on a machine with agents on it
+        // there is always one. It is a postponement now: stand down as soon as
+        // nothing would be lost, and after long enough even if something
+        // would. A dropped connection is remade; a build that never arrives is
+        // not.
+        if !state.retiring.swap(true, Ordering::AcqRel) {
+            spawn_retirement_watcher(Arc::clone(state));
+        }
+        false
+    }
+
+    /// Wait for a moment between things, then stop serving so the build that
+    /// asked can take this daemon's place. Nothing here retires a session: the
+    /// keepers own them and the next generation adopts them.
+    fn spawn_retirement_watcher(state: Arc<DaemonState>) {
+        thread::spawn(move || {
+            let armed = Instant::now();
+            let mut quiet_since = None;
+            while !state.shutdown.load(Ordering::Acquire) {
+                thread::sleep(RETIREMENT_POLL);
+                if daemon_has_work_in_hand(&state) {
+                    quiet_since = None;
+                    if armed.elapsed() < RETIREMENT_DEADLINE {
+                        continue;
+                    }
+                } else if quiet_since.get_or_insert_with(Instant::now).elapsed() < RETIREMENT_QUIET
+                {
+                    continue;
+                }
+                let _registration = state
+                    .client_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.draining.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                state.shutdown.store(true, Ordering::Release);
+                eprintln!(
+                    "muxloomd is standing down so a newer build can take over; its sessions keep running"
+                );
+                return;
+            }
+        });
+    }
+
+    /// Whether stopping right now would cost a client something: an answer it
+    /// is waiting for, or a session screen it is watching. Both come back on
+    /// their own once the next daemon is up, but only after a visible gap.
+    fn daemon_has_work_in_hand(state: &DaemonState) -> bool {
+        if state.in_flight.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|session| {
+                !session
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty()
+            })
     }
 
     /// Resolve a program name to an absolute path using `path_env`.
@@ -4726,18 +4826,86 @@ mod platform {
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
+    /// What this build stamps into the state directory while it is serving, so
+    /// the next client can tell whether it is talking to its own build.
+    ///
+    /// The last field is what orders two of them. CI stamps in the number of
+    /// commits behind the build, which is the only thing that tells two
+    /// nightlies carrying the same package version apart; a build made by hand
+    /// says `local` and ranks above every numbered build of its version,
+    /// because somebody made it deliberately and means it to be in front.
     fn current_generation() -> String {
         format!(
-            "{}:protocol-{}:{}",
+            "{}:protocol-{}:{}:{}",
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION,
-            option_env!("MUXLOOM_BUILD_ID").unwrap_or("local")
+            option_env!("MUXLOOM_BUILD_ID").unwrap_or("local"),
+            option_env!("MUXLOOM_BUILD_HEIGHT").unwrap_or("local"),
         )
     }
 
+    /// A generation broken down into what two of them can be compared by.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct GenerationRank {
+        version: (u64, u64, u64),
+        /// How many commits are behind the build. `u64::MAX` for one made by
+        /// hand, `0` for a build old enough not to say — which is every build
+        /// from before this field existed, and which must therefore rank below
+        /// the one asking to replace it.
+        height: u64,
+    }
+
+    fn generation_rank(stamp: &str) -> Option<GenerationRank> {
+        let mut fields = stamp.trim().split(':');
+        let mut numbers = fields.next()?.split('.').map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        });
+        let version = (
+            numbers.next()?,
+            numbers.next().unwrap_or(0),
+            numbers.next().unwrap_or(0),
+        );
+        // Past the version come the protocol version and the commit, then the
+        // height. An absent field is a stamp from before there was one.
+        let height = fields
+            .nth(2)
+            .map_or(0, |height| height.trim().parse().unwrap_or(u64::MAX));
+        Some(GenerationRank { version, height })
+    }
+
+    /// Whether to ask the daemon already running to make way for this build.
+    ///
+    /// Never for one that outranks it. Two builds that each believe they are
+    /// the current one would otherwise take turns retiring each other for as
+    /// long as both are in use — a dashboard run out of a working tree beside
+    /// an installed release is enough — and every turn costs every attached
+    /// client its connection. Equal rank and a different stamp still hands
+    /// over: that is one build replaced by another built from the same tree,
+    /// which is what a developer rebuilding expects to happen.
+    fn should_replace_generation(running: &str) -> bool {
+        let current = current_generation();
+        if running.trim() == current {
+            return false;
+        }
+        match (generation_rank(running), generation_rank(&current)) {
+            (Some(running), Some(current)) => running <= current,
+            // Nothing legible to order them by, so fall back to what this did
+            // before there was an order: any difference is a handover.
+            _ => true,
+        }
+    }
+
     fn running_generation_is_current(paths: &DaemonPaths) -> bool {
-        fs::read_to_string(&paths.generation)
-            .is_ok_and(|generation| generation.trim() == current_generation())
+        match fs::read_to_string(&paths.generation) {
+            Ok(running) => !should_replace_generation(&running),
+            // No stamp at all: either a daemon from before they existed, or one
+            // that has not finished starting. Settling tells them apart.
+            Err(_) => false,
+        }
     }
 
     fn prepare_atomic_handover(stream: &mut UnixStream) -> Result<Option<bool>> {
@@ -5399,7 +5567,7 @@ mod platform {
         }
 
         #[test]
-        fn generation_handover_requires_a_sole_client_but_not_idle_sessions() {
+        fn a_handover_a_second_client_defers_still_happens_once_nothing_is_in_hand() {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -5454,16 +5622,22 @@ mod platform {
                 thread::sleep(Duration::from_millis(10));
             }
             assert!(!prepare_handover(&state));
-            drop(second);
-            second_handle.join().unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while state.clients.load(Ordering::Relaxed) > 1 && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
+
+            // Deferred, not refused. Neither client is waiting on an answer or
+            // watching a screen, so the daemon stands down of its own accord
+            // and leaves the next generation to adopt the session — even
+            // though the second client is still sitting there, which is what
+            // an agent's MCP bridge does for as long as the agent runs.
+            let deadline = Instant::now() + RETIREMENT_DEADLINE;
+            while !state.shutdown.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
             }
             assert!(
-                prepare_handover(&state),
-                "a live keeper session must not defer the handover"
+                state.draining.load(Ordering::Acquire) && state.shutdown.load(Ordering::Acquire),
+                "a second client must postpone the handover, not cancel it"
             );
+            drop(second);
+            second_handle.join().unwrap().unwrap();
 
             let (mut rejected, server) = UnixStream::pair().unwrap();
             let draining_state = Arc::clone(&state);
@@ -5483,6 +5657,53 @@ mod platform {
             {
                 session.stop().unwrap();
             }
+        }
+
+        /// Two builds that each believe they are the current one would take
+        /// turns retiring each other for as long as both are in use, and every
+        /// turn costs every attached client its connection. So they are
+        /// ordered: the package version first, then how many commits are
+        /// behind the build, with a build made by hand in front of every
+        /// numbered one of its version and a build too old to say behind them
+        /// all.
+        #[test]
+        fn generations_of_one_version_are_ordered_by_where_they_came_from() {
+            let rank = |stamp: &str| generation_rank(stamp).unwrap();
+            let legacy = rank("0.5.4:protocol-3:abc123");
+            let release = rank("0.5.4:protocol-3:abc123:1200");
+            let nightly = rank("0.5.4:protocol-3:def456:1300");
+            let handmade = rank("0.5.4:protocol-3:local:local");
+            let next = rank("0.5.5:protocol-3:ghi789:1400");
+
+            assert!(legacy < release, "a build from before the order yields");
+            assert!(release < nightly, "a later commit count is a later build");
+            assert!(nightly < handmade, "a build made by hand is meant to win");
+            assert!(handmade < next, "but never against a later version");
+        }
+
+        #[test]
+        fn a_handover_is_asked_for_only_by_a_build_that_outranks_the_running_one() {
+            let current = current_generation();
+            assert!(!should_replace_generation(&current), "itself");
+            assert!(
+                !should_replace_generation(&format!("{current}\n")),
+                "the stamp is read back off disk, newline and all"
+            );
+            assert!(
+                !should_replace_generation("999.0.0:protocol-3:abc123:99999"),
+                "a build this one cannot be newer than keeps its place"
+            );
+            assert!(should_replace_generation("0.0.1:protocol-1:abc123:1"));
+            assert!(
+                should_replace_generation("0.0.1:protocol-1:abc123"),
+                "a daemon from before generations were ordered still yields"
+            );
+
+            // Same rank, different build: two compiles of one tree. Handing
+            // over is the whole point of rebuilding.
+            let mut fields: Vec<&str> = current.split(':').collect();
+            fields[2] = "a-different-commit";
+            assert!(should_replace_generation(&fields.join(":")));
         }
 
         /// A handover the asking client never hears about still has to happen.
