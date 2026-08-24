@@ -4724,7 +4724,7 @@ mod platform {
                         return Ok(stream);
                     }
                     drop(stream);
-                    stop_idle_daemon(paths)?;
+                    stop_running_daemon(paths)?;
                 }
             }
         }
@@ -4979,22 +4979,41 @@ mod platform {
         Ok(sole_client == Some(true) && no_live_sessions == Some(true))
     }
 
-    fn stop_idle_daemon(paths: &DaemonPaths) -> Result<()> {
+    /// Stop the daemon serving these paths, and say what happened.
+    ///
+    /// Sessions are not part of this: their keepers own them, keep writing
+    /// their histories, and are adopted by whichever daemon serves next — the
+    /// one the first client to ask for something starts. This is the way out
+    /// of the one case generations will not decide by themselves. A build only
+    /// asks for the place of one it outranks, so a deliberate downgrade leaves
+    /// the newer daemon serving until something stops it, and this is that
+    /// something.
+    pub fn stop(paths: &DaemonPaths) -> Result<()> {
+        if !daemon_process_alive(paths) {
+            println!("muxloomd is not running");
+            return Ok(());
+        }
+        stop_running_daemon(paths)?;
+        println!("muxloomd stopped; its sessions keep running and the next one adopts them");
+        Ok(())
+    }
+
+    fn stop_running_daemon(paths: &DaemonPaths) -> Result<()> {
         let pid = fs::read_to_string(&paths.pid)
-            .context("stale muxloomd generation has no pid file")?
+            .context("muxloomd has no pid file")?
             .trim()
             .parse::<i32>()
-            .context("stale muxloomd pid is invalid")?;
+            .context("muxloomd pid is invalid")?;
         let result = unsafe { libc::kill(pid, libc::SIGTERM) };
         if result != 0 {
-            return Err(io::Error::last_os_error()).context("failed to stop idle muxloomd");
+            return Err(io::Error::last_os_error()).context("failed to stop muxloomd");
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while daemon_process_alive(paths) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
         if daemon_process_alive(paths) {
-            bail!("idle muxloomd did not stop during generation handover");
+            bail!("muxloomd did not stop");
         }
         let _ = fs::remove_file(&paths.socket);
         let _ = fs::remove_file(&paths.pid);
@@ -6920,6 +6939,10 @@ mod unsupported {
     }
 
     pub fn bridge(_: &DaemonPaths) -> Result<()> {
+        bail!("muxloomd is currently supported on Unix targets")
+    }
+
+    pub fn stop(_: &DaemonPaths) -> Result<()> {
         bail!("muxloomd is currently supported on Unix targets")
     }
 
