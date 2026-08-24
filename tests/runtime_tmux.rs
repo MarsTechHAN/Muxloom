@@ -1,10 +1,13 @@
 #![cfg(unix)]
 
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
     process::Command,
     sync::{Mutex, MutexGuard},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +22,71 @@ struct SessionGuard<'a> {
     runtime: &'a Runtime,
     target: &'a Target,
     session_id: String,
+}
+
+/// A muxloomd of this build, serving a state directory of its own.
+///
+/// Without one, every launch here reaches the daemon this machine is really
+/// using: the tests would open sessions in the developer's own fleet, and
+/// whatever is wrong with that daemon — an install moved out from under it,
+/// a build old enough to lack what is being tested — is reported as a failure
+/// of the code under test. A daemon takes its state directory from its
+/// environment and the bridge is spawned deep inside the runtime, so the one
+/// place a caller can get in front of it is `companion_command`: point it at a
+/// wrapper that exports the directory and hands over to the built binary.
+struct PrivateDaemon {
+    root: PathBuf,
+    wrapper: PathBuf,
+}
+
+impl PrivateDaemon {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // Not the platform temp directory: a unix socket path may not exceed
+        // about a hundred bytes, and macOS hands out per-user temp directories
+        // that spend half of that before the daemon has named anything.
+        let root = PathBuf::from("/tmp").join(format!("mxt-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(root.join("state")).unwrap();
+        let wrapper = root.join("muxloomd");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n\
+                 MUXLOOMD_STATE_DIR='{state}'\n\
+                 MUXLOOM_MCP_REGISTER=0\n\
+                 export MUXLOOMD_STATE_DIR MUXLOOM_MCP_REGISTER\n\
+                 exec '{daemon}' \"$@\"\n",
+                state = root.join("state").display(),
+                daemon = env!("CARGO_BIN_EXE_muxloomd"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        Self { root, wrapper }
+    }
+
+    fn config(&self) -> Config {
+        Config {
+            companion_command: self.wrapper.display().to_string(),
+            ..Config::default()
+        }
+    }
+}
+
+impl Drop for PrivateDaemon {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(self.root.join("state/muxloomd.pid"))
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -58,7 +126,8 @@ impl Drop for SessionGuard<'_> {
 #[test]
 fn local_session_survives_agent_exit_and_is_discoverable() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -237,7 +306,8 @@ fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
 #[test]
 fn embedded_pty_attaches_renders_and_accepts_input() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -288,7 +358,8 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
 #[test]
 fn ordinary_terminal_with_empty_command_stays_running() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -323,7 +394,8 @@ fn ordinary_terminal_with_empty_command_stays_running() {
 #[test]
 fn exited_terminal_is_removed_instead_of_archived() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -364,7 +436,8 @@ fn exited_terminal_is_removed_instead_of_archived() {
 #[test]
 fn live_agent_can_be_archived_before_permanent_removal() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -426,7 +499,8 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
     let upload = source_root.join("upload.txt");
     std::fs::write(&upload, "uploaded").unwrap();
 
-    let runtime = Runtime::new(&Config::default());
+    let daemon = PrivateDaemon::new();
+    let runtime = Runtime::new(&daemon.config());
     let target = Target::local();
     let listing = runtime
         .list_files(&target, &root.display().to_string())
@@ -520,7 +594,8 @@ fn local_file_manager_lists_previews_uploads_and_downloads() {
 #[test]
 fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let request = LaunchRequest {
@@ -589,7 +664,8 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
 #[test]
 fn local_directory_listing_and_resume_scan_commands_execute() {
     let _test_lock = tmux_test_lock();
-    let config = Config::default();
+    let daemon = PrivateDaemon::new();
+    let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
     let root = std::env::temp_dir().join(format!("muxloom-picker-{}", std::process::id()));
