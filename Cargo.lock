@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "muxloom"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "crossterm",
