@@ -35,7 +35,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -46,6 +46,14 @@ pub const KEEPER_PROTOCOL: u8 = 1;
 const MAGIC: [u8; 4] = *b"MXK1";
 const MAX_PAYLOAD: usize = 256 * 1024;
 const DATA_CHUNK: usize = 64 * 1024;
+/// How long a keeper whose child is already gone waits to be claimed for the
+/// first time. A command can finish before the daemon that started the keeper
+/// finishes connecting to it — `ls`, a mistyped program, an agent that refuses
+/// its arguments — and a keeper that leaves in that gap turns "the command
+/// exited immediately" into "muxloomd was unavailable" and a silent fall back
+/// to legacy tmux. The daemon gives a new keeper five seconds to answer, so
+/// this outlasts the wait on the other side.
+const FIRST_CLIENT_GRACE: Duration = Duration::from_secs(10);
 
 pub mod frame {
     pub const HELLO: u8 = 1;
@@ -234,6 +242,21 @@ struct KeeperState {
     /// the socket, and `run` returns. Tests run keepers on threads, so this
     /// must never be a process exit.
     done: AtomicBool,
+    /// Whether anyone has ever connected, and since when nobody has.
+    first_client: Mutex<FirstClient>,
+}
+
+/// The keeper's side of "has anyone ever connected". Both halves live under
+/// one lock because a client arriving at the same moment the child dies
+/// decides both of them, and the two answers have to agree.
+#[derive(Default)]
+struct FirstClient {
+    /// Set the first time a client is greeted. Until then the keeper has never
+    /// been spoken to and the daemon that spawned it is still on its way.
+    claimed: bool,
+    /// When the child died while the keeper was still unclaimed. The accept
+    /// loop leaves once the grace period after that has run out.
+    orphaned_at: Option<Instant>,
 }
 
 impl KeeperState {
@@ -302,6 +325,42 @@ impl KeeperState {
     fn finish(&self) {
         self.done.store(true, Ordering::Release);
     }
+
+    /// The child is gone and nobody is listening. A keeper that has already
+    /// served someone has said everything it had to say; one that never has
+    /// still owes its daemon a greeting, so it waits a while to be claimed
+    /// before giving up on being asked at all.
+    fn nobody_left_to_tell(&self) {
+        let mut first = self
+            .first_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if first.claimed {
+            drop(first);
+            self.finish();
+            return;
+        }
+        first.orphaned_at = Some(Instant::now());
+    }
+
+    /// Whether the wait for a first client has gone on long enough.
+    fn waited_long_enough(&self) -> bool {
+        self.first_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .orphaned_at
+            .is_some_and(|since| since.elapsed() >= FIRST_CLIENT_GRACE)
+    }
+
+    /// Record that a client is here, which ends any wait for a first one.
+    fn claim(&self) {
+        let mut first = self
+            .first_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        first.claimed = true;
+        first.orphaned_at = None;
+    }
 }
 
 /// Serve one session until its child is gone and no client claims it. This is
@@ -354,6 +413,7 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
         child_pid,
         columns: Mutex::new((spec.columns.max(20), spec.rows.max(5))),
         done: AtomicBool::new(false),
+        first_client: Mutex::new(FirstClient::default()),
     });
 
     let reader_state = Arc::clone(&state);
@@ -396,14 +456,14 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
         // a dead child and nobody listening has nothing left to wait for;
         // leave rather than park forever.
         if !reader_state.has_client() {
-            reader_state.finish();
+            reader_state.nobody_left_to_tell();
         }
     });
 
     listener.set_nonblocking(true)?;
     let mut next_client = 0u64;
     loop {
-        if state.done.load(Ordering::Acquire) {
+        if state.done.load(Ordering::Acquire) || state.waited_long_enough() {
             break;
         }
         let stream = match listener.accept() {
@@ -445,8 +505,23 @@ pub fn run(spec: KeeperSpec, listener: UnixListener) -> Result<()> {
             if write_frame(&mut greeting, frame::HELLO, &hello).is_err() {
                 continue;
             }
+            // An exit is announced once, to whoever was listening when it
+            // happened — and for a child that outran its daemon, that was
+            // nobody. Repeat it to a client that arrives afterwards, so the
+            // death reaches it through the same frame it would have heard
+            // live rather than only as a flag in the greeting.
+            let exit_code = *state
+                .exit_code
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(code) = exit_code
+                && write_frame(&mut greeting, frame::EXITED, &code.to_be_bytes()).is_err()
+            {
+                continue;
+            }
             relay.client = Some((client_id, greeting));
         }
+        state.claim();
         let client_state = Arc::clone(&state);
         thread::spawn(move || {
             while let Ok(Some((kind, payload))) = read_frame(&mut reader) {
@@ -579,6 +654,52 @@ mod tests {
             format!("{closed:#}").contains("closed before greeting"),
             "{closed:#}"
         );
+    }
+
+    #[test]
+    fn a_child_that_outran_its_daemon_still_finds_its_keeper_waiting() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mxk-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("grace.sock");
+        let history_path = root.join("grace.ansi");
+        let spec = KeeperSpec {
+            session_id: "muxloomd-terminal-grace".into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'gone already\\n'".into()],
+            environment: Vec::new(),
+            cwd: "/".into(),
+            columns: 80,
+            rows: 24,
+            history_path: Some(history_path),
+            socket_path: socket_path.clone(),
+        };
+        let listener = bind_socket(&socket_path).unwrap();
+        let keeper = thread::spawn(move || run(spec, listener));
+
+        // Long enough that the child is not merely dead but already mourned:
+        // the reader thread has looked for a client and found nobody.
+        thread::sleep(Duration::from_millis(500));
+
+        let mut stream =
+            UnixStream::connect(&socket_path).expect("the keeper should still be listening");
+        let status = read_greeting(&mut stream).expect("the keeper should still greet");
+        assert!(!status.alive, "{status:?}");
+        assert_eq!(status.exit_code, Some(0));
+        assert!(status.history_bytes > 0, "{status:?}");
+
+        // And the death is repeated as a frame, because that is the only way
+        // the daemon ever learns of one.
+        let (kind, payload) = read_frame(&mut stream).unwrap().expect("an exit frame");
+        assert_eq!(kind, frame::EXITED);
+        assert_eq!(i32::from_be_bytes(payload.try_into().unwrap()), 0);
+
+        write_frame(&mut stream, frame::QUIT, &[]).unwrap();
+        keeper.join().unwrap().unwrap();
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

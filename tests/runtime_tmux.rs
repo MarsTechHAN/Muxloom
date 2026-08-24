@@ -139,9 +139,13 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
         resume_id: None,
         initial_prompt: None,
     };
+    // Nothing keeps this child alive for the launch to finish against: it is
+    // gone by the time the daemon has connected to its keeper, as often as
+    // not. That is the point — a session has to survive an agent that exits
+    // instantly just as much as one that lingers.
     let command = CommandConfig {
         command: "sh".into(),
-        args: vec!["-c".into(), "printf 'muxloom-smoke\\n'; sleep 0.1".into()],
+        args: vec!["-c".into(), "printf 'muxloom-smoke\\n'".into()],
         ..CommandConfig::default()
     };
 
