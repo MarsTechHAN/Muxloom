@@ -115,6 +115,10 @@ mod platform {
         pub triggers: PathBuf,
         pub talk: PathBuf,
         pub outbox: PathBuf,
+        /// Where a serving daemon keeps the copy of itself it starts keepers
+        /// from, so a package manager cannot take that ability away from it
+        /// mid-life. See `keeper_executable_for`.
+        pub bin: PathBuf,
     }
 
     impl DaemonPaths {
@@ -162,6 +166,7 @@ mod platform {
                 triggers: root.join("triggers.json"),
                 outbox: root.join("talk/outbox.json"),
                 talk: root.join("talk"),
+                bin: root.join("bin"),
                 root,
             }
         }
@@ -178,6 +183,8 @@ mod platform {
             fs::set_permissions(&self.keepers, fs::Permissions::from_mode(0o700))?;
             fs::create_dir_all(&self.scratch)?;
             fs::set_permissions(&self.scratch, fs::Permissions::from_mode(0o700))?;
+            fs::create_dir_all(&self.bin)?;
+            fs::set_permissions(&self.bin, fs::Permissions::from_mode(0o700))?;
             Ok(())
         }
     }
@@ -193,6 +200,9 @@ mod platform {
         persisted_sessions: Mutex<HashMap<String, Arc<PersistedSession>>>,
         paths: DaemonPaths,
         keeper_mode: KeeperMode,
+        /// The file a keeper is started from, settled once while this daemon
+        /// still knows where its own binary is.
+        keeper_executable: PathBuf,
         /// Extra attention patterns a controller sank down, applied alongside
         /// the built-in classification on every snapshot. Shared with every
         /// session so an update reaches sessions launched before it arrived.
@@ -408,6 +418,7 @@ mod platform {
             let armed = AtomicUsize::new(triggers.len());
             let outbox = load_outbox(&paths.outbox);
             let pending = AtomicUsize::new(outbox.len());
+            let keeper_executable = keeper_executable_for(&paths, keeper_mode);
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
@@ -419,6 +430,7 @@ mod platform {
                 persisted_sessions: Mutex::new(persisted_sessions),
                 paths,
                 keeper_mode,
+                keeper_executable,
                 attention_patterns: Arc::new(Mutex::new(Vec::new())),
                 triggers: Mutex::new(triggers),
                 armed,
@@ -2939,10 +2951,102 @@ mod platform {
         Some(joined)
     }
 
+    /// The binary this daemon starts its keepers from.
+    ///
+    /// Not, in the end, the path it was executed from. A keeper may have to be
+    /// started long after a package manager has moved, replaced or deleted
+    /// that file — an upgrade in the middle of a working day is exactly when
+    /// that happens — and what a process reports as its own path outlives the
+    /// file itself. The spawn then fails with "no such file", every launch
+    /// from then on quietly falls back to legacy tmux, and the daemon looks
+    /// healthy the whole time. So a serving daemon takes a copy of itself
+    /// while it still can, and starts its keepers from that.
+    ///
+    /// It has to be a copy of *this* build. A keeper speaks its daemon's
+    /// protocol, so reaching for whichever muxloomd happens to be installed
+    /// now would trade a launch that fails loudly for one that misbehaves.
+    fn keeper_executable_for(paths: &DaemonPaths, keeper_mode: KeeperMode) -> PathBuf {
+        let running = std::env::current_exe().unwrap_or_default();
+        if keeper_mode != KeeperMode::Process {
+            return running;
+        }
+        match stash_executable(paths, &running) {
+            Ok(stashed) => stashed,
+            Err(error) => {
+                eprintln!(
+                    "muxloomd could not keep a copy of itself, so its sessions depend on {} staying where it is: {error:#}",
+                    running.display()
+                );
+                running
+            }
+        }
+    }
+
+    /// Put a copy of `running` in the state directory and forget every copy
+    /// that is not it.
+    ///
+    /// The name carries the build's identity *and* the file's size and
+    /// timestamp, so a rebuilt working tree — which keeps the same generation
+    /// all day — is never mistaken for a copy already taken. Discarding the
+    /// others is safe while their keepers run: a running process holds its
+    /// file open, and on unix that is all it needs.
+    fn stash_executable(paths: &DaemonPaths, running: &Path) -> Result<PathBuf> {
+        let source =
+            fs::metadata(running).with_context(|| format!("cannot read {}", running.display()))?;
+        let stamp = source
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_millis());
+        let name = format!(
+            "muxloomd-{}-{}-{stamp}",
+            slugged(&current_generation()),
+            source.len()
+        );
+        let stashed = paths.bin.join(&name);
+        if !stashed.exists() {
+            // Whole or not at all: a copy interrupted halfway is a file that
+            // exists, has the right name, and cannot be executed.
+            let pending = paths.bin.join(format!("{name}.{}", std::process::id()));
+            let copied = fs::copy(running, &pending)
+                .with_context(|| format!("failed to copy {}", running.display()))
+                .and_then(|_| {
+                    fs::set_permissions(&pending, fs::Permissions::from_mode(0o700))
+                        .context("failed to make the copy executable")
+                })
+                .and_then(|()| fs::rename(&pending, &stashed).context("failed to put the copy in"));
+            if let Err(error) = copied {
+                let _ = fs::remove_file(&pending);
+                return Err(error);
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&paths.bin) {
+            for entry in entries.flatten() {
+                if entry.file_name() != name.as_str() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(stashed)
+    }
+
+    /// A string turned into one that can be a file name.
+    fn slugged(text: &str) -> String {
+        text.chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
     /// Spawn the detached `muxloomd keeper` that owns one session. The spec
     /// travels over stdin so environment values never appear in `ps`.
     fn spawn_keeper_process(state: &DaemonState, spec: &keeper::KeeperSpec) -> Result<()> {
-        let executable = std::env::current_exe().context("failed to find muxloomd executable")?;
+        let executable = state.keeper_executable.clone();
         let log = open_log(&state.paths.keepers.join(format!("{}.log", spec.session_id)))?;
         let error_log = log.try_clone()?;
         let mut command = Command::new(executable);
@@ -4975,6 +5079,53 @@ mod platform {
             assert_eq!(entry("releases").kind, FileEntryKind::Directory);
             assert!(!entry("releases").symlink);
             assert!(!entry("notes.txt").symlink);
+
+            fs::remove_dir_all(&root).ok();
+        }
+
+        #[test]
+        fn a_daemon_keeps_a_copy_of_itself_that_outlives_its_install() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloomd-stash-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let paths = DaemonPaths::under(root.clone());
+            paths.prepare().unwrap();
+            let install = root.join("installed-muxloomd");
+            fs::write(&install, b"#!/bin/sh\nexit 7\n").unwrap();
+            fs::set_permissions(&install, fs::Permissions::from_mode(0o755)).unwrap();
+            // Something an older generation left behind.
+            let stale = paths.bin.join("muxloomd-older-1-1");
+            fs::write(&stale, b"old").unwrap();
+
+            let stashed = stash_executable(&paths, &install).unwrap();
+            assert!(stashed.starts_with(&paths.bin));
+            assert_eq!(fs::read(&stashed).unwrap(), fs::read(&install).unwrap());
+            assert_ne!(
+                fs::metadata(&stashed).unwrap().permissions().mode() & 0o100,
+                0
+            );
+            // Only ever one copy: the previous generation's is not this
+            // daemon's build, and nothing is going to start a keeper from it.
+            assert!(!stale.exists());
+
+            // Asking again for the same binary settles on the same copy
+            // rather than writing it out a second time.
+            assert_eq!(stash_executable(&paths, &install).unwrap(), stashed);
+
+            // The whole point: the install goes away — an upgrade, an
+            // uninstall — and a keeper can still be started.
+            fs::remove_file(&install).unwrap();
+            assert!(stashed.exists());
+            assert_eq!(
+                Command::new(&stashed).status().unwrap().code(),
+                Some(7),
+                "the copy has to still run"
+            );
 
             fs::remove_dir_all(&root).ok();
         }
