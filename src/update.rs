@@ -314,9 +314,29 @@ fn bundle_dir() -> Result<PathBuf> {
 }
 
 /// The file a package manager drops beside `muxloom` to say the install is
-/// its own. Its first line names the manager, so a notice can point at the
-/// command that will actually work instead of only refusing.
+/// its own. Its first line names the manager, which is what lets an update be
+/// handed *to* that manager rather than merely refused.
 const MANAGED_MARKER: &str = ".muxloom-managed";
+
+/// What muxloom can do about an install whose files a package manager owns.
+///
+/// Writing over them would work exactly once: the manager hands its own build
+/// back at the next upgrade, and until then its records describe a package
+/// whose contents are somebody else's. So muxloom does not — but refusing is
+/// no answer either, and when it knows how to drive the manager it has the
+/// manager do the work.
+enum ManagedUpdate {
+    /// Run this program with these arguments: it is the manager's own way of
+    /// bringing this install forward.
+    Run(PathBuf, Vec<String>),
+    /// The manager's package cannot become the build being asked for. That is
+    /// a different package rather than a newer one, so name the way across
+    /// instead of installing something nobody asked for.
+    Switch(String),
+    /// A manager muxloom cannot drive. All that is left is to say whose the
+    /// files are.
+    Unknown,
+}
 
 /// The package manager that owns the bundle at `dir`, if one claimed it.
 fn managed_by_at(dir: &Path) -> Option<String> {
@@ -328,6 +348,65 @@ fn managed_by_at(dir: &Path) -> Option<String> {
         "" => "a package manager".to_string(),
         name => name.to_string(),
     })
+}
+
+/// The manager that owns the install at `dir` and how to update it there.
+/// `nightly` says which stream the build on offer came from, because a
+/// manager's package may be tied to one stream and unable to serve the other.
+fn managed_update_at(dir: &Path, nightly: bool) -> Option<(String, ManagedUpdate)> {
+    let manager = managed_by_at(dir)?;
+    let update = match manager.as_str() {
+        "homebrew" => homebrew_update(dir, nightly),
+        _ => ManagedUpdate::Unknown,
+    };
+    Some((manager, update))
+}
+
+/// Homebrew's own way of updating the keg the bundle at `dir` sits in.
+///
+/// A `HEAD-` keg is *reinstalled* rather than upgraded. `brew upgrade
+/// --fetch-HEAD` asks GitHub's API whether the branch moved and, when it
+/// cannot ask — a rate-limited address is enough — falls back to comparing the
+/// cached clone against itself and calls the install current. By the time
+/// muxloom runs this it has already established that a newer build exists, so
+/// a request that can answer "already installed" is the wrong one to make:
+/// reinstalling says what is meant, and its fetch always lands on the tip of
+/// the branch the formula follows.
+///
+/// That same keg is the nightly line and nothing else, so a tagged release is
+/// not something it can be upgraded into.
+fn homebrew_update(dir: &Path, nightly: bool) -> ManagedUpdate {
+    let Some((brew, formula, keg)) = homebrew_keg(dir) else {
+        return ManagedUpdate::Unknown;
+    };
+    if !keg.starts_with("HEAD-") {
+        return ManagedUpdate::Run(brew, vec!["upgrade".to_string(), formula]);
+    }
+    if !nightly {
+        return ManagedUpdate::Switch(format!(
+            "brew uninstall {formula} && brew install --cask muxloom"
+        ));
+    }
+    ManagedUpdate::Run(brew, vec!["reinstall".to_string(), formula])
+}
+
+/// The `brew` to run, the formula to name, and the keg version, for a bundle
+/// installed inside a Homebrew keg.
+///
+/// The path carries all three: a keg is `<prefix>/Cellar/<formula>/<version>`.
+/// Taking `brew` from the prefix that owns these files beats taking whichever
+/// one is on `PATH`, which may drive an entirely different prefix.
+fn homebrew_keg(dir: &Path) -> Option<(PathBuf, String, String)> {
+    let parts: Vec<_> = dir.components().collect();
+    let cellar = parts.iter().position(|part| part.as_os_str() == "Cellar")?;
+    let formula = parts.get(cellar + 1)?.as_os_str().to_str()?.to_string();
+    let keg = parts.get(cellar + 2)?.as_os_str().to_str()?.to_string();
+    let brew = parts[..cellar]
+        .iter()
+        .collect::<PathBuf>()
+        .join("bin")
+        .join("brew");
+    brew.is_file().then_some((brew, formula, keg))
 }
 
 /// The package manager that owns the running install, if any.
@@ -411,11 +490,39 @@ pub fn run_cli(channel: Channel, environment: &[(String, String)]) -> Result<()>
         );
         return Ok(());
     }
-    if let Some(manager) = managed_by() {
-        println!(
-            "This install is managed by {manager}; update it there — muxloom will not write \
-             over files it does not own."
-        );
+    if let Some((manager, update)) = bundle_dir()
+        .ok()
+        .and_then(|dir| managed_update_at(&dir, release.tag == NIGHTLY_TAG))
+    {
+        match update {
+            ManagedUpdate::Unknown => println!(
+                "This install is managed by {manager}; update it there — muxloom will not \
+                 write over files it does not own."
+            ),
+            ManagedUpdate::Switch(command) => println!(
+                "This install is {manager}'s, and its package cannot become {label} — that \
+                 is a different package rather than a newer one. To move across:\n  {command}"
+            ),
+            ManagedUpdate::Run(program, args) => {
+                // The files are the manager's, so the manager does the work.
+                // muxloom knows only that there is work to do, and says out
+                // loud what it is running on the user's behalf.
+                println!("This install belongs to {manager}, so muxloom is updating it there:");
+                let shown = program.file_name().unwrap_or(program.as_os_str());
+                println!("  {} {}", shown.to_string_lossy(), args.join(" "));
+                let status = std::process::Command::new(&program)
+                    .args(&args)
+                    .status()
+                    .with_context(|| format!("cannot run {}", program.display()))?;
+                if !status.success() {
+                    bail!("{manager} did not finish the update");
+                }
+                // Not "installed {label}": what the manager just built is the
+                // tip of the stream it follows, which is the build muxloom
+                // found or a later one that landed in between.
+                println!("Done. Restart muxloom to use the build {manager} installed.");
+            }
+        }
         return Ok(());
     }
     if !is_installed_bundle() {
@@ -739,6 +846,64 @@ mod tests {
         assert_eq!(updatable_bundle_at(&build), None);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_homebrew_keg_is_updated_through_brew_instead_of_being_refused() {
+        let nonce = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix =
+            env::temp_dir().join(format!("muxloom-brew-test-{}-{nonce}", std::process::id()));
+        let bundle = prefix.join("Cellar/muxloom-nightly/HEAD-a1b2c3d/libexec");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::write(bundle.join(MANAGED_MARKER), "homebrew\n").unwrap();
+
+        let ran = |dir: &Path, nightly: bool| match managed_update_at(dir, nightly) {
+            Some((manager, ManagedUpdate::Run(program, args))) => (manager, program, args),
+            other => panic!("expected a command to run, got {:?}", other.map(|(m, _)| m)),
+        };
+
+        // Without a `brew` in the prefix that owns these files there is nothing
+        // to drive, and saying whose they are is all that is left to do.
+        assert!(matches!(
+            managed_update_at(&bundle, true),
+            Some((_, ManagedUpdate::Unknown))
+        ));
+
+        let brew = prefix.join("bin/brew");
+        fs::write(&brew, b"#!/bin/sh\n").unwrap();
+        let (manager, program, args) = ran(&bundle, true);
+        assert_eq!(manager, "homebrew");
+        // The `brew` that owns the keg, not whichever one is on PATH.
+        assert_eq!(program, brew);
+        // A HEAD keg is reinstalled: `upgrade --fetch-HEAD` reports an install
+        // as current whenever it cannot reach GitHub's API to learn otherwise.
+        assert_eq!(args, ["reinstall", "muxloom-nightly"]);
+        // Driving the manager does not make the files ours to write over.
+        assert_eq!(updatable_bundle_at(&bundle), None);
+
+        // That keg only ever builds `main`, so a tagged release is a different
+        // package — reinstalling it would hand back another nightly instead.
+        let Some((_, ManagedUpdate::Switch(across))) = managed_update_at(&bundle, false) else {
+            panic!("a HEAD keg cannot install a tagged release");
+        };
+        assert!(across.contains("uninstall muxloom-nightly"), "{across}");
+        assert!(across.contains("--cask"), "{across}");
+
+        // A keg carrying a real version is an ordinary upgrade.
+        let released = prefix.join("Cellar/muxloom/0.5.4/libexec");
+        fs::create_dir_all(&released).unwrap();
+        fs::write(released.join(MANAGED_MARKER), "homebrew\n").unwrap();
+        assert_eq!(ran(&released, false).2, ["upgrade", "muxloom"]);
+
+        // A manager muxloom has never heard of is reported, not guessed at.
+        fs::write(bundle.join(MANAGED_MARKER), "apt\n").unwrap();
+        assert!(matches!(
+            managed_update_at(&bundle, true),
+            Some((manager, ManagedUpdate::Unknown)) if manager == "apt"
+        ));
+
+        fs::remove_dir_all(prefix).unwrap();
     }
 
     #[test]

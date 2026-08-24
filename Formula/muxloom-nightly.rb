@@ -127,14 +127,19 @@ class MuxloomNightly < Formula
   def caveats
     <<~EOS
       This is the nightly line: it was built from the newest commit on main.
-      Pick up a later one with:
+      Pick up a later one with either of:
 
-        brew upgrade --fetch-HEAD muxloom-nightly
+        muxloom update --nightly
+        brew reinstall muxloom-nightly
 
-      `muxloom update` will report new nightlies but not install them here,
-      since these files are Homebrew's. Companions for other architectures are
-      not built locally; muxloom downloads them into its cache when a machine
-      first needs one.
+      These files are Homebrew's, so `muxloom update` does not write over them
+      — it runs the second command for you. `brew upgrade --fetch-HEAD
+      muxloom-nightly` does the same job, but it asks GitHub's API whether main
+      has moved and reports the install as current whenever it cannot ask, so
+      it is the one to distrust when nothing seems to arrive.
+
+      Companions for other architectures are not built locally; muxloom
+      downloads them into its cache when a machine first needs one.
 
       The tagged releases are a separate package: `brew install --cask muxloom`.
       The two both provide `muxloom`, so uninstall one before linking the other.
