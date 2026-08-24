@@ -14,10 +14,13 @@
 
 </div>
 
-**Homebrew (macOS)**
+**Homebrew (macOS)** — tap once, then take either line:
 
 ```bash
-brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew install --cask muxloom
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+
+brew install --cask muxloom                               # stable: tagged releases
+brew install --HEAD marstechhan/muxloom/muxloom-nightly   # nightly: newest green commit on main
 ```
 
 > [!IMPORTANT]
@@ -240,23 +243,33 @@ archive/delete · `a` show archived.
 
 ### Homebrew (macOS)
 
-Install the release bundle and its bundled daemon, companion binaries, and
-media helper through the upstream tap:
+Tap once. Each package carries the daemon, the companion binaries for the other
+architectures, and the media helper:
 
 ```bash
 brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+```
+
+**Stable** — the tagged releases, as prebuilt binaries:
+
+```bash
 brew install --cask muxloom
 ```
 
-The cask is the tagged-release line: prebuilt binaries that muxloom updates in
-place. To follow `main` instead, install the nightly formula, which builds the
-controller and its companion here rather than downloading them:
+**Nightly** — the newest commit on `main` that passed the full regression
+suite, compiled on this machine rather than downloaded:
 
 ```bash
 brew install --HEAD marstechhan/muxloom/muxloom-nightly
 ```
 
-Both provide `muxloom`, so keep one of the two linked.
+Both provide `muxloom`, so keep one of the two linked; `brew uninstall
+--cask muxloom` and `brew uninstall muxloom-nightly` are how you swap.
+
+Either way, updating is `muxloom update`. The cask's bundle is muxloom's own to
+replace in place; the formula's files are Homebrew's, so muxloom does not write
+over them — it runs `brew reinstall muxloom-nightly` for you and shows the
+command as it goes.
 
 ### Release bundle
 
@@ -296,13 +309,19 @@ Homebrew reaches the same stream by building it:
 
 ```bash
 brew install --HEAD marstechhan/muxloom/muxloom-nightly
-brew upgrade --fetch-HEAD muxloom-nightly
+muxloom update --nightly     # or, by hand: brew reinstall muxloom-nightly
 ```
 
 What runs on this machine is compiled from `main`; what cannot be built here —
 the companions for other architectures — muxloom still fetches from the release
 when a machine first needs one. Those files are Homebrew's, so `muxloom update`
-reports a newer nightly there and leaves installing it to `brew upgrade`.
+hands the work back to Homebrew instead of writing over them. It reinstalls
+rather than upgrading on purpose: `brew upgrade --fetch-HEAD` asks GitHub's API
+whether `main` moved and reports the install as current whenever it cannot ask,
+which a rate-limited address is enough to cause.
+
+That formula is the nightly line and nothing else, so `muxloom update --stable`
+there does not install a release over it — it says which package to swap to.
 
 ### Build from source
 

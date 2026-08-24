@@ -10,10 +10,13 @@
   <a href="https://github.com/MarsTechHAN/Muxloom/releases">Releases</a>
 </p>
 
-**Homebrew（macOS）**
+**Homebrew（macOS）**——先加 tap，然后二选一：
 
 ```bash
-brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom && brew install --cask muxloom
+brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+
+brew install --cask muxloom                               # stable：打了 tag 的正式版
+brew install --HEAD marstechhan/muxloom/muxloom-nightly   # nightly：main 上最新的绿色 commit
 ```
 
 > [!NOTE]
@@ -65,21 +68,30 @@ Bootstrap 和明确选择的兼容路径可能临时复用单独的 SSH ControlM
 
 ### 安装
 
-通过上游 tap 安装完整发布包，其中包括配套 daemon、companion 二进制与媒体工具：
+先加 tap。两个包都自带配套 daemon、其他架构的 companion 二进制与媒体工具：
 
 ```bash
 brew tap marstechhan/muxloom https://github.com/MarsTechHAN/Muxloom
+```
+
+**Stable**——打了 tag 的正式版，预编译二进制：
+
+```bash
 brew install --cask muxloom
 ```
 
-cask 走的是打了 tag 的正式版：预编译好的二进制，muxloom 可以原地自更新。想跟随
-`main` 就装 nightly formula，它在本机现编译 Controller 和配套 daemon，而不是下载：
+**Nightly**——`main` 上最新一个通过全平台回归的 commit，在本机现编译而不是下载：
 
 ```bash
 brew install --HEAD marstechhan/muxloom/muxloom-nightly
 ```
 
-两者都提供 `muxloom` 命令，同一时间只保留一个链接。
+两者都提供 `muxloom` 命令，同一时间只保留一个链接；互换用
+`brew uninstall --cask muxloom` 和 `brew uninstall muxloom-nightly`。
+
+两条线更新都是 `muxloom update`。cask 那份 bundle 归 muxloom 自己，可以原地替换；
+formula 那份文件归 Homebrew，muxloom 不会覆盖它——而是替你执行
+`brew reinstall muxloom-nightly`，并把跑的命令原样打出来。
 
 从 [GitHub Releases](https://github.com/MarsTechHAN/Muxloom/releases) 下载对应控制机的
 压缩包。请保留解压后的目录结构，`muxloom` 会相对自身查找 `muxloomd`、其他目标架构
@@ -113,12 +125,17 @@ Homebrew 用编译的方式走同一条线：
 
 ```bash
 brew install --HEAD marstechhan/muxloom/muxloom-nightly
-brew upgrade --fetch-HEAD muxloom-nightly
+muxloom update --nightly     # 手动等价物：brew reinstall muxloom-nightly
 ```
 
 在本机运行的东西都从 `main` 现编译；本机编不出来的——其他架构的 companion——仍由
 muxloom 在某台机器第一次需要时从发布页取。这些文件归 Homebrew 所有，因此
-`muxloom update` 只会报告有更新的 nightly，安装交给 `brew upgrade`。
+`muxloom update` 把活交回给 Homebrew，而不是覆盖它们。这里用 reinstall 而不是
+upgrade 是有意的：`brew upgrade --fetch-HEAD` 要问 GitHub API `main` 有没有前进，
+问不到的时候（出口 IP 被限流就够了）它会直接报告"已是最新"。
+
+那个 formula 只有 nightly 一条线，所以在它上面执行 `muxloom update --stable`
+不会把正式版盖上去，而是告诉你该换成哪个包。
 
 源码构建需要 Rust 1.85 或更高版本；远程目标需要 `ssh`；视频预览需要 `PATH` 中的
 `ffmpeg` 或 `MUXLOOM_FFMPEG`。Controller 已内置 HTTPS 下载、SHA-256 校验和压缩包
