@@ -33,7 +33,7 @@ use crate::{
     talk::{
         MAX_TEXT, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind,
         TalkMessage, TalkPage, TalkScope, TalkSelector, TalkState, TalkVoice, decode_cursor,
-        hostname,
+        hostname, paste_bytes,
     },
 };
 
@@ -876,19 +876,51 @@ fn encode_key(name: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// The runtime a session is running, as far as its machine will say. `None`
+/// when the machine cannot be asked, which is the answer that changes nothing:
+/// typing raw is what muxloom has always done.
+fn session_kind(sessions: &[DaemonSession], session_id: &str) -> Option<AgentKind> {
+    sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.kind.parse().ok())
+}
+
 /// The bytes a send_input call types: text, then named keys, then Enter.
-fn build_input(arguments: &Value) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    if let Some(text) = optional_str(arguments, "text") {
-        bytes.extend_from_slice(text.as_bytes());
+///
+/// `kind` decides how the text is framed. Codex and Claude Code both decide
+/// whether an arriving carriage return submits or just breaks a line by how
+/// much came with it: text and Enter written together read as one paste, the
+/// Enter is absorbed into it as a newline, and what was typed sits in the prompt
+/// unsent while the caller is told it went. Measured on Claude Code v2.1.233,
+/// five characters submitted and a hundred did not. Bracketing the text says
+/// where the paste ends, so the Enter after it is a keystroke again whatever its
+/// length — the same framing a delivered message has always used. Everything
+/// else keeps typing raw: a shell has no such heuristic, and a program that
+/// never enabled bracketed paste would be handed the brackets as text.
+fn build_input(arguments: &Value, kind: Option<AgentKind>) -> Result<Vec<u8>> {
+    let text = optional_str(arguments, "text");
+    let keys = arguments.get("keys").and_then(Value::as_array);
+    let submit = optional_bool(arguments, "submit");
+    if text.is_none() && keys.is_none_or(|keys| keys.is_empty()) && !submit {
+        bail!("send_input needs text, keys, or submit");
     }
-    if let Some(keys) = arguments.get("keys").and_then(Value::as_array) {
+    let pastes = matches!(kind, Some(AgentKind::Codex | AgentKind::Claude));
+    let mut bytes = Vec::new();
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        if pastes {
+            bytes.extend(paste_bytes(text, false));
+        } else {
+            bytes.extend_from_slice(text.as_bytes());
+        }
+    }
+    if let Some(keys) = keys {
         for key in keys {
             let name = key.as_str().context("keys must be an array of strings")?;
             bytes.extend(encode_key(name)?);
         }
     }
-    if optional_bool(arguments, "submit") {
+    if submit {
         bytes.push(b'\r');
     }
     if bytes.is_empty() {
@@ -2223,7 +2255,13 @@ impl ControlSurface for ControllerControl {
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
-                let bytes = build_input(arguments)?;
+                let kind = self
+                    .runtime
+                    .bridge_pool()
+                    .list_sessions(&target)
+                    .ok()
+                    .and_then(|sessions| session_kind(&sessions, session_id));
+                let bytes = build_input(arguments, kind)?;
                 self.runtime.send_input(&target, session_id, &bytes)?;
                 Ok(format!("sent {} bytes to {session_id}", bytes.len()))
             }
@@ -2295,8 +2333,8 @@ mod daemon_surface {
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
         allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
         instructions, optional_bool, optional_str, optional_usize, plain_screen, pretty,
-        preview_text, required_str, screen_page, session_json, shell_report, talk_draft,
-        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
+        preview_text, required_str, screen_page, session_json, session_kind, shell_report,
+        talk_draft, talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -2756,7 +2794,11 @@ mod daemon_surface {
                 "message_agent" => self.message_agent(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
-                    let bytes = build_input(arguments)?;
+                    let kind = self
+                        .sessions()
+                        .ok()
+                        .and_then(|sessions| session_kind(&sessions, session_id));
+                    let bytes = build_input(arguments, kind)?;
                     self.expect_ack(&DaemonRequest::SendInput {
                         session_id: session_id.into(),
                         bytes: bytes.clone(),
@@ -2861,15 +2903,44 @@ mod tests {
 
     #[test]
     fn input_is_text_then_keys_then_submit() {
-        let bytes = build_input(&json!({
-            "text": "ls",
-            "keys": ["tab", "ctrl-a"],
-            "submit": true,
-        }))
+        let bytes = build_input(
+            &json!({
+                "text": "ls",
+                "keys": ["tab", "ctrl-a"],
+                "submit": true,
+            }),
+            None,
+        )
         .unwrap();
         assert_eq!(bytes, b"ls\t\x01\r");
-        assert!(build_input(&json!({})).is_err());
-        assert_eq!(build_input(&json!({"submit": true})).unwrap(), b"\r");
+        assert!(build_input(&json!({}), None).is_err());
+        assert_eq!(build_input(&json!({"submit": true}), None).unwrap(), b"\r");
+    }
+
+    #[test]
+    fn text_for_a_cli_is_bracketed_so_its_enter_still_submits() {
+        // Long enough that Claude Code would read an unbracketed trailing return
+        // as part of the paste and leave it all sitting in the prompt.
+        let text = "a".repeat(200);
+        let bytes = build_input(
+            &json!({ "text": text, "submit": true }),
+            Some(AgentKind::Claude),
+        )
+        .unwrap();
+        let mut want = b"\x1b[200~".to_vec();
+        want.extend(text.as_bytes());
+        want.extend_from_slice(b"\x1b[201~\r");
+        assert_eq!(bytes, want);
+
+        // A shell never asked for brackets, so it keeps getting plain typing.
+        assert_eq!(
+            build_input(
+                &json!({"text": "ls", "submit": true}),
+                Some(AgentKind::Terminal)
+            )
+            .unwrap(),
+            b"ls\r"
+        );
     }
 
     #[cfg(feature = "controller")]
