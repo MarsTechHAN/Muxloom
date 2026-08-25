@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    channel::ChannelSet,
+    channel::{ChannelReceipt, ChannelSet},
     model::{Composer, DirectoryListing, FileListing, FilePreview},
     relay::{RelayAnswer, RelayJob, RelayPeer},
     talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
@@ -394,6 +394,13 @@ pub enum DaemonRequest {
     /// What this machine holds, so a controller can tell whether it is in step
     /// without pushing the set again. The answer carries no secret.
     ChannelsGet,
+    /// An agent here reporting that it put a message in front of the human, so
+    /// that a reply to that message comes back to it rather than to the board.
+    /// The MCP surface is its own process, so the daemon is where this rests
+    /// until a dashboard comes round for it.
+    ChannelSent {
+        receipt: ChannelReceipt,
+    },
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -567,6 +574,12 @@ pub enum DaemonResponse {
     Channels {
         #[serde(default)]
         set: ChannelSet,
+        /// What agents here have said to the human since a dashboard last
+        /// asked, handed over and forgotten in the same breath. Empty from a
+        /// daemon that has none, which includes every daemon too old to keep
+        /// them.
+        #[serde(default)]
+        receipts: Vec<ChannelReceipt>,
     },
     Error {
         message: String,

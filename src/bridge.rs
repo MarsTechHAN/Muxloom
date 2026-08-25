@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    channel::{CHANNELS_CAPABILITY, ChannelSet},
+    channel::{CHANNELS_CAPABILITY, ChannelReceipt, ChannelSet},
     daemon_protocol::{
         DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
         OpenStream, PROTOCOL_VERSION, Trigger, stream,
@@ -928,16 +928,27 @@ impl BridgeConnection {
         self.expect_ack(DaemonRequest::RelayComplete { id, ok, output })
     }
 
-    /// What channel set this machine holds, or `None` from a daemon too old to
-    /// hold one. The answer carries revision and shape, never a secret.
-    pub fn channels_get(&self) -> Result<Option<ChannelSet>> {
+    /// What channel set this machine holds and what its agents have said to
+    /// the human since this was last asked, or `None` from a daemon too old to
+    /// hold either. The answer carries revision and shape, never a secret.
+    pub fn channels_get(&self) -> Result<Option<(ChannelSet, Vec<ChannelReceipt>)>> {
         if !self.has_capability(CHANNELS_CAPABILITY) {
             return Ok(None);
         }
         match self.request(DaemonRequest::ChannelsGet)?.response {
-            DaemonResponse::Channels { set } => Ok(Some(set)),
+            DaemonResponse::Channels { set, receipts } => Ok(Some((set, receipts))),
             response => bail!("unexpected channels response: {response:?}"),
         }
+    }
+
+    /// Leave a receipt here for whichever dashboard comes round next. A daemon
+    /// too old to keep one simply does not, and the message still went out —
+    /// the human's reply lands on the board instead of on the sender.
+    pub fn channel_sent(&self, receipt: ChannelReceipt) -> Result<()> {
+        if !self.has_capability(CHANNELS_CAPABILITY) {
+            return Ok(());
+        }
+        self.expect_ack(DaemonRequest::ChannelSent { receipt })
     }
 
     /// Hand this machine the channels it may speak through.
@@ -2307,8 +2318,15 @@ impl BridgePool {
             .relay_complete(id, ok, output)
     }
 
-    pub fn channels_get(&self, target: &Target) -> Result<Option<ChannelSet>> {
+    pub fn channels_get(
+        &self,
+        target: &Target,
+    ) -> Result<Option<(ChannelSet, Vec<ChannelReceipt>)>> {
         self.connection_for_target(target)?.channels_get()
+    }
+
+    pub fn channel_sent(&self, target: &Target, receipt: ChannelReceipt) -> Result<()> {
+        self.connection_for_target(target)?.channel_sent(receipt)
     }
 
     pub fn channels_put(&self, target: &Target, set: &ChannelSet) -> Result<()> {

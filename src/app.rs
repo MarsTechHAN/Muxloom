@@ -531,6 +531,9 @@ const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
 /// slow is still a conversation; a machine polled faster than this is being
 /// asked to answer more often than anyone types.
 const TALK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+/// How often a chat app is asked what the human said. Long enough not to be a
+/// nuisance to the platform, short enough that an answer feels like an answer.
+const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long one phase of a forced daemon update may take before the
 /// orchestration gives up and says so. Generous: the cycle can carry a
 /// companion upload over a slow link, and the escalation waits out a
@@ -1176,6 +1179,14 @@ pub struct App {
     pub channel_sync: crate::channel::ChannelRound,
     /// The file [`App::channels`] is read from and written to.
     pub channels_path: PathBuf,
+    /// What has been read out of the chats: how far each one was followed, who
+    /// each is aimed at, and which card belongs to which agent. Only the
+    /// dashboard reads a chat, so this is the only copy.
+    pub inbox: crate::channel::Inbox,
+    pub inbox_path: PathBuf,
+    /// When a chat was last read, so errands can run far more often than a
+    /// chat app is polled.
+    last_inbox_poll: Option<Instant>,
     pub sessions: Vec<AgentSession>,
     pub focus: Focus,
     pub selected_target: usize,
@@ -1360,6 +1371,7 @@ impl App {
         let history_cache_dir = state_dir.join("history");
         let backup_root = state_dir.join("backup");
         let channels_path = crate::channel::path_in(&state_dir);
+        let inbox_path = crate::channel::inbox_path_in(&state_dir);
         // A channel file that cannot be read must not keep the dashboard from
         // starting: it means nothing can be sent until it is bound again.
         let channels = crate::channel::ChannelSet::load(&channels_path).unwrap_or_else(|error| {
@@ -1383,6 +1395,9 @@ impl App {
             channels,
             channel_sync: crate::channel::ChannelRound::default(),
             channels_path,
+            inbox: crate::channel::Inbox::load(&inbox_path),
+            inbox_path,
+            last_inbox_poll: None,
             sessions: Vec::new(),
             focus: Focus::Machines,
             selected_target: 0,
@@ -5182,9 +5197,12 @@ impl App {
                 board,
                 forwarded,
                 channels,
+                inbox,
+                mail,
             } => {
                 self.talk_in_flight = false;
                 self.channel_sync = channels;
+                self.absorb_inbox(*inbox, mail);
                 match result {
                     Ok(summary) => debug::log("talk", summary),
                     Err(error) => debug::log("talk", format!("sync failed: {error}")),
@@ -5574,12 +5592,56 @@ impl App {
         // when agents on this machine get the errands they cannot run
         // themselves, and an agent asking for another machine while nothing
         // polls for work is told so rather than left waiting.
+        // A chat app is asked far less often than the errand queue: a human
+        // waits seconds for an answer without noticing, and a rate limit is
+        // shared with everything else the app does.
+        let read_inbox = self
+            .channels
+            .bindings
+            .iter()
+            .any(|binding| binding.kind.listens())
+            && self
+                .last_inbox_poll
+                .is_none_or(|at| at.elapsed() >= INBOX_POLL_INTERVAL);
+        if read_inbox {
+            self.last_inbox_poll = Some(Instant::now());
+        }
         let _ = self.worker.requests.send(Request::TalkSync {
             targets,
             config: Box::new(self.config.clone()),
             channels: Box::new(self.channels.clone()),
+            inbox: Box::new(self.inbox.clone()),
+            read_inbox,
             board_since: self.board.cursor.clone(),
         });
+    }
+
+    /// Take back what the round read out of the chats. The file is only
+    /// rewritten when something in it moved: most rounds read nothing, and a
+    /// dashboard that rewrites a file every two seconds for no reason is a
+    /// dashboard somebody has to explain.
+    fn absorb_inbox(&mut self, inbox: crate::channel::Inbox, mail: crate::channel::InboxRound) {
+        if mail.busy() {
+            debug::log(
+                "channel",
+                format!(
+                    "read {} from the chats{}",
+                    mail.read,
+                    if mail.failures.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} failed", mail.failures.len())
+                    }
+                ),
+            );
+        }
+        if inbox == self.inbox {
+            return;
+        }
+        self.inbox = inbox;
+        if let Err(error) = self.inbox.save(&self.inbox_path) {
+            debug::log("channel", format!("{error:#}"));
+        }
     }
 
     /// File what the round read off the local board. Everything anyone said

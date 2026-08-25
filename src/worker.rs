@@ -164,6 +164,15 @@ pub enum Request {
         /// round rather than being read off disk here: the dashboard is the
         /// only writer, and this way an edit is live on the next round.
         channels: Box<crate::channel::ChannelSet>,
+        /// What has been read out of the chats so far. It travels both ways
+        /// because the dashboard is the only reader: one reader means one
+        /// answer per message, with nobody to agree with about who saw it
+        /// first.
+        inbox: Box<crate::channel::Inbox>,
+        /// Whether this round also reads the chats. Errands run every couple of
+        /// seconds and a chat app does not need asking that often, so most
+        /// rounds only carry receipts back.
+        read_inbox: bool,
         /// What the dashboard's board already holds, so the round brings back
         /// only what was said since. Empty on the first round, which is how the
         /// board is filled the first time it is drawn.
@@ -331,6 +340,10 @@ pub enum Event {
         /// How far the channel set got: which machines now hold this revision,
         /// and which could not be told.
         channels: crate::channel::ChannelRound,
+        /// What reading the chats left to remember, and what it did. Handed
+        /// straight back so the next round starts where this one stopped.
+        inbox: Box<crate::channel::Inbox>,
+        mail: crate::channel::InboxRound,
     },
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
@@ -1074,6 +1087,8 @@ impl Worker {
                         targets,
                         config,
                         channels,
+                        mut inbox,
+                        read_inbox,
                         board_since,
                     } => {
                         let result = crate::talk::run_sync(&runtime, &targets)
@@ -1100,7 +1115,30 @@ impl Worker {
                         // hold the channel set is brought to this revision, so
                         // an agent anywhere can reach the human without the
                         // dashboard having to be the one to speak.
-                        let channels = crate::channel::run_sync(&runtime, &targets, &channels);
+                        let round = crate::channel::run_sync(&runtime, &targets, &channels);
+                        // Receipts first, then reading: a human who answers the
+                        // moment a card arrives is answering something this
+                        // very round collected.
+                        for receipt in &round.receipts {
+                            inbox.remember(receipt.clone());
+                        }
+                        let mail = if read_inbox {
+                            match config.environment_for(crate::model::LOCAL_TARGET_ID) {
+                                Ok(environment) => crate::channel::run_inbox(
+                                    &runtime,
+                                    &targets,
+                                    &channels,
+                                    &mut inbox,
+                                    &environment,
+                                ),
+                                Err(error) => {
+                                    debug::log("channel", format!("no environment: {error:#}"));
+                                    crate::channel::InboxRound::default()
+                                }
+                            }
+                        } else {
+                            crate::channel::InboxRound::default()
+                        };
                         // Whatever the round pulled is on the local board by
                         // now, so the dashboard reads one board rather than
                         // every machine in turn.
@@ -1109,7 +1147,9 @@ impl Worker {
                             result,
                             board,
                             forwarded,
-                            channels,
+                            channels: round,
+                            inbox,
+                            mail,
                         });
                     }
                 });

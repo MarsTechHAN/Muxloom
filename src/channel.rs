@@ -594,6 +594,208 @@ fn send_wecom(
     }
 }
 
+/// One session, anywhere in the fleet, as the human's end of a conversation
+/// knows it.
+///
+/// The machine is the id the dashboard uses, not the origin key a session
+/// carries in its environment: a receipt is stamped with it when the dashboard
+/// collects it from that machine, which is the one moment both names are in the
+/// same place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Correspondent {
+    #[serde(default)]
+    pub machine: String,
+    pub session_id: String,
+    /// What to call it in a chat message, where a session id means nothing.
+    #[serde(default)]
+    pub label: String,
+}
+
+impl Correspondent {
+    /// How the human reads it: the label if the session has one, and enough of
+    /// the id to tell two apart if it does not.
+    pub fn name(&self) -> String {
+        let called = if self.label.trim().is_empty() {
+            self.session_id.as_str()
+        } else {
+            self.label.trim()
+        };
+        if self.machine.is_empty() {
+            return called.to_string();
+        }
+        format!("{called} · {}", self.machine)
+    }
+
+    /// Whether a `/select` word picks this session out.
+    fn answers_to(&self, needle: &str) -> bool {
+        let needle = needle.to_lowercase();
+        let (machine, session) = needle
+            .split_once('/')
+            .map(|(machine, session)| (machine.trim(), session.trim()))
+            .unwrap_or(("", needle.trim()));
+        if !machine.is_empty() && !self.machine.to_lowercase().starts_with(machine) {
+            return false;
+        }
+        session.is_empty()
+            || self.session_id.to_lowercase().starts_with(session)
+            || self.label.to_lowercase().contains(session)
+    }
+}
+
+/// One message muxloom put in front of a human, kept so their reply to it can
+/// find the agent that wrote it.
+///
+/// It carries no secret and no text — only which chat message this was and who
+/// is owed the answer — so it is safe to hand between machines on the same
+/// round that carries everything else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelReceipt {
+    /// The binding it went out through.
+    #[serde(default)]
+    pub channel: String,
+    /// The platform's id for the message, which is what a reply names.
+    pub message_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// The most receipts a machine holds for a dashboard that has stopped
+/// collecting them. Old ones are the ones nobody is going to reply to.
+pub const RECEIPT_CAP: usize = 256;
+
+/// Everything reading a chat needs to remember between rounds.
+///
+/// It lives on the dashboard, because the dashboard is the only thing that
+/// reads: one reader means a message is routed once, with no agreement to
+/// reach about who saw it first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inbox {
+    /// Per binding: the newest message time already looked at, epoch
+    /// milliseconds. The next round asks for everything from a second before
+    /// it and leans on `handled` to not say anything twice.
+    #[serde(default)]
+    pub seen: HashMap<String, u64>,
+    /// Per binding: who a plain message goes to, until `/select` says otherwise.
+    #[serde(default)]
+    pub aimed: HashMap<String, Correspondent>,
+    /// Which agent sent each message a human might reply to, newest last.
+    #[serde(default)]
+    pub receipts: Vec<ChannelReceipt>,
+    /// Message ids already routed, newest last: reading the same window twice
+    /// must not deliver twice.
+    #[serde(default)]
+    pub handled: Vec<String>,
+}
+
+impl Inbox {
+    /// Read what is remembered, treating anything unreadable as nothing
+    /// remembered: the cost is a chat that repeats itself once, which is much
+    /// cheaper than a dashboard that will not start.
+    pub fn load(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            format!("{}\n", serde_json::to_string_pretty(self)?),
+        )
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to replace {}", path.display()))
+    }
+
+    /// Take one receipt in, dropping the oldest once the list is full.
+    pub fn remember(&mut self, receipt: ChannelReceipt) {
+        self.receipts
+            .retain(|held| held.message_id != receipt.message_id);
+        self.receipts.push(receipt);
+        let over = self.receipts.len().saturating_sub(RECEIPT_CAP);
+        self.receipts.drain(..over);
+    }
+
+    fn mark(&mut self, message_id: &str) {
+        self.handled.push(message_id.to_string());
+        let over = self.handled.len().saturating_sub(RECEIPT_CAP * 2);
+        self.handled.drain(..over);
+    }
+
+    fn sender_of(&self, message_id: &str) -> Option<Correspondent> {
+        self.receipts
+            .iter()
+            .find(|receipt| receipt.message_id == message_id)
+            .map(|receipt| Correspondent {
+                machine: String::new(),
+                session_id: receipt.session_id.clone(),
+                label: receipt.label.clone(),
+            })
+    }
+}
+
+/// Where a dashboard keeps what it has read, given its state directory. Beside
+/// the channels, but a separate file: this one holds no secret and is rewritten
+/// every few seconds.
+pub fn inbox_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("channel-inbox.json")
+}
+
+/// What is to be done with one thing a human said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Hand it to one agent.
+    Agent(Correspondent),
+    /// Point this chat at whoever matches these words, from here on.
+    Aim(String),
+    /// Say what there is to talk to.
+    Who,
+    /// Stop pointing anywhere; plain messages go back to the board.
+    Clear,
+    /// Put it on the machine board, where any agent can find it. `asked` is
+    /// whether the human meant to — `/all` — or whether it simply had nowhere
+    /// better to go. Nothing a person says is dropped.
+    Board { asked: bool },
+}
+
+/// Where one incoming message goes, and what is left of it once the command
+/// word is off the front.
+///
+/// Written as a function of what is remembered rather than of what is
+/// reachable: which sessions exist is settled afterwards, by whoever can ask.
+pub fn route(text: &str, reply_to: Option<&str>, binding: &str, inbox: &Inbox) -> (Route, String) {
+    let text = text.trim();
+    let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let rest = rest.trim().to_string();
+    // A command is a command wherever it was typed, including in a reply: the
+    // person who writes `/who` under a card wants the list, not to send the
+    // word `/who` to an agent.
+    match word.to_lowercase().as_str() {
+        "/select" | "/s" => return (Route::Aim(rest.clone()), rest),
+        "/who" | "/help" => return (Route::Who, rest),
+        "/clear" => return (Route::Clear, rest),
+        "/all" => return (Route::Board { asked: true }, rest),
+        _ => {}
+    }
+    // Replying to a card is the shortest way to answer the agent that wrote it,
+    // and the one that needs nothing learnt in advance.
+    if let Some(who) = reply_to.and_then(|id| inbox.sender_of(id)) {
+        return (Route::Agent(who), text.to_string());
+    }
+    if let Some(who) = inbox.aimed.get(binding) {
+        return (Route::Agent(who.clone()), text.to_string());
+    }
+    (Route::Board { asked: false }, text.to_string())
+}
+
 /// What one push round did, for the debug log and for the panel's count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelRound {
@@ -603,6 +805,9 @@ pub struct ChannelRound {
     pub asked: usize,
     /// Machines that could not be reached or refused, with the reason.
     pub failures: Vec<(String, String)>,
+    /// What agents out there told the human while the dashboard was not
+    /// looking, collected on the way past so their replies can find them.
+    pub receipts: Vec<ChannelReceipt>,
 }
 
 impl ChannelRound {
@@ -631,8 +836,9 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target], set: &ChannelSet) -> Chan
     for target in everywhere {
         match pool.channels_get(target) {
             Ok(None) => continue,
-            Ok(Some(held)) => {
+            Ok(Some((held, receipts))) => {
                 round.asked += 1;
+                round.receipts.extend(receipts);
                 if held.revision == set.revision {
                     round.synced += 1;
                     continue;
@@ -656,6 +862,450 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target], set: &ChannelSet) -> Chan
         debug::log("channel", format!("{machine}: not in step ({error})"));
     }
     round
+}
+
+/// One thing a human said, with only the parts routing depends on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Incoming {
+    pub message_id: String,
+    /// The message it answers, when it answers one.
+    pub reply_to: Option<String>,
+    /// Epoch milliseconds, as the platform recorded it.
+    pub at: u64,
+    pub text: String,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// The readable part of one Lark message. `body.content` is a JSON document
+/// inside a string, and which document depends on the type: plain text is one
+/// field, a rich post is paragraphs of runs. Anything else — an image, a file,
+/// a card — has no text to route, and saying nothing about it is better than
+/// waking an agent with an empty message.
+fn lark_text(item: &Value) -> Option<String> {
+    let content: Value = serde_json::from_str(item.pointer("/body/content")?.as_str()?).ok()?;
+    let text = match item.get("msg_type").and_then(Value::as_str)? {
+        "text" => content.get("text")?.as_str()?.to_string(),
+        "post" => content
+            .get("content")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_array)
+            .map(|line| {
+                line.iter()
+                    .filter_map(|run| run.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    // `@`-ing the bot is how a group message reaches it at all, and it arrives
+    // as a placeholder the human never typed. Taking it out leaves what they
+    // meant to say.
+    let text = text
+        .split_whitespace()
+        .filter(|word| !word.starts_with("@_user_") && *word != "@_all")
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(text).filter(|text| !text.trim().is_empty())
+}
+
+/// Everything said in one chat since `since`, oldest first.
+///
+/// Asked for from a second early and deduplicated by id afterwards, because the
+/// window is in seconds and the cursor is in milliseconds: overlapping is free,
+/// and a message that falls between two rounds is gone for good.
+fn lark_inbox(
+    binding: &ChannelBinding,
+    since: u64,
+    environment: &[(String, String)],
+) -> Result<Vec<Incoming>> {
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let answer = http::get_json(
+        &format!(
+            "{LARK_HOST}/open-apis/im/v1/messages?container_id_type=chat&container_id={}\
+             &sort_type=ByCreateTimeAsc&page_size=50&start_time={}",
+            binding.route.trim(),
+            (since / 1000).saturating_sub(1),
+        ),
+        &[("Authorization", authorization.as_str())],
+        environment,
+    )?;
+    lark_ok(&answer, "the chat")?;
+    let mut said = Vec::new();
+    for item in answer
+        .pointer("/data/items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        // Only what a person typed. muxloom's own cards come back through the
+        // same window, and routing those would be a chat talking to itself.
+        if item.pointer("/sender/sender_type").and_then(Value::as_str) != Some("user")
+            || item.get("deleted").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(text) = lark_text(item) else {
+            continue;
+        };
+        let at = item
+            .get("create_time")
+            .and_then(Value::as_str)
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_default();
+        if at <= since {
+            continue;
+        }
+        said.push(Incoming {
+            message_id: item
+                .get("message_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            reply_to: item
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            at,
+            text,
+        });
+    }
+    Ok(said)
+}
+
+/// What one round of reading the chats did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboxRound {
+    /// Messages from a human that this round acted on.
+    pub read: usize,
+    /// One line per message, in the words the debug log wants.
+    pub routed: Vec<String>,
+    pub failures: Vec<(String, String)>,
+}
+
+impl InboxRound {
+    pub fn busy(&self) -> bool {
+        self.read > 0 || !self.failures.is_empty()
+    }
+}
+
+/// Read every chat a human can answer through, and put what they said where it
+/// belongs.
+///
+/// Polling rather than a socket or a callback, and deliberately: a webhook
+/// needs an address on the public internet, which most of the machines muxloom
+/// runs on do not have and should not be given. The cost is that an answer
+/// takes a few seconds, which the panel says out loud.
+pub fn run_inbox(
+    runtime: &Runtime,
+    targets: &[Target],
+    set: &ChannelSet,
+    inbox: &mut Inbox,
+    environment: &[(String, String)],
+) -> InboxRound {
+    let mut round = InboxRound::default();
+    let listening: Vec<&ChannelBinding> = set
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind.listens() && binding.ready().is_ok())
+        .collect();
+    if listening.is_empty() {
+        return round;
+    }
+    let mut desk = Desk::new(runtime, targets);
+    for binding in listening {
+        let Some(&since) = inbox.seen.get(&binding.id) else {
+            // First sight of this chat. Start from now: nobody wants an agent
+            // woken by a conversation that happened before it was bound.
+            inbox.seen.insert(binding.id.clone(), now_ms());
+            continue;
+        };
+        let said = match lark_inbox(binding, since, environment) {
+            Ok(said) => said,
+            Err(error) => {
+                round
+                    .failures
+                    .push((binding.id.clone(), format!("{error:#}")));
+                continue;
+            }
+        };
+        for message in said {
+            let newest = inbox.seen.entry(binding.id.clone()).or_default();
+            *newest = (*newest).max(message.at);
+            if inbox.handled.contains(&message.message_id) {
+                continue;
+            }
+            inbox.mark(&message.message_id);
+            round.read += 1;
+            let answer = handle(&mut desk, binding, &message, inbox);
+            round.routed.push(format!("{}: {answer}", binding.id));
+            // The answer is itself something a human can reply to, so it is
+            // remembered under whoever it is about — an agent's name in a
+            // receipt is a handle, not just a report.
+            let receipt = Outgoing {
+                title: String::new(),
+                text: answer,
+                signature: String::new(),
+            };
+            match send(binding, &receipt, environment) {
+                Ok(sent) if !sent.message_id.is_empty() => {
+                    if let Some(who) = desk.last_agent.clone() {
+                        inbox.remember(ChannelReceipt {
+                            channel: binding.id.clone(),
+                            message_id: sent.message_id,
+                            session_id: who.session_id,
+                            label: who.label,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => round
+                    .failures
+                    .push((binding.id.clone(), format!("{error:#}"))),
+            }
+        }
+    }
+    for line in &round.routed {
+        debug::log("channel", line.clone());
+    }
+    for (binding, error) in &round.failures {
+        debug::log("channel", format!("{binding}: {error}"));
+    }
+    round
+}
+
+/// The fleet, as one round of reading needs it: listed once, however many
+/// messages ask about it, and not at all when none does.
+struct Desk<'a> {
+    runtime: &'a Runtime,
+    machines: Vec<Target>,
+    sessions: Option<Vec<Correspondent>>,
+    author: Option<crate::talk::TalkAuthor>,
+    /// Who the message just handled was about, so the receipt can be replied to.
+    last_agent: Option<Correspondent>,
+}
+
+impl<'a> Desk<'a> {
+    fn new(runtime: &'a Runtime, targets: &[Target]) -> Self {
+        let local = Target::local();
+        let machines = std::iter::once(local.clone())
+            .chain(targets.iter().filter(|it| it.id != local.id).cloned())
+            .collect();
+        Self {
+            runtime,
+            machines,
+            sessions: None,
+            author: None,
+            last_agent: None,
+        }
+    }
+
+    fn sessions(&mut self) -> &[Correspondent] {
+        self.sessions.get_or_insert_with(|| {
+            let pool = self.runtime.bridge_pool();
+            let mut found = Vec::new();
+            for machine in &self.machines {
+                let Ok(sessions) = pool.list_sessions(machine) else {
+                    continue;
+                };
+                found.extend(
+                    sessions
+                        .into_iter()
+                        .filter(|it| !it.temporary)
+                        .map(|session| Correspondent {
+                            machine: machine.id.clone(),
+                            session_id: session.id,
+                            label: session.label,
+                        }),
+                );
+            }
+            found
+        })
+    }
+
+    /// Which machine a session is on, when a receipt only remembered its id.
+    fn locate(&mut self, who: &Correspondent) -> Option<Correspondent> {
+        if !who.machine.is_empty() {
+            return Some(who.clone());
+        }
+        self.sessions()
+            .iter()
+            .find(|it| it.session_id == who.session_id)
+            .cloned()
+    }
+
+    fn target(&self, machine: &str) -> Option<&Target> {
+        self.machines.iter().find(|it| it.id == machine)
+    }
+
+    /// A human speaking, as the board records them. Asked of the local board
+    /// once, because what this machine is called is not something a chat knows.
+    fn author(&mut self, called: &str) -> crate::talk::TalkAuthor {
+        let base = self.author.get_or_insert_with(|| {
+            let (machine, machine_label) = self
+                .runtime
+                .bridge_pool()
+                .talk_status(&Target::local(), None)
+                .map(|state| (state.origin, state.label))
+                .unwrap_or_default();
+            crate::talk::TalkAuthor {
+                machine,
+                machine_label,
+                voice: crate::talk::TalkVoice::default(),
+            }
+        });
+        crate::talk::TalkAuthor {
+            voice: crate::talk::TalkVoice {
+                label: Some(called.to_string()),
+                // The one thing an agent reading this has to know: a person
+                // wrote it, so it is not another agent's suggestion.
+                human: true,
+                ..Default::default()
+            },
+            ..base.clone()
+        }
+    }
+}
+
+/// Act on one thing a human said, and answer in the words they should see.
+fn handle(
+    desk: &mut Desk<'_>,
+    binding: &ChannelBinding,
+    message: &Incoming,
+    inbox: &mut Inbox,
+) -> String {
+    desk.last_agent = None;
+    let called = if binding.label.trim().is_empty() {
+        format!("a human via {}", binding.kind.title())
+    } else {
+        format!("{} via {}", binding.label.trim(), binding.kind.title())
+    };
+    let (decision, text) = route(
+        &message.text,
+        message.reply_to.as_deref(),
+        &binding.id,
+        inbox,
+    );
+    match decision {
+        Route::Who => {
+            let mut lines: Vec<String> = desk
+                .sessions()
+                .iter()
+                .map(|who| format!("- {}", who.name()))
+                .collect();
+            if lines.is_empty() {
+                lines.push("- nobody is running".into());
+            }
+            lines.push(String::new());
+            lines.push(
+                "`/select <name>` to aim this chat · `/clear` to stop · `/all <text>` for the \
+                 board · replying to a card answers whoever sent it"
+                    .into(),
+            );
+            lines.join("\n")
+        }
+        Route::Clear => match inbox.aimed.remove(&binding.id) {
+            Some(who) => format!("· no longer aimed at {}", who.name()),
+            None => "· nothing was aimed".into(),
+        },
+        Route::Aim(words) if words.is_empty() => {
+            "· `/select` needs a name — `/who` lists them".into()
+        }
+        Route::Aim(words) => {
+            let found: Vec<Correspondent> = desk
+                .sessions()
+                .iter()
+                .filter(|who| who.answers_to(&words))
+                .cloned()
+                .collect();
+            match found.as_slice() {
+                [] => format!("· nothing here answers to `{words}` — `/who` lists what does"),
+                [only] => {
+                    let name = only.name();
+                    desk.last_agent = Some(only.clone());
+                    inbox.aimed.insert(binding.id.clone(), only.clone());
+                    format!("· aimed at {name}")
+                }
+                several => format!(
+                    "· `{words}` fits {} of them: {}",
+                    several.len(),
+                    several
+                        .iter()
+                        .map(Correspondent::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        Route::Agent(who) => {
+            let Some(who) = desk.locate(&who) else {
+                inbox.aimed.remove(&binding.id);
+                return format!(
+                    "· {} is not running any more, so that went nowhere. `/who` lists what is.",
+                    who.name()
+                );
+            };
+            let Some(target) = desk.target(&who.machine).cloned() else {
+                return format!("· {} is on a machine muxloom cannot reach", who.name());
+            };
+            let draft = crate::talk::TalkDraft {
+                scope: crate::talk::TalkScope::Machine {
+                    machine: String::new(),
+                },
+                author: desk.author(&called),
+                kind: crate::talk::TalkKind::Direct,
+                to: Some(crate::talk::TalkAddress {
+                    machine: String::new(),
+                    session_id: who.session_id.clone(),
+                }),
+                reply_to: None,
+                text,
+            };
+            desk.last_agent = Some(who.clone());
+            match desk.runtime.bridge_pool().talk_deliver(
+                &target,
+                draft,
+                crate::talk::TalkDeliver::Auto,
+                true,
+            ) {
+                Ok((_, delivery, reason)) => match reason {
+                    Some(reason) => format!("→ {} ({delivery}: {reason})", who.name()),
+                    None => format!("→ {} ({delivery})", who.name()),
+                },
+                Err(error) => format!("· {} did not get that: {error:#}", who.name()),
+            }
+        }
+        Route::Board { asked } => {
+            let draft = crate::talk::TalkDraft {
+                scope: crate::talk::TalkScope::Machine {
+                    machine: String::new(),
+                },
+                author: desk.author(&called),
+                kind: crate::talk::TalkKind::Message,
+                to: None,
+                reply_to: None,
+                text,
+            };
+            match desk
+                .runtime
+                .bridge_pool()
+                .talk_post(&Target::local(), draft)
+            {
+                Ok(_) if asked => "· on the board, where every agent reads it".into(),
+                Ok(_) => "· on the board — nothing is aimed yet. `/who` lists who is here.".into(),
+                Err(error) => format!("· the board did not take that: {error:#}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -903,5 +1553,145 @@ mod tests {
         .to_string();
         assert!(!error.contains(key), "{error}");
         assert!(error.contains("upstream is down"), "{error}");
+    }
+
+    fn who(session_id: &str, label: &str) -> Correspondent {
+        Correspondent {
+            machine: "seed".into(),
+            session_id: session_id.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn where_a_human_sentence_goes_is_settled_before_anyone_is_asked() {
+        let mut inbox = Inbox::default();
+        // Nothing aimed and nothing replied to: it goes where every agent can
+        // find it rather than nowhere.
+        assert_eq!(
+            route("the tests are red again", None, "lark-1", &inbox),
+            (
+                Route::Board { asked: false },
+                "the tests are red again".into()
+            )
+        );
+        // The commands, with the command word off the front of what is left.
+        assert_eq!(
+            route("/select lexer", None, "lark-1", &inbox),
+            (Route::Aim("lexer".into()), "lexer".into())
+        );
+        assert_eq!(route("/who", None, "lark-1", &inbox).0, Route::Who);
+        assert_eq!(route("/clear", None, "lark-1", &inbox).0, Route::Clear);
+        assert_eq!(
+            route("/all standup in five", None, "lark-1", &inbox),
+            (Route::Board { asked: true }, "standup in five".into())
+        );
+
+        // A reply reaches whoever wrote the card, without anyone having aimed
+        // anything: this is the shortest way to answer, and the one a person
+        // finds without being told.
+        inbox.remember(ChannelReceipt {
+            channel: "lark-1".into(),
+            message_id: "om_1".into(),
+            session_id: "s-lexer".into(),
+            label: "lexer".into(),
+        });
+        let (decision, text) = route("yes, go ahead", Some("om_1"), "lark-1", &inbox);
+        assert_eq!(text, "yes, go ahead");
+        match decision {
+            Route::Agent(who) => assert_eq!(who.session_id, "s-lexer"),
+            other => panic!("a reply must answer its card: {other:?}"),
+        }
+        // But a command typed as a reply is still a command.
+        assert_eq!(route("/who", Some("om_1"), "lark-1", &inbox).0, Route::Who);
+
+        // Once aimed, a plain sentence goes to the same agent every time, and
+        // per chat: two chats can be talking to two different agents.
+        inbox
+            .aimed
+            .insert("lark-2".into(), who("s-parser", "parser"));
+        assert_eq!(
+            route("keep going", None, "lark-2", &inbox).0,
+            Route::Agent(who("s-parser", "parser"))
+        );
+        assert_eq!(
+            route("keep going", None, "lark-1", &inbox).0,
+            Route::Board { asked: false }
+        );
+    }
+
+    #[test]
+    fn a_reply_to_a_card_nobody_kept_lands_where_the_chat_is_pointed() {
+        let mut inbox = Inbox {
+            aimed: HashMap::from([("lark-1".to_string(), who("s-parser", "parser"))]),
+            ..Default::default()
+        };
+        // The table is bounded, so a long conversation eventually forgets its
+        // own beginning. What must not happen then is silence: the aim is the
+        // fallback, and the board is the fallback after that.
+        for number in 0..RECEIPT_CAP + 5 {
+            inbox.remember(ChannelReceipt {
+                channel: "lark-1".into(),
+                message_id: format!("om_{number}"),
+                session_id: "s-lexer".into(),
+                label: "lexer".into(),
+            });
+        }
+        assert_eq!(inbox.receipts.len(), RECEIPT_CAP);
+        assert!(inbox.sender_of("om_0").is_none(), "the oldest is forgotten");
+        assert!(inbox.sender_of("om_260").is_some(), "the newest is kept");
+        assert_eq!(
+            route("thanks", Some("om_0"), "lark-1", &inbox).0,
+            Route::Agent(who("s-parser", "parser"))
+        );
+
+        // And a message already acted on is never acted on twice, however many
+        // times an overlapping window hands it back.
+        assert!(!inbox.handled.contains(&"om_9".to_string()));
+        inbox.mark("om_9");
+        assert!(inbox.handled.contains(&"om_9".to_string()));
+    }
+
+    #[test]
+    fn a_select_word_finds_a_session_by_its_name_its_id_or_its_machine() {
+        let session = Correspondent {
+            machine: "seed-debug".into(),
+            session_id: "a7f3c1".into(),
+            label: "lexer rewrite".into(),
+        };
+        for needle in ["lexer", "LEXER", "a7f3", "seed/lexer", "seed-debug/a7f3"] {
+            assert!(session.answers_to(needle), "{needle} names it");
+        }
+        for needle in ["parser", "other/lexer", "b7f3"] {
+            assert!(!session.answers_to(needle), "{needle} does not name it");
+        }
+        // A session with no label is still worth reading back: half an id
+        // tells two of them apart, where nothing at all does not.
+        assert_eq!(session.name(), "lexer rewrite · seed-debug");
+    }
+
+    #[test]
+    fn only_what_a_person_typed_comes_back_out_of_a_lark_message() {
+        let text =
+            |kind: &str, content: &str| json!({ "msg_type": kind, "body": { "content": content } });
+        // Reaching the bot in a group means @-ing it, and the @ arrives as a
+        // placeholder nobody typed and nobody wants delivered.
+        assert_eq!(
+            lark_text(&text("text", r#"{"text":"@_user_1 ship it"}"#)),
+            Some("ship it".into())
+        );
+        // A rich post is paragraphs of runs; the readable part is the text.
+        assert_eq!(
+            lark_text(&text(
+                "post",
+                r#"{"title":"t","content":[[{"tag":"text","text":"one"}],
+                   [{"tag":"a","href":"h","text":"two"}]]}"#
+            )),
+            Some("one two".into())
+        );
+        // An image or a file has nothing to route, and an @ on its own is a
+        // person getting the bot's attention, not a message for an agent.
+        assert_eq!(lark_text(&text("image", r#"{"image_key":"k"}"#)), None);
+        assert_eq!(lark_text(&text("text", r#"{"text":"@_user_1"}"#)), None);
     }
 }

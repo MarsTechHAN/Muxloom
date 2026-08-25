@@ -1308,6 +1308,7 @@ fn send_channel(
     binding: &crate::channel::ChannelBinding,
     arguments: &Value,
     environment: &[(String, String)],
+    leave: impl FnOnce(crate::channel::ChannelReceipt),
 ) -> Result<String> {
     let message = crate::channel::Outgoing {
         title: optional_str(arguments, "title").unwrap_or_default().into(),
@@ -1315,6 +1316,20 @@ fn send_channel(
         signature: speaker(),
     };
     let sent = crate::channel::send(binding, &message, environment)?;
+    // A receipt is what turns the human's reply into an answer: without one it
+    // lands on the board, which is not wrong but is not this conversation. It
+    // needs a session to name, so a call from outside a session leaves none.
+    if let (false, Some(session_id)) = (
+        sent.message_id.is_empty(),
+        session_env("MUXLOOM_SESSION_ID"),
+    ) {
+        leave(crate::channel::ChannelReceipt {
+            channel: sent.channel.clone(),
+            message_id: sent.message_id.clone(),
+            session_id,
+            label: session_env("MUXLOOM_SESSION_LABEL").unwrap_or_default(),
+        });
+    }
     Ok(pretty(&json!({
         "channel": sent.channel,
         "through": sent.through,
@@ -2355,7 +2370,15 @@ impl ControllerControl {
         let channels = self.channels()?;
         let binding = channels.pick(optional_str(arguments, "channel"))?;
         let environment = self.config.environment_for(crate::model::LOCAL_TARGET_ID)?;
-        send_channel(binding, arguments, &environment)
+        // Left with the daemon on this machine rather than kept here: this
+        // process ends when the tool call does, and the dashboard that reads
+        // the chat is somewhere else entirely.
+        send_channel(binding, arguments, &environment, |receipt| {
+            let _ = self
+                .runtime
+                .bridge_pool()
+                .channel_sent(&Target::local(), receipt);
+        })
     }
 
     fn message_agent(&self, arguments: &Value) -> Result<String> {
@@ -3015,7 +3038,9 @@ mod daemon_surface {
             let channels = ChannelSet::read(&self.paths.channels);
             let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
             match channels.pick(optional_str(arguments, "channel")) {
-                Ok(binding) => send_channel(binding, arguments, &environment),
+                Ok(binding) => send_channel(binding, arguments, &environment, |receipt| {
+                    let _ = self.transact(&DaemonRequest::ChannelSent { receipt });
+                }),
                 Err(unbound) => self
                     .relay("send_channel_message", arguments)
                     // The controller could not help either. What a human can

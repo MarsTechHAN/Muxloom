@@ -255,6 +255,10 @@ mod platform {
         /// pushed here by a controller and kept on disk so a restart does not
         /// leave the machine mute until the next round.
         channels: Mutex<ChannelSet>,
+        /// What agents here have put in front of the human, waiting for a
+        /// dashboard to come round and take them. In memory only, and bounded:
+        /// a receipt nobody collected is a reply nobody is going to send.
+        receipts: Mutex<Vec<crate::channel::ChannelReceipt>>,
     }
 
     /// A stored trigger plus the edge state that decides when it fires.
@@ -467,6 +471,7 @@ mod platform {
                 directs: Mutex::new(HashMap::new()),
                 relay: Mutex::new(RelayQueue::default()),
                 channels: Mutex::new(channels),
+                receipts: Mutex::new(Vec::new()),
             }
         }
 
@@ -2254,7 +2259,32 @@ mod platform {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .redacted();
-                write_response(writer, request_id, &DaemonResponse::Channels { set })
+                // Handed over and forgotten in the same breath. The dashboard
+                // is the only thing that reads a chat, so it is the only place
+                // these are of any use, and keeping a second copy here would
+                // only be a second thing to keep in step.
+                let receipts = std::mem::take(
+                    &mut *state
+                        .receipts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::Channels { set, receipts },
+                )
+            }
+            DaemonRequest::ChannelSent { receipt } => {
+                let mut receipts = state
+                    .receipts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                receipts.push(receipt);
+                let over = receipts.len().saturating_sub(crate::channel::RECEIPT_CAP);
+                receipts.drain(..over);
+                drop(receipts);
+                write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::RelayComplete { id, ok, output } => {
                 state
@@ -6337,7 +6367,7 @@ mod platform {
 
             handle_request(&writer, &state, 2, DaemonRequest::ChannelsGet).unwrap();
             match answer(&mut client, 2) {
-                DaemonResponse::Channels { set } => {
+                DaemonResponse::Channels { set, .. } => {
                     assert_eq!(set.revision, 4);
                     assert_eq!(set.bindings[0].route, "oc_1");
                     assert!(
@@ -6361,6 +6391,56 @@ mod platform {
             .unwrap();
             assert!(matches!(answer(&mut client, 3), DaemonResponse::Ack));
             assert_eq!(ChannelSet::read(&state.paths.channels), set);
+
+            fs::remove_dir_all(&state.paths.root).ok();
+        }
+
+        /// An agent's MCP surface is its own process, so a receipt has nowhere
+        /// to rest but here, and nothing to do with it but hand it to the one
+        /// dashboard that reads the chat.
+        #[test]
+        fn a_receipt_waits_here_for_a_dashboard_and_is_handed_over_once() {
+            use crate::channel::ChannelReceipt;
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let state = test_state("receipts");
+            let writer = Arc::new(Mutex::new(server));
+            let answer = |client: &mut UnixStream, id: u64| loop {
+                let frame = Frame::read_from(client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == id {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            };
+            let receipt = ChannelReceipt {
+                channel: "lark-1".into(),
+                message_id: "om_1".into(),
+                session_id: "a7f3c1".into(),
+                label: "lexer".into(),
+            };
+
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::ChannelSent {
+                    receipt: receipt.clone(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(answer(&mut client, 1), DaemonResponse::Ack));
+
+            handle_request(&writer, &state, 2, DaemonRequest::ChannelsGet).unwrap();
+            match answer(&mut client, 2) {
+                DaemonResponse::Channels { receipts, .. } => assert_eq!(receipts, vec![receipt]),
+                other => panic!("unexpected answer: {other:?}"),
+            }
+            // Taken, not copied: a second dashboard asking must not be told
+            // about a reply the first one is already holding.
+            handle_request(&writer, &state, 3, DaemonRequest::ChannelsGet).unwrap();
+            match answer(&mut client, 3) {
+                DaemonResponse::Channels { receipts, .. } => assert!(receipts.is_empty()),
+                other => panic!("unexpected answer: {other:?}"),
+            }
 
             fs::remove_dir_all(&state.paths.root).ok();
         }
