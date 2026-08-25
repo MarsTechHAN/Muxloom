@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::LazyLock,
+};
 
 use ratatui::{
     Frame,
@@ -3139,7 +3143,14 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "b / footer ● chip",
             "Open what every machine has been saying",
         ),
-        help_row("Tab / Left / Right", "All, Global, Machine, Path, Direct"),
+        help_row(
+            "Tab / Left / Right",
+            "All, Global, Machine, Path, Task, Direct",
+        ),
+        help_row(
+            "Task tab",
+            "What the selected agent's whole task said, indented by who started whom",
+        ),
         help_row("Enter in board", "Expand the selected message in full"),
         help_row(
             "p / r in board",
@@ -3709,8 +3720,9 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
 }
 
 /// The colour a scope reads in. Global is the accent everyone shares, a machine
-/// borrows the header's cyan, a directory takes the green the terminals use,
-/// and a direct message is yellow because it was aimed at someone.
+/// borrows the header's cyan, a directory takes the green the terminals use, a
+/// task takes magenta because it cuts across all three, and a direct message is
+/// yellow because it was aimed at someone.
 fn board_scope_color(message: &TalkMessage) -> Color {
     if message.kind == TalkKind::Direct {
         return Color::Yellow;
@@ -3719,6 +3731,7 @@ fn board_scope_color(message: &TalkMessage) -> Color {
         TalkScope::Global => ACCENT,
         TalkScope::Machine { .. } => CODEX,
         TalkScope::Path { .. } => TERMINAL,
+        TalkScope::Task { .. } => Color::Magenta,
     }
 }
 
@@ -3729,6 +3742,29 @@ fn board_scope_tag(message: &TalkMessage) -> &'static str {
     } else {
         message.scope.name()
     }
+}
+
+/// How deep in the task a message sits, for the indentation on the Task tab.
+///
+/// Whoever said it decides it. A message from outside the task sits on the
+/// line of the session it was said to instead — a person at a dashboard
+/// writing to one subagent belongs beside that subagent, not at the top of a
+/// tree they are not in.
+fn board_task_depth(message: &TalkMessage, task: &BTreeMap<String, usize>) -> usize {
+    message
+        .author
+        .voice
+        .session_id
+        .as_deref()
+        .and_then(|id| task.get(id))
+        .or_else(|| {
+            message
+                .to
+                .as_ref()
+                .and_then(|to| task.get(to.session_id.as_str()))
+        })
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Who said it, short enough for a line: `name@machine` plus the last part of
@@ -3771,6 +3807,13 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
     }
 
     let view = app.board_view(form.tab, &form.query);
+    // Who is working with whom, for the Task tab's indentation. The other tabs
+    // have no hierarchy to draw and do not pay for one.
+    let task = if form.tab == BoardTab::Task {
+        app.selected_task()
+    } else {
+        BTreeMap::new()
+    };
     let selected_at = form
         .selected
         .as_ref()
@@ -3823,8 +3866,21 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
             },
         ));
     }
+    // The Task tab is the one view that answers a question about the agent
+    // list rather than about the board, so it says which task it is showing.
+    let heading = task
+        .iter()
+        .find(|(_, depth)| **depth == 0)
+        .map(|(root, _)| {
+            app.sessions
+                .iter()
+                .find(|session| session.id == *root)
+                .map_or_else(|| root.clone(), |session| session.display_label().into())
+        })
+        .map(|label| format!(" · {}", truncate(&label, 18)))
+        .unwrap_or_default();
     let counted = format!(
-        "{} of {} · times UTC ",
+        "{} of {}{heading} · times UTC ",
         view.len(),
         app.board.messages.len()
     );
@@ -3857,10 +3913,12 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
     let head = inner.y + 1 + (list_height - shown) as u16;
     if view.is_empty() && list_height > 0 {
         frame.render_widget(
-            Paragraph::new(if form.query.trim().is_empty() {
-                "Nothing said here yet."
-            } else {
+            Paragraph::new(if !form.query.trim().is_empty() {
                 "Nothing here matches."
+            } else if form.tab == BoardTab::Task && task.is_empty() {
+                "Select an agent to see the task it is part of."
+            } else {
+                "Nothing said here yet."
             })
             .style(Style::default().fg(MUTED)),
             Rect::new(inner.x, head - 1, inner.width, 1),
@@ -3899,7 +3957,17 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
                     .bg(background),
             ),
             Span::styled(
-                format!("{:<26} ", truncate(&board_author(message), 26)),
+                format!(
+                    "{:<26} ",
+                    truncate(
+                        &format!(
+                            "{}{}",
+                            "  ".repeat(board_task_depth(message, &task)),
+                            board_author(message)
+                        ),
+                        26
+                    )
+                ),
                 Style::default().fg(voice).bg(background),
             ),
             Span::styled(
@@ -5174,6 +5242,113 @@ mod tests {
         );
         assert!(
             !drawn.iter().any(|text| text.contains("helper")),
+            "{drawn:?}"
+        );
+    }
+
+    /// The board's Task tab answers "what is my team doing", so the tree the
+    /// agent list draws has to survive into it: a subagent's line sits under
+    /// the line of whoever started it.
+    #[test]
+    fn the_task_tab_indents_a_subagent_under_the_agent_that_started_it() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let session = |id: &str, parent: Option<&str>| AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work".into(),
+            label: id.into(),
+            created_at: 1,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            parent: parent.map(Into::into),
+        };
+        app.sessions = vec![
+            session("lead", None),
+            session("scout", Some("lead")),
+            session("digger", Some("scout")),
+        ];
+        app.selected_session_id = Some("lead".into());
+        let said = |seq: u64, who: &str, text: &str| TalkMessage {
+            id: format!("mars:{seq}"),
+            origin: "mars".into(),
+            seq,
+            ts: seq * 1000,
+            scope: TalkScope::Task {
+                machine: "mars".into(),
+                root_session: "lead".into(),
+            },
+            author: crate::talk::TalkAuthor {
+                machine: "mars".into(),
+                machine_label: "mars".into(),
+                voice: crate::talk::TalkVoice {
+                    session_id: Some(who.into()),
+                    label: Some(who.into()),
+                    kind: Some("claude".into()),
+                    human: false,
+                },
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: text.into(),
+        };
+        app.board.merge(vec![
+            said(1, "lead", "take the parser"),
+            said(2, "scout", "on it"),
+            said(3, "digger", "found the retry"),
+        ]);
+
+        let mut form = BoardForm {
+            tab: BoardTab::Task,
+            ..BoardForm::default()
+        };
+        let backend = TestBackend::new(114, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_board_modal(frame, &app, &mut form, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let drawn: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let indent = |needle: &str| -> usize {
+            let row = drawn
+                .iter()
+                .find(|text| text.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle} in {drawn:?}"));
+            row.find(needle).expect("just matched")
+        };
+        // Two spaces per step down the chain, so the shape reads the same way
+        // the agent list does.
+        assert_eq!(indent("scout@mars"), indent("lead@mars") + 2, "{drawn:?}");
+        assert_eq!(indent("digger@mars"), indent("lead@mars") + 4, "{drawn:?}");
+        // And the tab says which task it is showing, since the answer changes
+        // with whatever the agent list is standing on.
+        assert!(
+            drawn.iter().any(|text| text.contains("[Task]")),
             "{drawn:?}"
         );
     }

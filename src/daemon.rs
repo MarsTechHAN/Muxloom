@@ -2885,6 +2885,14 @@ mod platform {
         }
         keeper_environment.push(("MUXLOOM_SESSION_ID".into(), session_id.clone()));
         keeper_environment.push(("MUXLOOM_SESSION_PATH".into(), path.clone()));
+        // Which piece of work this session is part of, for the task scope on
+        // the board. Worked out once, here, because parentage is fixed at
+        // launch: the chain a session hangs off cannot change under it later,
+        // and nothing downstream should have to walk it again.
+        keeper_environment.push((
+            "MUXLOOM_TASK_ROOT".into(),
+            task_root(state, &session_id, parent.as_deref()),
+        ));
         keeper_environment.push(("MUXLOOM_SESSION_KIND".into(), kind.clone()));
         if !label.trim().is_empty() {
             keeper_environment.push(("MUXLOOM_SESSION_LABEL".into(), label.clone()));
@@ -3510,6 +3518,41 @@ mod platform {
             .get(session_id)
             .cloned()
             .with_context(|| format!("unknown daemon session {session_id}"))
+    }
+
+    /// The session at the top of the chain of subagents `session_id` hangs
+    /// off: the task it belongs to. A session nobody started is its own task.
+    ///
+    /// A parent is a bare session id with no machine on it, so a chain that
+    /// leaves this machine stops at the last id this daemon can resolve. That
+    /// is the right place to stop rather than a shortcoming: both machines end
+    /// up naming the same id, which is what makes a task spanning two of them
+    /// one task.
+    fn task_root(state: &DaemonState, session_id: &str, parent: Option<&str>) -> String {
+        let mut root = session_id.to_string();
+        let mut seen = BTreeSet::from([root.clone()]);
+        let mut next = parent.map(str::to_string);
+        while let Some(id) = next {
+            if !seen.insert(id.clone()) {
+                // Somebody's records have a loop in them. Whatever the chain
+                // means, it has no top, and the walk has to end somewhere.
+                break;
+            }
+            next = session_parent(state, &id);
+            root = id;
+        }
+        root
+    }
+
+    /// Who started a session, as this daemon has it recorded. A session it has
+    /// never heard of has no parent it can name, which ends a walk.
+    fn session_parent(state: &DaemonState, session_id: &str) -> Option<String> {
+        if let Ok(session) = daemon_session(state, session_id) {
+            return session.snapshot().parent;
+        }
+        persisted_session(state, session_id)
+            .ok()
+            .and_then(|session| session.snapshot().parent)
     }
 
     fn persisted_session(state: &DaemonState, session_id: &str) -> Result<Arc<PersistedSession>> {
@@ -5608,7 +5651,36 @@ mod platform {
                 Some("muxloomd-claude-elsewhere")
             );
 
-            for session in [lead, child, loop_back, far] {
+            // Which piece of work each of them is part of, which is what the
+            // task scope on the board is keyed by.
+            let grandchild = start(
+                "muxloomd-terminal-grandchild",
+                Some("muxloomd-terminal-child"),
+            );
+            assert_eq!(
+                task_root(&state, "muxloomd-terminal-lead", None),
+                "muxloomd-terminal-lead"
+            );
+            for under in ["muxloomd-terminal-child", "muxloomd-terminal-grandchild"] {
+                assert_eq!(
+                    task_root(&state, under, session_parent(&state, under).as_deref()),
+                    "muxloomd-terminal-lead",
+                    "{under} should belong to the task its chain hangs off"
+                );
+            }
+            // A chain that leaves this machine stops at the last id there is
+            // anything to resolve — which is the id the other machine names
+            // too, so both halves of the task agree on it.
+            assert_eq!(
+                task_root(
+                    &state,
+                    "muxloomd-terminal-far",
+                    Some("muxloomd-claude-elsewhere")
+                ),
+                "muxloomd-claude-elsewhere"
+            );
+
+            for session in [lead, child, loop_back, far, grandchild] {
                 session.stop().ok();
             }
             fs::remove_dir_all(&root).ok();

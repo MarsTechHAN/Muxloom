@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -520,7 +520,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 78;
+pub const HELP_CONTENT_ROWS: usize = 79;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -638,15 +638,17 @@ pub enum BoardTab {
     Global,
     Machine,
     Path,
+    Task,
     Direct,
 }
 
 impl BoardTab {
-    pub const ORDER: [BoardTab; 5] = [
+    pub const ORDER: [BoardTab; 6] = [
         BoardTab::All,
         BoardTab::Global,
         BoardTab::Machine,
         BoardTab::Path,
+        BoardTab::Task,
         BoardTab::Direct,
     ];
 
@@ -656,6 +658,7 @@ impl BoardTab {
             Self::Global => "Global",
             Self::Machine => "Machine",
             Self::Path => "Path",
+            Self::Task => "Task",
             Self::Direct => "Direct",
         }
     }
@@ -663,7 +666,13 @@ impl BoardTab {
     /// Whether a message belongs on this tab. A direct message answers for its
     /// delivery rather than for the scope it was filed under: it was said to
     /// one session, not to everyone standing in that directory.
-    pub fn admits(self, message: &TalkMessage) -> bool {
+    ///
+    /// `task` is the task the agent list is standing in, from
+    /// [`App::selected_task`]. Only the Task tab reads it, and it is the one
+    /// tab a message cannot answer for on its own: whether something belongs
+    /// to a piece of work is a fact about who started whom, which lives in the
+    /// session list rather than on the message.
+    pub fn admits(self, message: &TalkMessage, task: &BTreeMap<String, usize>) -> bool {
         let direct = message.kind == TalkKind::Direct;
         match self {
             Self::All => true,
@@ -671,6 +680,20 @@ impl BoardTab {
             Self::Global => !direct && matches!(message.scope, TalkScope::Global),
             Self::Machine => !direct && matches!(message.scope, TalkScope::Machine { .. }),
             Self::Path => !direct && matches!(message.scope, TalkScope::Path { .. }),
+            // Everything the task said and everything said to it, whichever
+            // board it was filed under: a task is a set of agents, and what
+            // they are doing is scattered across the scopes they used. The
+            // scope check catches a message from a session the machine has
+            // since forgotten, which the author check no longer can.
+            Self::Task => {
+                let member = |id: Option<&str>| id.is_some_and(|id| task.contains_key(id));
+                member(message.author.voice.session_id.as_deref())
+                    || member(message.to.as_ref().map(|to| to.session_id.as_str()))
+                    || message
+                        .scope
+                        .task()
+                        .is_some_and(|root| task.contains_key(root))
+            }
         }
     }
 
@@ -3390,6 +3413,54 @@ impl App {
             .any(|(_, shape)| shape.descendants > 0)
     }
 
+    /// The task the agent list is standing in: the session at the top of the
+    /// chain the selected one hangs off, and everything under it, each with
+    /// how deep it sits. Empty when nothing is selected — a task nobody is
+    /// standing in has nothing to show.
+    ///
+    /// Every session counts here, not just the visible ones. A folded subagent
+    /// or one filtered out of the list is still doing the work, and the board
+    /// is about what was said rather than about what is on screen.
+    pub fn selected_task(&self) -> BTreeMap<String, usize> {
+        let Some(selected) = self.selected_session_id.as_deref() else {
+            return BTreeMap::new();
+        };
+        let by_id: HashMap<&str, &AgentSession> = self
+            .sessions
+            .iter()
+            .map(|session| (session.id.as_str(), session))
+            .collect();
+        if !by_id.contains_key(selected) {
+            return BTreeMap::new();
+        }
+        // Up to the top of the chain first. A parent naming a session this
+        // machine has never heard of ends the walk here for the same reason it
+        // does in the daemon: there is nothing to resolve it against.
+        let mut root = selected;
+        let mut climbed: HashSet<&str> = HashSet::from([root]);
+        while let Some(parent) = by_id
+            .get(root)
+            .and_then(|session| session.parent.as_deref())
+            .filter(|parent| by_id.contains_key(*parent) && climbed.insert(parent))
+        {
+            root = parent;
+        }
+        let mut task = BTreeMap::from([(root.to_string(), 0usize)]);
+        let mut frontier = vec![(root, 0usize)];
+        while let Some((id, depth)) = frontier.pop() {
+            for child in self
+                .sessions
+                .iter()
+                .filter(|session| session.parent.as_deref() == Some(id))
+            {
+                if task.insert(child.id.clone(), depth + 1).is_none() {
+                    frontier.push((child.id.as_str(), depth + 1));
+                }
+            }
+        }
+        task
+    }
+
     pub fn archived_count(&self) -> usize {
         self.sessions
             .iter()
@@ -5495,10 +5566,18 @@ impl App {
     /// which is the order they were said in, and the order a board is read in.
     pub fn board_view(&self, tab: BoardTab, query: &str) -> Vec<&TalkMessage> {
         let needle = query.trim().to_lowercase();
+        // Only the Task tab needs to know who is working with whom, and
+        // working it out costs a pass over the session list, so the other
+        // tabs do not pay for it.
+        let task = if tab == BoardTab::Task {
+            self.selected_task()
+        } else {
+            BTreeMap::new()
+        };
         self.board
             .messages
             .iter()
-            .filter(|message| tab.admits(message))
+            .filter(|message| tab.admits(message, &task))
             .filter(|message| {
                 needle.is_empty()
                     || message.text.to_lowercase().contains(&needle)
@@ -5562,6 +5641,19 @@ impl App {
                         format!("this directory has no name to post under: {error}")
                     })?,
             },
+            // Both of these are views rather than channels a person can speak
+            // into. A task's channel belongs to the agents doing the work, and
+            // this tab gathers what they said across every scope they used, so
+            // there is no one board a new message here would land on. Replying
+            // to something still works: a reply goes where the message it
+            // answers went, which for a task message is that task.
+            BoardTab::Task => {
+                return Err(
+                    "A task is the agents doing one piece of work — reply to something \
+                            they said, or message one of them directly"
+                        .into(),
+                );
+            }
             BoardTab::Direct => {
                 return Err(
                     "A direct message is between two sessions — open the session to answer it"
@@ -15785,6 +15877,110 @@ mod tests {
             },
         );
         (app, request_rx)
+    }
+
+    /// The Task tab is the one view keyed to the agent list rather than to the
+    /// board: whichever session is selected, it gathers what that whole piece
+    /// of work has said, across every scope its members used.
+    #[test]
+    fn the_task_tab_gathers_what_one_piece_of_work_said_wherever_it_said_it() {
+        let (mut app, _requests) = board_app();
+        let under = |id: &str, parent: Option<&str>| AgentSession {
+            parent: parent.map(Into::into),
+            ..waiting_session(id, "waiting")
+        };
+        app.sessions = vec![
+            under("lead", None),
+            under("scout", Some("lead")),
+            under("digger", Some("scout")),
+            // Somebody else's work, on the same machine and in the same
+            // directory, which is exactly what the other tabs cannot tell
+            // apart from this one.
+            under("stranger", None),
+        ];
+        let from = |seq: u64, session: &str, scope: TalkScope, text: &str| TalkMessage {
+            author: TalkAuthor {
+                voice: TalkVoice {
+                    session_id: Some(session.into()),
+                    ..TalkVoice::default()
+                },
+                ..said(seq, seq * 10, TalkScope::Global, TalkKind::Message, text).author
+            },
+            scope,
+            ..said(seq, seq * 10, TalkScope::Global, TalkKind::Message, text)
+        };
+        let here = || TalkScope::Path {
+            machine: "mars".into(),
+            path: "/work".into(),
+        };
+        let task = |root: &str| TalkScope::Task {
+            machine: "mars".into(),
+            root_session: root.into(),
+        };
+        app.board.merge(vec![
+            from(1, "lead", here(), "starting on the parser"),
+            from(2, "scout", task("lead"), "the retry lives in client.rs"),
+            from(3, "digger", TalkScope::Global, "and the pool is fine"),
+            from(4, "stranger", here(), "unrelated work in the same folder"),
+            // A member that has since gone still answers for its task,
+            // because the scope says which one it was.
+            from(5, "forgotten", task("lead"), "left before anyone looked"),
+            // And so does a message aimed at a member from outside.
+            TalkMessage {
+                to: Some(crate::talk::TalkAddress {
+                    machine: "mars".into(),
+                    session_id: "scout".into(),
+                }),
+                ..from(6, "stranger", here(), "asking the scout something")
+            },
+        ]);
+        let texts = |app: &App, tab| {
+            app.board_view(tab, "")
+                .into_iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>()
+        };
+        // Nothing selected is no task, and an empty tab says so rather than
+        // guessing at one.
+        assert!(texts(&app, BoardTab::Task).is_empty());
+
+        // Selecting anywhere in the task shows the whole of it: the tab is
+        // keyed to the work, not to the row the cursor happens to be on.
+        for standing in ["lead", "scout", "digger"] {
+            app.selected_session_id = Some(standing.into());
+            assert_eq!(
+                texts(&app, BoardTab::Task),
+                [
+                    "starting on the parser",
+                    "the retry lives in client.rs",
+                    "and the pool is fine",
+                    "left before anyone looked",
+                    "asking the scout something",
+                ],
+                "standing on {standing}"
+            );
+        }
+        // Somebody else's work is somebody else's.
+        app.selected_session_id = Some("stranger".into());
+        assert_eq!(
+            texts(&app, BoardTab::Task),
+            [
+                "unrelated work in the same folder",
+                "asking the scout something",
+            ]
+        );
+
+        // How deep each member sits, which is what the tab indents by.
+        app.selected_session_id = Some("digger".into());
+        let shape = app.selected_task();
+        assert_eq!(shape.get("lead"), Some(&0));
+        assert_eq!(shape.get("scout"), Some(&1));
+        assert_eq!(shape.get("digger"), Some(&2));
+        assert_eq!(shape.get("stranger"), None);
+
+        // A task is a view of what was said, not a channel a person can speak
+        // into, and saying so beats a message that lands nowhere.
+        assert!(app.board_scope(BoardTab::Task).is_err());
     }
 
     #[test]

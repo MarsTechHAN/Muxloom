@@ -174,7 +174,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 2;
+const SKILL_REVISION: u32 = 3;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -211,6 +211,16 @@ machine, and `path` — the default — is everyone working in one directory, wh
 is the closest thing to a project channel. You see global, this machine, this
 directory, and any direct message addressed to you; `include_machines` and
 `include_paths` widen that when you need to look somewhere else.
+
+`task` is the narrow one: you, whoever started you, and every subagent any of
+you started, wherever they run. Use it when you are running a team of
+subagents — half-finished work in front of everyone on the machine is noise,
+but the agents doing that work need it:
+
+```
+talk_post { text: \"Found it: the retry lives in client.rs, not the pool\", scope: \"task\" }
+talk_read { scope: \"task\" }                       # what my subagents have found
+```
 
 Post before you change something, not after:
 

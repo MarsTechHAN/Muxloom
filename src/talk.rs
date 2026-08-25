@@ -64,6 +64,15 @@ pub enum TalkScope {
     /// Everyone working in one directory on one machine — the default, and the
     /// one that behaves like a project channel.
     Path { machine: String, path: String },
+    /// Everyone working on one task: an agent, every subagent it started, and
+    /// everything those started in turn. `root_session` is the session at the
+    /// top of that chain, and it is the same id on every machine the task
+    /// reaches — a subagent started across a machine boundary is still part of
+    /// the same piece of work.
+    Task {
+        machine: String,
+        root_session: String,
+    },
 }
 
 impl TalkScope {
@@ -72,13 +81,24 @@ impl TalkScope {
             Self::Global => "global",
             Self::Machine { .. } => "machine",
             Self::Path { .. } => "path",
+            Self::Task { .. } => "task",
         }
     }
 
     pub fn machine(&self) -> Option<&str> {
         match self {
             Self::Global => None,
-            Self::Machine { machine } | Self::Path { machine, .. } => Some(machine),
+            Self::Machine { machine } | Self::Path { machine, .. } | Self::Task { machine, .. } => {
+                Some(machine)
+            }
+        }
+    }
+
+    /// The task a message belongs to, when it was said to one.
+    pub fn task(&self) -> Option<&str> {
+        match self {
+            Self::Task { root_session, .. } => Some(root_session),
+            _ => None,
         }
     }
 
@@ -95,7 +115,7 @@ impl TalkScope {
     fn anchor(&mut self, origin: &str) {
         match self {
             Self::Global => {}
-            Self::Machine { machine } | Self::Path { machine, .. } => {
+            Self::Machine { machine } | Self::Path { machine, .. } | Self::Task { machine, .. } => {
                 if machine.trim().is_empty() {
                     *machine = origin.to_string();
                 }
@@ -292,7 +312,8 @@ pub struct TalkFilter {
     /// ones without seeing the board again.
     #[serde(default)]
     pub since: TalkVector,
-    /// Restrict to one scope: `global`, `machine`, `path`, or `direct`.
+    /// Restrict to one scope: `global`, `machine`, `path`, `task`, or
+    /// `direct`.
     #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
@@ -312,6 +333,13 @@ pub struct TalkFilter {
     pub session_id: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// The task the reader belongs to: the session at the top of the chain of
+    /// subagents it was started from, or its own id when nobody started it.
+    /// Filled in from the reader's session the same way `session_id` is, and
+    /// for the same reason — which task an agent is part of is not something
+    /// it should be able to claim.
+    #[serde(default)]
+    pub task: Option<String>,
     /// Read backwards from here, for paging into the past.
     #[serde(default)]
     pub before: Option<u64>,
@@ -698,6 +726,14 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
                 TalkSelector::Mine if filter.path.is_none() => true,
                 selector => selector.admits(filter.path.as_deref(), path, None),
             }
+        }
+        // A task is the one scope a machine boundary does not cut, so no
+        // machine selector applies to it. An agent that starts a subagent on
+        // another machine is still doing the same piece of work and the two of
+        // them have to hear each other; the machine on the scope only records
+        // where a thing was said. Being in the task is the whole of it.
+        TalkScope::Task { root_session, .. } => {
+            filter.owner || filter.task.as_deref() == Some(root_session.as_str())
         }
     }
 }
@@ -1410,6 +1446,97 @@ mod tests {
             .map(|message| message.seq)
             .collect();
         assert_eq!(from_two, vec![3]);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_task_is_read_by_its_members_and_reaches_across_machines() {
+        let store = store("task");
+        store
+            .post(draft(
+                "the retry lives in client.rs",
+                TalkScope::Task {
+                    machine: String::new(),
+                    root_session: "lead".into(),
+                },
+            ))
+            .unwrap();
+        // A subagent of the same task, running on another machine, filed on
+        // its own board and replicated here.
+        store
+            .merge(vec![TalkMessage {
+                id: "other-1234abcd:1".into(),
+                origin: "other-1234abcd".into(),
+                seq: 1,
+                ts: 20,
+                scope: TalkScope::Task {
+                    machine: "other-1234abcd".into(),
+                    root_session: "lead".into(),
+                },
+                author: TalkAuthor {
+                    machine: "other-1234abcd".into(),
+                    machine_label: "gpu-box".into(),
+                    voice: TalkVoice::default(),
+                },
+                kind: TalkKind::Message,
+                to: None,
+                reply_to: None,
+                text: "the pool is fine".into(),
+            }])
+            .unwrap();
+
+        let texts = |filter: &TalkFilter| -> Vec<String> {
+            store
+                .read(filter)
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        // Both halves of the task reach a member without it having to widen
+        // anything: a machine boundary does not cut a piece of work in two.
+        assert_eq!(
+            texts(&TalkFilter {
+                task: Some("lead".into()),
+                ..TalkFilter::default()
+            }),
+            // Oldest first, and the merged one carries a stamp from before
+            // this test started.
+            ["the pool is fine", "the retry lives in client.rs"]
+        );
+        // Somebody else's task, on the same machine and in the same
+        // directory, is none of this reader's business.
+        assert!(
+            texts(&TalkFilter {
+                task: Some("another-lead".into()),
+                path: Some("/work".into()),
+                machines: TalkSelector::All,
+                paths: TalkSelector::All,
+                ..TalkFilter::default()
+            })
+            .is_empty()
+        );
+        // Nor is asking for the scope by name a way into it.
+        assert!(
+            texts(&TalkFilter {
+                scope: Some("task".into()),
+                machines: TalkSelector::All,
+                ..TalkFilter::default()
+            })
+            .is_empty()
+        );
+        // The dashboard reads as the person the machines belong to and sees
+        // what the agents said, the same as it does for directs.
+        assert_eq!(
+            texts(&TalkFilter {
+                owner: true,
+                scope: Some("task".into()),
+                ..TalkFilter::default()
+            })
+            .len(),
+            2
+        );
 
         fs::remove_dir_all(&store.root).ok();
     }

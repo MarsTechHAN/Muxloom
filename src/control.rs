@@ -209,7 +209,9 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          - talk_read before you start and after you have been away: the board carries what every \
          other agent and every person at a dashboard is doing, on every machine. talk_post what \
          you are about to change before you change it, and post what you worked out as kind \
-         \"note\" so whoever comes next finds it instead of working it out again.\n\
+         \"note\" so whoever comes next finds it instead of working it out again. When you are \
+         running subagents, scope \"task\" keeps that work between you and them instead of in \
+         front of everyone on the machine.\n\
          - message_agent is how you ask one agent for something: it lands in that session's \
          prompt in an envelope that names you, and it is read when the turn it is in ends. Its \
          answer comes back as a direct message — wait for it with talk_read {{ scope: \
@@ -470,12 +472,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              how you wait to be answered. A wait that ends with nothing is not an answer of no: \
              it comes back with `waiting_on`, listing which of your own messages are still \
              unanswered and what the sessions holding them are doing, and calling it again is \
-             usually right. `before` pages into the past."
+             usually right. `before` pages into the past. scope \"task\" is narrower than any of \
+             that: just you, whoever started you, and the subagents any of you started."
         ),
         input_schema: schema(
             multi,
             json!({
-                "scope": { "type": "string", "enum": ["path", "machine", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
+                "scope": { "type": "string", "enum": ["path", "machine", "task", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
                 "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
                 "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
                 "limit": { "type": "integer", "description": "Newest N messages. Default 50." },
@@ -497,17 +500,21 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       found, and what you are about to change — this is how agents avoid \
                       colliding, and nobody is in charge of anyone else here. `scope` decides who \
                       it is for: \"path\" (default) is the board for one directory on one machine, \
-                      the project channel; \"machine\" is everyone on this machine; \"global\" is \
-                      everyone, everywhere — keep that one for things that genuinely travel. \
-                      kind \"note\" is the same thing meant to be kept and found later: decisions, \
-                      gotchas, where a thing lives. Posting does not interrupt anyone; to put a \
-                      message in front of one agent, use message_agent."
+                      the project channel; \"machine\" is everyone on this machine; \"task\" is the \
+                      piece of work you are part of — you, whoever started you, and every \
+                      subagent any of you started, wherever they run; \"global\" is everyone, \
+                      everywhere — keep that one for things that genuinely travel. Use \"task\" \
+                      to keep a team of subagents in step without putting half-finished work in \
+                      front of everyone else on the machine. kind \"note\" is the same thing meant \
+                      to be kept and found later: decisions, gotchas, where a thing lives. \
+                      Posting does not interrupt anyone; to put a message in front of one agent, \
+                      use message_agent."
             .into(),
         input_schema: schema(
             multi,
             json!({
                 "text": { "type": "string", "description": "What to say." },
-                "scope": { "type": "string", "enum": ["path", "machine", "global"], "description": "Who it is for. Default path." },
+                "scope": { "type": "string", "enum": ["path", "machine", "task", "global"], "description": "Who it is for. Default path." },
                 "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
                 "kind": { "type": "string", "enum": ["message", "note"], "description": "\"note\" is meant to be kept and searched later. Default message." },
                 "reply_to": { "type": "string", "description": "Message id this answers." },
@@ -1227,7 +1234,14 @@ fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
                      muxloom session that could name one",
                 )?,
         },
-        other => bail!("unknown scope {other}: use path, machine, or global"),
+        "task" => TalkScope::Task {
+            machine: String::new(),
+            root_session: task_root().context(
+                "scope \"task\" is the agents working on one piece of work, and this process is \
+                 not running inside a muxloom session that could say which one",
+            )?,
+        },
+        other => bail!("unknown scope {other}: use path, machine, task, or global"),
     };
     Ok(TalkDraft {
         scope,
@@ -1237,6 +1251,16 @@ fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
         reply_to: optional_str(arguments, "reply_to").map(Into::into),
         text: text.into(),
     })
+}
+
+/// The task the calling session belongs to: what the daemon worked out when it
+/// launched the session, and failing that the session itself.
+///
+/// The fallback is what a daemon too old to have said would have meant anyway —
+/// a session nobody started is its own task — so an agent talking to one is
+/// alone in its task rather than cut off from the scope.
+fn task_root() -> Option<String> {
+    session_env("MUXLOOM_TASK_ROOT").or_else(|| session_env("MUXLOOM_SESSION_ID"))
 }
 
 /// Who a direct message is from.
@@ -1330,8 +1354,10 @@ fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) 
 fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
     let scope = match optional_str(arguments, "scope") {
         None => None,
-        Some(scope @ ("global" | "machine" | "path" | "direct")) => Some(scope.to_string()),
-        Some(other) => bail!("unknown scope {other}: use path, machine, global, or direct"),
+        Some(scope @ ("global" | "machine" | "path" | "task" | "direct")) => {
+            Some(scope.to_string())
+        }
+        Some(other) => bail!("unknown scope {other}: use path, machine, task, global, or direct"),
     };
     Ok(TalkFilter {
         since: optional_str(arguments, "since_cursor")
@@ -1347,6 +1373,7 @@ fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
         path: optional_str(arguments, "path")
             .map(Into::into)
             .or_else(|| session_env("MUXLOOM_SESSION_PATH")),
+        task: task_root(),
         before: arguments.get("before").and_then(Value::as_u64),
         limit: optional_usize(arguments, "limit", 50),
         // An agent reads the board as the session it runs in. Seeing every
