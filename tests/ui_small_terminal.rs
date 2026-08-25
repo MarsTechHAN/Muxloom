@@ -7,9 +7,10 @@ use std::path::PathBuf;
 
 use muxloom::{
     app::{
-        App, BoardForm, BoardTab, HelpForm, LaunchForm, Modal, PathPickerForm, PortForwardForm,
-        ResumeForm, SearchForm, SettingsForm,
+        App, BoardForm, BoardTab, ChannelEdit, ChannelsForm, HelpForm, LaunchForm, Modal,
+        PathPickerForm, PortForwardForm, ResumeForm, SearchForm, SettingsForm,
     },
+    channel::{ChannelBinding, ChannelKind, ChannelSet},
     config::{Config, State},
     model::{AgentKind, AgentSession, Target},
     port_forward::{PortForwardState, PortForwardSummary},
@@ -140,6 +141,52 @@ fn port_forward_modal_never_panics() {
                 let mut form = port_forward_form(count);
                 form.selected = selected;
                 draw_with(Some(Modal::PortForward(form)), *w, *h);
+            }
+        }
+    }
+}
+
+#[test]
+fn channels_modal_never_panics() {
+    // The list and the form share a frame, and the form's height changes with
+    // the chat app it is describing, so both shapes are swept.
+    for (w, h) in SIZES {
+        for count in [0usize, 1, 5] {
+            let set = ChannelSet {
+                revision: 3,
+                bindings: (0..count)
+                    .map(|index| ChannelBinding {
+                        id: format!("lark-{index}"),
+                        kind: ChannelKind::Lark,
+                        label: "phone".into(),
+                        app_id: "cli_00000000000000".into(),
+                        secret: "s".repeat(64),
+                        route: "oc_0000000000000000000000000000".into(),
+                        preferred: index == 0,
+                    })
+                    .collect(),
+            };
+            for edit in [
+                None,
+                Some(ChannelEdit::default()),
+                Some(ChannelEdit {
+                    index: Some(0),
+                    kind: ChannelKind::WeCom,
+                    selected: 2,
+                    borrowed: Some("/home/somebody/.cc-connect/config.toml".into()),
+                    ..ChannelEdit::default()
+                }),
+            ] {
+                let form = ChannelsForm {
+                    set: set.clone(),
+                    selected: count.saturating_sub(1),
+                    edit,
+                    error: Some("Lark refused the message".into()),
+                    note: Some("lark-0 is bound".into()),
+                    reach: "On 2/3 machines".into(),
+                    dirty: true,
+                };
+                draw_with(Some(Modal::Channels(form)), *w, *h);
             }
         }
     }

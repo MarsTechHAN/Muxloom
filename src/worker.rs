@@ -184,6 +184,14 @@ pub enum Request {
     TalkPost {
         draft: Box<TalkDraft>,
     },
+    /// Post one message through one binding, on behalf of the person looking at
+    /// the communication panel. The binding travels rather than being read off
+    /// disk, because the point of the test is to find out whether what is in
+    /// the panel — not what was last saved — actually reaches anybody.
+    ChannelTest {
+        binding: Box<crate::channel::ChannelBinding>,
+        environment: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug)]
@@ -348,6 +356,12 @@ pub enum Event {
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
         result: Box<Result<TalkMessage, String>>,
+    },
+    /// What the communication panel's test message did. Carries the binding's
+    /// id rather than the binding, so nothing secret goes back through a queue.
+    ChannelTested {
+        id: String,
+        result: Result<String, String>,
     },
 }
 
@@ -1082,6 +1096,35 @@ impl Worker {
                         let _ = events.send(Event::TalkPosted {
                             result: Box::new(result),
                         });
+                    }
+                    Request::ChannelTest {
+                        binding,
+                        environment,
+                    } => {
+                        let message = crate::channel::Outgoing {
+                            title: "muxloom".into(),
+                            text: format!(
+                                "This channel is bound. Every agent on every enabled machine \
+                                 can reach you here from now on.{}",
+                                if binding.kind.listens() {
+                                    "\n\nReply to a card an agent sends and the answer goes \
+                                     back to that agent. `/who` lists them, `/select <name>` \
+                                     picks one for this chat."
+                                } else {
+                                    "\n\nThis kind of channel only sends: a reply here \
+                                     reaches nobody."
+                                }
+                            ),
+                            signature: "muxloom dashboard".into(),
+                        };
+                        let id = binding.id.clone();
+                        let result = crate::channel::send(&binding, &message, &environment)
+                            .map(|sent| sent.through)
+                            .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            debug::log("channel", format!("test through {id} failed: {error}"));
+                        }
+                        let _ = events.send(Event::ChannelTested { id, result });
                     }
                     Request::TalkSync {
                         targets,

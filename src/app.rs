@@ -11,6 +11,7 @@ use ratatui::{layout::Rect, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    channel::ChannelKind,
     config::{Config, State},
     debug,
     media::{MediaFrame, MediaPlayback, MediaUpdate},
@@ -222,6 +223,157 @@ impl PortForwardForm {
     pub fn active_index(&self) -> Option<usize> {
         self.selected.checked_sub(Self::FIELD_COUNT)
     }
+}
+
+/// One line of a channel binding's form. Which lines there are depends on the
+/// chat app: a Lark app is an id, a secret and a chat to post into, while a
+/// WeCom group robot is one key that already names its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelField {
+    Kind,
+    Label,
+    AppId,
+    Secret,
+    Route,
+}
+
+impl ChannelField {
+    /// What the field is called, in the words the platform's own console uses —
+    /// this form is filled in by copying from that console, so matching its
+    /// vocabulary is most of the help it needs.
+    pub fn label(self, kind: ChannelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Kind, _) => "Chat app",
+            (Self::Label, _) => "Name",
+            (Self::AppId, _) => "App id",
+            (Self::Secret, ChannelKind::Lark) => "App secret",
+            (Self::Secret, ChannelKind::WeCom) => "Webhook key",
+            (Self::Route, _) => "Chat id",
+        }
+    }
+
+    /// Where to go and find it.
+    pub fn hint(self, kind: ChannelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Kind, _) => "Left/Right to change",
+            (Self::Label, _) => "what a message says it came through",
+            (Self::AppId, _) => "cli_… from the Lark app console",
+            (Self::Secret, ChannelKind::Lark) => "the app secret beside that id",
+            (Self::Secret, ChannelKind::WeCom) => "the key= part of the robot's webhook URL",
+            (Self::Route, _) => "oc_… the app has been added to",
+        }
+    }
+
+    /// Whether the value is shown as bullets. A secret on a dashboard is a
+    /// secret on whatever is behind the person reading it.
+    pub fn hidden(self) -> bool {
+        matches!(self, Self::Secret)
+    }
+}
+
+/// One binding being written down.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelEdit {
+    /// Which entry of the list this replaces; `None` while it is a new one.
+    pub index: Option<usize>,
+    pub kind: ChannelKind,
+    pub label: String,
+    pub app_id: String,
+    pub secret: String,
+    pub route: String,
+    /// Which of [`ChannelEdit::fields`] the cursor is on.
+    pub selected: usize,
+    /// The file some of what is on screen was read out of, when it was not
+    /// typed here. Shown, because fields that fill themselves in are unnerving
+    /// when nothing says where they came from.
+    pub borrowed: Option<String>,
+}
+
+impl ChannelEdit {
+    pub fn fields(&self) -> &'static [ChannelField] {
+        match self.kind {
+            ChannelKind::Lark => &[
+                ChannelField::Kind,
+                ChannelField::Label,
+                ChannelField::AppId,
+                ChannelField::Secret,
+                ChannelField::Route,
+            ],
+            // No app id and no chat: the webhook URL is the whole address.
+            ChannelKind::WeCom => &[
+                ChannelField::Kind,
+                ChannelField::Label,
+                ChannelField::Secret,
+            ],
+        }
+    }
+
+    /// The field the cursor is on. Clamped rather than indexed, because
+    /// switching a Lark binding to WeCom shortens the form under the cursor.
+    pub fn field(&self) -> ChannelField {
+        let fields = self.fields();
+        fields[self.selected.min(fields.len() - 1)]
+    }
+
+    pub fn value(&self, field: ChannelField) -> &str {
+        match field {
+            ChannelField::Kind => self.kind.title(),
+            ChannelField::Label => &self.label,
+            ChannelField::AppId => &self.app_id,
+            ChannelField::Secret => &self.secret,
+            ChannelField::Route => &self.route,
+        }
+    }
+
+    /// The value under the cursor, when it is one a person types into.
+    fn typed(&mut self) -> Option<&mut String> {
+        match self.field() {
+            ChannelField::Kind => None,
+            ChannelField::Label => Some(&mut self.label),
+            ChannelField::AppId => Some(&mut self.app_id),
+            ChannelField::Secret => Some(&mut self.secret),
+            ChannelField::Route => Some(&mut self.route),
+        }
+    }
+
+    /// What the form says, as a binding. The id is kept when one is being
+    /// edited so that an agent's `channel: "lark-1"` keeps meaning what it did.
+    fn binding(&self, set: &crate::channel::ChannelSet) -> crate::channel::ChannelBinding {
+        let held = self.index.and_then(|index| set.bindings.get(index));
+        crate::channel::ChannelBinding {
+            id: held
+                .map(|binding| binding.id.clone())
+                .unwrap_or_else(|| set.mint_id(self.kind)),
+            kind: self.kind,
+            label: self.label.trim().to_string(),
+            app_id: self.app_id.trim().to_string(),
+            secret: self.secret.trim().to_string(),
+            route: self.route.trim().to_string(),
+            preferred: held.is_some_and(|binding| binding.preferred),
+        }
+    }
+}
+
+/// The communication panel: what this fleet can reach a human through.
+///
+/// It edits a copy. Every machine is brought to the dashboard's revision on the
+/// talk round, so a half-typed secret must not be able to travel; the list is
+/// only handed back to [`App::channels`] when the panel is closed.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelsForm {
+    pub set: crate::channel::ChannelSet,
+    pub selected: usize,
+    /// The binding being written, while the panel is on its form rather than
+    /// its list.
+    pub edit: Option<ChannelEdit>,
+    pub error: Option<String>,
+    pub note: Option<String>,
+    /// How far the last push round got, in words. Refreshed from the round
+    /// itself, because "saved" and "out there" are not the same thing and only
+    /// the second one means an agent can use it.
+    pub reach: String,
+    /// Whether the list has moved away from what the dashboard holds.
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -470,6 +622,7 @@ pub enum Modal {
     Moderator(ModeratorForm),
     Temporal(TemporalForm),
     PortForward(PortForwardForm),
+    Channels(ChannelsForm),
     ConfirmKill {
         session_id: String,
         label: String,
@@ -520,7 +673,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 80;
+pub const HELP_CONTENT_ROWS: usize = 87;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -2205,6 +2358,13 @@ impl App {
             }
             KeyCode::Char(' ') if self.focus == Focus::Agents => {
                 self.toggle_task_fold();
+                Action::Continue
+            }
+            // Not per-machine, though it is opened from the machine list: a
+            // channel belongs to the whole fleet, because the point of it is
+            // that any agent anywhere can reach the person who left.
+            KeyCode::Char('c') if self.focus == Focus::Machines => {
+                self.open_channels();
                 Action::Continue
             }
             KeyCode::Char(' ') if self.focus == Focus::Machines => {
@@ -5202,6 +5362,12 @@ impl App {
             } => {
                 self.talk_in_flight = false;
                 self.channel_sync = channels;
+                // The panel is watching this number: it is the only way to
+                // tell whether a secret typed a moment ago is out there yet.
+                let reach = self.channel_reach();
+                if let Some(Modal::Channels(form)) = self.modal.as_mut() {
+                    form.reach = reach;
+                }
                 self.absorb_inbox(*inbox, mail);
                 match result {
                     Ok(summary) => debug::log("talk", summary),
@@ -5239,6 +5405,9 @@ impl App {
                     self.set_error(format!("Could not post: {error}"));
                 }
             },
+            Event::ChannelTested { id, result } => {
+                self.absorb_channel_test(id, result.map_err(|error| short_error(&error)))
+            }
             Event::BackupSynced { result } => {
                 self.backup_in_flight = false;
                 match result {
@@ -7251,6 +7420,302 @@ impl App {
         self.status_message = format!("Starting {label}...");
     }
 
+    /// Open the communication panel on a copy of the bindings.
+    pub fn open_channels(&mut self) {
+        self.modal = Some(Modal::Channels(ChannelsForm {
+            set: self.channels.clone(),
+            reach: self.channel_reach(),
+            ..ChannelsForm::default()
+        }));
+    }
+
+    /// Hand what was written back to the dashboard, one revision on, and let
+    /// the next talk round carry it everywhere.
+    ///
+    /// Only when something changed. The revision is what every daemon compares
+    /// its copy against, so bumping it for a panel that was merely looked at
+    /// would have every machine in the fleet rewrite a file for nothing.
+    fn close_channels(&mut self, form: ChannelsForm) {
+        if !form.dirty {
+            return;
+        }
+        let mut set = form.set;
+        set.revision = self.channels.revision.max(set.revision).saturating_add(1);
+        self.channels = set;
+        if let Err(error) = self.channels.save(&self.channels_path) {
+            self.set_error(format!("Channels not saved: {error:#}"));
+            return;
+        }
+        // The push rides the talk round, which is a couple of seconds out. Ask
+        // for one now, so someone who has just typed a secret watches it land
+        // rather than wondering whether it took.
+        self.last_talk_sync = None;
+        self.status_message = match self.channels.bindings.len() {
+            0 => "No channel is bound; agents can no longer reach you".into(),
+            1 => "Channel saved; carrying it to every machine".into(),
+            count => format!("{count} channels saved; carrying them to every machine"),
+        };
+    }
+
+    /// What the panel says about how far the last round got. Read off the round
+    /// rather than remembered here, so it stays true as machines come and go.
+    fn channel_reach(&self) -> String {
+        let round = &self.channel_sync;
+        if round.asked == 0 {
+            return "Not carried anywhere yet".into();
+        }
+        let mut reach = format!(
+            "On {}/{} machine{}",
+            round.synced,
+            round.asked,
+            if round.asked == 1 { "" } else { "s" }
+        );
+        if let Some((machine, _)) = round.failures.first() {
+            reach.push_str(&format!(" · {machine} is behind"));
+        }
+        reach
+    }
+
+    fn handle_channels_key(&mut self, mut form: ChannelsForm, key: KeyEvent) {
+        form.error = None;
+        if let Some(edit) = form.edit.take() {
+            self.handle_channel_edit_key(form, edit, key);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_channels(form),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                form.selected = clamped_index(form.selected, form.set.bindings.len(), -1);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                form.selected = clamped_index(form.selected, form.set.bindings.len(), 1);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('n') => {
+                // A first Lark binding starts from cc-connect's credentials
+                // when that is what this machine already had.
+                let mut edit = ChannelEdit {
+                    selected: 1,
+                    ..ChannelEdit::default()
+                };
+                if let Some(borrowed) =
+                    crate::channel::borrow_cc_connect(&crate::channel::cc_connect_path())
+                {
+                    edit.app_id = borrowed.app_id;
+                    edit.secret = borrowed.secret;
+                    edit.route = borrowed.route;
+                    edit.borrowed = Some(borrowed.from.display().to_string());
+                }
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('e') | KeyCode::Char('i') => {
+                match form.set.bindings.get(form.selected) {
+                    Some(binding) => {
+                        form.edit = Some(ChannelEdit {
+                            index: Some(form.selected),
+                            kind: binding.kind,
+                            label: binding.label.clone(),
+                            app_id: binding.app_id.clone(),
+                            secret: binding.secret.clone(),
+                            route: binding.route.clone(),
+                            selected: 1,
+                            borrowed: None,
+                        });
+                    }
+                    None => form.error = Some("Nothing to edit — press n to bind a chat".into()),
+                }
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('x') => {
+                if form.selected < form.set.bindings.len() {
+                    let gone = form.set.bindings.remove(form.selected);
+                    form.selected = form.selected.min(form.set.bindings.len().saturating_sub(1));
+                    form.dirty = true;
+                    // Something has to be the default once the default is
+                    // gone, or every agent that names no channel is told to
+                    // choose between chats it cannot see.
+                    if gone.preferred
+                        && let Some(next) = form.set.bindings.first_mut()
+                    {
+                        next.preferred = true;
+                    }
+                    form.note = Some(format!("Removed {}", gone.id));
+                } else {
+                    form.error = Some("Nothing to remove".into());
+                }
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Enter => {
+                if form.set.bindings.get(form.selected).is_some() {
+                    for (index, binding) in form.set.bindings.iter_mut().enumerate() {
+                        binding.preferred = index == form.selected;
+                    }
+                    form.dirty = true;
+                    form.note = Some(format!(
+                        "{} is where a message that names no channel goes",
+                        form.set.bindings[form.selected].id
+                    ));
+                } else {
+                    form.error = Some("Nothing to make the default".into());
+                }
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('t') => self.test_channel(form),
+            _ => self.modal = Some(Modal::Channels(form)),
+        }
+    }
+
+    fn handle_channel_edit_key(
+        &mut self,
+        mut form: ChannelsForm,
+        mut edit: ChannelEdit,
+        key: KeyEvent,
+    ) {
+        let fields = edit.fields().len();
+        match key.code {
+            // Back to the list, not out of the panel: leaving a form is a
+            // smaller step than leaving what the form was part of.
+            KeyCode::Esc => self.modal = Some(Modal::Channels(form)),
+            KeyCode::Tab | KeyCode::Down => {
+                edit.selected = clamped_index(edit.selected, fields, 1);
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                edit.selected = clamped_index(edit.selected, fields, -1);
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Left | KeyCode::Right if edit.field() == ChannelField::Kind => {
+                let kinds = ChannelKind::ALL;
+                let index = kinds
+                    .iter()
+                    .position(|kind| *kind == edit.kind)
+                    .unwrap_or(0);
+                let step = if key.code == KeyCode::Left { -1 } else { 1 };
+                edit.kind = kinds[clamped_index(index, kinds.len(), step)];
+                edit.selected = edit.selected.min(edit.fields().len() - 1);
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Enter => self.save_channel_edit(form, edit),
+            KeyCode::Backspace => {
+                if let Some(value) = edit.typed() {
+                    value.pop();
+                }
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(value) = edit.typed() {
+                    value.clear();
+                }
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(value) = edit.typed() {
+                    value.push(character);
+                    // Whatever is on screen now is what the person typed, so
+                    // the note about where the old value came from is no
+                    // longer about anything on screen.
+                    edit.borrowed = None;
+                }
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+            _ => {
+                form.edit = Some(edit);
+                self.modal = Some(Modal::Channels(form));
+            }
+        }
+    }
+
+    fn save_channel_edit(&mut self, mut form: ChannelsForm, edit: ChannelEdit) {
+        let mut binding = edit.binding(&form.set);
+        if binding.label.is_empty() {
+            binding.label = binding.kind.title().to_string();
+        }
+        if let Err(error) = binding.ready() {
+            form.error = Some(format!("{error:#}"));
+            form.edit = Some(edit);
+            self.modal = Some(Modal::Channels(form));
+            return;
+        }
+        // The first binding is the default, because a fleet with one chat in it
+        // should not make anyone name it.
+        binding.preferred = binding.preferred || form.set.bindings.is_empty();
+        form.note = Some(format!("{} is bound", binding.id));
+        match edit.index {
+            Some(index) if index < form.set.bindings.len() => form.set.bindings[index] = binding,
+            _ => {
+                form.set.bindings.push(binding);
+                form.selected = form.set.bindings.len() - 1;
+            }
+        }
+        form.dirty = true;
+        self.modal = Some(Modal::Channels(form));
+    }
+
+    /// Say something through the selected binding, as the person at the
+    /// dashboard. The sending happens on the worker: it dials a chat API, and a
+    /// slow answer must not stop the dashboard from drawing.
+    fn test_channel(&mut self, mut form: ChannelsForm) {
+        let Some(binding) = form.set.bindings.get(form.selected).cloned() else {
+            form.error = Some("Nothing to test yet — press n to bind a chat".into());
+            self.modal = Some(Modal::Channels(form));
+            return;
+        };
+        if let Err(error) = binding.ready() {
+            form.error = Some(format!("{error:#}"));
+            self.modal = Some(Modal::Channels(form));
+            return;
+        }
+        let environment = self
+            .config
+            .environment_for(LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        form.note = Some(format!("Sending a test through {}…", binding.id));
+        if self
+            .worker
+            .requests
+            .send(Request::ChannelTest {
+                binding: Box::new(binding),
+                environment,
+            })
+            .is_err()
+        {
+            form.note = None;
+            form.error = Some("The worker is gone; nothing was sent".into());
+        }
+        self.modal = Some(Modal::Channels(form));
+    }
+
+    /// What came of that test. It lands in the panel when the panel is still
+    /// open and in the footer when it is not: either way the answer is not
+    /// dropped, because a test whose result vanishes tests nothing.
+    fn absorb_channel_test(&mut self, id: String, result: Result<String, String>) {
+        let (note, error) = match result {
+            Ok(through) => (Some(format!("{id} delivered · {through}")), None),
+            Err(error) => (None, Some(format!("{id}: {error}"))),
+        };
+        if let Some(Modal::Channels(form)) = self.modal.as_mut() {
+            form.note = note.clone();
+            form.error = error.clone();
+            return;
+        }
+        match error {
+            Some(error) => self.set_error(error),
+            None => self.status_message = note.unwrap_or_default(),
+        }
+    }
+
     fn open_port_forward(&mut self) {
         let Some(session) = self.selected_session().cloned() else {
             self.status_message = "Select an agent before configuring port forwarding".into();
@@ -8901,6 +9366,7 @@ impl App {
                 KeyCode::Enter => self.launch_temporary_agent(form),
                 _ => self.modal = Some(Modal::Temporal(form)),
             },
+            Modal::Channels(form) => self.handle_channels_key(form, key),
             Modal::PortForward(mut form) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Char('p') if form.selected >= PortForwardForm::FIELD_COUNT => {}
@@ -13452,6 +13918,195 @@ mod tests {
             Request::UploadFiles { ref remote_directory, .. } if remote_directory == "/work/project"
         ));
         let _ = std::fs::remove_file(dropped);
+    }
+
+    /// An app with the communication panel open on the given bindings.
+    ///
+    /// The channel file is redirected at a throwaway path: closing the panel
+    /// writes it, and a test must never write into whatever this machine
+    /// really uses to reach its human.
+    fn channels_app(
+        tag: &str,
+        bindings: Vec<crate::channel::ChannelBinding>,
+    ) -> (App, std::sync::mpsc::Receiver<Request>, PathBuf) {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "muxloom-panel-channels-{}-{tag}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.channels_path = path.clone();
+        app.channels = crate::channel::ChannelSet {
+            revision: 4,
+            bindings,
+        };
+        app.focus = Focus::Machines;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.modal, Some(Modal::Channels(_))),
+            "c on the machines panel opens the channels"
+        );
+        (app, request_rx, path)
+    }
+
+    fn channels_form(app: &App) -> &ChannelsForm {
+        match &app.modal {
+            Some(Modal::Channels(form)) => form,
+            _ => panic!("the channels panel closed"),
+        }
+    }
+
+    fn type_into(app: &mut App, text: &str) {
+        for character in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn a_binding_typed_into_the_panel_reaches_every_machine_one_revision_on() {
+        let (mut app, _requests, path) = channels_app("typed", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        type_into(&mut app, "phone");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "cli_9");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "shhh");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "oc_1");
+        // Bullets are what is drawn, not what is held: a masked field that
+        // stored its mask would bind a channel nothing could send through.
+        let edit = channels_form(&app).edit.as_ref().expect("still writing it");
+        assert_eq!(edit.secret, "shhh");
+        assert!(edit.field().hidden() || edit.field() == ChannelField::Route);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let form = channels_form(&app);
+        assert!(form.edit.is_none(), "saving goes back to the list");
+        assert_eq!(form.set.bindings.len(), 1);
+        assert!(
+            form.set.bindings[0].preferred,
+            "the only channel there is needs no naming"
+        );
+        // Nothing has left the panel yet: a half-typed secret must not be able
+        // to travel to every machine in the fleet.
+        assert_eq!(app.channels.revision, 4);
+        assert!(app.channels.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert_eq!(app.channels.revision, 5, "a newer list, so a newer number");
+        assert_eq!(app.channels.bindings[0].secret, "shhh");
+        assert_eq!(app.channels.bindings[0].id, "lark-1");
+        assert!(
+            app.last_talk_sync.is_none(),
+            "a round is asked for now rather than on the next tick"
+        );
+        assert_eq!(
+            crate::channel::ChannelSet::load(&path).unwrap(),
+            app.channels
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn switching_the_chat_app_asks_only_for_what_that_one_needs() {
+        let (mut app, _requests, path) = channels_app("switch", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            channels_form(&app).edit.as_ref().unwrap().field(),
+            ChannelField::Route
+        );
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let edit = channels_form(&app).edit.as_ref().unwrap();
+        assert_eq!(edit.kind, ChannelKind::WeCom);
+        // A robot's webhook URL already names its group, so there is no app id
+        // row and no chat id row to leave someone staring at.
+        assert_eq!(edit.fields().len(), 3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let error = channels_form(&app).error.clone().unwrap_or_default();
+        assert!(channels_form(&app).edit.is_some(), "nothing usable to save");
+        assert!(error.contains("webhook key"), "{error}");
+        assert!(!error.contains("app id"), "{error}");
+
+        // Two Tabs from the top is the key, whichever chat app is selected.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "abc123");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let form = channels_form(&app);
+        assert!(form.edit.is_none(), "{:?}", form.error);
+        assert_eq!(form.set.bindings[0].id, "wecom-1");
+        assert_eq!(form.set.bindings[0].secret, "abc123");
+        assert_eq!(
+            form.set.bindings[0].label,
+            ChannelKind::WeCom.title(),
+            "an unnamed binding is called what it is"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removing_the_default_hands_the_default_on() {
+        let binding = |id: &str, preferred: bool| crate::channel::ChannelBinding {
+            id: id.into(),
+            kind: ChannelKind::Lark,
+            label: id.into(),
+            app_id: "cli_9".into(),
+            secret: "shhh".into(),
+            route: "oc_1".into(),
+            preferred,
+        };
+        let (mut app, _requests, path) = channels_app(
+            "default",
+            vec![binding("lark-1", true), binding("lark-2", false)],
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let form = channels_form(&app);
+        assert_eq!(form.set.bindings.len(), 1);
+        assert!(
+            form.set.bindings[0].preferred,
+            "something has to be the default, or every agent that names no \
+             channel is asked to choose between chats it cannot see"
+        );
+        assert!(form.dirty);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_test_message_with_nothing_bound_says_which_key_binds_one() {
+        let (mut app, requests, path) = channels_app("test-key", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let error = channels_form(&app).error.clone().unwrap_or_default();
+        assert!(error.contains("press n"), "{error}");
+        assert!(
+            requests.try_recv().is_err(),
+            "nothing was asked of the worker"
+        );
+        // And nothing changed, so closing the panel leaves the fleet alone.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.channels.revision, 4);
+        assert!(!path.exists());
     }
 
     #[test]

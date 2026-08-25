@@ -307,6 +307,65 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(CHANNELS_FILE)
 }
 
+/// Credentials found somewhere else on this machine, offered as a starting
+/// point for a new binding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Borrowed {
+    /// The file they came out of, so the panel can say where the fields it
+    /// filled in came from rather than appearing to know them.
+    pub from: PathBuf,
+    pub app_id: String,
+    pub secret: String,
+    pub route: String,
+}
+
+/// Read a Lark app out of a `cc-connect` configuration, if there is one.
+///
+/// Somebody who already talks to their agents through cc-connect has a working
+/// app id and secret on disk; asking them to go back to the Lark console and
+/// find both again is the kind of small tax that stops a feature from being
+/// tried at all. Nothing is copied without being shown: these only ever land in
+/// a form the person is looking at, and only when they open a new binding.
+///
+/// The file is walked rather than deserialized into a fixed shape. cc-connect's
+/// own layout is not muxloom's to promise, and a key that moves into or out of
+/// a table should not turn a convenience into a parse error.
+pub fn borrow_cc_connect(path: &Path) -> Option<Borrowed> {
+    let text = fs::read_to_string(path).ok()?;
+    let table: toml::Value = text.parse().ok()?;
+    let mut found = Borrowed {
+        from: path.to_path_buf(),
+        ..Borrowed::default()
+    };
+    fn walk(value: &toml::Value, found: &mut Borrowed) {
+        let toml::Value::Table(table) = value else {
+            return;
+        };
+        for (key, value) in table {
+            if let toml::Value::String(text) = value {
+                let slot = match key.as_str() {
+                    "app_id" => &mut found.app_id,
+                    "app_secret" | "secret" => &mut found.secret,
+                    "chat_id" | "default_chat_id" => &mut found.route,
+                    _ => continue,
+                };
+                if slot.is_empty() {
+                    *slot = text.clone();
+                }
+            } else {
+                walk(value, found);
+            }
+        }
+    }
+    walk(&table, &mut found);
+    (!found.app_id.is_empty() && !found.secret.is_empty()).then_some(found)
+}
+
+/// Where cc-connect keeps the file above.
+pub fn cc_connect_path() -> PathBuf {
+    crate::config::expand_tilde("~/.cc-connect/config.toml")
+}
+
 /// Where Lark's open platform lives. `feishu.cn` and `larksuite.com` are the
 /// same API under two names; a `cli_…` app id issued by 飞书 belongs to this one.
 const LARK_HOST: &str = "https://open.feishu.cn";
@@ -1344,6 +1403,39 @@ mod tests {
         }
         assert_eq!(ChannelSet::load(&path).unwrap(), set);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_app_cc_connect_already_has_is_offered_wherever_it_keeps_it() {
+        let path = std::env::temp_dir().join(format!(
+            "muxloom-cc-connect-{}-{}.toml",
+            std::process::id(),
+            line!()
+        ));
+        // Nested, because cc-connect's own layout is not muxloom's to promise
+        // and a key that moves into a table should not silently stop working.
+        fs::write(
+            &path,
+            "log_level = \"info\"\n\n[feishu]\napp_id = \"cli_9\"\napp_secret = \"shhh\"\n\
+             [feishu.defaults]\nchat_id = \"oc_1\"\n",
+        )
+        .unwrap();
+        let borrowed = borrow_cc_connect(&path).expect("an app is there to borrow");
+        assert_eq!(borrowed.app_id, "cli_9");
+        assert_eq!(borrowed.secret, "shhh");
+        assert_eq!(borrowed.route, "oc_1");
+        assert_eq!(borrowed.from, path);
+
+        // Half an app is nothing to offer: prefilling one field of two reads as
+        // muxloom knowing something it does not.
+        fs::write(&path, "[feishu]\napp_id = \"cli_9\"\n").unwrap();
+        assert_eq!(borrow_cc_connect(&path), None);
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            borrow_cc_connect(&path),
+            None,
+            "and no file is not an error"
+        );
     }
 
     #[test]

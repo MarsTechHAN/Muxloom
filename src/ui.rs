@@ -21,9 +21,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BoardForm, BoardTab, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, LaunchField,
-        LaunchForm, MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
-        PortForwardForm, ResumeForm, SearchForm, SettingsForm, SettingsRow, SettingsScope,
+        App, BoardForm, BoardTab, ChannelEdit, ChannelField, ChannelsForm, FileManagerForm, Focus,
+        HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, MachineRow, Modal, ModeratorForm,
+        ModeratorRow, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
+        SettingsForm, SettingsRow, SettingsScope,
     },
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
@@ -1426,14 +1427,14 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         "  Cmd/Opt+Arrow panes  Shift/Opt+Enter newline  PgUp history"
     } else if area.width < 88 {
         match app.focus {
-            Focus::Machines => "  Space toggle  n new  / search  q quit",
+            Focus::Machines => "  Space toggle  n new  c channels  / search  q quit",
             Focus::Agents => "  Enter open  n new  t temporal  p ports  / search  q quit",
             Focus::Recap => "  Cmd/Opt+Arrow panes  PgUp history  / search  q quit",
         }
     } else {
         match app.focus {
             Focus::Machines => {
-                "  Space toggle  n new  , settings  / search  b board  q quit  ? more"
+                "  Space toggle  n new  c channels  , settings  / search  b board  q quit  ? more"
             }
             // The fold key is only worth a place in the line while something
             // in the list has subagents to fold away.
@@ -1522,6 +1523,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
         Modal::Temporal(form) => draw_temporal_modal(frame, form, outer, kinds),
         Modal::Moderator(form) => draw_moderator_modal(frame, form, outer, kinds),
         Modal::PortForward(form) => draw_port_forward_modal(frame, form, outer),
+        Modal::Channels(form) => draw_channels_modal(frame, form, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
             frame.render_widget(Clear, area);
@@ -3156,6 +3158,19 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "A machine another muxloom reaches; agents here can look at it",
         ),
         Line::raw(""),
+        help_header("Channels"),
+        help_row(
+            "c in Machines",
+            "Bind Lark or a WeCom robot so any agent can reach you",
+        ),
+        help_row("n / e / x there", "Add, edit, or remove a binding"),
+        help_row("Enter there", "Where a message that names no channel goes"),
+        help_row("t there", "Send yourself a test message through it"),
+        help_row(
+            "Reply in the chat",
+            "Answers the agent whose card you replied to; /who lists them",
+        ),
+        Line::raw(""),
         help_header("Moderators"),
         help_row(
             "Top row of Machines",
@@ -4649,6 +4664,220 @@ fn moderator_item_line(item: &crate::app::ScopeItem) -> String {
         if item.selected { "x" } else { " " },
         item.label
     )
+}
+
+/// The communication panel. Its list is the whole fleet's, not the selected
+/// machine's: a binding written here is pushed to every enabled machine, so
+/// that an agent finishing something at three in the morning on a machine
+/// nobody is watching can still say so.
+fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) {
+    let area = centered_rect(76, 18, outer);
+    frame.render_widget(Clear, area);
+    let title = match &form.edit {
+        Some(edit) => match edit.index.and_then(|index| form.set.bindings.get(index)) {
+            Some(binding) => format!(" Channel {} ", binding.id),
+            None => " New channel ".to_string(),
+        },
+        None => " Channels · how an agent reaches you ".to_string(),
+    };
+    let block = panel(&title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let hints = match &form.edit {
+        Some(_) => "Tab field   Left/Right chat app   Enter save   Esc back",
+        None => "n new   e edit   x remove   Enter default   t test   Esc save & close",
+    };
+    let message = match (&form.error, &form.note) {
+        (Some(error), _) => (truncate(error, inner.width as usize), Color::Red),
+        (None, Some(note)) => (truncate(note, inner.width as usize), Color::Green),
+        (None, None) => (String::new(), MUTED),
+    };
+    if let Some(row) = modal_row(inner, inner.height.saturating_sub(2)) {
+        frame.render_widget(
+            Paragraph::new(message.0).style(Style::default().fg(message.1)),
+            row,
+        );
+    }
+    if let Some(row) = modal_row(inner, inner.height.saturating_sub(1)) {
+        frame.render_widget(
+            Paragraph::new(truncate(hints, inner.width as usize)).style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    match &form.edit {
+        Some(edit) => draw_channel_edit(frame, form, edit, inner),
+        None => draw_channel_list(frame, form, inner),
+    }
+}
+
+fn draw_channel_list(frame: &mut Frame<'_>, form: &ChannelsForm, inner: Rect) {
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new("Bound chats").style(Style::default().fg(Color::Gray).bold()),
+            row,
+        );
+    }
+    if form.set.bindings.is_empty()
+        && let Some(row) = modal_row(inner, 1)
+    {
+        frame.render_widget(
+            Paragraph::new("None yet. Press n to bind Lark or a WeCom group robot.")
+                .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    // Two trailing rows carry the message and the hints, and four more the
+    // notes below the list.
+    let rows = usize::from(inner.height.saturating_sub(8)).max(1);
+    let first = form.selected.saturating_add(1).saturating_sub(rows);
+    for (visible, (index, binding)) in form
+        .set
+        .bindings
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .enumerate()
+    {
+        let Some(row) = modal_row(inner, 1 + visible as u16) else {
+            break;
+        };
+        let selected = index == form.selected;
+        let name = if binding.label.is_empty() {
+            binding.kind.title().to_string()
+        } else {
+            binding.label.clone()
+        };
+        let line = format!(
+            "{:<10}{name}  ·  {}{}",
+            binding.id,
+            binding.describes(),
+            if binding.preferred {
+                "  ·  default"
+            } else {
+                ""
+            }
+        );
+        frame.render_widget(
+            Paragraph::new(truncate(&line, inner.width as usize)).style(
+                Style::default()
+                    .fg(if binding.preferred {
+                        ACCENT
+                    } else {
+                        Color::White
+                    })
+                    .bg(if selected {
+                        Color::Rgb(42, 48, 58)
+                    } else {
+                        Color::Reset
+                    }),
+            ),
+            row,
+        );
+    }
+    // Everything below is said plainly rather than discovered: what a person
+    // most wants to know here is whether a message will actually arrive, and
+    // how long an answer takes to come back.
+    let notes = [
+        form.reach.clone(),
+        "Lark also listens: a reply goes back to the agent that spoke, read every ~5s.".into(),
+        "WeCom group robots only send. Personal WeChat has no API and is not offered.".into(),
+    ];
+    for (offset, note) in notes.iter().enumerate() {
+        let Some(row) = modal_row(inner, inner.height.saturating_sub(6) + offset as u16) else {
+            break;
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(note, inner.width as usize)).style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+}
+
+fn draw_channel_edit(frame: &mut Frame<'_>, form: &ChannelsForm, edit: &ChannelEdit, inner: Rect) {
+    let label_width = 14;
+    let fields = edit.fields();
+    let mut cursor = None;
+    for (index, field) in fields.iter().enumerate() {
+        let Some(row) = modal_row(inner, index as u16) else {
+            break;
+        };
+        let active = index == edit.selected.min(fields.len() - 1);
+        let value = edit.value(*field);
+        // A secret is shown as bullets whether or not the cursor is on it: the
+        // person typing it knows what they pasted, and everyone behind them
+        // does not need to.
+        let shown = if field.hidden() {
+            "•".repeat(value.chars().count().min(28))
+        } else {
+            value.to_string()
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<label_width$}", field.label(edit.kind)),
+                Style::default().fg(if active { ACCENT } else { Color::Gray }),
+            ),
+            Span::styled(
+                shown.clone(),
+                if active {
+                    Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+        ];
+        if active {
+            // Cut to what is left of the row rather than to the row, or a long
+            // secret pushes the hint off the edge mid-word.
+            let room = (inner.width as usize)
+                .saturating_sub(label_width + UnicodeWidthStr::width(shown.as_str()) + 2);
+            spans.push(Span::styled(
+                format!("  {}", truncate(field.hint(edit.kind), room)),
+                Style::default().fg(MUTED),
+            ));
+            if *field != ChannelField::Kind {
+                cursor = Some((
+                    inner
+                        .x
+                        .saturating_add(label_width as u16)
+                        .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
+                        .min(inner.x + inner.width.saturating_sub(1)),
+                    row.y,
+                ));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+    }
+    if let Some(borrowed) = &edit.borrowed
+        && let Some(row) = modal_row(inner, fields.len() as u16 + 1)
+    {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                &format!("Filled in from {borrowed} — check it, then Enter to save"),
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            row,
+        );
+    }
+    if form.set.bindings.is_empty()
+        && let Some(row) = modal_row(inner, inner.height.saturating_sub(4))
+    {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                "The first channel bound is the one a message that names none goes to.",
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    if let Some((x, y)) = cursor {
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn draw_port_forward_modal(frame: &mut Frame<'_>, form: &PortForwardForm, outer: Rect) {
