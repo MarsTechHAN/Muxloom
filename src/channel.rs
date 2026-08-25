@@ -710,6 +710,68 @@ fn send_lark(
     })
 }
 
+/// One chat a Lark app's bot has been added to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    pub id: String,
+    pub name: String,
+}
+
+/// The chats a Lark app can already talk in, newest first.
+///
+/// A chat id is `oc_` and thirty-odd characters of hexadecimal, and there is
+/// nowhere in the Lark client to copy one from — the way people find theirs is
+/// to open a chat in a browser and read the address bar. Asking is better: the
+/// app knows which chats it is in, and the answer comes back with the names
+/// they are known by.
+///
+/// One page. A hundred chats is far more than a bot bound to a dashboard is in,
+/// and paging a chooser nobody will scroll is complexity bought for nobody.
+pub fn chats(app_id: &str, secret: &str, environment: &[(String, String)]) -> Result<Vec<Chat>> {
+    // Borrows the token cache and the refusal check by borrowing the shape
+    // those want, so the two credentials being tried out here are checked
+    // exactly the way they will be when a message goes through them.
+    let asking = ChannelBinding {
+        id: "the app".into(),
+        kind: ChannelKind::Lark,
+        app_id: app_id.trim().into(),
+        secret: secret.trim().into(),
+        ..Default::default()
+    };
+    let authorization = format!("Bearer {}", tenant_token(&asking, environment)?);
+    let answer = http::get_json(
+        &format!("{LARK_HOST}/open-apis/im/v1/chats?page_size=100&sort_type=ByCreateTimeDesc"),
+        &[("Authorization", authorization.as_str())],
+        environment,
+    )
+    .context("could not ask Lark which chats this app is in")?;
+    lark_ok(&answer, "that request")?;
+    Ok(answer
+        .pointer("/data/items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("chat_id").and_then(Value::as_str)?;
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            Some(Chat {
+                id: id.to_string(),
+                // A group with no name set is not an error and should not read
+                // as an empty row; Lark itself shows these by their members.
+                name: match name.is_empty() {
+                    true => "(unnamed chat)".to_string(),
+                    false => name.to_string(),
+                },
+            })
+        })
+        .collect())
+}
+
 /// The bot behind one WeChat binding, in the terms the protocol wants.
 fn wechat_account(binding: &ChannelBinding) -> ilink::Account {
     ilink::Account {

@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use muxloom::{
     app::{
-        App, BoardForm, BoardTab, ChannelKeys, ChannelScan, ChannelStep, ChannelsForm, HelpForm,
-        LaunchForm, Modal, PathPickerForm, PortForwardForm, ResumeForm, ScanState, SearchForm,
-        SettingsForm,
+        App, BoardForm, BoardTab, ChannelChats, ChannelKeys, ChannelScan, ChannelStep,
+        ChannelsForm, HelpForm, LaunchForm, Modal, PathPickerForm, PortForwardForm, ResumeForm,
+        ScanState, SearchForm, SettingsForm,
     },
-    channel::{ChannelBinding, ChannelKind, ChannelSet},
+    channel::{ChannelBinding, ChannelKind, ChannelSet, Chat},
     config::{Config, State},
     model::{AgentKind, AgentSession, Target},
     port_forward::{PortForwardState, PortForwardSummary},
@@ -195,6 +195,23 @@ fn channels_modal_never_panics() {
                     borrowed: Some("/home/somebody/.cc-connect/config.toml".into()),
                     ..ChannelKeys::default()
                 })),
+                Some(ChannelStep::Chats(Box::default())),
+                Some(ChannelStep::Chats(Box::new(ChannelChats {
+                    found: Some(Vec::new()),
+                    ..ChannelChats::default()
+                }))),
+                Some(ChannelStep::Chats(Box::new(ChannelChats {
+                    found: Some(
+                        (0..6)
+                            .map(|index| Chat {
+                                id: format!("oc_{index}"),
+                                name: "a group with a rather long name on it".into(),
+                            })
+                            .collect(),
+                    ),
+                    selected: 5,
+                    ..ChannelChats::default()
+                }))),
                 Some(ChannelStep::Rename {
                     index: 0,
                     label: "the phone in my pocket".into(),

@@ -21,9 +21,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BoardForm, BoardTab, ChannelKeys, ChannelScan, ChannelStep, ChannelsForm,
-        FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, KeysField, LaunchField, LaunchForm,
-        MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
+        App, BoardForm, BoardTab, ChannelChats, ChannelKeys, ChannelScan, ChannelStep,
+        ChannelsForm, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, KeysField, LaunchField,
+        LaunchForm, MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
         PortForwardForm, ResumeForm, ScanState, SearchForm, SettingsForm, SettingsRow,
         SettingsScope,
     },
@@ -3167,7 +3167,11 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row(
             "n there",
-            "Bind a chat: WeChat is a scan, Lark asks for keys",
+            "Bind a chat: WeChat is a scan, Lark asks for two keys",
+        ),
+        help_row(
+            "Lark's chat list",
+            "The app's own chats, so no id has to be dug out of a URL",
         ),
         help_row(
             "r on the code",
@@ -4697,7 +4701,7 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
         None => " Channels · how an agent reaches you ".to_string(),
         Some(ChannelStep::Pick { .. }) => " Bind a chat ".to_string(),
         Some(ChannelStep::Scan(_)) => " Bind a chat · WeChat ".to_string(),
-        Some(ChannelStep::Keys(_)) => " Bind a chat · Lark ".to_string(),
+        Some(ChannelStep::Keys(_) | ChannelStep::Chats(_)) => " Bind a chat · Lark ".to_string(),
         Some(ChannelStep::Rename { index, .. }) => match form.set.bindings.get(*index) {
             Some(binding) => format!(" Rename {} ", binding.id),
             None => " Rename ".to_string(),
@@ -4713,7 +4717,8 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
         None => "n new   e rename   x remove   Enter default   t test   Esc save & close",
         Some(ChannelStep::Pick { .. }) => "Up/Down choose   Enter start   Esc back",
         Some(ChannelStep::Scan(_)) => "r new code   Esc back",
-        Some(ChannelStep::Keys(_)) => "Tab field   Enter bind   Esc back",
+        Some(ChannelStep::Keys(_)) => "Tab field   Enter find my chats   Esc back",
+        Some(ChannelStep::Chats(_)) => "Up/Down choose   Enter bind   r ask again   Esc back",
         Some(ChannelStep::Rename { .. }) => "Enter rename   Esc back",
     };
     let message = match (&form.error, &form.note) {
@@ -4743,6 +4748,7 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
         Some(ChannelStep::Pick { selected }) => draw_channel_pick(frame, *selected, body),
         Some(ChannelStep::Scan(scan)) => draw_channel_scan(frame, scan, body),
         Some(ChannelStep::Keys(keys)) => draw_channel_keys(frame, form, keys, body),
+        Some(ChannelStep::Chats(chats)) => draw_channel_chats(frame, chats, body),
         Some(ChannelStep::Rename { label, .. }) => draw_channel_rename(frame, label, body),
     }
 }
@@ -5061,6 +5067,76 @@ fn draw_channel_keys(frame: &mut Frame<'_>, form: &ChannelsForm, keys: &ChannelK
     }
     if let Some((x, y)) = cursor {
         frame.set_cursor_position((x, y));
+    }
+}
+
+/// The chats that app turned out to be in.
+///
+/// A list rather than a box to paste an `oc_…` into: those ids exist nowhere a
+/// person can copy them from, and the app already knows both the ids and the
+/// names the chats are known by.
+fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) {
+    let Some(found) = chats.found.as_deref() else {
+        if let Some(row) = modal_row(inner, 0) {
+            frame.render_widget(
+                Paragraph::new("Asking Lark which chats this app is in…")
+                    .style(Style::default().fg(MUTED)),
+                row,
+            );
+        }
+        return;
+    };
+    if found.is_empty() {
+        for (offset, line) in [
+            "That app is in no chats yet.",
+            "",
+            "In Lark, open the group you want and add the app's bot to it —",
+            "群设置 › 群机器人 › 添加机器人. Then press r.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let Some(row) = modal_row(inner, offset as u16) else {
+                break;
+            };
+            frame.render_widget(
+                Paragraph::new(truncate(line, inner.width as usize))
+                    .style(Style::default().fg(if offset == 0 { Color::Yellow } else { MUTED })),
+                row,
+            );
+        }
+        return;
+    }
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new("Which chat should agents reach you in?")
+                .style(Style::default().fg(Color::Gray).bold()),
+            row,
+        );
+    }
+    let rows = usize::from(inner.height.saturating_sub(2)).max(1);
+    let first = chats.selected.saturating_add(1).saturating_sub(rows);
+    for (visible, (index, chat)) in found.iter().enumerate().skip(first).take(rows).enumerate() {
+        let Some(row) = modal_row(inner, 2 + visible as u16) else {
+            break;
+        };
+        let active = index == chats.selected;
+        frame.render_widget(
+            Paragraph::new(truncate(
+                &format!("{} {}", if active { "▸" } else { " " }, chat.name),
+                inner.width as usize,
+            ))
+            .style(
+                Style::default()
+                    .fg(if active { Color::White } else { Color::Gray })
+                    .bg(if active {
+                        Color::Rgb(42, 48, 58)
+                    } else {
+                        Color::Reset
+                    }),
+            ),
+            row,
+        );
     }
 }
 

@@ -212,6 +212,17 @@ pub enum Request {
         alive: Arc<AtomicBool>,
         environment: Vec<(String, String)>,
     },
+    /// Ask Lark which chats an app's bot is in, so one can be chosen instead of
+    /// having its id copied out of a browser's address bar.
+    ChannelChats {
+        /// Which attempt this is, for the same reason a login carries one: a
+        /// person who corrected a typo and asked again must not be shown the
+        /// answer to what they corrected.
+        attempt: u64,
+        app_id: String,
+        secret: String,
+        environment: Vec<(String, String)>,
+    },
 }
 
 /// How far a WeChat login has got, in the steps a person sees.
@@ -402,6 +413,13 @@ pub enum Event {
     ChannelLogin {
         attempt: u64,
         step: LoginStep,
+    },
+    /// The chats a Lark app turned out to be in, or why asking failed. Failing
+    /// is the ordinary way a mistyped secret is found, so the reason is carried
+    /// rather than swallowed.
+    ChannelChats {
+        attempt: u64,
+        result: Result<Vec<crate::channel::Chat>, String>,
     },
 }
 
@@ -1207,6 +1225,16 @@ impl Worker {
                                 }
                             }
                         }
+                    }
+                    Request::ChannelChats {
+                        attempt,
+                        app_id,
+                        secret,
+                        environment,
+                    } => {
+                        let result = crate::channel::chats(&app_id, &secret, &environment)
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::ChannelChats { attempt, result });
                     }
                     Request::TalkSync {
                         targets,

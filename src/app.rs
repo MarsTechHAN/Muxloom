@@ -246,6 +246,8 @@ pub enum ChannelStep {
     /// left in this panel where somebody still has to copy something, and the
     /// screen says so rather than pretending otherwise.
     Keys(ChannelKeys),
+    /// Lark: which of the chats that app is already in.
+    Chats(Box<ChannelChats>),
     /// Renaming one that is already bound. The only part of a binding a person
     /// has any business changing now that the rest comes from the platform.
     Rename { index: usize, label: String },
@@ -301,11 +303,10 @@ pub enum KeysField {
     #[default]
     AppId,
     Secret,
-    Route,
 }
 
 impl KeysField {
-    pub const ALL: [Self; 3] = [Self::AppId, Self::Secret, Self::Route];
+    pub const ALL: [Self; 2] = [Self::AppId, Self::Secret];
 
     /// The words open.feishu.cn puts beside the box being copied out of. This
     /// step is filled in by looking back and forth between two screens, so
@@ -314,7 +315,6 @@ impl KeysField {
         match self {
             Self::AppId => "App ID",
             Self::Secret => "App Secret",
-            Self::Route => "Chat",
         }
     }
 
@@ -322,7 +322,6 @@ impl KeysField {
         match self {
             Self::AppId => "cli_… from 开发者后台 › 凭证与基础信息",
             Self::Secret => "the secret beside that id, on the same page",
-            Self::Route => "oc_… of a chat the bot has been added to",
         }
     }
 
@@ -333,11 +332,15 @@ impl KeysField {
     }
 }
 
-/// The Lark step's three strings.
+/// The Lark step's two strings.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelKeys {
     pub app_id: String,
     pub secret: String,
+    /// The chat cc-connect was pointed at, when there was one to borrow. Not
+    /// typed here — it is used to put the cursor on that chat once Lark has
+    /// said which chats there are, so an old configuration lands on the row it
+    /// already meant.
     pub route: String,
     pub selected: usize,
     /// The file some of this was read out of, when it was not typed here.
@@ -355,7 +358,6 @@ impl ChannelKeys {
         match field {
             KeysField::AppId => &self.app_id,
             KeysField::Secret => &self.secret,
-            KeysField::Route => &self.route,
         }
     }
 
@@ -363,9 +365,27 @@ impl ChannelKeys {
         match self.field() {
             KeysField::AppId => &mut self.app_id,
             KeysField::Secret => &mut self.secret,
-            KeysField::Route => &mut self.route,
         }
     }
+}
+
+/// Choosing which chat a Lark app should speak in.
+///
+/// A chat id is `oc_` and thirty-odd hex characters, and the Lark client offers
+/// no way to copy one — people find theirs by opening the chat in a browser and
+/// reading the address bar. So the app is asked instead: it knows which chats it
+/// is in, and it knows their names.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelChats {
+    /// Which ask this is, so a corrected typo's answer cannot be overtaken by
+    /// the answer to what was corrected.
+    pub attempt: u64,
+    /// What was typed to get here, so Esc goes back to it rather than to two
+    /// empty boxes.
+    pub keys: ChannelKeys,
+    /// None while Lark is still being asked.
+    pub found: Option<Vec<crate::channel::Chat>>,
+    pub selected: usize,
 }
 
 /// The communication panel: what this fleet can reach a human through.
@@ -696,7 +716,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 90;
+pub const HELP_CONTENT_ROWS: usize = 91;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -5441,6 +5461,7 @@ impl App {
                 self.absorb_channel_test(id, result.map_err(|error| short_error(&error)))
             }
             Event::ChannelLogin { attempt, step } => self.absorb_channel_login(attempt, step),
+            Event::ChannelChats { attempt, result } => self.absorb_channel_chats(attempt, result),
             Event::BackupSynced { result } => {
                 self.backup_in_flight = false;
                 match result {
@@ -7590,6 +7611,7 @@ impl App {
             }
             Some(ChannelStep::Scan(scan)) => self.handle_channel_scan_key(form, *scan, key),
             Some(ChannelStep::Keys(keys)) => self.handle_channel_keys_key(form, keys, key),
+            Some(ChannelStep::Chats(chats)) => self.handle_channel_chats_key(form, *chats, key),
             Some(ChannelStep::Rename { index, label }) => {
                 self.handle_channel_rename_key(form, index, label, key)
             }
@@ -7800,7 +7822,7 @@ impl App {
                 form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
-            KeyCode::Enter => self.save_lark_keys(form, keys),
+            KeyCode::Enter => self.ask_for_chats(form, keys),
             KeyCode::Backspace => {
                 keys.typed().pop();
                 form.step = Some(ChannelStep::Keys(keys));
@@ -7831,25 +7853,153 @@ impl App {
         }
     }
 
-    fn save_lark_keys(&mut self, mut form: ChannelsForm, keys: ChannelKeys) {
-        let binding = crate::channel::ChannelBinding {
-            id: form.set.mint_id(ChannelKind::Lark),
-            kind: ChannelKind::Lark,
-            label: "Lark".into(),
-            app_id: keys.app_id.trim().to_string(),
-            secret: keys.secret.trim().to_string(),
-            route: keys.route.trim().to_string(),
-            preferred: form.set.bindings.is_empty(),
-            ..Default::default()
-        };
-        if let Err(error) = binding.ready() {
-            form.error = Some(format!("{error:#}"));
+    /// Take the two credentials to Lark and ask what chats they can reach.
+    ///
+    /// This doubles as the check on them. A pair of strings that Lark will not
+    /// issue a token for fails here, with Lark's own words for why, rather than
+    /// silently becoming a binding that fails the first time an agent uses it.
+    fn ask_for_chats(&mut self, mut form: ChannelsForm, keys: ChannelKeys) {
+        if keys.app_id.trim().is_empty() || keys.secret.trim().is_empty() {
+            form.error = Some("Both the app id and the app secret, from open.feishu.cn".into());
             form.step = Some(ChannelStep::Keys(keys));
             self.modal = Some(Modal::Channels(form));
             return;
         }
-        self.adopt_binding(&mut form, binding);
+        self.channel_attempt = self.channel_attempt.saturating_add(1);
+        let environment = self
+            .config
+            .environment_for(LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        if self
+            .worker
+            .requests
+            .send(Request::ChannelChats {
+                attempt: self.channel_attempt,
+                app_id: keys.app_id.trim().to_string(),
+                secret: keys.secret.trim().to_string(),
+                environment,
+            })
+            .is_err()
+        {
+            form.error = Some("The worker is gone; Lark was not asked".into());
+            form.step = Some(ChannelStep::Keys(keys));
+        } else {
+            form.step = Some(ChannelStep::Chats(Box::new(ChannelChats {
+                attempt: self.channel_attempt,
+                keys,
+                found: None,
+                selected: 0,
+            })));
+        }
         self.modal = Some(Modal::Channels(form));
+    }
+
+    fn handle_channel_chats_key(
+        &mut self,
+        mut form: ChannelsForm,
+        mut chats: ChannelChats,
+        key: KeyEvent,
+    ) {
+        let found = chats.found.as_ref().map(Vec::len).unwrap_or_default();
+        match key.code {
+            // Back to the two strings, still filled in: getting here at all
+            // means they were good enough for Lark to issue a token, so making
+            // somebody retype them to change their mind would be perverse.
+            KeyCode::Esc => {
+                form.step = Some(ChannelStep::Keys(chats.keys));
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                chats.selected = clamped_index(chats.selected, found, -1);
+                form.step = Some(ChannelStep::Chats(Box::new(chats)));
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                chats.selected = clamped_index(chats.selected, found, 1);
+                form.step = Some(ChannelStep::Chats(Box::new(chats)));
+                self.modal = Some(Modal::Channels(form));
+            }
+            // The way back from "the bot is in no chats yet": add it to one in
+            // Lark, then ask again without retyping anything.
+            KeyCode::Char('r') => self.ask_for_chats(form, chats.keys),
+            KeyCode::Enter => match chats
+                .found
+                .as_ref()
+                .and_then(|found| found.get(chats.selected))
+            {
+                Some(chat) => {
+                    let binding = crate::channel::ChannelBinding {
+                        id: form.set.mint_id(ChannelKind::Lark),
+                        kind: ChannelKind::Lark,
+                        label: "Lark".into(),
+                        app_id: chats.keys.app_id.trim().to_string(),
+                        secret: chats.keys.secret.trim().to_string(),
+                        route: chat.id.clone(),
+                        route_label: chat.name.clone(),
+                        preferred: form.set.bindings.is_empty(),
+                        ..Default::default()
+                    };
+                    self.adopt_binding(&mut form, binding);
+                    self.modal = Some(Modal::Channels(form));
+                }
+                None => {
+                    form.error = Some(match chats.found.is_some() {
+                        true => "No chat to pick — add the bot to one, then press r".into(),
+                        false => "Still asking Lark…".to_string(),
+                    });
+                    form.step = Some(ChannelStep::Chats(Box::new(chats)));
+                    self.modal = Some(Modal::Channels(form));
+                }
+            },
+            _ => {
+                form.step = Some(ChannelStep::Chats(Box::new(chats)));
+                self.modal = Some(Modal::Channels(form));
+            }
+        }
+    }
+
+    /// Take Lark's answer about an app's chats, if the panel is still on the
+    /// ask that produced it.
+    fn absorb_channel_chats(
+        &mut self,
+        attempt: u64,
+        result: Result<Vec<crate::channel::Chat>, String>,
+    ) {
+        let Some(Modal::Channels(form)) = self.modal.as_mut() else {
+            return;
+        };
+        let Some(ChannelStep::Chats(chats)) = form.step.as_mut() else {
+            return;
+        };
+        if chats.attempt != attempt {
+            return;
+        }
+        match result {
+            Ok(found) => {
+                // An old cc-connect configuration named a chat; if it is one of
+                // these, start on it. Otherwise this is a fresh choice and the
+                // top of the list is as good a place as any.
+                chats.selected = found
+                    .iter()
+                    .position(|chat| chat.id == chats.keys.route.trim())
+                    .unwrap_or_default();
+                if found.is_empty() {
+                    form.note = Some(
+                        "That app is not in any chat yet. Add its bot to a group in Lark, \
+                         then press r."
+                            .into(),
+                    );
+                }
+                chats.found = Some(found);
+            }
+            Err(error) => {
+                let keys = chats.keys.clone();
+                form.error = Some(error);
+                // Straight back to the two strings: a refusal here is nearly
+                // always one of them, and the cursor should be where the fix is.
+                form.step = Some(ChannelStep::Keys(keys));
+            }
+        }
     }
 
     fn handle_channel_rename_key(
@@ -14417,7 +14567,7 @@ mod tests {
 
     #[test]
     fn a_lark_binding_typed_into_the_panel_reaches_every_machine_one_revision_on() {
-        let (mut app, _requests, path) = channels_app("typed", Vec::new());
+        let (mut app, requests, path) = channels_app("typed", Vec::new());
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -14425,23 +14575,56 @@ mod tests {
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_into(&mut app, "shhh");
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        type_into(&mut app, "oc_1");
         // Bullets are what is drawn, not what is held: a masked field that
         // stored its mask would bind a channel nothing could send through.
         match channel_step(&app) {
             ChannelStep::Keys(keys) => {
                 assert_eq!(keys.secret, "shhh");
                 assert!(KeysField::Secret.hidden());
-                assert_eq!(keys.field(), KeysField::Route);
+                assert_eq!(keys.field(), KeysField::Secret);
             }
             other => panic!("still writing it: {other:?}"),
         }
 
+        // Enter takes the credentials to Lark rather than binding blind: what
+        // comes back is both the list to choose from and the proof they work.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let attempt = match requests.try_recv() {
+            Ok(Request::ChannelChats {
+                attempt,
+                app_id,
+                secret,
+                ..
+            }) => {
+                assert_eq!(app_id, "cli_9");
+                assert_eq!(secret, "shhh");
+                attempt
+            }
+            other => panic!("Lark should have been asked: {other:?}"),
+        };
+        app.handle_worker_event(Event::ChannelChats {
+            attempt,
+            result: Ok(vec![
+                crate::channel::Chat {
+                    id: "oc_0".into(),
+                    name: "everyone".into(),
+                },
+                crate::channel::Chat {
+                    id: "oc_1".into(),
+                    name: "just me".into(),
+                },
+            ]),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let form = channels_form(&app);
         assert!(form.step.is_none(), "saving goes back to the list");
         assert_eq!(form.set.bindings.len(), 1);
+        assert_eq!(form.set.bindings[0].route, "oc_1");
+        assert_eq!(
+            form.set.bindings[0].route_label, "just me",
+            "the name is kept so the list reads as a chat, not as an id"
+        );
         assert!(
             form.set.bindings[0].preferred,
             "the only channel there is needs no naming"
@@ -14488,6 +14671,105 @@ mod tests {
             channel_step(&app),
             ChannelStep::Pick { selected: 1 }
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn what_lark_says_about_two_bad_strings_is_shown_over_the_two_strings() {
+        let (mut app, requests, path) = channels_app("refused", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into(&mut app, "cli_9");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "wrong");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let attempt = match requests.try_recv() {
+            Ok(Request::ChannelChats { attempt, .. }) => attempt,
+            other => panic!("Lark should have been asked: {other:?}"),
+        };
+        app.handle_worker_event(Event::ChannelChats {
+            attempt,
+            result: Err("Lark refused these credentials: app not found (code 10003)".into()),
+        });
+        // Lark's own words, and the cursor back where the mistake is — with
+        // both strings still there, because retyping the right one to fix the
+        // wrong one is the sort of thing that makes people give up.
+        let form = channels_form(&app);
+        assert!(
+            form.error.clone().unwrap_or_default().contains("10003"),
+            "{:?}",
+            form.error
+        );
+        match channel_step(&app) {
+            ChannelStep::Keys(keys) => {
+                assert_eq!(keys.app_id, "cli_9");
+                assert_eq!(keys.secret, "wrong");
+            }
+            other => panic!("back at the two strings: {other:?}"),
+        }
+        assert!(form.set.bindings.is_empty(), "nothing was bound");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_app_in_no_chats_is_told_how_to_get_into_one_rather_than_left_empty() {
+        let (mut app, requests, path) = channels_app("lonely", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into(&mut app, "cli_9");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "shhh");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let attempt = match requests.try_recv() {
+            Ok(Request::ChannelChats { attempt, .. }) => attempt,
+            other => panic!("Lark should have been asked: {other:?}"),
+        };
+        app.handle_worker_event(Event::ChannelChats {
+            attempt,
+            result: Ok(Vec::new()),
+        });
+        let note = channels_form(&app).note.clone().unwrap_or_default();
+        assert!(note.contains("Add its bot to a group"), "{note}");
+        // Enter on nothing binds nothing, and says what to do instead.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(channels_form(&app).set.bindings.is_empty());
+        assert!(
+            channels_form(&app)
+                .error
+                .clone()
+                .unwrap_or_default()
+                .contains("press r")
+        );
+        // And r asks again without making anybody retype the credentials.
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        match requests.try_recv() {
+            Ok(Request::ChannelChats {
+                attempt: again,
+                app_id,
+                secret,
+                ..
+            }) => {
+                assert!(again > attempt);
+                assert_eq!(app_id, "cli_9");
+                assert_eq!(secret, "shhh");
+            }
+            other => panic!("asked again: {other:?}"),
+        }
+        // An answer to the ask that was walked away from cannot land on the
+        // one being waited for.
+        app.handle_worker_event(Event::ChannelChats {
+            attempt,
+            result: Ok(vec![crate::channel::Chat {
+                id: "oc_0".into(),
+                name: "stale".into(),
+            }]),
+        });
+        match channel_step(&app) {
+            ChannelStep::Chats(chats) => assert!(chats.found.is_none(), "still waiting"),
+            other => panic!("still choosing: {other:?}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 
