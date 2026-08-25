@@ -24,6 +24,7 @@ mod platform {
     use anyhow::{Context, Result, anyhow, bail};
 
     use crate::{
+        channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession,
             Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PROTOCOL_VERSION, StreamOpened,
@@ -120,6 +121,10 @@ mod platform {
         pub triggers: PathBuf,
         pub talk: PathBuf,
         pub outbox: PathBuf,
+        /// The channels an agent here may speak to a human through, as the last
+        /// controller round left them. Secrets, so `0600` and never on the
+        /// board.
+        pub channels: PathBuf,
         /// Where a serving daemon keeps the copy of itself it starts keepers
         /// from, so a package manager cannot take that ability away from it
         /// mid-life. See `keeper_executable_for`.
@@ -172,6 +177,7 @@ mod platform {
                 triggers: root.join("triggers.json"),
                 outbox: root.join("talk/outbox.json"),
                 talk: root.join("talk"),
+                channels: crate::channel::path_in(&root),
                 bin: root.join("bin"),
                 root,
             }
@@ -245,6 +251,10 @@ mod platform {
         /// memory only: a job outlives neither the daemon nor the minute it
         /// was asked in.
         relay: Mutex<RelayQueue>,
+        /// The channels an agent on this machine may reach a human through,
+        /// pushed here by a controller and kept on disk so a restart does not
+        /// leave the machine mute until the next round.
+        channels: Mutex<ChannelSet>,
     }
 
     /// A stored trigger plus the edge state that decides when it fires.
@@ -431,6 +441,7 @@ mod platform {
             let armed = AtomicUsize::new(triggers.len());
             let outbox = load_outbox(&paths.outbox);
             let pending = AtomicUsize::new(outbox.len());
+            let channels = ChannelSet::read(&paths.channels);
             let keeper_executable = keeper_executable_for(&paths, keeper_mode);
             Self {
                 started: Instant::now(),
@@ -455,6 +466,7 @@ mod platform {
                 draining_outbox: AtomicBool::new(false),
                 directs: Mutex::new(HashMap::new()),
                 relay: Mutex::new(RelayQueue::default()),
+                channels: Mutex::new(channels),
             }
         }
 
@@ -1934,6 +1946,7 @@ mod platform {
                             TALK_CAPABILITY.into(),
                             DIRECT_CAPABILITY.into(),
                             RELAY_CAPABILITY.into(),
+                            CHANNELS_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -2211,6 +2224,37 @@ mod platform {
                 };
                 drop(relay);
                 write_response(writer, request_id, &response)
+            }
+            DaemonRequest::ChannelsPut { set } => {
+                let mut channels = state
+                    .channels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let changed = channels.adopt(set);
+                // Written while the lock is held so the file and the memory
+                // never disagree about which revision this machine is at.
+                let written = changed
+                    .then(|| channels.save(&state.paths.channels))
+                    .transpose();
+                drop(channels);
+                if let Err(error) = written {
+                    return write_response(
+                        writer,
+                        request_id,
+                        &DaemonResponse::Error {
+                            message: format!("failed to store the channel set: {error:#}"),
+                        },
+                    );
+                }
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
+            DaemonRequest::ChannelsGet => {
+                let set = state
+                    .channels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .redacted();
+                write_response(writer, request_id, &DaemonResponse::Channels { set })
             }
             DaemonRequest::RelayComplete { id, ok, output } => {
                 state
@@ -6243,6 +6287,82 @@ mod platform {
                 state.shutdown.load(Ordering::Acquire),
                 "a daemon that accepted a handover must stop even if the answer never arrived"
             );
+        }
+
+        /// A machine is told the channels once and remembers them. The file is
+        /// where an agent here looks when it has something to tell a human, so
+        /// it has to outlive the daemon that was handed it — and it has to be
+        /// unreadable to everyone else, because it holds an app secret.
+        #[test]
+        fn a_pushed_channel_set_is_kept_privately_and_answered_without_its_secret() {
+            use crate::channel::{ChannelBinding, ChannelKind};
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let state = test_state("channels");
+            let writer = Arc::new(Mutex::new(server));
+            let answer = |client: &mut UnixStream, id: u64| loop {
+                let frame = Frame::read_from(client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == id {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            };
+            let set = ChannelSet {
+                revision: 4,
+                bindings: vec![ChannelBinding {
+                    id: "lark-1".into(),
+                    kind: ChannelKind::Lark,
+                    label: "Team".into(),
+                    app_id: "cli_1".into(),
+                    secret: "shhh".into(),
+                    route: "oc_1".into(),
+                    preferred: true,
+                }],
+            };
+
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::ChannelsPut { set: set.clone() },
+            )
+            .unwrap();
+            assert!(matches!(answer(&mut client, 1), DaemonResponse::Ack));
+            assert_eq!(ChannelSet::read(&state.paths.channels), set);
+            let mode = fs::metadata(&state.paths.channels)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "an app secret must not be readable by others");
+
+            handle_request(&writer, &state, 2, DaemonRequest::ChannelsGet).unwrap();
+            match answer(&mut client, 2) {
+                DaemonResponse::Channels { set } => {
+                    assert_eq!(set.revision, 4);
+                    assert_eq!(set.bindings[0].route, "oc_1");
+                    assert!(
+                        set.bindings[0].secret.is_empty(),
+                        "the answer says what is bound, never what it is bound with"
+                    );
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+
+            // A controller that has fallen behind must not be able to take a
+            // machine's channels away from it.
+            handle_request(
+                &writer,
+                &state,
+                3,
+                DaemonRequest::ChannelsPut {
+                    set: ChannelSet::default(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(answer(&mut client, 3), DaemonResponse::Ack));
+            assert_eq!(ChannelSet::read(&state.paths.channels), set);
+
+            fs::remove_dir_all(&state.paths.root).ok();
         }
 
         #[test]

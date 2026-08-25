@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    channel::{CHANNELS_CAPABILITY, ChannelSet},
     daemon_protocol::{
         DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
         OpenStream, PROTOCOL_VERSION, Trigger, stream,
@@ -925,6 +926,24 @@ impl BridgeConnection {
     /// Hand back what a job produced, successfully or not.
     pub fn relay_complete(&self, id: String, ok: bool, output: String) -> Result<()> {
         self.expect_ack(DaemonRequest::RelayComplete { id, ok, output })
+    }
+
+    /// What channel set this machine holds, or `None` from a daemon too old to
+    /// hold one. The answer carries revision and shape, never a secret.
+    pub fn channels_get(&self) -> Result<Option<ChannelSet>> {
+        if !self.has_capability(CHANNELS_CAPABILITY) {
+            return Ok(None);
+        }
+        match self.request(DaemonRequest::ChannelsGet)?.response {
+            DaemonResponse::Channels { set } => Ok(Some(set)),
+            response => bail!("unexpected channels response: {response:?}"),
+        }
+    }
+
+    /// Hand this machine the channels it may speak through.
+    pub fn channels_put(&self, set: &ChannelSet) -> Result<()> {
+        self.require_capability(CHANNELS_CAPABILITY)?;
+        self.expect_ack(DaemonRequest::ChannelsPut { set: set.clone() })
     }
 
     fn has_capability(&self, capability: &str) -> bool {
@@ -2286,6 +2305,14 @@ impl BridgePool {
     ) -> Result<()> {
         self.connection_for_target(target)?
             .relay_complete(id, ok, output)
+    }
+
+    pub fn channels_get(&self, target: &Target) -> Result<Option<ChannelSet>> {
+        self.connection_for_target(target)?.channels_get()
+    }
+
+    pub fn channels_put(&self, target: &Target, set: &ChannelSet) -> Result<()> {
+        self.connection_for_target(target)?.channels_put(set)
     }
 
     /// The serving daemon's pid and client count.

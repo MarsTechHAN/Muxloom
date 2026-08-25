@@ -159,6 +159,11 @@ pub enum Request {
     TalkSync {
         targets: Vec<Target>,
         config: Box<Config>,
+        /// The channels the fleet may speak through, so the round can also put
+        /// every machine at the dashboard's revision. They travel with the
+        /// round rather than being read off disk here: the dashboard is the
+        /// only writer, and this way an edit is live on the next round.
+        channels: Box<crate::channel::ChannelSet>,
         /// What the dashboard's board already holds, so the round brings back
         /// only what was said since. Empty on the first round, which is how the
         /// board is filled the first time it is drawn.
@@ -323,6 +328,9 @@ pub enum Event {
         /// Machines another controller told one of these daemons it could
         /// reach, which this one cannot. Shown, never opened.
         forwarded: Vec<crate::relay::RelayPeer>,
+        /// How far the channel set got: which machines now hold this revision,
+        /// and which could not be told.
+        channels: crate::channel::ChannelRound,
     },
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
@@ -1065,6 +1073,7 @@ impl Worker {
                     Request::TalkSync {
                         targets,
                         config,
+                        channels,
                         board_since,
                     } => {
                         let result = crate::talk::run_sync(&runtime, &targets)
@@ -1087,6 +1096,11 @@ impl Worker {
                                 Vec::new()
                             }
                         };
+                        // And while the round is out: every machine that can
+                        // hold the channel set is brought to this revision, so
+                        // an agent anywhere can reach the human without the
+                        // dashboard having to be the one to speak.
+                        let channels = crate::channel::run_sync(&runtime, &targets, &channels);
                         // Whatever the round pulled is on the local board by
                         // now, so the dashboard reads one board rather than
                         // every machine in turn.
@@ -1095,6 +1109,7 @@ impl Worker {
                             result,
                             board,
                             forwarded,
+                            channels,
                         });
                     }
                 });

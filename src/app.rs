@@ -1168,6 +1168,14 @@ pub struct App {
     /// Shown so the fleet does not look smaller than it is, and never more
     /// than shown — the way there belongs to whoever is named on it.
     pub forwarded: Vec<crate::relay::RelayPeer>,
+    /// The ways to reach the human who is not at this dashboard. Edited here,
+    /// held here, and pushed to every machine on the talk round: an agent
+    /// sends its own messages, so every machine needs the credentials.
+    pub channels: crate::channel::ChannelSet,
+    /// Where the last push got to, for the panel to be honest about.
+    pub channel_sync: crate::channel::ChannelRound,
+    /// The file [`App::channels`] is read from and written to.
+    pub channels_path: PathBuf,
     pub sessions: Vec<AgentSession>,
     pub focus: Focus,
     pub selected_target: usize,
@@ -1351,6 +1359,13 @@ impl App {
             .to_path_buf();
         let history_cache_dir = state_dir.join("history");
         let backup_root = state_dir.join("backup");
+        let channels_path = crate::channel::path_in(&state_dir);
+        // A channel file that cannot be read must not keep the dashboard from
+        // starting: it means nothing can be sent until it is bound again.
+        let channels = crate::channel::ChannelSet::load(&channels_path).unwrap_or_else(|error| {
+            debug::log("channel", format!("{error:#}"));
+            crate::channel::ChannelSet::default()
+        });
         let statuses = targets
             .into_iter()
             .map(|target| {
@@ -1365,6 +1380,9 @@ impl App {
             state_path,
             targets: statuses,
             forwarded: Vec::new(),
+            channels,
+            channel_sync: crate::channel::ChannelRound::default(),
+            channels_path,
             sessions: Vec::new(),
             focus: Focus::Machines,
             selected_target: 0,
@@ -5163,8 +5181,10 @@ impl App {
                 result,
                 board,
                 forwarded,
+                channels,
             } => {
                 self.talk_in_flight = false;
+                self.channel_sync = channels;
                 match result {
                     Ok(summary) => debug::log("talk", summary),
                     Err(error) => debug::log("talk", format!("sync failed: {error}")),
@@ -5557,6 +5577,7 @@ impl App {
         let _ = self.worker.requests.send(Request::TalkSync {
             targets,
             config: Box::new(self.config.clone()),
+            channels: Box::new(self.channels.clone()),
             board_since: self.board.cursor.clone(),
         });
     }

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
+    channel::ChannelSet,
     model::{Composer, DirectoryListing, FileListing, FilePreview},
     relay::{RelayAnswer, RelayJob, RelayPeer},
     talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
@@ -384,6 +385,15 @@ pub enum DaemonRequest {
     /// An agent on this machine asking which other machines it can reach, which
     /// is whatever the last controller round named.
     RelayPeers,
+    /// A controller handing this machine the channels the fleet may speak
+    /// through, secrets included: an agent here sends its own messages, so the
+    /// credentials have to be here. Kept in a `0600` file beside the sessions.
+    ChannelsPut {
+        set: ChannelSet,
+    },
+    /// What this machine holds, so a controller can tell whether it is in step
+    /// without pushing the set again. The answer carries no secret.
+    ChannelsGet,
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -550,6 +560,13 @@ pub enum DaemonResponse {
         peers: Vec<RelayPeer>,
         #[serde(default)]
         attached: bool,
+    },
+    /// Answers `ChannelsGet`: the revision this machine holds and what the
+    /// bindings are for, with every secret blanked. The file on the machine is
+    /// the only place a secret rests.
+    Channels {
+        #[serde(default)]
+        set: ChannelSet,
     },
     Error {
         message: String,

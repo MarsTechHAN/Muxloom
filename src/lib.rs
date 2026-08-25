@@ -2,6 +2,7 @@ pub mod app;
 #[cfg(feature = "controller")]
 pub mod backup;
 pub mod bridge;
+pub mod channel;
 pub mod config;
 pub mod control;
 pub mod daemon;
