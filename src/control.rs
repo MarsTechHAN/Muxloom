@@ -15,6 +15,7 @@
 //! and the discovery tools that need a controller's view.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     path::PathBuf,
     thread,
@@ -28,12 +29,13 @@ use crate::{
     config::{Config, McpConfig, State, default_state_path},
     daemon_protocol::{DaemonSession, Trigger, TriggerAction},
     model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Target},
+    relay::now_ms,
     runtime::Runtime,
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
     talk::{
         MAX_TEXT, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind,
-        TalkMessage, TalkPage, TalkScope, TalkSelector, TalkState, TalkVoice, decode_cursor,
-        hostname, paste_bytes,
+        TalkMessage, TalkPage, TalkScope, TalkSelector, TalkState, TalkVector, TalkVoice,
+        decode_cursor, hostname, paste_bytes,
     },
 };
 
@@ -83,8 +85,20 @@ const WAIT_ERROR_TOLERANCE: usize = 3;
 /// The longest a `talk_read` may sit waiting for someone to say something, and
 /// how often it looks while it waits. Same reasoning as the wait ceiling: an
 /// answer of "nothing yet, here is your cursor" beats a dropped call.
-const TALK_MAX_WAIT_SECONDS: u64 = 120;
+///
+/// Two minutes was too short by a wide margin. An agent asked a question is
+/// usually in the middle of something else, and the answer comes when that
+/// finishes: on this board most replies take minutes and a fair number take
+/// far longer. A cap under the common case turns one wait into a poll loop the
+/// asker has to drive, and an asker that stops driving it never hears back at
+/// all. Same ceiling as `wait_for`, for the same reason.
+const TALK_MAX_WAIT_SECONDS: u64 = WAIT_MAX_TIMEOUT_SECONDS;
 const TALK_POLL: Duration = Duration::from_secs(2);
+/// How far back a timed-out wait looks for messages of its own still waiting
+/// on an answer. Longer than anyone reasonably waits in one call, so the
+/// question "is anything of mine outstanding" is answered from the whole
+/// exchange rather than from this call's window.
+const TALK_OUTSTANDING_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Every tool that changes something rather than reporting it. `read_only`
 /// denies exactly this set, so a tool added here is denied by that switch from
@@ -197,8 +211,11 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          you are about to change before you change it, and post what you worked out as kind \
          \"note\" so whoever comes next finds it instead of working it out again.\n\
          - message_agent is how you ask one agent for something: it lands in that session's \
-         prompt in an envelope that names you. Its answer comes back as a direct message — wait \
-         for it with talk_read {{ scope: \"direct\", wait_seconds }}.\n\
+         prompt in an envelope that names you, and it is read when the turn it is in ends. Its \
+         answer comes back as a direct message — wait for it with talk_read {{ scope: \
+         \"direct\", wait_seconds: {TALK_MAX_WAIT_SECONDS} }}, and call that again each time it \
+         returns nothing rather than asking twice. Minutes is normal. When you are the one asked, \
+         answer even if the answer is no: the agent waiting on you cannot act on silence.\n\
          - Nobody here is in charge of anyone else, and nothing you send has to be obeyed. Ask, \
          say why, and leave the other agent to judge it against what it is already doing.\n\n\
          Boundaries that are not negotiable:\n\
@@ -360,10 +377,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       session; a terminal has nobody in it to read. Every message is also filed on \
                       the talk board, so read your own with talk_read { scope: \"direct\" } — that \
                       is where replies arrive if the other agent is not sure how to reach you. \
-                      Delivery interrupts whoever is working there, so one message says everything \
-                      you have to say; there is a rate limit per session and it will tell you. \
-                      \"auto\" waits for a busy session to finish, up to a minute; \"when_idle\" \
-                      waits as long as it takes; \"now\" types it in mid-turn."
+                      A message lands whole even while that agent is mid-turn; it is read when \
+                      the turn ends, so one message should say everything you have to say. There \
+                      is a rate limit per session and it will tell you. \"auto\" is almost always \
+                      right; \"when_idle\" holds it back until the turn ends; \"now\" skips the \
+                      checks that keep a message out of a dialog box."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -371,7 +389,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "session_id": { "type": "string", "description": "Session id from list_sessions: who to tell." },
                 "text": { "type": "string", "description": "What to say. Say it as you would to a colleague: what you want, and what you already know." },
                 "deliver": { "type": "string", "enum": ["auto", "now", "when_idle"], "description": "When to put it in front of them. Default auto." },
-                "reply_expected": { "type": "boolean", "description": "Say that you are waiting on an answer. Then wait for it with talk_read { scope: \"direct\", wait_seconds }." },
+                "reply_expected": { "type": "boolean", "description": "Say that you are waiting on an answer, and ask for one even if it is no. Then wait with talk_read { scope: \"direct\", wait_seconds }, calling it again each time it returns nothing: an answer often takes several minutes." },
+                "reply_to": { "type": "string", "description": "The message_id this answers. Set it whenever you are replying — it is how the agent waiting on you knows its answer arrived." },
             }),
             &["session_id", "text"],
         ),
@@ -448,7 +467,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              `since_cursor` takes the `cursor` from a previous read and returns only what has \
              happened since, so polling never repeats itself; `wait_seconds` (up to \
              {TALK_MAX_WAIT_SECONDS}) holds the call open until something new is said, which is \
-             how you wait to be answered. `before` pages into the past."
+             how you wait to be answered. A wait that ends with nothing is not an answer of no: \
+             it comes back with `waiting_on`, listing which of your own messages are still \
+             unanswered and what the sessions holding them are doing, and calling it again is \
+             usually right. `before` pages into the past."
         ),
         input_schema: schema(
             multi,
@@ -1273,10 +1295,13 @@ fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) 
         "delivery": delivery,
         "reason": reason,
         "note": match delivery {
-            "delivered" => "it is in that agent's prompt now; any answer comes back as a direct \
-                            message, so read it with talk_read { scope: \"direct\", wait_seconds }",
-            "queued" => "that session is working; muxloom types it in when it stops. Do not send \
-                         it again — watch for the answer with talk_read { scope: \"direct\" }",
+            "delivered" => "it is in that agent's prompt now, and it reads it when the turn it is \
+                            in ends. An answer comes back as a direct message: wait for it with \
+                            talk_read { scope: \"direct\", wait_seconds }, and call that again \
+                            each time it returns nothing rather than sending this a second time",
+            "queued" => "muxloom types it in as soon as that session can take it, and tells you \
+                         above why it cannot yet. Do not send it again — wait for the answer with \
+                         talk_read { scope: \"direct\", wait_seconds }",
             _ => "the message is on the board, but nothing was typed into that session",
         },
     }))
@@ -1384,6 +1409,7 @@ fn talk_wait(
     arguments: &Value,
     mut filter: TalkFilter,
     mut read: impl FnMut(&TalkFilter) -> Result<TalkPage>,
+    sessions: impl FnOnce() -> Vec<DaemonSession>,
 ) -> Result<String> {
     let wait =
         Duration::from_secs(optional_u64(arguments, "wait_seconds", 0).min(TALK_MAX_WAIT_SECONDS));
@@ -1392,15 +1418,30 @@ fn talk_wait(
         let page = read(&filter)?;
         let elapsed = started.elapsed();
         if !page.messages.is_empty() || elapsed >= wait {
+            // A wait that ends empty is the one that needs explaining. Say
+            // which of the caller's own messages are still unanswered and what
+            // the sessions holding them are doing, so the next move is a fact
+            // rather than a guess.
+            let outstanding = if page.messages.is_empty() && !wait.is_zero() {
+                unanswered(&filter, &mut read, sessions)
+            } else {
+                Vec::new()
+            };
             return Ok(pretty(&json!({
                 "messages": page.messages.iter().map(talk_json).collect::<Vec<_>>(),
                 "cursor": page.cursor,
                 "truncated": page.truncated,
                 "waited_ms": elapsed.as_millis() as u64,
-                "note": page.truncated.then_some(
-                    "more messages matched than fit: read again with `before` set to the oldest \
-                     ts you got to page further back",
-                ),
+                "waiting_on": (!outstanding.is_empty()).then_some(&outstanding),
+                "note": if page.truncated {
+                    Some(
+                        "more messages matched than fit: read again with `before` set to the \
+                         oldest ts you got to page further back"
+                            .to_string(),
+                    )
+                } else {
+                    outstanding_note(&outstanding)
+                },
             })));
         }
         // Only what arrives from here on is news, and paging into the past is
@@ -1409,6 +1450,137 @@ fn talk_wait(
         filter.before = None;
         thread::sleep(TALK_POLL.min(wait - elapsed));
     }
+}
+
+/// The caller's own direct messages that nobody has answered, newest first,
+/// each with what the session holding it is doing right now.
+///
+/// "Answered" is the plain reading: a direct message back from that session
+/// after the one that was sent. Nothing here depends on `reply_to` being set,
+/// because most replies do not set it — the tools ask for it so a sender can
+/// match an answer to a question, not so muxloom can.
+fn unanswered(
+    filter: &TalkFilter,
+    read: &mut impl FnMut(&TalkFilter) -> Result<TalkPage>,
+    sessions: impl FnOnce() -> Vec<DaemonSession>,
+) -> Vec<Value> {
+    let Some(me) = filter.session_id.clone() else {
+        return Vec::new();
+    };
+    let mut directs = TalkFilter {
+        since: TalkVector::default(),
+        scope: Some("direct".into()),
+        kinds: vec!["direct".into()],
+        authors: Vec::new(),
+        query: None,
+        before: None,
+        limit: 200,
+        ..filter.clone()
+    };
+    directs.machines = TalkSelector::All;
+    let Ok(page) = read(&directs) else {
+        return Vec::new();
+    };
+    let recent = now_ms().saturating_sub(TALK_OUTSTANDING_MS);
+    let mine = |message: &TalkMessage| message.author.voice.session_id.as_deref() == Some(&me);
+    // The last time each session said anything to me at all. Newer than what I
+    // sent it means the exchange moved on, whatever it was about.
+    let mut answered: BTreeMap<&str, u64> = BTreeMap::new();
+    for message in &page.messages {
+        if message.to.as_ref().is_some_and(|to| to.session_id == me)
+            && let Some(from) = message.author.voice.session_id.as_deref()
+        {
+            let seen = answered.entry(from).or_default();
+            *seen = (*seen).max(message.ts);
+        }
+    }
+    let mut waiting: Vec<&TalkMessage> = page
+        .messages
+        .iter()
+        .filter(|message| mine(message) && message.ts >= recent)
+        .filter(|message| {
+            message.to.as_ref().is_some_and(|to| {
+                answered.get(to.session_id.as_str()).copied().unwrap_or(0) < message.ts
+            })
+        })
+        .collect();
+    // One entry per session, the last thing said to it: a follow-up does not
+    // become a second thing to wait on. Then oldest first, so whoever reads
+    // this sees the exchange that has been stalled longest at the top.
+    waiting.sort_by_key(|message| std::cmp::Reverse(message.ts));
+    let mut seen = BTreeSet::new();
+    waiting.retain(|message| {
+        message
+            .to
+            .as_ref()
+            .is_some_and(|to| seen.insert(to.session_id.clone()))
+    });
+    waiting.sort_by_key(|message| message.ts);
+    if waiting.is_empty() {
+        return Vec::new();
+    }
+    let sessions = sessions();
+    let now = now_ms();
+    waiting
+        .into_iter()
+        .map(|message| {
+            let to = message.to.as_ref().expect("filtered to addressed messages");
+            let session = sessions.iter().find(|session| session.id == to.session_id);
+            json!({
+                "message_id": message.id,
+                "to": { "machine": to.machine, "session_id": to.session_id },
+                "sent_seconds_ago": now.saturating_sub(message.ts) / 1000,
+                "text": message.text,
+                "state": session.map(|session| json!({
+                    "label": session.label,
+                    "working": session.working,
+                    "needs_attention": session.needs_attention,
+                    "attention_reason": session.attention_reason,
+                })),
+                "reading": reading(session, now.saturating_sub(message.ts)),
+            })
+        })
+        .collect()
+}
+
+/// What the state of the session holding an unanswered message means for the
+/// agent waiting on it.
+fn reading(session: Option<&DaemonSession>, waited_ms: u64) -> &'static str {
+    let Some(session) = session else {
+        return "that session is no longer on this machine; no answer is coming, so act without \
+                one or find another agent";
+    };
+    if session.dead || session.archived {
+        return "that session has ended; no answer is coming, so act without one or find another \
+                agent";
+    }
+    if session.needs_attention {
+        return "it is stopped on a question only a person can answer, and will not get to your \
+                message until somebody does; tell the human if you can reach one";
+    }
+    if session.working {
+        return "it is mid-turn — it has your message and answers when the turn ends; wait again";
+    }
+    if waited_ms < 2 * 60 * 1000 {
+        return "it is between turns and has only just been asked; wait again";
+    }
+    "it has been idle since, so it has probably read your message and decided it needs no answer, \
+     or forgot to send one; ask once more or carry on without it"
+}
+
+/// The one line that turns the list above into a next move.
+fn outstanding_note(outstanding: &[Value]) -> Option<String> {
+    let first = outstanding.first()?;
+    Some(format!(
+        "nothing new was said, and {} message{} of yours {} still unanswered — see `waiting_on`. \
+         An answer commonly takes several minutes, so calling this again with wait_seconds up to \
+         {TALK_MAX_WAIT_SECONDS} is usually the right move; sending the same thing twice is not. \
+         For the one you have waited longest on: {}",
+        outstanding.len(),
+        if outstanding.len() == 1 { "" } else { "s" },
+        if outstanding.len() == 1 { "is" } else { "are" },
+        first["reading"].as_str().unwrap_or_default(),
+    ))
 }
 
 fn pretty(value: &Value) -> String {
@@ -1954,9 +2126,12 @@ impl ControllerControl {
     fn talk_read(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        talk_wait(arguments, talk_filter(arguments)?, |filter| {
-            pool.talk_read(&target, filter.clone())
-        })
+        talk_wait(
+            arguments,
+            talk_filter(arguments)?,
+            |filter| pool.talk_read(&target, filter.clone()),
+            || pool.list_sessions(&target).unwrap_or_default(),
+        )
     }
 
     fn message_agent(&self, arguments: &Value) -> Result<String> {
@@ -2552,8 +2727,10 @@ mod daemon_surface {
         }
 
         fn talk_read(&self, arguments: &Value) -> Result<String> {
-            talk_wait(arguments, talk_filter(arguments)?, |filter| {
-                match self
+            talk_wait(
+                arguments,
+                talk_filter(arguments)?,
+                |filter| match self
                     .transact(&DaemonRequest::TalkRead {
                         filter: filter.clone(),
                     })?
@@ -2561,8 +2738,9 @@ mod daemon_surface {
                 {
                     DaemonResponse::Talk { page } => Ok(page),
                     response => bail!("unexpected talk response: {response:?}"),
-                }
-            })
+                },
+                || self.sessions().unwrap_or_default(),
+            )
         }
 
         /// Whether these arguments name a machine other than this one, in
@@ -2890,6 +3068,150 @@ impl ControlSurface for DaemonControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A board holding one exchange, so a wait can be run against it.
+    fn direct(seq: u64, from: &str, to: &str, ts: u64, text: &str) -> TalkMessage {
+        TalkMessage {
+            id: format!("here:{seq}"),
+            origin: "here".into(),
+            seq,
+            ts,
+            scope: TalkScope::Machine {
+                machine: "here".into(),
+            },
+            author: TalkAuthor {
+                machine: "here".into(),
+                machine_label: "tiger".into(),
+                voice: TalkVoice {
+                    session_id: Some(from.into()),
+                    label: Some(from.into()),
+                    kind: Some("claude".into()),
+                    human: false,
+                },
+            },
+            kind: TalkKind::Direct,
+            to: Some(TalkAddress {
+                machine: "here".into(),
+                session_id: to.into(),
+            }),
+            reply_to: None,
+            text: text.into(),
+        }
+    }
+
+    fn probe_session(id: &str, working: bool, attention: bool) -> DaemonSession {
+        DaemonSession {
+            id: id.into(),
+            kind: "claude".into(),
+            path: "/tmp".into(),
+            label: id.into(),
+            temporary: false,
+            created_at: 0,
+            pid: Some(1),
+            dead: false,
+            archived: false,
+            recap: None,
+            title: None,
+            thread: None,
+            working,
+            needs_attention: attention,
+            attention_reason: attention.then(|| "waiting on a person".into()),
+            composer: None,
+        }
+    }
+
+    #[test]
+    fn a_wait_that_ends_empty_says_which_of_its_own_messages_are_still_unanswered() {
+        let now = now_ms();
+        let board = vec![
+            // Answered: they said something back afterwards.
+            direct(1, "me", "settled", now - 600_000, "did you land that?"),
+            direct(2, "settled", "me", now - 500_000, "yes, an hour ago"),
+            // Outstanding, and the session is mid-turn.
+            direct(
+                3,
+                "me",
+                "thinking",
+                now - 400_000,
+                "can you take the lexer?",
+            ),
+            // Outstanding, asked twice; only the later one is worth reporting.
+            direct(4, "me", "gone-quiet", now - 300_000, "any thoughts?"),
+            direct(5, "me", "gone-quiet", now - 200_000, "still after those"),
+            // Somebody else's exchange is none of this session's business.
+            direct(6, "other", "thinking", now - 100_000, "and from me"),
+        ];
+        let filter = TalkFilter {
+            session_id: Some("me".into()),
+            ..TalkFilter::default()
+        };
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({ "scope": "direct", "wait_seconds": 1 }),
+                filter,
+                |_| {
+                    Ok(TalkPage {
+                        messages: Vec::new(),
+                        cursor: String::new(),
+                        truncated: false,
+                    })
+                },
+                Vec::new,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Nothing on the board to read means nothing to report, and no advice
+        // invented out of an empty exchange.
+        assert_eq!(answer["waiting_on"], Value::Null);
+        assert_eq!(answer["note"], Value::Null);
+
+        let filter = TalkFilter {
+            session_id: Some("me".into()),
+            ..TalkFilter::default()
+        };
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({ "scope": "direct", "wait_seconds": 1 }),
+                filter,
+                |filter| {
+                    // Nothing new is said while the wait runs. The look for
+                    // outstanding messages reaches every machine, and that is
+                    // the read the whole board answers.
+                    let sweep = matches!(filter.machines, TalkSelector::All);
+                    Ok(TalkPage {
+                        messages: if sweep { board.clone() } else { Vec::new() },
+                        cursor: String::new(),
+                        truncated: false,
+                    })
+                },
+                || {
+                    vec![
+                        probe_session("thinking", true, false),
+                        probe_session("gone-quiet", false, false),
+                    ]
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let waiting = answer["waiting_on"].as_array().unwrap();
+        assert_eq!(waiting.len(), 2, "{answer:#}");
+        // Oldest first, and the follow-up stands in for the pair.
+        assert_eq!(waiting[0]["message_id"], "here:3");
+        assert_eq!(waiting[1]["message_id"], "here:5");
+        assert!(
+            waiting[0]["reading"].as_str().unwrap().contains("mid-turn"),
+            "{answer:#}"
+        );
+        assert!(
+            waiting[1]["reading"].as_str().unwrap().contains("idle"),
+            "{answer:#}"
+        );
+        let note = answer["note"].as_str().unwrap();
+        assert!(note.contains("2 messages"), "{note}");
+        assert!(note.contains("mid-turn"), "{note}");
+    }
 
     #[test]
     fn key_names_encode_to_the_bytes_a_terminal_expects() {
@@ -3759,8 +4081,10 @@ mod tests {
             // A stand-in for Claude Code, because a bare shell no longer is
             // one: what decides whether a message goes in is the prompt box on
             // screen, so the stand-in draws a prompt box. It echoes each line
-            // it is handed, and carries the marker muxloom reads as working
-            // only once it has been told to look busy.
+            // it is handed, and starts out carrying the marker muxloom reads as
+            // working, which is how the test can tell the daemon's poll loop
+            // has actually looked at the screen and not just that the screen
+            // has something on it.
             let script = std::env::temp_dir().join(format!(
                 "mxl-fake-claude-{}-{}.sh",
                 std::process::id(),
@@ -3772,13 +4096,12 @@ mod tests {
             std::fs::write(
                 &script,
                 "rule='────────────────────────────────────────'\n\
-                 hint='  ⏵⏵ accepts edits on'\n\
+                 hint='  esc to interrupt'\n\
                  draw() { printf '%s\\n❯ \\n%s\\n%s\\n' \"$rule\" \"$rule\" \"$hint\"; }\n\
                  draw\n\
                  while IFS= read -r line; do\n\
                  \x20 printf '%s\\n' \"$line\"\n\
                  \x20 case $line in\n\
-                 \x20   *look-busy*) hint='  esc to interrupt' ;;\n\
                  \x20   *settled*) hint='  ⏵⏵ accepts edits on' ;;\n\
                  \x20 esac\n\
                  \x20 draw\n\
@@ -3818,6 +4141,33 @@ mod tests {
                     thread::sleep(Duration::from_millis(100));
                 }
             };
+            // What decides a delivery is the snapshot the daemon's poll loop
+            // writes, which lands a moment after the screen it was read from.
+            // Waiting on the daemon's own account of the session is the only
+            // way to know that pass has happened; waiting on the screen races
+            // it. The stand-in starts out working, so the flag going true and
+            // then false is a poll pass observed from the outside.
+            let reads = |surface: &mut DaemonControl, session: &str, working: bool| {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let listed: Value =
+                        serde_json::from_str(&call(surface, "list_sessions", json!({}))).unwrap();
+                    let seen = listed
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|entry| entry["session_id"] == session)
+                        .map(|entry| entry["working"] == Value::Bool(true));
+                    if seen == Some(working) {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{session} never read as working={working}: {listed:#}"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+            };
 
             // Nobody is reading a shell, so nothing is typed into one.
             let shell = launch(&mut surface, "terminal");
@@ -3832,6 +4182,13 @@ mod tests {
 
             // A session that is not working gets it straight away.
             let idle = launch(&mut surface, "claude");
+            reads(&mut surface, &idle, true);
+            call(
+                &mut surface,
+                "send_input",
+                json!({ "session_id": idle, "text": "settled", "submit": true }),
+            );
+            reads(&mut surface, &idle, false);
             let sent: Value = serde_json::from_str(&call(
                 &mut surface,
                 "message_agent",
@@ -3848,12 +4205,7 @@ mod tests {
             // A working session is left alone by a when_idle message, even
             // though its prompt box is empty and an ordinary one would go in.
             let busy = launch(&mut surface, "claude");
-            call(
-                &mut surface,
-                "send_input",
-                json!({ "session_id": busy, "text": "look-busy", "submit": true }),
-            );
-            until(&mut surface, &busy, "esc to interrupt");
+            reads(&mut surface, &busy, true);
             let queued: Value = serde_json::from_str(&call(
                 &mut surface,
                 "message_agent",

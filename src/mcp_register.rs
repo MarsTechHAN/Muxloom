@@ -174,7 +174,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 1;
+const SKILL_REVISION: u32 = 2;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -226,7 +226,7 @@ instead of deriving it again.
 To wait for someone rather than poll them:
 
 ```
-talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 60 }
+talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 300 }
 ```
 
 ## Ask another agent directly
@@ -237,15 +237,22 @@ message_agent { machine: \"gpu-1\", session_id: \"...\", text: \"...\" }
 
 It arrives in that session's prompt wrapped in an envelope naming you, the
 machine, and how to answer, so the agent knows it is talking to a colleague and
-not to its user. The reply comes back as a direct message:
+not to its user. A turn already in progress is not a problem: the message waits
+in the prompt and is read when that turn ends. The reply comes back as a direct
+message:
 
 ```
-talk_read { scope: \"direct\", wait_seconds: 120 }
+talk_read { scope: \"direct\", wait_seconds: 900 }
 ```
 
-Before you send: `list_sessions` says whether the target is `working` or
-`needs_attention`. Typing into a busy session interrupts it. `deliver:
-\"when_idle\"` waits for a gap instead.
+Waiting is the whole skill here. An agent you asked is usually in the middle of
+something, so minutes is normal and a wait that ends with nothing is not an
+answer of no — it comes back with `waiting_on`, saying which of your messages
+are unanswered and what those sessions are doing. Call it again. Sending the
+same thing twice does not make it arrive faster.
+
+When you are on the other end, answer. \"No\", \"not yet\", or \"wrong agent to
+ask\" all let the other side act; silence does not, and it is waiting.
 
 ## Watch instead of poll
 

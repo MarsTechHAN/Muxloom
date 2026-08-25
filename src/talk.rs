@@ -1038,15 +1038,29 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool) -> String {
         .as_deref()
         .map(|session| format!(" (session {session})"))
         .unwrap_or_default();
+    // The whole reply call, `reply_to` and all, so answering is one paste
+    // rather than three things to look up. A reply that carries the id is what
+    // lets the sender's wait end on the right message instead of on the next
+    // thing anyone happens to say.
+    let call = |session: &str| {
+        format!(
+            "message_agent {{ machine: \"{machine}\", session_id: \"{session}\", reply_to: \
+             \"{}\", text: \"…\" }}",
+            message.id
+        )
+    };
     let reply = match author.voice.session_id.as_deref() {
+        Some(session) if reply_expected => format!(
+            "The sender is blocked waiting on this answer and will keep waiting. Reply with the \
+             muxloom tool {} as soon as you know something — including if the answer is no, or \
+             not yet, or that you are the wrong agent to ask. Silence is the one answer it \
+             cannot act on.",
+            call(session)
+        ),
         Some(session) => format!(
-            "Reply with the muxloom tool message_agent {{ machine: \"{machine}\", session_id: \
-             \"{session}\" }}{}.",
-            if reply_expected {
-                " — the sender is waiting on an answer"
-            } else {
-                ", or ignore this if it does not concern what you are doing"
-            }
+            "Reply with the muxloom tool {}, or ignore this if it does not concern what you are \
+             doing.",
+            call(session)
         ),
         None => "Say anything back on the talk board with talk_post; the sender is not a muxloom \
                  session, so there is nowhere to reply directly."
@@ -1583,10 +1597,27 @@ mod tests {
         assert!(envelope.contains(
             "--- message ---\nlook at src/talk.rs\nline 40 is wrong\n--- end of message ---"
         ));
-        assert!(envelope.contains(
-            "message_agent { machine: \"gpu-box\", session_id: \"session-1\" }, or ignore this"
-        ));
-        assert!(render_delivery(&message, true).contains("waiting on an answer"));
+        // The reply call is complete enough to paste, `reply_to` included —
+        // that id is what ends the sender's wait on this answer rather than on
+        // the next thing anyone says.
+        assert!(
+            envelope.contains(&format!(
+                "message_agent {{ machine: \"gpu-box\", session_id: \"session-1\", reply_to: \
+                 \"{}\", text: \"…\" }}, or ignore this",
+                message.id
+            )),
+            "{envelope}"
+        );
+        let awaited = render_delivery(&message, true);
+        assert!(
+            awaited.contains("blocked waiting on this answer"),
+            "{awaited}"
+        );
+        // An answer of no is still an answer, and the envelope says so.
+        assert!(
+            awaited.contains("including if the answer is no"),
+            "{awaited}"
+        );
 
         // A message from something that is not a session says so instead of
         // pointing at a reply address that does not exist.
