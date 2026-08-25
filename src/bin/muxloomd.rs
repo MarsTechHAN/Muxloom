@@ -39,18 +39,35 @@ fn hand_over(controller: &str) -> Result<()> {
     Err(anyhow::Error::new(error).context(format!("failed to run {controller} mcp")))
 }
 
-#[cfg(not(unix))]
-fn hand_over(controller: &str) -> Result<()> {
-    use anyhow::Context;
-    let status = std::process::Command::new(controller)
-        .arg("mcp")
-        .status()
-        .with_context(|| format!("failed to run {controller} mcp"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("{controller} mcp exited with {status}")
+/// This machine's control surface, over stdio.
+///
+/// Every agent on this machine has the same entry, and it points here. A
+/// moderator is the exception: its work is the fleet, so it is handed to the
+/// controller beside this daemon before anything is served, taking over these
+/// very pipes.
+#[cfg(unix)]
+fn mcp_entry(paths: &DaemonPaths) -> Result<()> {
+    let session_path = std::env::var("MUXLOOM_SESSION_PATH").ok();
+    let daemon = std::env::current_exe().unwrap_or_default();
+    if let Some(controller) =
+        muxloom::mcp_register::handover_to_controller(&paths.root, session_path.as_deref(), &daemon)
+    {
+        return hand_over(&controller);
     }
+    let mut surface = muxloom::control::DaemonControl::new()?;
+    muxloom::mcp::serve(
+        &mut surface,
+        "muxloomd",
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    )
+}
+
+/// Off Unix there is no daemon to serve a surface for, and no state directory
+/// to read one out of: `DaemonPaths` there is a stub with nothing in it.
+#[cfg(not(unix))]
+fn mcp_entry(_: &DaemonPaths) -> Result<()> {
+    bail!("muxloomd is currently supported on Unix targets")
 }
 
 fn run() -> Result<()> {
@@ -60,28 +77,7 @@ fn run() -> Result<()> {
         Some("bridge") => bridge(&paths),
         Some("keeper") => keeper_entry(),
         Some("stop") => stop(&paths),
-        Some("mcp") => {
-            // Every agent on this machine has the same entry, and it points
-            // here. A moderator is the exception: its work is the fleet, so it
-            // is handed to the controller beside this daemon before anything is
-            // served, taking over these very pipes.
-            let session_path = std::env::var("MUXLOOM_SESSION_PATH").ok();
-            let daemon = std::env::current_exe().unwrap_or_default();
-            if let Some(controller) = muxloom::mcp_register::handover_to_controller(
-                &paths.root,
-                session_path.as_deref(),
-                &daemon,
-            ) {
-                return hand_over(&controller);
-            }
-            let mut surface = muxloom::control::DaemonControl::new()?;
-            muxloom::mcp::serve(
-                &mut surface,
-                "muxloomd",
-                std::io::stdin().lock(),
-                std::io::stdout().lock(),
-            )
-        }
+        Some("mcp") => mcp_entry(&paths),
         Some("status") => {
             match request_status(&paths)? {
                 DaemonResponse::Status {

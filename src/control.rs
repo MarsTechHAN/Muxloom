@@ -1267,6 +1267,10 @@ fn launching_session() -> Option<String> {
 ///
 /// Leaving `path` out is the ordinary case and means the caller's own folder,
 /// so starting a subagent takes no argument the agent has to look up.
+///
+/// The surface that consults it is the daemon's, which exists only where the
+/// daemon does; the rule it states is worth testing everywhere all the same.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
     let Some(path) = optional_str(arguments, "path") else {
         return Ok(own.to_string());

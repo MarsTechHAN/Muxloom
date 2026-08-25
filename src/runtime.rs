@@ -3012,6 +3012,12 @@ const CODEX_PLACEHOLDERS: [&str; 3] = [
 /// means it was never looked for, because this is a runtime whose box muxloom
 /// has not learned; callers read that as "no reason to hold anything back",
 /// which is what muxloom did for every runtime before it could read one.
+///
+/// Only the daemon reads a prompt box, and there is no daemon off Unix, so
+/// this and everything under it are unreachable there. Allowed rather than
+/// `cfg`'d out: it is plain text work, and the tests for it are worth running
+/// wherever they can run.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn composer(kind: AgentKind, screen: &str) -> Option<Composer> {
     let mut lines: Vec<&str> = screen.lines().collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
