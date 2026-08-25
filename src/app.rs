@@ -391,8 +391,12 @@ pub struct ChannelChats {
 /// The communication panel: what this fleet can reach a human through.
 ///
 /// It edits a copy. Every machine is brought to the dashboard's revision on the
-/// talk round, so a half-written secret must not be able to travel; the list is
-/// only handed back to [`App::channels`] when the panel is closed.
+/// talk round, so a half-written secret must not be able to travel: what is
+/// being typed stays in the step it is being typed in, and only a whole binding
+/// is handed to [`App::channels`]. That happens the moment one is bound rather
+/// than when the panel is closed — a binding this panel does not hold on to is
+/// a binding the platform handed over entire, and one nothing is listening to
+/// is worse than useless.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelsForm {
     pub set: crate::channel::ChannelSet,
@@ -7566,22 +7570,35 @@ impl App {
         if !form.dirty {
             return;
         }
-        let mut set = form.set;
-        set.revision = self.channels.revision.max(set.revision).saturating_add(1);
-        self.channels = set;
-        if let Err(error) = self.channels.save(&self.channels_path) {
-            self.set_error(format!("Channels not saved: {error:#}"));
+        if let Err(error) = self.publish_channels(form.set) {
+            self.set_error(format!("Channels not saved: {error}"));
             return;
         }
-        // The push rides the talk round, which is a couple of seconds out. Ask
-        // for one now, so someone who has just typed a secret watches it land
-        // rather than wondering whether it took.
-        self.last_talk_sync = None;
         self.status_message = match self.channels.bindings.len() {
             0 => "No channel is bound; agents can no longer reach you".into(),
             1 => "Channel saved; carrying it to every machine".into(),
             count => format!("{count} channels saved; carrying them to every machine"),
         };
+    }
+
+    /// Make this the fleet's channel set: written down here, carried everywhere
+    /// on the next round.
+    ///
+    /// The revision is taken from whichever of the two is further along, so a
+    /// set that has been through the panel and a set the inbox has been writing
+    /// tokens into cannot talk each other backwards.
+    fn publish_channels(&mut self, set: crate::channel::ChannelSet) -> Result<(), String> {
+        let mut set = set;
+        set.revision = self.channels.revision.max(set.revision).saturating_add(1);
+        self.channels = set;
+        self.channels
+            .save(&self.channels_path)
+            .map_err(|error| format!("{error:#}"))?;
+        // The push rides the talk round, which is a couple of seconds out. Ask
+        // for one now, so someone who has just bound a chat watches it land
+        // rather than wondering whether it took.
+        self.last_talk_sync = None;
+        Ok(())
     }
 
     /// What the panel says about how far the last round got. Read off the round
@@ -8050,7 +8067,18 @@ impl App {
         }
     }
 
-    /// Put a freshly bound chat in the list and leave the panel on it.
+    /// Put a freshly bound chat in the list, make it live, and leave the panel
+    /// on it.
+    ///
+    /// Live straight away, and not when the panel is closed, because nothing in
+    /// a binding that got this far was typed: the platform handed all of it
+    /// back, so there is nothing left to review. Waiting was actively wrong for
+    /// WeChat. A ClawBot can only answer a conversation somebody else started,
+    /// so the panel asks for a hello — and the token that hello carries is the
+    /// one thing that lets the bot ever speak. Only the live set is listened
+    /// to, so a binding sitting in a draft form is a binding whose hello nobody
+    /// hears: the test refuses, nothing arrives, and the channel looks broken
+    /// because it is.
     fn adopt_binding(&mut self, form: &mut ChannelsForm, binding: crate::channel::ChannelBinding) {
         // The first binding is the default, because a fleet with one chat in it
         // should not make anyone name it.
@@ -8063,6 +8091,12 @@ impl App {
         form.selected = form.set.bindings.len() - 1;
         form.step = None;
         form.dirty = true;
+        if let Err(error) = self.publish_channels(form.set.clone()) {
+            form.error = Some(format!("Bound, but not saved: {error}"));
+        }
+        // And start listening now rather than on the next turn of the ordinary
+        // round, for the same reason.
+        self.last_inbox_poll = None;
     }
 
     /// Take one step of a WeChat scan. Anything from an attempt the panel has
@@ -8122,10 +8156,6 @@ impl App {
                         .into(),
                 );
                 self.modal = Some(Modal::Channels(form));
-                // The first message is what carries the token that lets it
-                // answer, so start listening now rather than on the next turn
-                // of the ordinary round.
-                self.last_inbox_poll = None;
             }
         }
     }
@@ -14516,10 +14546,25 @@ mod tests {
         let note = form.note.clone().unwrap_or_default();
         assert!(note.contains("say anything"), "{note}");
 
+        // And the hello that note asks for has to be heard, which means the
+        // binding is live now — not when somebody remembers to close the panel.
+        // Only the live set is listened to, and the token that hello carries is
+        // the one thing that ever lets this bot speak.
+        assert_eq!(
+            app.channels.bindings.len(),
+            1,
+            "a scanned bot nothing is listening to is a bot that never works"
+        );
+        assert_eq!(app.channels.revision, 5, "and every machine is told");
+        assert!(
+            app.last_inbox_poll.is_none(),
+            "the hello is seconds away, so the next round reads the chat"
+        );
+
         // The first thing the human says carries the token that lets it answer,
         // and that has to reach every machine, not just this one.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.channels.revision, 5);
+        assert_eq!(app.channels.revision, 6);
         app.absorb_inbox(
             app.inbox.clone(),
             crate::channel::InboxRound {
@@ -14530,7 +14575,7 @@ mod tests {
         assert_eq!(app.channels.bindings[0].context_token, "ctx-9");
         assert!(app.channels.bindings[0].ready().is_ok());
         assert_eq!(
-            app.channels.revision, 6,
+            app.channels.revision, 7,
             "every machine needs the token, so the list moves on"
         );
         assert!(app.status_message.contains("can answer now"));
@@ -14629,14 +14674,17 @@ mod tests {
             form.set.bindings[0].preferred,
             "the only channel there is needs no naming"
         );
-        // Nothing has left the panel yet: a half-typed secret must not be able
-        // to travel to every machine in the fleet.
-        assert_eq!(app.channels.revision, 4);
-        assert!(app.channels.is_empty());
+        // A chat picked off a list Lark itself answered with is not a draft —
+        // those two strings have already been as far as a tenant token — so it
+        // is live and on its way to every machine before the panel is closed.
+        // Nothing was live while the secret was still being typed: it took a
+        // round trip to Lark to get here at all.
+        assert_eq!(app.channels.revision, 5);
+        assert_eq!(app.channels.bindings[0].route, "oc_1");
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.modal.is_none());
-        assert_eq!(app.channels.revision, 5, "a newer list, so a newer number");
+        assert_eq!(app.channels.revision, 6, "a newer list, so a newer number");
         assert_eq!(app.channels.bindings[0].secret, "shhh");
         assert_eq!(app.channels.bindings[0].id, "lark-1");
         assert!(

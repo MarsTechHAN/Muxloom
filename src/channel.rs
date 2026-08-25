@@ -1255,6 +1255,13 @@ pub struct Incoming {
     /// WeChat: the token that has to travel on anything said back. Empty for
     /// Lark, which needs no such thing.
     pub context_token: String,
+    /// Said before anything here was listening, so it is read for what it
+    /// carries and not delivered to anybody.
+    ///
+    /// It is not the same as having been handled: nothing was done about it and
+    /// nothing will be. What it is still good for is the token above, which is
+    /// the only thing that ever lets a WeChat bot speak.
+    pub stale: bool,
 }
 
 fn now_ms() -> u64 {
@@ -1360,6 +1367,7 @@ fn lark_inbox(
             at,
             text,
             context_token: String::new(),
+            stale: false,
         });
     }
     Ok(said)
@@ -1387,8 +1395,15 @@ fn wechat_inbox(
     let held = inbox.cursors.get(&binding.id);
     // No cursor at all means this dashboard has never read this chat — either
     // it was just bound, or whatever remembered where it had got to is gone.
-    // Either way, catch up silently: waking an agent with a conversation that
-    // happened before it existed is worse than missing it.
+    // Either way this round is a catch-up and nothing in it is delivered:
+    // waking an agent with a conversation that happened before it existed is
+    // worse than missing it.
+    //
+    // Read, though, rather than thrown away. What comes back on a first round
+    // is most often the hello the panel has just asked for, and the token that
+    // hello carries is the only thing that will ever let this bot answer. A
+    // round dropped whole is a bot that stays mute until the person thinks to
+    // say something a second time.
     let first = held.is_none();
     let cursor = held.cloned().unwrap_or_default();
     let round = ilink::updates(&wechat_account(binding), &cursor, environment)?;
@@ -1400,13 +1415,11 @@ fn wechat_inbox(
         return Ok(Vec::new());
     }
     inbox.waking.remove(&binding.id);
-    if first {
-        return Ok(Vec::new());
-    }
     Ok(round
         .said
         .into_iter()
         .map(|said| Incoming {
+            stale: first,
             // WeChat does not always number a message. The cursor is what
             // actually keeps a round from repeating itself; this only has to be
             // different from its neighbours.
@@ -1520,28 +1533,10 @@ pub fn run_inbox(
             round.asleep.push(binding.id.clone());
         }
         for message in said {
-            let newest = inbox.seen.entry(binding.id.clone()).or_default();
-            *newest = (*newest).max(message.at);
-            if inbox.handled.contains(&message.message_id) {
+            let Some(answering) = absorb(&message, binding, inbox, &mut round) else {
                 continue;
-            }
-            inbox.mark(&message.message_id);
-            round.read += 1;
-            // The token off this very message is the one that can answer it.
-            // Anything older may already have been spent, so the reply below
-            // goes out through a binding holding the newest there is.
-            let answering = match message.context_token.is_empty() {
-                true => binding.clone(),
-                false => {
-                    round
-                        .refreshed
-                        .push((binding.id.clone(), message.context_token.clone()));
-                    ChannelBinding {
-                        context_token: message.context_token.clone(),
-                        ..binding.clone()
-                    }
-                }
             };
+            round.read += 1;
             let answer = handle(&mut desk, binding, &message, inbox);
             round.routed.push(format!("{}: {answer}", binding.id));
             // The answer is itself something a human can reply to, so it is
@@ -1577,6 +1572,48 @@ pub fn run_inbox(
         debug::log("channel", format!("{binding}: {error}"));
     }
     round
+}
+
+/// Take everything off one inbound message that is worth keeping, and say
+/// whether anybody should be told about it.
+///
+/// `Some` is the binding to answer through — the one holding the token off this
+/// very message, since anything older may already have been spent. `None` means
+/// the message has been accounted for and nothing more happens to it.
+///
+/// The order is the point. A message from before this dashboard was listening
+/// is not worth waking an agent with, and a message already dealt with must not
+/// be dealt with twice — but both still move the bookkeeping on, and a WeChat
+/// one still carries the one thing that ever lets its bot speak. Refusing to
+/// look at a message you have decided not to deliver is how a bot that has
+/// been said hello to stays mute.
+fn absorb(
+    message: &Incoming,
+    binding: &ChannelBinding,
+    inbox: &mut Inbox,
+    round: &mut InboxRound,
+) -> Option<ChannelBinding> {
+    let newest = inbox.seen.entry(binding.id.clone()).or_default();
+    *newest = (*newest).max(message.at);
+    if !message.context_token.is_empty() {
+        round
+            .refreshed
+            .push((binding.id.clone(), message.context_token.clone()));
+    }
+    if inbox.handled.contains(&message.message_id) {
+        return None;
+    }
+    inbox.mark(&message.message_id);
+    if message.stale {
+        return None;
+    }
+    Some(match message.context_token.is_empty() {
+        true => binding.clone(),
+        false => ChannelBinding {
+            context_token: message.context_token.clone(),
+            ..binding.clone()
+        },
+    })
 }
 
 /// The fleet, as one round of reading needs it: listed once, however many
@@ -2327,6 +2364,50 @@ mod tests {
             route("go ahead", None, "wechat-2", true, &inbox).0,
             Route::Board { asked: false }
         );
+    }
+
+    #[test]
+    fn a_message_nobody_was_listening_for_still_gives_up_the_token_that_answers_it() {
+        let binding = wechat("wechat-1");
+        let mut inbox = Inbox::default();
+        let mut round = InboxRound::default();
+        let hello = Incoming {
+            message_id: "m_1".into(),
+            reply_to: None,
+            at: 1_787_659_402_199,
+            text: "hello".into(),
+            context_token: "ctx-fresh".into(),
+            // The catch-up round a chat nothing had read yet comes back with.
+            stale: true,
+        };
+
+        // Not delivered — nobody here was around to be told — and yet the whole
+        // point of reading it is kept, because a ClawBot with no token is a bot
+        // that cannot say a word.
+        assert!(absorb(&hello, &binding, &mut inbox, &mut round).is_none());
+        assert_eq!(
+            round.refreshed,
+            vec![("wechat-1".to_string(), "ctx-fresh".to_string())]
+        );
+        assert_eq!(round.read, 0);
+        assert_eq!(inbox.seen.get("wechat-1"), Some(&1_787_659_402_199));
+
+        // The next thing they say is theirs to answer, through a binding
+        // holding the token that came with it rather than the one on file.
+        let asked = Incoming {
+            message_id: "m_2".into(),
+            context_token: "ctx-newer".into(),
+            stale: false,
+            ..hello.clone()
+        };
+        let answering =
+            absorb(&asked, &binding, &mut inbox, &mut round).expect("that one is for somebody");
+        assert_eq!(answering.context_token, "ctx-newer");
+        assert_eq!(answering.secret, binding.secret, "same bot, newer token");
+
+        // And an overlapping window handing the same message back does not
+        // deliver it twice.
+        assert!(absorb(&asked, &binding, &mut inbox, &mut round).is_none());
     }
 
     #[test]
