@@ -581,11 +581,11 @@ denied_tools = []
 # Observation only: deny every tool that changes something.
 read_only = false
 
-# Chat channels — the Lark app or WeCom robot an agent reaches you through —
-# are not configured here. They hold secrets and this file is meant to be
-# readable (and committed to a dotfile repository); they live in a 0600 file
-# beside the state instead. Bind one in the dashboard: focus the machines
-# panel and press c.
+# Chat channels — the WeChat bot or Lark app an agent reaches you through — are
+# not configured here. They hold secrets and this file is meant to be readable
+# (and committed to a dotfile repository); they live in a 0600 file beside the
+# state instead. Bind one in the dashboard: focus the machines panel and press
+# c. WeChat takes a scan and about ten seconds.
 
 [agents.codex]
 command = "codex"

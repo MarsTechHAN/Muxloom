@@ -544,18 +544,20 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         // machine, it reaches a person. Which machine dials the chat app is
         // muxloom's business, and the message says where it came from anyway.
         description: "Reach the human who is not at a dashboard, through the chat app they bound \
-                      to muxloom (Lark, or a WeCom group robot). Use it when something they are \
-                      waiting on is finished, when you are blocked on a decision only they can \
-                      make, or when a long run ends while nobody is watching — and not otherwise: \
-                      this arrives on somebody's phone. One message per milestone, never a \
-                      progress log. Write it as a summary they can act on: `title` says what \
-                      happened, `text` is markdown (headings, lists, tables, code fences and \
-                      links all render) and should open with the conclusion, then the numbers, \
-                      then what you need from them and exactly how to answer. muxloom signs it \
-                      with the machine and session you are in, so do not write that yourself, and \
-                      never put a token, a key, or an absolute home path in it. Their reply comes \
-                      back to you as a direct message: watch for it with talk_read { scope: \
-                      \"direct\", wait_seconds }."
+                      to muxloom (WeChat, or Lark). Use it when something they are waiting on is \
+                      finished, when you are blocked on a decision only they can make, or when a \
+                      long run ends while nobody is watching — and not otherwise: this arrives on \
+                      somebody's phone. One message per milestone, never a progress log. Write it \
+                      as a summary they can act on: `title` says what happened, and `text` opens \
+                      with the conclusion, then the numbers, then what you need from them and \
+                      exactly how to answer. Write `text` as markdown, but keep to short lines \
+                      and plain lists: Lark renders headings, tables and code fences, WeChat \
+                      renders none of them and gets a flattened version where the words and line \
+                      breaks survive and the marks do not. muxloom signs it with the machine and \
+                      session you are in, so do not write that yourself, and never put a token, a \
+                      key, or an absolute home path in it. Their reply comes back to you as a \
+                      direct message: watch for it with talk_read { scope: \"direct\", \
+                      wait_seconds }."
             .into(),
         input_schema: schema(
             false,
@@ -3823,6 +3825,17 @@ mod tests {
                 "a channel message goes to a person, not to a machine"
             );
             assert_eq!(tool.input_schema["required"], json!(["text"]));
+            // Both chats are named, and so is the difference between them: an
+            // agent told "markdown renders" writes a table, and a table on a
+            // phone that renders no markdown is the one thing this must not
+            // quietly produce.
+            assert!(tool.description.contains("WeChat"), "{}", tool.description);
+            assert!(tool.description.contains("Lark"), "{}", tool.description);
+            assert!(
+                tool.description.contains("renders none of them"),
+                "{}",
+                tool.description
+            );
         }
         // It says something on a machine's behalf without changing anything
         // there, which is exactly the shape of an errand a controller runs.

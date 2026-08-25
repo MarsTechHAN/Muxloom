@@ -174,7 +174,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 4;
+const SKILL_REVISION: u32 = 5;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -278,13 +278,19 @@ something they were waiting on is finished, when you are blocked on a decision
 only they can make, or when a long run ends with nobody watching. Do not send a
 progress log: if two messages could be one, make them one.
 
-Write it as something they can act on without opening a laptop. `text` is
-markdown and the card renders all of it — headings, lists, tables, code fences,
-links — so lead with the conclusion, then the numbers, then what you need from
-them and exactly how to answer (\"回 1 / 2 / 3\", \"yes/no\"); an open question
-costs them more than the whole message saves. Keep it to a screen or two.
-muxloom signs every message with your machine and session, so do not introduce
-yourself, and never put a token, a key, or an absolute home path in one.
+Write it as something they can act on without opening a laptop. Lead with the
+conclusion, then the numbers, then what you need from them and exactly how to
+answer (\"回 1 / 2 / 3\", \"yes/no\"); an open question costs them more than the
+whole message saves. Keep it to a screen or two. muxloom signs every message
+with your machine and session, so do not introduce yourself, and never put a
+token, a key, or an absolute home path in one.
+
+Write `text` as markdown either way, but know that only some of it survives.
+Lark renders the lot — headings, lists, tables, code fences, links. WeChat
+renders none of it and muxloom flattens it first: the words, the line breaks
+and the order arrive exactly as written, the marks around them do not, and a
+table becomes a row of pipes nobody can read on a phone. Prefer short lines and
+plain lists to anything that needs a grid.
 
 Their reply comes back to you as a direct message, so end your turn and wait:
 
