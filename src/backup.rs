@@ -2172,6 +2172,7 @@ mod tests {
             recap: None,
             title: None,
             thread: thread.map(str::to_string),
+            seed: None,
             working: false,
             needs_attention: false,
             attention_reason: None,

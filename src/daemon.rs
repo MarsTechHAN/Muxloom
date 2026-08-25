@@ -1287,6 +1287,7 @@ mod platform {
                 // what went missing.
                 title: None,
                 thread: None,
+                seed: None,
                 working: false,
                 needs_attention: false,
                 attention_reason: None,
@@ -3079,6 +3080,7 @@ mod platform {
             recap: None,
             title: None,
             thread: None,
+            seed: seed.clone(),
             working: false,
             needs_attention: false,
             attention_reason: None,
@@ -3597,6 +3599,7 @@ mod platform {
         metadata.pid = status.child_pid;
         let archived = metadata.archived;
         let temporary = metadata.temporary;
+        let seed = metadata.seed.clone();
         let columns = status.columns.max(20);
         let rows = status.rows.max(5);
         let session = Arc::new(ManagedSession {
@@ -3617,10 +3620,13 @@ mod platform {
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             // The command line that started this one belongs to a keeper this
-            // daemon did not spawn. What the last generation had matched it to
-            // is in the metadata, and the first refresh picks it up from
-            // there.
-            native: Mutex::new(NativeLink::default()),
+            // daemon did not spawn, so both of the things it said - what the
+            // launch meant to reopen, and what the last generation matched it
+            // to - are read back out of the metadata instead.
+            native: Mutex::new(NativeLink {
+                seed,
+                ..NativeLink::default()
+            }),
             history_path,
             metadata_path,
             archived: AtomicBool::new(archived),
@@ -7083,6 +7089,7 @@ mod platform {
                     recap: Some("completed the persistent work".into()),
                     title: None,
                     thread: None,
+                    seed: None,
                     working: false,
                     needs_attention: false,
                     attention_reason: None,
@@ -7136,6 +7143,7 @@ mod platform {
                 recap: None,
                 title: None,
                 thread: None,
+                seed: None,
                 working: true,
                 needs_attention: false,
                 attention_reason: None,
@@ -7275,6 +7283,68 @@ mod platform {
             let history = persisted.read_history(0, 10, false).unwrap();
             assert!(history.rows.is_empty() && history.total_lines == 0);
             assert!(persisted.search_history("anything", 10).unwrap().is_empty());
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        /// A resumed conversation began long before the session that reopened
+        /// it, so nothing about when each started can pair the two. The
+        /// command line said so outright, but it belongs to a keeper the next
+        /// daemon did not spawn - and a daemon that restarts before the match
+        /// has been made would otherwise have nothing left to go on.
+        #[test]
+        fn a_daemon_that_restarts_still_knows_which_conversation_was_reopened() {
+            let state = test_state("handover-seed");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-claude-1700000000-9-3";
+            // Stands in for `claude --resume <id>`: a shell that sits on the
+            // PTY reading, with the flag among its arguments where the seed is
+            // read from.
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "resumed work".into(),
+                false,
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "cat".into(),
+                    "muxloom".into(),
+                    "--resume".into(),
+                    "the-conversation".into(),
+                ],
+                vec![],
+                5,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                launched.snapshot().seed.as_deref(),
+                Some("the-conversation"),
+                "the launch writes down what it was told to reopen"
+            );
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            assert_eq!(
+                session_facts(0, &adopted).seed.as_deref(),
+                Some("the-conversation"),
+                "and the next generation matches on it as the first one would have"
+            );
+
+            adopted.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().dead && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
             fs::remove_dir_all(paths.root).unwrap();
         }
 

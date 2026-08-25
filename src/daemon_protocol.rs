@@ -608,6 +608,14 @@ pub struct DaemonSession {
     /// go on reading the same one instead of matching it again from scratch.
     #[serde(default)]
     pub thread: Option<String>,
+    /// The conversation the launch was told to reopen, taken off the command
+    /// line. It is the only durable account of what a `--resume` meant: the
+    /// command line belongs to a keeper the next daemon did not spawn, and a
+    /// resumed conversation began long before the session did, so a daemon
+    /// that restarted before the two were matched could never match them by
+    /// when each started.
+    #[serde(default)]
+    pub seed: Option<String>,
     pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,

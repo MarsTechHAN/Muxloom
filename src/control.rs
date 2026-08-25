@@ -3496,6 +3496,7 @@ mod tests {
             recap: None,
             title: None,
             thread: None,
+            seed: None,
             working,
             needs_attention: attention,
             attention_reason: attention.then(|| "waiting on a person".into()),
