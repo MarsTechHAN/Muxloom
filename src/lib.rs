@@ -18,6 +18,7 @@ pub mod model;
 pub mod moderator;
 pub mod native_history;
 pub mod port_forward;
+pub mod qr;
 pub mod recap;
 pub mod relay;
 pub mod runtime;
