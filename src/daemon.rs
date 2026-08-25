@@ -308,6 +308,11 @@ mod platform {
         screen: Mutex<vt100::Parser>,
         codex_activity: Mutex<CodexActivity>,
         recent_output: Mutex<Vec<u8>>,
+        /// The last thing the agent was seen to say, for a runtime that keeps
+        /// no transcript of its own. Its answer scrolls off the screen long
+        /// before it stops being the last word on the session, so the reading
+        /// is kept rather than taken again from whatever is on screen now.
+        screen_recap: Mutex<Option<String>>,
         /// What a `notify` trigger left for whoever looks next. It reads as an
         /// attention reason until someone types into the session, which is the
         /// one signal that the message was seen.
@@ -3076,6 +3081,7 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             native: Mutex::new(NativeLink {
                 seed,
@@ -3571,6 +3577,7 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             // The command line that started this one belongs to a keeper this
             // daemon did not spawn. What the last generation had matched it to
@@ -3988,6 +3995,35 @@ mod platform {
                 .temporary
         }
 
+        /// The last answer visible on the session's screen, or the last one
+        /// that was.
+        ///
+        /// Read off the screen as the terminal draws it rather than out of the
+        /// bytes that drew it: an agent paints its window with cursor moves, so
+        /// the raw stream has no lines in it - a status bar arrives as
+        /// `manualmodeon?forshortcuts` and the composer arrives one keystroke
+        /// at a time, each repaint appended to the last. Rendering first is
+        /// what makes the difference between reading a sentence and reading
+        /// the pixels it was written with.
+        fn recap_on_screen(&self, kind: AgentKind) -> Option<String> {
+            let drawn = {
+                let screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                extract_recap(kind, &screen.screen().contents())
+            };
+            let mut kept = self
+                .screen_recap
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if drawn.is_some() {
+                kept.clone_from(&drawn);
+                return drawn;
+            }
+            kept.clone()
+        }
+
         fn snapshot(&self) -> DaemonSession {
             let mut snapshot = self
                 .metadata
@@ -4023,20 +4059,10 @@ mod platform {
                     }
                     native_recap = recap;
                 }
-                // A shell gets no recap, and its scrollback is megabytes: copy
-                // it out only for a runtime that has something to say - and
-                // only when its own account of itself is not to be had.
-                snapshot.recap = native_recap.or_else(|| {
-                    (kind != AgentKind::Terminal)
-                        .then(|| {
-                            let recent = self
-                                .recent_output
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            extract_recap(kind, &String::from_utf8_lossy(&recent))
-                        })
-                        .flatten()
-                });
+                // Only when the runtime's own account of itself is not to be
+                // had. What it wrote down is the turn as the agent meant it;
+                // the screen is a guess at the same thing.
+                snapshot.recap = native_recap.or_else(|| self.recap_on_screen(kind));
                 if snapshot.dead || snapshot.archived {
                     snapshot.pid = None;
                     snapshot.working = false;
@@ -6721,6 +6747,67 @@ mod platform {
             );
             session.record_output(b"\x1b]0;project\x07");
             assert!(!session.snapshot().working);
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// A recap has to come off the screen the agent drew, not the bytes it
+        /// sent to draw it. A full-screen agent positions the cursor for every
+        /// line it paints, so the raw stream is one unbroken run with the
+        /// status bar and every keystroke of the composer folded into it, and
+        /// nothing read out of that is anything anybody said.
+        #[test]
+        fn a_recap_is_read_off_the_drawn_screen_and_stands_until_there_is_another() {
+            let state = test_state("recap-screen");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-recap-screen".into(),
+                "claude".into(),
+                "/tmp".into(),
+                "recap off the screen".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+
+            session.record_output(
+                concat!(
+                    "\x1b[2J",
+                    "\x1b[3;1H⏺ The renderer keeps its width across restarts.",
+                    "\x1b[20;1H⏸ manual mode on · ? for shortcuts ◉ xhigh · /effort",
+                    "\x1b[22;1H❯ ",
+                )
+                .as_bytes(),
+            );
+            assert_eq!(
+                session.snapshot().recap.as_deref(),
+                Some("The renderer keeps its width across restarts.")
+            );
+
+            // The answer scrolls away behind a long tool call. What is left on
+            // screen is the frame around the conversation, and the frame is
+            // not a new answer.
+            session.record_output(
+                concat!(
+                    "\x1b[2J",
+                    "\x1b[19;1H✻ Whirlpooling… (21s · ↓ 25 tokens · thought for 17s)",
+                    "\x1b[20;1H⏸ manual mode on · ? for shortcuts ◉ xhigh · /effort",
+                )
+                .as_bytes(),
+            );
+            assert_eq!(
+                session.snapshot().recap.as_deref(),
+                Some("The renderer keeps its width across restarts."),
+                "the last answer stands until the agent gives another"
+            );
 
             session.archive().unwrap();
             fs::remove_dir_all(root).unwrap();

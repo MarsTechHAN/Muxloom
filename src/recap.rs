@@ -2,6 +2,12 @@ use crate::model::AgentKind;
 
 const MAX_RECAP_CHARS: usize = 180;
 
+/// The last thing an agent said, read off a *rendered* screen.
+///
+/// Give this the terminal's contents, not the bytes that produced them: an
+/// agent draws its window with cursor moves rather than newlines, so the raw
+/// stream has no lines to read.
+///
 /// A shell has no turns to summarise. Whatever scrolled past last is a
 /// command, a prompt, or half a build log, and dressing that up as a recap
 /// only puts a misleading sentence under the session. Say nothing instead -
@@ -27,6 +33,11 @@ pub fn extract_recap(kind: AgentKind, output: &str) -> Option<String> {
         }
     }
 
+    // Only a line the agent marked as its own. Anything else on the screen is
+    // the frame around the conversation - a spinner, a token counter, a model
+    // name, half a prompt the person is still typing - and none of that is
+    // what the session is about. Saying nothing is the honest answer when the
+    // last answer is not in view.
     let mut last_assistant = None;
     for line in &lines {
         if let Some(content) = assistant_line(kind, line)
@@ -35,13 +46,7 @@ pub fn extract_recap(kind: AgentKind, output: &str) -> Option<String> {
             last_assistant = Some(content);
         }
     }
-    last_assistant.or_else(|| {
-        lines
-            .iter()
-            .rev()
-            .filter(|line| !is_terminal_chrome(line))
-            .find_map(|line| clean_recap_text(line))
-    })
+    last_assistant
 }
 
 fn explicit_recap_content(line: &str) -> Option<&str> {
@@ -127,49 +132,6 @@ fn is_tool_or_status(kind: AgentKind, content: &str) -> bool {
         }
         AgentKind::Terminal => true,
     }
-}
-
-fn is_terminal_chrome(line: &str) -> bool {
-    let line = line.trim();
-    if line.is_empty()
-        || explicit_recap_content(line).is_some()
-        || line.starts_with(['›', '❯', '>', '└', '⎿'])
-        || line.chars().all(|character| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    '─' | '━'
-                        | '│'
-                        | '┃'
-                        | '┌'
-                        | '┐'
-                        | '└'
-                        | '┘'
-                        | '╭'
-                        | '╮'
-                        | '╰'
-                        | '╯'
-                )
-        })
-    {
-        return true;
-    }
-    let lowercase = line.to_lowercase();
-    [
-        "pane is dead",
-        "gpt-",
-        "tokens left",
-        "esc to interrupt",
-        "for shortcuts",
-        "manual mode on",
-        "press enter",
-        "tip:",
-        "working (",
-        "running…",
-        "running...",
-    ]
-    .iter()
-    .any(|marker| lowercase.contains(marker))
 }
 
 fn clean_recap_text(value: &str) -> Option<String> {
@@ -294,6 +256,23 @@ mod tests {
             "<Trial 368492514 worker_0> tiger $ \n"
         );
         assert_eq!(extract_recap(AgentKind::Terminal, output), None);
+    }
+
+    /// Every line here was once shown as a recap under a live session: a
+    /// spinner, a prompt caught mid-keystroke, and the status bar. None of
+    /// them is anything the agent said.
+    #[test]
+    fn the_frame_around_a_conversation_is_never_the_recap() {
+        let screen = concat!(
+            "✻ Whirlpooling… (21s · ↓ 25 tokens · thought for 17s)\n",
+            "❯ 你看看Arxiv AI Reader\n",
+            "⏸ manual mode on · ? for shortcuts ◉ xhigh · /effort\n"
+        );
+        assert_eq!(extract_recap(AgentKind::Claude, screen), None);
+
+        let status =
+            "↑72M ↓191k 34.2%/1.0M (auto) (sglang-soil) /dev/shm/models/Flash-0731 • high\n";
+        assert_eq!(extract_recap(AgentKind::Pi, status), None);
     }
 
     #[test]
