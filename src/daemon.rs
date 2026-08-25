@@ -2631,8 +2631,23 @@ mod platform {
     }
 
     /// The sessions running in one folder, each with when it was launched -
-    /// which is what pairs it off against a transcript.
+    /// which is what pairs it off against a transcript. In milliseconds, the
+    /// units the transcripts are read in; see [`launched_at_ms`].
     type NativeGroup = Vec<(u64, Arc<ManagedSession>)>;
+
+    /// When a session was launched, in the units a transcript keeps its own
+    /// clock in.
+    ///
+    /// A session records its launch in seconds - it is right there in the
+    /// session id - while every time a transcript writes down, and the
+    /// modification time of the file itself, is in milliseconds. Compared
+    /// directly the launch looks like it happened decades before any
+    /// conversation, which turns "the transcript that began nearest to this
+    /// launch" into "the oldest transcript in the folder": a fresh agent
+    /// listed under a name and a recap belonging to somebody else's work.
+    fn launched_at_ms(created_at: u64) -> u64 {
+        created_at.saturating_mul(1_000)
+    }
 
     /// Keep reading what each session's runtime writes about itself.
     ///
@@ -2686,7 +2701,7 @@ mod platform {
             folders
                 .entry((kind, path))
                 .or_default()
-                .push((created_at, session));
+                .push((launched_at_ms(created_at), session));
         }
         for ((kind, path), mut group) in folders {
             // Oldest first, whatever order the map handed them over in: the
@@ -6555,6 +6570,47 @@ mod platform {
 
             session.archive().unwrap();
             fs::remove_dir_all(root).unwrap();
+        }
+
+        /// A session records when it was launched in seconds; a transcript
+        /// stamps itself in milliseconds. Handed to the matching as they are,
+        /// every launch looks like it happened decades before every
+        /// conversation in the folder, and "the transcript that began nearest
+        /// this launch" quietly becomes "the oldest transcript here" - a fresh
+        /// agent listed under a name and a recap belonging to work somebody
+        /// did last month.
+        #[test]
+        fn a_launch_is_matched_against_transcripts_on_a_transcripts_own_clock() {
+            fn thread(id: &str, started_at: u64) -> crate::native_history::NativeThread {
+                crate::native_history::NativeThread {
+                    id: id.into(),
+                    path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+                    cwd: "/work".into(),
+                    started_at,
+                    updated_at: started_at,
+                    forked_from: None,
+                    title: None,
+                    last_message: None,
+                }
+            }
+
+            // The launch as a session records it, and the same instant as a
+            // transcript would stamp it.
+            let launched_seconds = 1_787_649_863;
+            let launched_ms = 1_787_649_863_000;
+            let facts = [NativeFacts {
+                created_at: launched_at_ms(launched_seconds),
+                ..NativeFacts::default()
+            }];
+            let threads = [
+                // Started a moment after the launch: this session's own.
+                thread("its-own", launched_ms + 1_200),
+                thread("last-month", launched_ms - 30 * 86_400_000),
+            ];
+            assert_eq!(
+                crate::native_history::assign_threads(&facts, &threads),
+                [Some(0)]
+            );
         }
 
         /// The runtime's own account of the turn is what the session is

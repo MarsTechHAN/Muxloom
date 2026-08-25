@@ -125,6 +125,9 @@ pub fn resume_seed(kind: AgentKind, args: &[String]) -> Option<String> {
 /// its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionFacts {
+    /// When it was launched, in milliseconds - the clock every transcript
+    /// here keeps. A session records its own launch in seconds, so whoever
+    /// fills this in has to convert.
     pub created_at: u64,
     /// The thread the launch was told to reopen.
     pub seed: Option<String>,
