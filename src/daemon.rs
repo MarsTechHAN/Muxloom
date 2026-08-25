@@ -94,10 +94,11 @@ mod platform {
     /// while whoever asked for it is still looking, rarely enough that the
     /// reading costs nothing.
     const NATIVE_POLL: Duration = Duration::from_secs(5);
-    /// How long a session may go on producing output over a transcript that
-    /// has stopped growing before muxloom takes it to be writing somewhere
-    /// else. Clearing a conversation does exactly that: the old transcript is
-    /// closed where it stands and a new one begins.
+    /// How long a session must have been quiet, after answering something it
+    /// was asked and writing none of it down, before muxloom takes it to be
+    /// writing somewhere else. Clearing a conversation does exactly that: the
+    /// old transcript is closed where it stands and a new one begins. The wait
+    /// is what lets a transcript that is slow to be flushed catch up.
     const NATIVE_CLAIM_STALE_MS: u64 = 60_000;
 
     #[derive(Debug, Clone)]
@@ -302,6 +303,12 @@ mod platform {
         /// their spinner continuously while working, so a screen that still
         /// says "working" over a quiet PTY is a leftover, not a state.
         last_output: AtomicU64,
+        /// When something was last typed into the session (epoch ms), by
+        /// anyone - a person at a dashboard, another agent, a trigger. Unlike
+        /// output, this only moves when a turn is actually asked for, which is
+        /// what tells a session that is thinking apart from one that has been
+        /// started over somewhere else.
+        last_input: AtomicU64,
         /// Shared with [`DaemonState::attention_patterns`].
         attention_patterns: Arc<Mutex<Vec<String>>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
@@ -2832,10 +2839,21 @@ mod platform {
             }
             return false;
         }
-        // The transcript has stopped growing while the session goes on
-        // talking: whatever it is saying is being written somewhere else.
-        // Clearing a conversation does precisely this.
-        if last_output <= written.saturating_add(NATIVE_CLAIM_STALE_MS) {
+        // The transcript has stopped growing. That on its own says nothing:
+        // an agent repaints its spinner the whole time it is thinking, so a
+        // turn that runs for two minutes produces output continuously and
+        // appends nothing until it answers. Reading that as "the words are
+        // going somewhere else" is how a working session lost its name.
+        //
+        // What does mean it is a turn that went by the transcript entirely: a
+        // prompt submitted after the transcript last grew, an answer that came
+        // back, and quiet since. That is the shape of a conversation cleared
+        // and started over, which is the case this is here for.
+        let now = now_ms();
+        let last_input = session.last_input.load(Ordering::Relaxed);
+        let asked_and_answered = last_input > written && last_output > last_input;
+        let quiet_since = now.saturating_sub(last_output) >= NATIVE_CLAIM_STALE_MS;
+        if !asked_and_answered || !quiet_since {
             return false;
         }
         {
@@ -3091,6 +3109,8 @@ mod platform {
                     .context("failed to clone keeper stream")?,
             ),
             last_output: AtomicU64::new(now_ms()),
+            // Nothing has been asked of it yet.
+            last_input: AtomicU64::new(0),
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
@@ -3587,6 +3607,8 @@ mod platform {
                     .context("failed to clone keeper stream")?,
             ),
             last_output: AtomicU64::new(now_ms()),
+            // Nothing has been asked of it yet.
+            last_input: AtomicU64::new(0),
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
@@ -4164,6 +4186,7 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
+            self.last_input.store(now_ms(), Ordering::Relaxed);
             self.keeper_frame(keeper::frame::DATA, bytes)
         }
 
@@ -6692,9 +6715,25 @@ mod platform {
             fs::remove_dir_all(root).unwrap();
         }
 
+        /// Put a file's modification time where a test needs it, so a
+        /// transcript can be one that stopped growing a while ago.
+        fn set_modified(path: &std::path::Path, epoch_ms: u64) {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(epoch_ms);
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
+
         /// A conversation cleared with `/clear` is closed where it stands and
         /// a new file begins. Nothing says so; the session simply goes on
-        /// talking over a transcript that has stopped growing.
+        /// talking into a transcript that is not the one it was matched to.
+        ///
+        /// The telling part is what it takes to be sure of that, because an
+        /// agent that is only thinking looks the same from the outside: it
+        /// prints continuously and appends nothing.
         #[test]
         fn a_session_lets_go_of_a_transcript_it_has_talked_past() {
             let state = test_state("native-stale");
@@ -6718,7 +6757,14 @@ mod platform {
 
             let transcript = root.join("thread-1.jsonl");
             fs::write(&transcript, "{}\n").unwrap();
-            let written = crate::native_history::last_written(&transcript).unwrap();
+            // The conversation was closed five minutes ago and the file has
+            // not been touched since.
+            let written = now_ms().saturating_sub(5 * 60_000);
+            set_modified(&transcript, written);
+            assert_eq!(
+                crate::native_history::last_written(&transcript),
+                Some(written)
+            );
             {
                 let mut native = session
                     .native
@@ -6734,7 +6780,9 @@ mod platform {
                 native.scanned_at = written;
             }
 
-            session.last_output.store(written, Ordering::Relaxed);
+            // Thinking: nothing has been asked since the file last grew, and
+            // the spinner has been printing the whole time.
+            session.last_output.store(now_ms(), Ordering::Relaxed);
             assert!(
                 !refresh_native_claim(AgentKind::Claude, &session),
                 "a session that has only just spoken is still on its thread"
@@ -6744,12 +6792,31 @@ mod platform {
                 Some("the conversation before")
             );
 
-            session.last_output.store(
-                written
-                    .saturating_add(NATIVE_CLAIM_STALE_MS)
-                    .saturating_add(1),
-                Ordering::Relaxed,
+            // Still thinking, and long enough that the answer is well past the
+            // minute the transcript has been quiet for. This is the reading
+            // that used to take a working session's name away from it.
+            session
+                .last_input
+                .store(written.saturating_sub(60_000), Ordering::Relaxed);
+            session.last_output.store(now_ms(), Ordering::Relaxed);
+            assert!(
+                !refresh_native_claim(AgentKind::Claude, &session),
+                "an agent that is thinking out loud has not gone anywhere"
             );
+            assert_eq!(
+                session.snapshot().title.as_deref(),
+                Some("the conversation before")
+            );
+
+            // Asked something after the file stopped growing, answered, and
+            // quiet since: the words went into a transcript that is not this
+            // one.
+            session
+                .last_input
+                .store(written.saturating_add(1_000), Ordering::Relaxed);
+            session
+                .last_output
+                .store(now_ms().saturating_sub(2 * 60_000), Ordering::Relaxed);
             assert!(
                 refresh_native_claim(AgentKind::Claude, &session),
                 "the folder has to be looked through for wherever it went"
