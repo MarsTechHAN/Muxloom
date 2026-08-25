@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use muxloom::{
     app::{
-        App, BoardForm, BoardTab, ChannelEdit, ChannelsForm, HelpForm, LaunchForm, Modal,
-        PathPickerForm, PortForwardForm, ResumeForm, SearchForm, SettingsForm,
+        App, BoardForm, BoardTab, ChannelKeys, ChannelScan, ChannelStep, ChannelsForm, HelpForm,
+        LaunchForm, Modal, PathPickerForm, PortForwardForm, ResumeForm, ScanState, SearchForm,
+        SettingsForm,
     },
     channel::{ChannelBinding, ChannelKind, ChannelSet},
     config::{Config, State},
@@ -148,8 +149,10 @@ fn port_forward_modal_never_panics() {
 
 #[test]
 fn channels_modal_never_panics() {
-    // The list and the form share a frame, and the form's height changes with
-    // the chat app it is describing, so both shapes are swept.
+    // Every step of the wizard draws into the same frame at its own height —
+    // the scan step asks for far more rows than the rest, because a QR code is
+    // as wide as it is and cannot be wrapped — so all of them are swept.
+    let code = muxloom::qr::encode("https://ilink.example/qr/0123456789abcdef").unwrap();
     for (w, h) in SIZES {
         for count in [0usize, 1, 5] {
             let set = ChannelSet {
@@ -162,25 +165,48 @@ fn channels_modal_never_panics() {
                         app_id: "cli_00000000000000".into(),
                         secret: "s".repeat(64),
                         route: "oc_0000000000000000000000000000".into(),
+                        route_label: "a group with a very long name in it".into(),
                         preferred: index == 0,
+                        ..ChannelBinding::default()
                     })
                     .collect(),
             };
-            for edit in [
+            for step in [
                 None,
-                Some(ChannelEdit::default()),
-                Some(ChannelEdit {
-                    index: Some(0),
-                    kind: ChannelKind::WeCom,
+                Some(ChannelStep::Pick { selected: 1 }),
+                Some(ChannelStep::Scan(Box::new(ChannelScan {
+                    state: ScanState::Asking,
+                    ..ChannelScan::default()
+                }))),
+                Some(ChannelStep::Scan(Box::new(ChannelScan {
+                    state: ScanState::Showing,
+                    link: "https://ilink.example/qr/0123456789abcdef".into(),
+                    code: Some(code.clone()),
+                    ..ChannelScan::default()
+                }))),
+                Some(ChannelStep::Scan(Box::new(ChannelScan {
+                    state: ScanState::Failed("WeChat said no".into()),
+                    ..ChannelScan::default()
+                }))),
+                Some(ChannelStep::Keys(ChannelKeys {
+                    app_id: "cli_00000000000000".into(),
+                    secret: "s".repeat(64),
                     selected: 2,
                     borrowed: Some("/home/somebody/.cc-connect/config.toml".into()),
-                    ..ChannelEdit::default()
+                    ..ChannelKeys::default()
+                })),
+                Some(ChannelStep::Rename {
+                    index: 0,
+                    label: "the phone in my pocket".into(),
                 }),
             ] {
+                if count == 0 && matches!(step, Some(ChannelStep::Rename { .. })) {
+                    continue;
+                }
                 let form = ChannelsForm {
                     set: set.clone(),
                     selected: count.saturating_sub(1),
-                    edit,
+                    step,
                     error: Some("Lark refused the message".into()),
                     note: Some("lark-0 is bound".into()),
                     reach: "On 2/3 machines".into(),

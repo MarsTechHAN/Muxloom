@@ -6417,7 +6417,9 @@ mod platform {
                     app_id: "cli_1".into(),
                     secret: "shhh".into(),
                     route: "oc_1".into(),
+                    route_label: "Team".into(),
                     preferred: true,
+                    ..Default::default()
                 }],
             };
 

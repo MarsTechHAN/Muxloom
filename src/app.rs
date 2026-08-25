@@ -2,7 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -225,131 +229,141 @@ impl PortForwardForm {
     }
 }
 
-/// One line of a channel binding's form. Which lines there are depends on the
-/// chat app: a Lark app is an id, a secret and a chat to post into, while a
-/// WeCom group robot is one key that already names its group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelField {
-    Kind,
-    Label,
+/// What binding a chat is waiting on, when the panel is not on its list.
+///
+/// A wizard rather than a form, because the honest shape of this job is a
+/// sequence: nothing about the second step can be filled in before the first
+/// one has answered. The old form asked a person to paste four strings out of a
+/// web console before anything would work, which meant every mistake was found
+/// at the end and none of them said which string was wrong.
+#[derive(Debug, Clone)]
+pub enum ChannelStep {
+    /// Which chat app. Every new binding starts here.
+    Pick { selected: usize },
+    /// WeChat: a code on the screen and a phone that has not been through it.
+    Scan(Box<ChannelScan>),
+    /// Lark: the two strings only open.feishu.cn can hand out. The one place
+    /// left in this panel where somebody still has to copy something, and the
+    /// screen says so rather than pretending otherwise.
+    Keys(ChannelKeys),
+    /// Renaming one that is already bound. The only part of a binding a person
+    /// has any business changing now that the rest comes from the platform.
+    Rename { index: usize, label: String },
+}
+
+/// Where a WeChat scan has got to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScanState {
+    /// Waiting on WeChat for a code to draw.
+    #[default]
+    Asking,
+    /// A code is up and nobody has scanned it.
+    Showing,
+    /// A phone has read it; what is left is a tap on the phone.
+    Scanned,
+    /// The code timed out. Codes last about five minutes.
+    Expired,
+    Failed(String),
+}
+
+/// One run at scanning a code.
+#[derive(Debug, Clone)]
+pub struct ChannelScan {
+    /// Which attempt this is, matched against what comes back so that a code
+    /// somebody walked away from cannot reappear over the one they are looking
+    /// at.
+    pub attempt: u64,
+    /// Held by the watching thread too. Cleared on the way out of this step.
+    pub alive: Arc<AtomicBool>,
+    pub state: ScanState,
+    /// The link WeChat handed over, and the grid it becomes. The link is kept
+    /// as well as the grid: a terminal too small to draw the code can still
+    /// show something a phone can be pointed at.
+    pub link: String,
+    pub code: Option<crate::qr::Code>,
+}
+
+impl Default for ChannelScan {
+    fn default() -> Self {
+        Self {
+            attempt: 0,
+            alive: Arc::new(AtomicBool::new(true)),
+            state: ScanState::default(),
+            link: String::new(),
+            code: None,
+        }
+    }
+}
+
+/// Which line of the Lark step the cursor is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeysField {
+    #[default]
     AppId,
     Secret,
     Route,
 }
 
-impl ChannelField {
-    /// What the field is called, in the words the platform's own console uses —
-    /// this form is filled in by copying from that console, so matching its
-    /// vocabulary is most of the help it needs.
-    pub fn label(self, kind: ChannelKind) -> &'static str {
-        match (self, kind) {
-            (Self::Kind, _) => "Chat app",
-            (Self::Label, _) => "Name",
-            (Self::AppId, _) => "App id",
-            (Self::Secret, ChannelKind::Lark) => "App secret",
-            (Self::Secret, ChannelKind::WeCom) => "Webhook key",
-            (Self::Route, _) => "Chat id",
+impl KeysField {
+    pub const ALL: [Self; 3] = [Self::AppId, Self::Secret, Self::Route];
+
+    /// The words open.feishu.cn puts beside the box being copied out of. This
+    /// step is filled in by looking back and forth between two screens, so
+    /// matching the other screen's vocabulary is most of the help it can give.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AppId => "App ID",
+            Self::Secret => "App Secret",
+            Self::Route => "Chat",
         }
     }
 
-    /// Where to go and find it.
-    pub fn hint(self, kind: ChannelKind) -> &'static str {
-        match (self, kind) {
-            (Self::Kind, _) => "Left/Right to change",
-            (Self::Label, _) => "what a message says it came through",
-            (Self::AppId, _) => "cli_… from the Lark app console",
-            (Self::Secret, ChannelKind::Lark) => "the app secret beside that id",
-            (Self::Secret, ChannelKind::WeCom) => "the key= part of the robot's webhook URL",
-            (Self::Route, _) => "oc_… the app has been added to",
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::AppId => "cli_… from 开发者后台 › 凭证与基础信息",
+            Self::Secret => "the secret beside that id, on the same page",
+            Self::Route => "oc_… of a chat the bot has been added to",
         }
     }
 
-    /// Whether the value is shown as bullets. A secret on a dashboard is a
-    /// secret on whatever is behind the person reading it.
+    /// Whether it is shown as bullets. A secret on a dashboard is a secret on
+    /// whatever is behind the person reading it.
     pub fn hidden(self) -> bool {
         matches!(self, Self::Secret)
     }
 }
 
-/// One binding being written down.
+/// The Lark step's three strings.
 #[derive(Debug, Clone, Default)]
-pub struct ChannelEdit {
-    /// Which entry of the list this replaces; `None` while it is a new one.
-    pub index: Option<usize>,
-    pub kind: ChannelKind,
-    pub label: String,
+pub struct ChannelKeys {
     pub app_id: String,
     pub secret: String,
     pub route: String,
-    /// Which of [`ChannelEdit::fields`] the cursor is on.
     pub selected: usize,
-    /// The file some of what is on screen was read out of, when it was not
-    /// typed here. Shown, because fields that fill themselves in are unnerving
-    /// when nothing says where they came from.
+    /// The file some of this was read out of, when it was not typed here.
+    /// Shown, because a box that fills itself in is unnerving when nothing says
+    /// where it came from.
     pub borrowed: Option<String>,
 }
 
-impl ChannelEdit {
-    pub fn fields(&self) -> &'static [ChannelField] {
-        match self.kind {
-            ChannelKind::Lark => &[
-                ChannelField::Kind,
-                ChannelField::Label,
-                ChannelField::AppId,
-                ChannelField::Secret,
-                ChannelField::Route,
-            ],
-            // No app id and no chat: the webhook URL is the whole address.
-            ChannelKind::WeCom => &[
-                ChannelField::Kind,
-                ChannelField::Label,
-                ChannelField::Secret,
-            ],
-        }
+impl ChannelKeys {
+    pub fn field(&self) -> KeysField {
+        KeysField::ALL[self.selected.min(KeysField::ALL.len() - 1)]
     }
 
-    /// The field the cursor is on. Clamped rather than indexed, because
-    /// switching a Lark binding to WeCom shortens the form under the cursor.
-    pub fn field(&self) -> ChannelField {
-        let fields = self.fields();
-        fields[self.selected.min(fields.len() - 1)]
-    }
-
-    pub fn value(&self, field: ChannelField) -> &str {
+    pub fn value(&self, field: KeysField) -> &str {
         match field {
-            ChannelField::Kind => self.kind.title(),
-            ChannelField::Label => &self.label,
-            ChannelField::AppId => &self.app_id,
-            ChannelField::Secret => &self.secret,
-            ChannelField::Route => &self.route,
+            KeysField::AppId => &self.app_id,
+            KeysField::Secret => &self.secret,
+            KeysField::Route => &self.route,
         }
     }
 
-    /// The value under the cursor, when it is one a person types into.
-    fn typed(&mut self) -> Option<&mut String> {
+    fn typed(&mut self) -> &mut String {
         match self.field() {
-            ChannelField::Kind => None,
-            ChannelField::Label => Some(&mut self.label),
-            ChannelField::AppId => Some(&mut self.app_id),
-            ChannelField::Secret => Some(&mut self.secret),
-            ChannelField::Route => Some(&mut self.route),
-        }
-    }
-
-    /// What the form says, as a binding. The id is kept when one is being
-    /// edited so that an agent's `channel: "lark-1"` keeps meaning what it did.
-    fn binding(&self, set: &crate::channel::ChannelSet) -> crate::channel::ChannelBinding {
-        let held = self.index.and_then(|index| set.bindings.get(index));
-        crate::channel::ChannelBinding {
-            id: held
-                .map(|binding| binding.id.clone())
-                .unwrap_or_else(|| set.mint_id(self.kind)),
-            kind: self.kind,
-            label: self.label.trim().to_string(),
-            app_id: self.app_id.trim().to_string(),
-            secret: self.secret.trim().to_string(),
-            route: self.route.trim().to_string(),
-            preferred: held.is_some_and(|binding| binding.preferred),
+            KeysField::AppId => &mut self.app_id,
+            KeysField::Secret => &mut self.secret,
+            KeysField::Route => &mut self.route,
         }
     }
 }
@@ -357,15 +371,14 @@ impl ChannelEdit {
 /// The communication panel: what this fleet can reach a human through.
 ///
 /// It edits a copy. Every machine is brought to the dashboard's revision on the
-/// talk round, so a half-typed secret must not be able to travel; the list is
+/// talk round, so a half-written secret must not be able to travel; the list is
 /// only handed back to [`App::channels`] when the panel is closed.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelsForm {
     pub set: crate::channel::ChannelSet,
     pub selected: usize,
-    /// The binding being written, while the panel is on its form rather than
-    /// its list.
-    pub edit: Option<ChannelEdit>,
+    /// What is being bound, while the panel is on a step rather than its list.
+    pub step: Option<ChannelStep>,
     pub error: Option<String>,
     pub note: Option<String>,
     /// How far the last push round got, in words. Refreshed from the round
@@ -374,6 +387,16 @@ pub struct ChannelsForm {
     pub reach: String,
     /// Whether the list has moved away from what the dashboard holds.
     pub dirty: bool,
+}
+
+impl ChannelsForm {
+    /// Stop whatever the panel had running before it moves on. Called on every
+    /// way out of the scan step, including the ones that are not Esc.
+    fn abandon_scan(&mut self) {
+        if let Some(ChannelStep::Scan(scan)) = &self.step {
+            scan.alive.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -673,7 +696,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 87;
+pub const HELP_CONTENT_ROWS: usize = 90;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1340,6 +1363,13 @@ pub struct App {
     /// When a chat was last read, so errands can run far more often than a
     /// chat app is polled.
     last_inbox_poll: Option<Instant>,
+    /// How many login codes this dashboard has asked WeChat for. Only ever goes
+    /// up: it is what tells one code's answer from another's.
+    channel_attempt: u64,
+    /// Bindings WeChat has put to sleep. Not an error — a ClawBot conversation
+    /// closes on its own and only the person speaking reopens it — but the
+    /// panel says so, because otherwise it looks like nothing is happening.
+    pub channel_asleep: HashSet<String>,
     pub sessions: Vec<AgentSession>,
     pub focus: Focus,
     pub selected_target: usize,
@@ -1551,6 +1581,8 @@ impl App {
             inbox: crate::channel::Inbox::load(&inbox_path),
             inbox_path,
             last_inbox_poll: None,
+            channel_attempt: 0,
+            channel_asleep: HashSet::new(),
             sessions: Vec::new(),
             focus: Focus::Machines,
             selected_target: 0,
@@ -5408,6 +5440,7 @@ impl App {
             Event::ChannelTested { id, result } => {
                 self.absorb_channel_test(id, result.map_err(|error| short_error(&error)))
             }
+            Event::ChannelLogin { attempt, step } => self.absorb_channel_login(attempt, step),
             Event::BackupSynced { result } => {
                 self.backup_in_flight = false;
                 match result {
@@ -5804,12 +5837,85 @@ impl App {
                 ),
             );
         }
+        self.absorb_context_tokens(&mail);
+        self.channel_asleep = mail.asleep.into_iter().collect();
         if inbox == self.inbox {
             return;
         }
         self.inbox = inbox;
         if let Err(error) = self.inbox.save(&self.inbox_path) {
             debug::log("channel", format!("{error:#}"));
+        }
+    }
+
+    /// Write the tokens this round collected into the bindings and send them
+    /// round the fleet.
+    ///
+    /// This is what finishes a WeChat binding, and it has to reach every
+    /// machine rather than staying here: the token off the human's last message
+    /// is the only thing that lets a bot answer, and the agent that wants to
+    /// answer is usually somewhere else. So it goes in the set, the revision
+    /// goes up, and the next talk round carries it.
+    fn absorb_context_tokens(&mut self, mail: &crate::channel::InboxRound) {
+        let mut moved = false;
+        let mut finished = Vec::new();
+        for (id, token) in &mail.refreshed {
+            let Some(binding) = self
+                .channels
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.id == *id)
+            else {
+                continue;
+            };
+            if binding.context_token == *token {
+                continue;
+            }
+            if binding.context_token.is_empty() {
+                finished.push(binding.id.clone());
+            }
+            binding.context_token = token.clone();
+            moved = true;
+        }
+        if !moved {
+            return;
+        }
+        self.channels.revision = self.channels.revision.saturating_add(1);
+        if let Err(error) = self.channels.save(&self.channels_path) {
+            debug::log("channel", format!("{error:#}"));
+        }
+        // Carry it now rather than on the next round: somebody who has just
+        // said hello to a bot is watching for this exact thing to happen.
+        self.last_talk_sync = None;
+        if finished.is_empty() {
+            return;
+        }
+        let said = format!(
+            "{} can answer now",
+            finished
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        match self.modal.as_mut() {
+            // The panel is editing a copy, so the token has to be put into that
+            // copy too — binding by binding, because everything else in it is
+            // something the person typed and has not saved yet.
+            Some(Modal::Channels(form)) => {
+                for (id, token) in &mail.refreshed {
+                    if let Some(binding) = form
+                        .set
+                        .bindings
+                        .iter_mut()
+                        .find(|binding| binding.id == *id)
+                    {
+                        binding.context_token = token.clone();
+                    }
+                }
+                form.note = Some(said);
+            }
+            _ => self.status_message = said,
         }
     }
 
@@ -7478,10 +7584,20 @@ impl App {
 
     fn handle_channels_key(&mut self, mut form: ChannelsForm, key: KeyEvent) {
         form.error = None;
-        if let Some(edit) = form.edit.take() {
-            self.handle_channel_edit_key(form, edit, key);
-            return;
+        match form.step.take() {
+            Some(ChannelStep::Pick { selected }) => {
+                self.handle_channel_pick_key(form, selected, key)
+            }
+            Some(ChannelStep::Scan(scan)) => self.handle_channel_scan_key(form, *scan, key),
+            Some(ChannelStep::Keys(keys)) => self.handle_channel_keys_key(form, keys, key),
+            Some(ChannelStep::Rename { index, label }) => {
+                self.handle_channel_rename_key(form, index, label, key)
+            }
+            None => self.handle_channel_list_key(form, key),
         }
+    }
+
+    fn handle_channel_list_key(&mut self, mut form: ChannelsForm, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.close_channels(form),
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -7493,38 +7609,21 @@ impl App {
                 self.modal = Some(Modal::Channels(form));
             }
             KeyCode::Char('n') => {
-                // A first Lark binding starts from cc-connect's credentials
-                // when that is what this machine already had.
-                let mut edit = ChannelEdit {
-                    selected: 1,
-                    ..ChannelEdit::default()
-                };
-                if let Some(borrowed) =
-                    crate::channel::borrow_cc_connect(&crate::channel::cc_connect_path())
-                {
-                    edit.app_id = borrowed.app_id;
-                    edit.secret = borrowed.secret;
-                    edit.route = borrowed.route;
-                    edit.borrowed = Some(borrowed.from.display().to_string());
-                }
-                form.edit = Some(edit);
+                form.step = Some(ChannelStep::Pick { selected: 0 });
                 self.modal = Some(Modal::Channels(form));
             }
+            // Renaming, and nothing else. Everything else about a binding now
+            // comes from the platform rather than from a person, so an edit
+            // form over it would only offer ways to break it.
             KeyCode::Char('e') | KeyCode::Char('i') => {
                 match form.set.bindings.get(form.selected) {
                     Some(binding) => {
-                        form.edit = Some(ChannelEdit {
-                            index: Some(form.selected),
-                            kind: binding.kind,
+                        form.step = Some(ChannelStep::Rename {
+                            index: form.selected,
                             label: binding.label.clone(),
-                            app_id: binding.app_id.clone(),
-                            secret: binding.secret.clone(),
-                            route: binding.route.clone(),
-                            selected: 1,
-                            borrowed: None,
                         });
                     }
-                    None => form.error = Some("Nothing to edit — press n to bind a chat".into()),
+                    None => form.error = Some("Nothing to rename — press n to bind a chat".into()),
                 }
                 self.modal = Some(Modal::Channels(form));
             }
@@ -7567,52 +7666,149 @@ impl App {
         }
     }
 
-    fn handle_channel_edit_key(
+    fn handle_channel_pick_key(&mut self, mut form: ChannelsForm, selected: usize, key: KeyEvent) {
+        let kinds = ChannelKind::ALL;
+        match key.code {
+            KeyCode::Esc => self.modal = Some(Modal::Channels(form)),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::BackTab => {
+                form.step = Some(ChannelStep::Pick {
+                    selected: clamped_index(selected, kinds.len(), -1),
+                });
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Tab => {
+                form.step = Some(ChannelStep::Pick {
+                    selected: clamped_index(selected, kinds.len(), 1),
+                });
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Enter => {
+                let kind = kinds[selected.min(kinds.len() - 1)];
+                self.begin_channel(form, kind);
+            }
+            _ => {
+                form.step = Some(ChannelStep::Pick { selected });
+                self.modal = Some(Modal::Channels(form));
+            }
+        }
+    }
+
+    /// Start binding one kind of chat: a code for WeChat, a short form for
+    /// Lark.
+    fn begin_channel(&mut self, mut form: ChannelsForm, kind: ChannelKind) {
+        match kind {
+            ChannelKind::WeChat => {
+                form.step = Some(ChannelStep::Scan(Box::default()));
+                self.ask_for_code(form);
+            }
+            ChannelKind::Lark => {
+                // A Lark binding starts from cc-connect's credentials when that
+                // is what this machine already had: the same two strings out of
+                // the same console, already copied once.
+                let mut keys = ChannelKeys::default();
+                if let Some(borrowed) =
+                    crate::channel::borrow_cc_connect(&crate::channel::cc_connect_path())
+                {
+                    keys.app_id = borrowed.app_id;
+                    keys.secret = borrowed.secret;
+                    keys.route = borrowed.route;
+                    keys.borrowed = Some(borrowed.from.display().to_string());
+                }
+                form.step = Some(ChannelStep::Keys(keys));
+                self.modal = Some(Modal::Channels(form));
+            }
+        }
+    }
+
+    /// Ask the worker for a fresh code, on a new attempt number.
+    ///
+    /// The number is what keeps two codes apart. Pressing `r` twice quickly
+    /// leaves two watches running for a moment, and without it the first one's
+    /// answer would land on top of the second one's code.
+    fn ask_for_code(&mut self, mut form: ChannelsForm) {
+        form.abandon_scan();
+        self.channel_attempt = self.channel_attempt.saturating_add(1);
+        let scan = ChannelScan {
+            attempt: self.channel_attempt,
+            ..ChannelScan::default()
+        };
+        let environment = self
+            .config
+            .environment_for(LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        if self
+            .worker
+            .requests
+            .send(Request::ChannelLogin {
+                attempt: scan.attempt,
+                alive: scan.alive.clone(),
+                environment,
+            })
+            .is_err()
+        {
+            form.error = Some("The worker is gone; no code was asked for".into());
+            form.step = None;
+        } else {
+            form.step = Some(ChannelStep::Scan(Box::new(scan)));
+        }
+        self.modal = Some(Modal::Channels(form));
+    }
+
+    fn handle_channel_scan_key(
         &mut self,
         mut form: ChannelsForm,
-        mut edit: ChannelEdit,
+        scan: ChannelScan,
         key: KeyEvent,
     ) {
-        let fields = edit.fields().len();
         match key.code {
-            // Back to the list, not out of the panel: leaving a form is a
-            // smaller step than leaving what the form was part of.
-            KeyCode::Esc => self.modal = Some(Modal::Channels(form)),
+            KeyCode::Esc => {
+                scan.alive.store(false, Ordering::Relaxed);
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('r') | KeyCode::Enter => {
+                form.step = Some(ChannelStep::Scan(Box::new(scan)));
+                self.ask_for_code(form);
+            }
+            _ => {
+                form.step = Some(ChannelStep::Scan(Box::new(scan)));
+                self.modal = Some(Modal::Channels(form));
+            }
+        }
+    }
+
+    fn handle_channel_keys_key(
+        &mut self,
+        mut form: ChannelsForm,
+        mut keys: ChannelKeys,
+        key: KeyEvent,
+    ) {
+        let fields = KeysField::ALL.len();
+        match key.code {
+            // Back one step rather than out of the panel: whoever got here
+            // through the chooser can get back to it.
+            KeyCode::Esc => {
+                form.step = Some(ChannelStep::Pick { selected: 1 });
+                self.modal = Some(Modal::Channels(form));
+            }
             KeyCode::Tab | KeyCode::Down => {
-                edit.selected = clamped_index(edit.selected, fields, 1);
-                form.edit = Some(edit);
+                keys.selected = clamped_index(keys.selected, fields, 1);
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
             KeyCode::BackTab | KeyCode::Up => {
-                edit.selected = clamped_index(edit.selected, fields, -1);
-                form.edit = Some(edit);
+                keys.selected = clamped_index(keys.selected, fields, -1);
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
-            KeyCode::Left | KeyCode::Right if edit.field() == ChannelField::Kind => {
-                let kinds = ChannelKind::ALL;
-                let index = kinds
-                    .iter()
-                    .position(|kind| *kind == edit.kind)
-                    .unwrap_or(0);
-                let step = if key.code == KeyCode::Left { -1 } else { 1 };
-                edit.kind = kinds[clamped_index(index, kinds.len(), step)];
-                edit.selected = edit.selected.min(edit.fields().len() - 1);
-                form.edit = Some(edit);
-                self.modal = Some(Modal::Channels(form));
-            }
-            KeyCode::Enter => self.save_channel_edit(form, edit),
+            KeyCode::Enter => self.save_lark_keys(form, keys),
             KeyCode::Backspace => {
-                if let Some(value) = edit.typed() {
-                    value.pop();
-                }
-                form.edit = Some(edit);
+                keys.typed().pop();
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(value) = edit.typed() {
-                    value.clear();
-                }
-                form.edit = Some(edit);
+                keys.typed().clear();
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
             KeyCode::Char(character)
@@ -7620,47 +7816,168 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(value) = edit.typed() {
-                    value.push(character);
-                    // Whatever is on screen now is what the person typed, so
-                    // the note about where the old value came from is no
-                    // longer about anything on screen.
-                    edit.borrowed = None;
-                }
-                form.edit = Some(edit);
+                keys.typed().push(character);
+                // Whatever is on screen now is what the person typed, so the
+                // note about where the old value came from is no longer about
+                // anything on screen.
+                keys.borrowed = None;
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
             _ => {
-                form.edit = Some(edit);
+                form.step = Some(ChannelStep::Keys(keys));
                 self.modal = Some(Modal::Channels(form));
             }
         }
     }
 
-    fn save_channel_edit(&mut self, mut form: ChannelsForm, edit: ChannelEdit) {
-        let mut binding = edit.binding(&form.set);
-        if binding.label.is_empty() {
-            binding.label = binding.kind.title().to_string();
-        }
+    fn save_lark_keys(&mut self, mut form: ChannelsForm, keys: ChannelKeys) {
+        let binding = crate::channel::ChannelBinding {
+            id: form.set.mint_id(ChannelKind::Lark),
+            kind: ChannelKind::Lark,
+            label: "Lark".into(),
+            app_id: keys.app_id.trim().to_string(),
+            secret: keys.secret.trim().to_string(),
+            route: keys.route.trim().to_string(),
+            preferred: form.set.bindings.is_empty(),
+            ..Default::default()
+        };
         if let Err(error) = binding.ready() {
             form.error = Some(format!("{error:#}"));
-            form.edit = Some(edit);
+            form.step = Some(ChannelStep::Keys(keys));
             self.modal = Some(Modal::Channels(form));
             return;
         }
-        // The first binding is the default, because a fleet with one chat in it
-        // should not make anyone name it.
-        binding.preferred = binding.preferred || form.set.bindings.is_empty();
-        form.note = Some(format!("{} is bound", binding.id));
-        match edit.index {
-            Some(index) if index < form.set.bindings.len() => form.set.bindings[index] = binding,
+        self.adopt_binding(&mut form, binding);
+        self.modal = Some(Modal::Channels(form));
+    }
+
+    fn handle_channel_rename_key(
+        &mut self,
+        mut form: ChannelsForm,
+        index: usize,
+        mut label: String,
+        key: KeyEvent,
+    ) {
+        match key.code {
+            KeyCode::Esc => self.modal = Some(Modal::Channels(form)),
+            KeyCode::Enter => {
+                if let Some(binding) = form.set.bindings.get_mut(index) {
+                    let named = label.trim();
+                    binding.label = if named.is_empty() {
+                        binding.kind.title().to_string()
+                    } else {
+                        named.to_string()
+                    };
+                    form.note = Some(format!("{} is now {}", binding.id, binding.label));
+                    form.dirty = true;
+                }
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Backspace => {
+                label.pop();
+                form.step = Some(ChannelStep::Rename { index, label });
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                label.clear();
+                form.step = Some(ChannelStep::Rename { index, label });
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                label.push(character);
+                form.step = Some(ChannelStep::Rename { index, label });
+                self.modal = Some(Modal::Channels(form));
+            }
             _ => {
-                form.set.bindings.push(binding);
-                form.selected = form.set.bindings.len() - 1;
+                form.step = Some(ChannelStep::Rename { index, label });
+                self.modal = Some(Modal::Channels(form));
             }
         }
+    }
+
+    /// Put a freshly bound chat in the list and leave the panel on it.
+    fn adopt_binding(&mut self, form: &mut ChannelsForm, binding: crate::channel::ChannelBinding) {
+        // The first binding is the default, because a fleet with one chat in it
+        // should not make anyone name it.
+        form.note = Some(format!(
+            "{} is bound · {}",
+            binding.id,
+            binding.destination()
+        ));
+        form.set.bindings.push(binding);
+        form.selected = form.set.bindings.len() - 1;
+        form.step = None;
         form.dirty = true;
-        self.modal = Some(Modal::Channels(form));
+    }
+
+    /// Take one step of a WeChat scan. Anything from an attempt the panel has
+    /// moved on from is dropped: it is a code nobody is looking at.
+    fn absorb_channel_login(&mut self, attempt: u64, step: crate::worker::LoginStep) {
+        use crate::worker::LoginStep;
+        let Some(Modal::Channels(form)) = self.modal.as_mut() else {
+            return;
+        };
+        let Some(ChannelStep::Scan(scan)) = form.step.as_mut() else {
+            return;
+        };
+        if scan.attempt != attempt {
+            return;
+        }
+        match step {
+            LoginStep::Code(link) => {
+                match crate::qr::encode(&link) {
+                    Ok(code) => scan.code = Some(code),
+                    // A link that will not fit in a code is still a link, and
+                    // the step below says to open it on a phone.
+                    Err(error) => debug::log("channel", format!("{error:#}")),
+                }
+                scan.link = link;
+                scan.state = ScanState::Showing;
+            }
+            LoginStep::Scanned => scan.state = ScanState::Scanned,
+            LoginStep::Expired => scan.state = ScanState::Expired,
+            LoginStep::Failed(error) => scan.state = ScanState::Failed(error),
+            LoginStep::Connected(account) => {
+                let binding = crate::channel::ChannelBinding {
+                    id: form.set.mint_id(ChannelKind::WeChat),
+                    kind: ChannelKind::WeChat,
+                    label: "WeChat".into(),
+                    app_id: account.bot_id.clone(),
+                    secret: account.token.clone(),
+                    route: account.user_id.clone(),
+                    base_url: account.base_url.clone(),
+                    preferred: form.set.bindings.is_empty(),
+                    ..Default::default()
+                };
+                let mut form = match self.modal.take() {
+                    Some(Modal::Channels(form)) => form,
+                    other => {
+                        self.modal = other;
+                        return;
+                    }
+                };
+                self.adopt_binding(&mut form, binding);
+                // Bound, but not yet able to speak: a ClawBot answers a
+                // conversation and cannot open one. Saying so here, while the
+                // phone is still in their hand, is the difference between one
+                // more tap and a channel that quietly never works.
+                form.note = Some(
+                    "Scanned. Now say anything at all to the bot in WeChat — hello will do — \
+                     and it can answer from then on."
+                        .into(),
+                );
+                self.modal = Some(Modal::Channels(form));
+                // The first message is what carries the token that lets it
+                // answer, so start listening now rather than on the next turn
+                // of the ordinary round.
+                self.last_inbox_poll = None;
+            }
+        }
     }
 
     /// Say something through the selected binding, as the person at the
@@ -13976,12 +14293,135 @@ mod tests {
         }
     }
 
+    fn channel_step(app: &App) -> &ChannelStep {
+        channels_form(app)
+            .step
+            .as_ref()
+            .expect("the panel is on its list")
+    }
+
     #[test]
-    fn a_binding_typed_into_the_panel_reaches_every_machine_one_revision_on() {
+    fn picking_wechat_puts_a_code_on_screen_and_a_scan_binds_it() {
+        let (mut app, requests, path) = channels_app("scan", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        // WeChat is offered first because it is the one that costs nothing to
+        // set up, so Enter straight away is the whole happy path.
+        assert!(matches!(
+            channel_step(&app),
+            ChannelStep::Pick { selected: 0 }
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let attempt = match requests.try_recv() {
+            Ok(Request::ChannelLogin { attempt, .. }) => attempt,
+            other => panic!("a code should have been asked for: {other:?}"),
+        };
+        assert!(matches!(
+            channel_step(&app),
+            ChannelStep::Scan(scan) if scan.state == ScanState::Asking
+        ));
+
+        app.handle_worker_event(Event::ChannelLogin {
+            attempt,
+            step: crate::worker::LoginStep::Code("https://ilink.example/x".into()),
+        });
+        match channel_step(&app) {
+            ChannelStep::Scan(scan) => {
+                assert_eq!(scan.state, ScanState::Showing);
+                assert!(scan.code.is_some(), "the link became something to draw");
+                assert_eq!(scan.link, "https://ilink.example/x");
+            }
+            other => panic!("still scanning: {other:?}"),
+        }
+        // A code nobody is looking at any more cannot come back over the one
+        // they are.
+        app.handle_worker_event(Event::ChannelLogin {
+            attempt: attempt.saturating_sub(1),
+            step: crate::worker::LoginStep::Expired,
+        });
+        assert!(matches!(
+            channel_step(&app),
+            ChannelStep::Scan(scan) if scan.state == ScanState::Showing
+        ));
+
+        app.handle_worker_event(Event::ChannelLogin {
+            attempt,
+            step: crate::worker::LoginStep::Connected(Box::new(crate::ilink::Account {
+                bot_id: "bot_7".into(),
+                token: "tok".into(),
+                base_url: "https://near.example".into(),
+                user_id: "u_1".into(),
+            })),
+        });
+        let form = channels_form(&app);
+        assert!(form.step.is_none(), "a scan that lands goes to the list");
+        let bound = &form.set.bindings[0];
+        assert_eq!(bound.id, "wechat-1");
+        assert_eq!(bound.secret, "tok", "the token is what it speaks with");
+        assert_eq!(bound.base_url, "https://near.example");
+        assert!(bound.preferred, "the only channel there is needs no naming");
+        // Bound, but not able to speak yet, and the panel says which way round
+        // that is rather than looking broken.
+        assert!(bound.reachable().is_ok());
+        assert!(bound.ready().is_err());
+        let note = form.note.clone().unwrap_or_default();
+        assert!(note.contains("say anything"), "{note}");
+
+        // The first thing the human says carries the token that lets it answer,
+        // and that has to reach every machine, not just this one.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.channels.revision, 5);
+        app.absorb_inbox(
+            app.inbox.clone(),
+            crate::channel::InboxRound {
+                refreshed: vec![("wechat-1".into(), "ctx-9".into())],
+                ..Default::default()
+            },
+        );
+        assert_eq!(app.channels.bindings[0].context_token, "ctx-9");
+        assert!(app.channels.bindings[0].ready().is_ok());
+        assert_eq!(
+            app.channels.revision, 6,
+            "every machine needs the token, so the list moves on"
+        );
+        assert!(app.status_message.contains("can answer now"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn walking_away_from_a_code_stops_the_watch_that_was_left_on_it() {
+        let (mut app, requests, path) = channels_app("abandon", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let alive = match requests.try_recv() {
+            Ok(Request::ChannelLogin { alive, .. }) => alive,
+            other => panic!("a code should have been asked for: {other:?}"),
+        };
+        assert!(alive.load(Ordering::Relaxed));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            !alive.load(Ordering::Relaxed),
+            "nobody is looking at that code, so nothing should still be asking \
+             WeChat about it"
+        );
+        assert!(channels_form(&app).step.is_none(), "back on the list");
+        // And asking again is a different code, so the first one's answer can
+        // never land on the second one's screen.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match requests.try_recv() {
+            Ok(Request::ChannelLogin { attempt, .. }) => assert_eq!(attempt, 2),
+            other => panic!("a second code: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_lark_binding_typed_into_the_panel_reaches_every_machine_one_revision_on() {
         let (mut app, _requests, path) = channels_app("typed", Vec::new());
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        type_into(&mut app, "phone");
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(channel_step(&app), ChannelStep::Keys(_)));
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_into(&mut app, "shhh");
@@ -13989,13 +14429,18 @@ mod tests {
         type_into(&mut app, "oc_1");
         // Bullets are what is drawn, not what is held: a masked field that
         // stored its mask would bind a channel nothing could send through.
-        let edit = channels_form(&app).edit.as_ref().expect("still writing it");
-        assert_eq!(edit.secret, "shhh");
-        assert!(edit.field().hidden() || edit.field() == ChannelField::Route);
+        match channel_step(&app) {
+            ChannelStep::Keys(keys) => {
+                assert_eq!(keys.secret, "shhh");
+                assert!(KeysField::Secret.hidden());
+                assert_eq!(keys.field(), KeysField::Route);
+            }
+            other => panic!("still writing it: {other:?}"),
+        }
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let form = channels_form(&app);
-        assert!(form.edit.is_none(), "saving goes back to the list");
+        assert!(form.step.is_none(), "saving goes back to the list");
         assert_eq!(form.set.bindings.len(), 1);
         assert!(
             form.set.bindings[0].preferred,
@@ -14023,46 +14468,56 @@ mod tests {
     }
 
     #[test]
-    fn switching_the_chat_app_asks_only_for_what_that_one_needs() {
-        let (mut app, _requests, path) = channels_app("switch", Vec::new());
+    fn a_lark_app_with_no_chat_behind_it_says_so_before_it_is_bound() {
+        let (mut app, _requests, path) = channels_app("half", Vec::new());
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        for _ in 0..4 {
-            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        }
-        assert_eq!(
-            channels_form(&app).edit.as_ref().unwrap().field(),
-            ChannelField::Route
-        );
-        for _ in 0..4 {
-            app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        }
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        let edit = channels_form(&app).edit.as_ref().unwrap();
-        assert_eq!(edit.kind, ChannelKind::WeCom);
-        // A robot's webhook URL already names its group, so there is no app id
-        // row and no chat id row to leave someone staring at.
-        assert_eq!(edit.fields().len(), 3);
-
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let error = channels_form(&app).error.clone().unwrap_or_default();
-        assert!(channels_form(&app).edit.is_some(), "nothing usable to save");
-        assert!(error.contains("webhook key"), "{error}");
-        assert!(!error.contains("app id"), "{error}");
+        assert!(
+            matches!(channel_step(&app), ChannelStep::Keys(_)),
+            "nothing usable to save, so nobody is sent back to the list"
+        );
+        assert!(error.contains("app secret"), "{error}");
+        // Esc from a step is a step back, not the way out of the panel: the
+        // chooser is where whoever got here came from.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            channel_step(&app),
+            ChannelStep::Pick { selected: 1 }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
 
-        // Two Tabs from the top is the key, whichever chat app is selected.
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        type_into(&mut app, "abc123");
+    #[test]
+    fn a_bound_chat_can_be_renamed_and_nothing_else_about_it_typed_over() {
+        let (mut app, _requests, path) = channels_app(
+            "rename",
+            vec![crate::channel::ChannelBinding {
+                id: "wechat-1".into(),
+                kind: ChannelKind::WeChat,
+                label: "WeChat".into(),
+                secret: "tok".into(),
+                route: "u_1".into(),
+                context_token: "ctx".into(),
+                preferred: true,
+                ..Default::default()
+            }],
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_into(&mut app, "my phone");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let form = channels_form(&app);
-        assert!(form.edit.is_none(), "{:?}", form.error);
-        assert_eq!(form.set.bindings[0].id, "wecom-1");
-        assert_eq!(form.set.bindings[0].secret, "abc123");
+        assert!(form.step.is_none());
+        assert_eq!(form.set.bindings[0].label, "my phone");
         assert_eq!(
-            form.set.bindings[0].label,
-            ChannelKind::WeCom.title(),
-            "an unnamed binding is called what it is"
+            form.set.bindings[0].secret, "tok",
+            "renaming touches the name and nothing that makes it work"
         );
+        assert!(form.dirty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -14076,6 +14531,7 @@ mod tests {
             secret: "shhh".into(),
             route: "oc_1".into(),
             preferred,
+            ..Default::default()
         };
         let (mut app, _requests, path) = channels_app(
             "default",

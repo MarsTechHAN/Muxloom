@@ -21,11 +21,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BoardForm, BoardTab, ChannelEdit, ChannelField, ChannelsForm, FileManagerForm, Focus,
-        HELP_CONTENT_ROWS, HelpForm, LaunchField, LaunchForm, MachineRow, Modal, ModeratorForm,
-        ModeratorRow, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, SearchForm,
-        SettingsForm, SettingsRow, SettingsScope,
+        App, BoardForm, BoardTab, ChannelKeys, ChannelScan, ChannelStep, ChannelsForm,
+        FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, KeysField, LaunchField, LaunchForm,
+        MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
+        PortForwardForm, ResumeForm, ScanState, SearchForm, SettingsForm, SettingsRow,
+        SettingsScope,
     },
+    channel::ChannelKind,
     debug,
     model::{AgentKind, ConnectionState, FileEntryKind, FilePreviewKind, SearchMatchKind},
     port_forward::PortForwardState,
@@ -3161,14 +3163,26 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         help_header("Channels"),
         help_row(
             "c in Machines",
-            "Bind Lark or a WeCom robot so any agent can reach you",
+            "Bind WeChat or Lark so any agent in the fleet can reach you",
         ),
-        help_row("n / e / x there", "Add, edit, or remove a binding"),
+        help_row(
+            "n there",
+            "Bind a chat: WeChat is a scan, Lark asks for keys",
+        ),
+        help_row(
+            "r on the code",
+            "A fresh code, once the old one has timed out",
+        ),
+        help_row("e / x there", "Rename a binding, or remove it"),
         help_row("Enter there", "Where a message that names no channel goes"),
         help_row("t there", "Send yourself a test message through it"),
         help_row(
+            "Say anything in WeChat",
+            "A new binding cannot answer until you have spoken to it once",
+        ),
+        help_row(
             "Reply in the chat",
-            "Answers the agent whose card you replied to; /who lists them",
+            "Answers the agent whose message you replied to; /who lists them",
         ),
         Line::raw(""),
         help_header("Moderators"),
@@ -4671,14 +4685,23 @@ fn moderator_item_line(item: &crate::app::ScopeItem) -> String {
 /// that an agent finishing something at three in the morning on a machine
 /// nobody is watching can still say so.
 fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) {
-    let area = centered_rect(76, 18, outer);
+    // The scan step takes the window it needs. A code has to come out square
+    // and big enough for a phone to read across a desk, and there is nothing
+    // else on that screen to make room for.
+    let area = match &form.step {
+        Some(ChannelStep::Scan(_)) => centered_rect(76, 40, outer),
+        _ => centered_rect(76, 18, outer),
+    };
     frame.render_widget(Clear, area);
-    let title = match &form.edit {
-        Some(edit) => match edit.index.and_then(|index| form.set.bindings.get(index)) {
-            Some(binding) => format!(" Channel {} ", binding.id),
-            None => " New channel ".to_string(),
-        },
+    let title = match &form.step {
         None => " Channels · how an agent reaches you ".to_string(),
+        Some(ChannelStep::Pick { .. }) => " Bind a chat ".to_string(),
+        Some(ChannelStep::Scan(_)) => " Bind a chat · WeChat ".to_string(),
+        Some(ChannelStep::Keys(_)) => " Bind a chat · Lark ".to_string(),
+        Some(ChannelStep::Rename { index, .. }) => match form.set.bindings.get(*index) {
+            Some(binding) => format!(" Rename {} ", binding.id),
+            None => " Rename ".to_string(),
+        },
     };
     let block = panel(&title, true);
     let inner = block.inner(area);
@@ -4686,9 +4709,12 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let hints = match &form.edit {
-        Some(_) => "Tab field   Left/Right chat app   Enter save   Esc back",
-        None => "n new   e edit   x remove   Enter default   t test   Esc save & close",
+    let hints = match &form.step {
+        None => "n new   e rename   x remove   Enter default   t test   Esc save & close",
+        Some(ChannelStep::Pick { .. }) => "Up/Down choose   Enter start   Esc back",
+        Some(ChannelStep::Scan(_)) => "r new code   Esc back",
+        Some(ChannelStep::Keys(_)) => "Tab field   Enter bind   Esc back",
+        Some(ChannelStep::Rename { .. }) => "Enter rename   Esc back",
     };
     let message = match (&form.error, &form.note) {
         (Some(error), _) => (truncate(error, inner.width as usize), Color::Red),
@@ -4707,9 +4733,17 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
             row,
         );
     }
-    match &form.edit {
-        Some(edit) => draw_channel_edit(frame, form, edit, inner),
+    // Two rows at the bottom are the message and the hints, whatever the step.
+    let body = Rect {
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    match &form.step {
         None => draw_channel_list(frame, form, inner),
+        Some(ChannelStep::Pick { selected }) => draw_channel_pick(frame, *selected, body),
+        Some(ChannelStep::Scan(scan)) => draw_channel_scan(frame, scan, body),
+        Some(ChannelStep::Keys(keys)) => draw_channel_keys(frame, form, keys, body),
+        Some(ChannelStep::Rename { label, .. }) => draw_channel_rename(frame, label, body),
     }
 }
 
@@ -4724,7 +4758,7 @@ fn draw_channel_list(frame: &mut Frame<'_>, form: &ChannelsForm, inner: Rect) {
         && let Some(row) = modal_row(inner, 1)
     {
         frame.render_widget(
-            Paragraph::new("None yet. Press n to bind Lark or a WeCom group robot.")
+            Paragraph::new("None yet. Press n — WeChat takes a scan and about ten seconds.")
                 .style(Style::default().fg(MUTED)),
             row,
         );
@@ -4751,20 +4785,26 @@ fn draw_channel_list(frame: &mut Frame<'_>, form: &ChannelsForm, inner: Rect) {
         } else {
             binding.label.clone()
         };
+        // What is wrong with it, when something is, in place of the flags that
+        // would otherwise be there: a row that cannot be used should say so
+        // where a person is already looking.
+        let state = match binding.ready() {
+            Err(_) if binding.kind == ChannelKind::WeChat => "  ·  say hello to it in WeChat",
+            Err(_) => "  ·  unfinished",
+            Ok(()) if binding.preferred => "  ·  default",
+            Ok(()) => "",
+        };
         let line = format!(
-            "{:<10}{name}  ·  {}{}",
+            "{:<10}{name}  ·  {}{state}",
             binding.id,
-            binding.describes(),
-            if binding.preferred {
-                "  ·  default"
-            } else {
-                ""
-            }
+            binding.destination()
         );
         frame.render_widget(
             Paragraph::new(truncate(&line, inner.width as usize)).style(
                 Style::default()
-                    .fg(if binding.preferred {
+                    .fg(if binding.ready().is_err() {
+                        Color::Yellow
+                    } else if binding.preferred {
                         ACCENT
                     } else {
                         Color::White
@@ -4783,8 +4823,8 @@ fn draw_channel_list(frame: &mut Frame<'_>, form: &ChannelsForm, inner: Rect) {
     // how long an answer takes to come back.
     let notes = [
         form.reach.clone(),
-        "Lark also listens: a reply goes back to the agent that spoke, read every ~5s.".into(),
-        "WeCom group robots only send. Personal WeChat has no API and is not offered.".into(),
+        "Both listen: a reply goes back to the agent that spoke, read every ~5s.".into(),
+        "In WeChat, whatever you say goes to whoever spoke last. /who lists them.".into(),
     ];
     for (offset, note) in notes.iter().enumerate() {
         let Some(row) = modal_row(inner, inner.height.saturating_sub(6) + offset as u16) else {
@@ -4797,16 +4837,168 @@ fn draw_channel_list(frame: &mut Frame<'_>, form: &ChannelsForm, inner: Rect) {
     }
 }
 
-fn draw_channel_edit(frame: &mut Frame<'_>, form: &ChannelsForm, edit: &ChannelEdit, inner: Rect) {
-    let label_width = 14;
-    let fields = edit.fields();
-    let mut cursor = None;
-    for (index, field) in fields.iter().enumerate() {
-        let Some(row) = modal_row(inner, index as u16) else {
+/// The chooser. Two rows, each saying what it will cost to go that way — a name
+/// on its own is not a decision anybody can make.
+fn draw_channel_pick(frame: &mut Frame<'_>, selected: usize, inner: Rect) {
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new("Which chat should agents reach you in?")
+                .style(Style::default().fg(Color::Gray).bold()),
+            row,
+        );
+    }
+    for (index, kind) in ChannelKind::ALL.iter().enumerate() {
+        let Some(row) = modal_row(inner, 2 + index as u16 * 2) else {
             break;
         };
-        let active = index == edit.selected.min(fields.len() - 1);
-        let value = edit.value(*field);
+        let active = index == selected.min(ChannelKind::ALL.len() - 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if active { "  ▸ " } else { "    " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    kind.title(),
+                    Style::default()
+                        .fg(if active { Color::White } else { Color::Gray })
+                        .bold(),
+                ),
+            ])),
+            row,
+        );
+        if let Some(row) = modal_row(inner, 3 + index as u16 * 2) {
+            frame.render_widget(
+                Paragraph::new(truncate(
+                    &format!("      {}", kind.pitch()),
+                    inner.width as usize,
+                ))
+                .style(Style::default().fg(MUTED)),
+                row,
+            );
+        }
+    }
+}
+
+/// The code, and one line saying what to do with it.
+fn draw_channel_scan(frame: &mut Frame<'_>, scan: &ChannelScan, inner: Rect) {
+    let (headline, colour) = match &scan.state {
+        ScanState::Asking => ("Asking WeChat for a code…", MUTED),
+        ScanState::Showing => ("Open WeChat › 扫一扫 and point it here", Color::White),
+        ScanState::Scanned => ("Scanned — now tap confirm on your phone", Color::Green),
+        ScanState::Expired => ("That code timed out. Press r for another.", Color::Yellow),
+        ScanState::Failed(error) => (error.as_str(), Color::Red),
+    };
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new(truncate(headline, inner.width as usize))
+                .style(Style::default().fg(colour).bold()),
+            row,
+        );
+    }
+    let grid = Rect {
+        y: inner.y.saturating_add(2),
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    let drawn = matches!(scan.state, ScanState::Showing | ScanState::Scanned)
+        && scan
+            .code
+            .as_ref()
+            .is_some_and(|code| draw_qr(frame, grid, code));
+    // A window too small for the code is not a dead end: the same link opened
+    // on the phone does the same thing.
+    if !drawn
+        && !scan.link.is_empty()
+        && let Some(row) = modal_row(inner, inner.height.saturating_sub(1))
+    {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                &format!(
+                    "Too small to draw the code here. Open on your phone: {}",
+                    scan.link
+                ),
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+}
+
+/// Paint a QR code into `area`, centred, and say whether there was room.
+///
+/// Half blocks: the top half of a cell is one module and the bottom half is the
+/// module under it. A terminal cell is about twice as tall as it is wide, so
+/// this is the only way to get modules that come out square — and a scanner
+/// wants them square.
+///
+/// Black on white whatever the terminal's own colours are. A scanner reads
+/// contrast and does not know about themes; a code painted in a dark palette's
+/// foreground on its background is a code that will not scan.
+fn draw_qr(frame: &mut Frame<'_>, area: Rect, code: &crate::qr::Code) -> bool {
+    let (columns, rows) = (code.columns(), code.rows());
+    let (Ok(width), Ok(height)) = (u16::try_from(columns), u16::try_from(rows)) else {
+        return false;
+    };
+    if area.width < width || area.height < height {
+        return false;
+    }
+    let dark = Style::default().fg(Color::Black).bg(Color::White);
+    let lines = (0..rows)
+        .map(|row| {
+            Line::from(
+                (0..columns)
+                    .map(|column| {
+                        // The upper half block is drawn in the foreground and
+                        // the lower half is whatever shows through behind it.
+                        Span::styled(
+                            "▀",
+                            match (code.dark(column, row * 2), code.dark(column, row * 2 + 1)) {
+                                (true, true) => dark.fg(Color::Black).bg(Color::Black),
+                                (true, false) => dark,
+                                (false, true) => dark.fg(Color::White).bg(Color::Black),
+                                (false, false) => dark.fg(Color::White).bg(Color::White),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        ),
+    );
+    true
+}
+
+/// Lark's two strings, and the one honest sentence about why they have to be
+/// typed at all.
+fn draw_channel_keys(frame: &mut Frame<'_>, form: &ChannelsForm, keys: &ChannelKeys, inner: Rect) {
+    if let Some(row) = modal_row(inner, 0) {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                "Lark has no code to scan: an app is a thing only open.feishu.cn can make.",
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
+            row,
+        );
+    }
+    let label_width = 14;
+    let mut cursor = None;
+    for (index, field) in KeysField::ALL.iter().enumerate() {
+        let Some(row) = modal_row(inner, 2 + index as u16) else {
+            break;
+        };
+        let active = index == keys.selected.min(KeysField::ALL.len() - 1);
+        let value = keys.value(*field);
         // A secret is shown as bullets whether or not the cursor is on it: the
         // person typing it knows what they pasted, and everyone behind them
         // does not need to.
@@ -4817,7 +5009,7 @@ fn draw_channel_edit(frame: &mut Frame<'_>, form: &ChannelsForm, edit: &ChannelE
         };
         let mut spans = vec![
             Span::styled(
-                format!("{:<label_width$}", field.label(edit.kind)),
+                format!("{:<label_width$}", field.label()),
                 Style::default().fg(if active { ACCENT } else { Color::Gray }),
             ),
             Span::styled(
@@ -4835,48 +5027,77 @@ fn draw_channel_edit(frame: &mut Frame<'_>, form: &ChannelsForm, edit: &ChannelE
             let room = (inner.width as usize)
                 .saturating_sub(label_width + UnicodeWidthStr::width(shown.as_str()) + 2);
             spans.push(Span::styled(
-                format!("  {}", truncate(field.hint(edit.kind), room)),
+                format!("  {}", truncate(field.hint(), room)),
                 Style::default().fg(MUTED),
             ));
-            if *field != ChannelField::Kind {
-                cursor = Some((
-                    inner
-                        .x
-                        .saturating_add(label_width as u16)
-                        .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
-                        .min(inner.x + inner.width.saturating_sub(1)),
-                    row.y,
-                ));
-            }
+            cursor = Some((
+                inner
+                    .x
+                    .saturating_add(label_width as u16)
+                    .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
+                    .min(inner.x + inner.width.saturating_sub(1)),
+                row.y,
+            ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), row);
     }
-    if let Some(borrowed) = &edit.borrowed
-        && let Some(row) = modal_row(inner, fields.len() as u16 + 1)
-    {
+    let footnote = match &keys.borrowed {
+        Some(borrowed) => (
+            format!("Filled in from {borrowed} — check it, then Enter"),
+            Color::Yellow,
+        ),
+        None if form.set.bindings.is_empty() => (
+            "The first channel bound is the one a message that names none goes to.".into(),
+            MUTED,
+        ),
+        None => (String::new(), MUTED),
+    };
+    if let Some(row) = modal_row(inner, 2 + KeysField::ALL.len() as u16 + 1) {
         frame.render_widget(
-            Paragraph::new(truncate(
-                &format!("Filled in from {borrowed} — check it, then Enter to save"),
-                inner.width as usize,
-            ))
-            .style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(truncate(&footnote.0, inner.width as usize))
+                .style(Style::default().fg(footnote.1)),
             row,
         );
     }
-    if form.set.bindings.is_empty()
-        && let Some(row) = modal_row(inner, inner.height.saturating_sub(4))
-    {
+    if let Some((x, y)) = cursor {
+        frame.set_cursor_position((x, y));
+    }
+}
+
+fn draw_channel_rename(frame: &mut Frame<'_>, label: &str, inner: Rect) {
+    if let Some(row) = modal_row(inner, 0) {
         frame.render_widget(
             Paragraph::new(truncate(
-                "The first channel bound is the one a message that names none goes to.",
+                "What a message says it came through. Nothing else about a binding is typed.",
                 inner.width as usize,
             ))
             .style(Style::default().fg(MUTED)),
             row,
         );
     }
-    if let Some((x, y)) = cursor {
-        frame.set_cursor_position((x, y));
+    let label_width = 14;
+    if let Some(row) = modal_row(inner, 2) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<label_width$}", "Name"),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    label.to_string(),
+                    Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58)),
+                ),
+            ])),
+            row,
+        );
+        frame.set_cursor_position((
+            inner
+                .x
+                .saturating_add(label_width as u16)
+                .saturating_add(UnicodeWidthStr::width(label) as u16)
+                .min(inner.x + inner.width.saturating_sub(1)),
+            row.y,
+        ));
     }
 }
 

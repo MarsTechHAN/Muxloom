@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -192,6 +196,36 @@ pub enum Request {
         binding: Box<crate::channel::ChannelBinding>,
         environment: Vec<(String, String)>,
     },
+    /// Ask WeChat for a login code and then watch it until a phone has been
+    /// through it.
+    ///
+    /// The whole scan is one request rather than a poll from the dashboard,
+    /// because watching is a long poll that can run for the five minutes a code
+    /// lives: keeping it here leaves the dashboard's side as "draw what came".
+    ChannelLogin {
+        /// Which attempt this is. Echoed on every event, so somebody who walked
+        /// away from one code and asked for another is never shown the first.
+        attempt: u64,
+        /// Cleared when nobody is looking at the code any more, so the watch
+        /// stops asking WeChat about it rather than running out its five
+        /// minutes on a screen that has moved on.
+        alive: Arc<AtomicBool>,
+        environment: Vec<(String, String)>,
+    },
+}
+
+/// How far a WeChat login has got, in the steps a person sees.
+#[derive(Debug, Clone)]
+pub enum LoginStep {
+    /// A code to draw, as the link a phone should arrive at.
+    Code(String),
+    /// A phone has read it. What is left is a tap on the phone.
+    Scanned,
+    /// Nobody got there in time; codes last about five minutes.
+    Expired,
+    /// Done, and this is the bot that came of it.
+    Connected(Box<crate::ilink::Account>),
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -362,6 +396,12 @@ pub enum Event {
     ChannelTested {
         id: String,
         result: Result<String, String>,
+    },
+    /// A WeChat login moved on. Every step of one scan carries the same
+    /// `attempt`; anything from an older one is the dashboard's to drop.
+    ChannelLogin {
+        attempt: u64,
+        step: LoginStep,
     },
 }
 
@@ -1125,6 +1165,48 @@ impl Worker {
                             debug::log("channel", format!("test through {id} failed: {error}"));
                         }
                         let _ = events.send(Event::ChannelTested { id, result });
+                    }
+                    Request::ChannelLogin {
+                        attempt,
+                        alive,
+                        environment,
+                    } => {
+                        let reached = |step| {
+                            let _ = events.send(Event::ChannelLogin { attempt, step });
+                        };
+                        match crate::ilink::begin(&environment) {
+                            Err(error) => reached(LoginStep::Failed(format!("{error:#}"))),
+                            Ok(login) => {
+                                reached(LoginStep::Code(login.link));
+                                // Said once. WeChat repeats "scanned" on every
+                                // poll until the tap comes, and a line that
+                                // rewrites itself with the same words reads as
+                                // something going wrong.
+                                let mut announced = false;
+                                while alive.load(Ordering::Relaxed) {
+                                    match crate::ilink::watch(&login.handle, &environment) {
+                                        Ok(crate::ilink::Scan::Waiting) => {}
+                                        Ok(crate::ilink::Scan::Scanned) if announced => {}
+                                        Ok(crate::ilink::Scan::Scanned) => {
+                                            announced = true;
+                                            reached(LoginStep::Scanned);
+                                        }
+                                        Ok(crate::ilink::Scan::Expired) => {
+                                            reached(LoginStep::Expired);
+                                            break;
+                                        }
+                                        Ok(crate::ilink::Scan::Connected(account)) => {
+                                            reached(LoginStep::Connected(account));
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            reached(LoginStep::Failed(format!("{error:#}")));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     Request::TalkSync {
                         targets,
