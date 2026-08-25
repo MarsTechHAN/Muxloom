@@ -73,6 +73,10 @@ pub const RELAYED_TOOLS: &[&str] = &[
     "read_screen",
     "search_conversations",
     "search_history",
+    // Speaking to the human, for a machine that has not been handed the
+    // credentials yet. It changes nothing over there — the controller says
+    // something on this machine's behalf, exactly as `message_agent` does.
+    "send_channel_message",
     "talk_post",
     "talk_read",
 ];

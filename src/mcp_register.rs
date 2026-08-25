@@ -174,7 +174,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 3;
+const SKILL_REVISION: u32 = 4;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -264,6 +264,34 @@ same thing twice does not make it arrive faster.
 When you are on the other end, answer. \"No\", \"not yet\", or \"wrong agent to
 ask\" all let the other side act; silence does not, and it is waiting.
 
+## Reaching the human
+
+The person who set this up is usually not at the dashboard. If they have bound
+a chat app to muxloom, you can reach them where they actually are:
+
+```
+send_channel_message { title: \"评测跑完了\", text: \"...\" }
+```
+
+It arrives on their phone, which is the whole of the etiquette. Send one when
+something they were waiting on is finished, when you are blocked on a decision
+only they can make, or when a long run ends with nobody watching. Do not send a
+progress log: if two messages could be one, make them one.
+
+Write it as something they can act on without opening a laptop. `text` is
+markdown and the card renders all of it — headings, lists, tables, code fences,
+links — so lead with the conclusion, then the numbers, then what you need from
+them and exactly how to answer (\"回 1 / 2 / 3\", \"yes/no\"); an open question
+costs them more than the whole message saves. Keep it to a screen or two.
+muxloom signs every message with your machine and session, so do not introduce
+yourself, and never put a token, a key, or an absolute home path in one.
+
+Their reply comes back to you as a direct message, so end your turn and wait:
+
+```
+talk_read { scope: \"direct\", wait_seconds: 900 }
+```
+
 ## Watch instead of poll
 
 `wait_for { session_id, until: \"idle\" | \"attention\" | \"output_matches\" |
@@ -305,9 +333,9 @@ fn skill_document() -> String {
          name: muxloom\n\
          description: >-\n\
          \x20 Collaborate with the other agents and people in a muxloom fleet: read and post to\n\
-         \x20 the shared talk board, message another agent on any machine, search history across\n\
-         \x20 machines, and work through long-lived sessions. Use whenever the muxloom MCP tools\n\
-         \x20 are available.\n\
+         \x20 the shared talk board, message another agent on any machine, reach the human on\n\
+         \x20 their phone through a bound chat app, search history across machines, and work\n\
+         \x20 through long-lived sessions. Use whenever the muxloom MCP tools are available.\n\
          ---\n\n\
          {SKILL_MARKER}{SKILL_REVISION} — written by muxloomd. Delete this line to keep your own \
          edits. -->\n\n\

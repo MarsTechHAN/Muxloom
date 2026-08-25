@@ -17,14 +17,18 @@
 //! what is behind it.
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::{debug, model::Target, runtime::Runtime};
+use crate::{debug, http, model::Target, runtime::Runtime};
 
 /// Advertised by a daemon that can be given a channel set. A daemon without it
 /// is simply left out of the round; nothing else about it changes.
@@ -303,6 +307,293 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(CHANNELS_FILE)
 }
 
+/// Where Lark's open platform lives. `feishu.cn` and `larksuite.com` are the
+/// same API under two names; a `cli_…` app id issued by 飞书 belongs to this one.
+const LARK_HOST: &str = "https://open.feishu.cn";
+/// A WeCom group robot is a URL and nothing else: no account, no token, and the
+/// key a person copied out of the group's own settings.
+const WECOM_HOOK: &str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=";
+
+/// The most text one message carries, in bytes. Lark caps a card at 30 KB and a
+/// WeCom robot at 4 KB, and both answer something larger by refusing it rather
+/// than by shortening it — so the shortening happens here, where it can be said
+/// out loud in the message itself.
+const LARK_LIMIT: usize = 20 * 1024;
+const WECOM_LIMIT: usize = 3 * 1024;
+
+/// How long before its stated expiry a tenant token is treated as spent. The
+/// token is good for two hours; a minute covers a slow request and a clock that
+/// is not quite right.
+const TOKEN_MARGIN: Duration = Duration::from_secs(60);
+
+/// A message on its way to a human.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outgoing {
+    /// What the message is about, in a few words. Lark shows it as the card's
+    /// own header; WeCom gets it as a heading above the text.
+    pub title: String,
+    /// The message, as markdown.
+    pub text: String,
+    /// One line naming who is speaking, put under the text. A human reading
+    /// this on their phone has no other way to tell one agent from another.
+    pub signature: String,
+}
+
+impl Outgoing {
+    /// The title and the body as they go on the wire.
+    ///
+    /// The text itself is left almost exactly as it was written: the card
+    /// renders GitHub-flavoured markdown, which is what an agent writes without
+    /// being asked to, and rewriting someone's prose to protect a renderer
+    /// costs more than it saves. Two things are done to it:
+    ///
+    /// - a leading `# ` line becomes the title when there is not one already,
+    ///   because a card whose header and first line say the same thing reads as
+    ///   a stutter, and
+    /// - the whole thing is cut to fit, with the signature kept: a message that
+    ///   was too long is still worth reading, and one the platform refused is
+    ///   not a message at all.
+    fn compose(&self, limit: usize) -> (String, String) {
+        let mut title = self.title.trim().replace(['\r', '\n'], " ");
+        let mut text = self.text.trim();
+        if title.is_empty()
+            && let Some(rest) = text.strip_prefix("# ")
+        {
+            let (heading, remainder) = rest.split_once('\n').unwrap_or((rest, ""));
+            title = heading.trim().to_string();
+            text = remainder.trim_start();
+        }
+        let signature = self.signature.trim();
+        let mut body = clip(text, limit.saturating_sub(signature.len() + 2));
+        if !signature.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(signature);
+        }
+        (title, body)
+    }
+}
+
+/// The text cut to fit on a character boundary, saying so where it was cut.
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    const MARK: &str = "\n\n*(cut to fit — the rest stayed on the machine)*";
+    let mut end = limit.saturating_sub(MARK.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARK}", &text[..end])
+}
+
+/// What a delivered message left behind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sent {
+    /// The binding it went through, by the id an agent named.
+    pub channel: String,
+    /// That binding described without its secret, for the answer and the panel.
+    pub through: String,
+    /// The platform's own id for the message. Lark gives one — it is what a
+    /// human's reply points back at, and how [`crate::channel`] will know which
+    /// agent an answer belongs to. A WeCom robot gives nothing.
+    pub message_id: String,
+}
+
+/// Post one message to a human through one binding.
+///
+/// Whichever machine runs this is the machine that talks to the chat API, which
+/// is why the credentials travel: an agent that finishes something at three in
+/// the morning on a machine the controller is not watching still gets to say so.
+pub fn send(
+    binding: &ChannelBinding,
+    message: &Outgoing,
+    environment: &[(String, String)],
+) -> Result<Sent> {
+    binding.ready()?;
+    if message.text.trim().is_empty() {
+        bail!("a channel message needs something to say");
+    }
+    match binding.kind {
+        ChannelKind::Lark => send_lark(binding, message, environment),
+        ChannelKind::WeCom => send_wecom(binding, message, environment),
+    }
+}
+
+/// Lark answers HTTP 200 with a non-zero `code` for everything it refuses, so
+/// the status alone never says whether a message arrived. Checking this is what
+/// keeps "sent" from meaning "the request was well formed".
+fn lark_ok(answer: &Value, what: &str) -> Result<()> {
+    match answer
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+    {
+        0 => Ok(()),
+        code => bail!(
+            "Lark refused {what}: {} (code {code})",
+            answer
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given"),
+        ),
+    }
+}
+
+/// Tenant tokens already in hand, by app id.
+///
+/// Lark rate-limits the token endpoint harder than the message one, and the
+/// controller asks for a token every few seconds once it is watching a chat.
+/// Keyed by app id rather than by binding so two chats behind one app share it.
+fn token_cache() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn tenant_token(binding: &ChannelBinding, environment: &[(String, String)]) -> Result<String> {
+    let app_id = binding.app_id.trim().to_string();
+    let held = {
+        let cache = token_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .get(&app_id)
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(token, _)| token.clone())
+    };
+    if let Some(token) = held {
+        return Ok(token);
+    }
+    let answer = http::post_json(
+        &format!("{LARK_HOST}/open-apis/auth/v3/tenant_access_token/internal"),
+        &[],
+        &json!({ "app_id": app_id, "app_secret": binding.secret.trim() }),
+        environment,
+    )
+    .with_context(|| format!("channel {} could not reach Lark", binding.id))?;
+    lark_ok(&answer, "these credentials")?;
+    let token = answer
+        .get("tenant_access_token")
+        .and_then(Value::as_str)
+        .context("Lark accepted the credentials but issued no token")?
+        .to_string();
+    let lifetime =
+        Duration::from_secs(answer.get("expire").and_then(Value::as_u64).unwrap_or(7200));
+    token_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            app_id,
+            (
+                token.clone(),
+                Instant::now() + lifetime.saturating_sub(TOKEN_MARGIN),
+            ),
+        );
+    Ok(token)
+}
+
+/// The card one message becomes.
+///
+/// Card JSON 2.0, and it has to be: the 1.0 markdown component renders bold,
+/// italics and links and nothing else, so headings, tables, block quotes and
+/// inline code — most of what makes a summary readable on a phone — arrive as
+/// the literal characters someone typed. 2.0 renders GitHub-flavoured markdown.
+/// It wants a Lark client from 7.20 on; an older one shows the title and an
+/// upgrade notice where the body would be.
+///
+/// Deliberately minimal past that. Every field 2.0 allows is another thing the
+/// platform can reject, and a rejected card is a message the human never sees.
+fn lark_card(title: &str, body: &str) -> Value {
+    let mut card = json!({
+        "schema": "2.0",
+        "body": { "elements": [{ "tag": "markdown", "content": body }] },
+    });
+    if !title.is_empty() {
+        card["header"] = json!({
+            "title": { "tag": "plain_text", "content": title },
+            "template": "blue",
+        });
+    }
+    card
+}
+
+fn send_lark(
+    binding: &ChannelBinding,
+    message: &Outgoing,
+    environment: &[(String, String)],
+) -> Result<Sent> {
+    let (title, body) = message.compose(LARK_LIMIT);
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let answer = http::post_json(
+        &format!("{LARK_HOST}/open-apis/im/v1/messages?receive_id_type=chat_id"),
+        &[("Authorization", authorization.as_str())],
+        &json!({
+            "receive_id": binding.route.trim(),
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&lark_card(&title, &body))?,
+        }),
+        environment,
+    )?;
+    lark_ok(&answer, "the message")?;
+    Ok(Sent {
+        channel: binding.id.clone(),
+        through: binding.describes(),
+        message_id: answer
+            .pointer("/data/message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// A group robot's key is in its URL, and an error carries the URL. Nothing an
+/// agent reads may carry a secret, so it is taken back out on the way past.
+fn without_key(error: anyhow::Error, key: &str) -> anyhow::Error {
+    anyhow!("{}", format!("{error:#}").replace(key, "<webhook key>"))
+}
+
+fn send_wecom(
+    binding: &ChannelBinding,
+    message: &Outgoing,
+    environment: &[(String, String)],
+) -> Result<Sent> {
+    let (title, body) = message.compose(WECOM_LIMIT);
+    // A robot's message has no header of its own, so the title goes back into
+    // the text it was taken out of.
+    let body = if title.is_empty() {
+        body
+    } else {
+        format!("# {title}\n{body}")
+    };
+    let key = binding.secret.trim();
+    let answer = http::post_json(
+        &format!("{WECOM_HOOK}{key}"),
+        &[],
+        &json!({ "msgtype": "markdown", "markdown": { "content": body } }),
+        environment,
+    )
+    .map_err(|error| without_key(error, key))?;
+    match answer
+        .get("errcode")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+    {
+        0 => Ok(Sent {
+            channel: binding.id.clone(),
+            through: binding.describes(),
+            // A robot answers `ok` and nothing else: there is no id to reply
+            // to, which is the same reason nothing comes back this way.
+            message_id: String::new(),
+        }),
+        code => bail!(
+            "WeCom refused the message: {} (errcode {code})",
+            answer
+                .get("errmsg")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given"),
+        ),
+    }
+}
+
 /// What one push round did, for the debug log and for the panel's count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelRound {
@@ -518,5 +809,99 @@ mod tests {
             ..Default::default()
         };
         assert!(robot.ready().is_ok(), "a robot needs nothing but its key");
+    }
+
+    #[test]
+    fn a_leading_heading_becomes_the_title_unless_there_already_is_one() {
+        let message = Outgoing {
+            title: String::new(),
+            text: "# 构建完成\n\n42 tests passed.".into(),
+            signature: "*— gpu-1 · claude*".into(),
+        };
+        let (title, body) = message.compose(LARK_LIMIT);
+        assert_eq!(title, "构建完成");
+        assert_eq!(body, "42 tests passed.\n\n*— gpu-1 · claude*");
+
+        let named = Outgoing {
+            title: "Nightly".into(),
+            ..message.clone()
+        };
+        let (title, body) = named.compose(LARK_LIMIT);
+        assert_eq!(title, "Nightly");
+        assert!(
+            body.starts_with("# 构建完成"),
+            "a heading the title did not take must stay in the text: {body}"
+        );
+
+        // Nothing that looks like a heading, nothing taken out of the text.
+        let plain = Outgoing {
+            title: String::new(),
+            text: "#not a heading".into(),
+            signature: String::new(),
+        };
+        assert_eq!(
+            plain.compose(LARK_LIMIT),
+            (String::new(), "#not a heading".into())
+        );
+    }
+
+    #[test]
+    fn a_long_message_is_cut_to_fit_and_still_says_who_sent_it() {
+        let message = Outgoing {
+            title: "Report".into(),
+            text: "あ".repeat(4096),
+            signature: "*— gpu-1*".into(),
+        };
+        let (_, body) = message.compose(WECOM_LIMIT);
+        assert!(body.len() <= WECOM_LIMIT, "{} bytes", body.len());
+        assert!(body.contains("cut to fit"));
+        assert!(
+            body.ends_with("*— gpu-1*"),
+            "the signature must survive the cut: {body}"
+        );
+        // A cut that landed inside one of those three-byte characters would
+        // have panicked on the way out of `clip`.
+        assert!(body.starts_with('あ'));
+    }
+
+    #[test]
+    fn the_card_is_the_only_structure_that_renders_a_whole_message() {
+        let card = lark_card("Nightly", "# heading\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+        assert_eq!(card["schema"], "2.0");
+        assert_eq!(card["body"]["elements"][0]["tag"], "markdown");
+        assert!(
+            card["body"]["elements"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("| a | b |")
+        );
+        assert_eq!(card["header"]["title"]["content"], "Nightly");
+        // No title, no header: an empty one would render as a bare grey bar.
+        assert!(lark_card("", "hello").get("header").is_none());
+    }
+
+    #[test]
+    fn a_refusal_says_what_the_platform_said() {
+        let error = lark_ok(
+            &json!({ "code": 230001, "msg": "bot is not in the chat" }),
+            "the message",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("bot is not in the chat"), "{error}");
+        assert!(error.contains("230001"), "{error}");
+        assert!(lark_ok(&json!({ "code": 0 }), "the message").is_ok());
+    }
+
+    #[test]
+    fn a_failed_robot_post_never_reads_back_its_own_key() {
+        let key = "693axxx6-7aoc-4bc4-97a0-0ec2sifa5aaa";
+        let error = without_key(
+            anyhow!("{WECOM_HOOK}{key} returned HTTP 500: upstream is down"),
+            key,
+        )
+        .to_string();
+        assert!(!error.contains(key), "{error}");
+        assert!(error.contains("upstream is down"), "{error}");
     }
 }

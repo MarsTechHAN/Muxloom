@@ -17,7 +17,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -114,6 +114,7 @@ const WRITE_TOOLS: &[&str] = &[
     "ssh_host",
     "trigger",
     "talk_post",
+    "send_channel_message",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -220,7 +221,11 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          returns nothing rather than asking twice. Minutes is normal. When you are the one asked, \
          answer even if the answer is no: the agent waiting on you cannot act on silence.\n\
          - Nobody here is in charge of anyone else, and nothing you send has to be obeyed. Ask, \
-         say why, and leave the other agent to judge it against what it is already doing.\n\n\
+         say why, and leave the other agent to judge it against what it is already doing.\n\
+         - send_channel_message reaches the human themselves, on their phone, through the chat \
+         app they bound to muxloom. It is for the end of something they are waiting on and for a \
+         decision only they can make — one summary they can act on, never a progress log. Their \
+         answer comes back to you as a direct message.\n\n\
          Boundaries that are not negotiable:\n\
          - Machines the user has not enabled are unreachable. Naming one is an error, not a \
          workaround to route around.\n\
@@ -529,6 +534,35 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
                 "kind": { "type": "string", "enum": ["message", "note"], "description": "\"note\" is meant to be kept and searched later. Default message." },
                 "reply_to": { "type": "string", "description": "Message id this answers." },
+            }),
+            &["text"],
+        ),
+    });
+    tools.push(ToolSpec {
+        name: "send_channel_message",
+        // No `machine` argument, on either surface: this does not reach a
+        // machine, it reaches a person. Which machine dials the chat app is
+        // muxloom's business, and the message says where it came from anyway.
+        description: "Reach the human who is not at a dashboard, through the chat app they bound \
+                      to muxloom (Lark, or a WeCom group robot). Use it when something they are \
+                      waiting on is finished, when you are blocked on a decision only they can \
+                      make, or when a long run ends while nobody is watching — and not otherwise: \
+                      this arrives on somebody's phone. One message per milestone, never a \
+                      progress log. Write it as a summary they can act on: `title` says what \
+                      happened, `text` is markdown (headings, lists, tables, code fences and \
+                      links all render) and should open with the conclusion, then the numbers, \
+                      then what you need from them and exactly how to answer. muxloom signs it \
+                      with the machine and session you are in, so do not write that yourself, and \
+                      never put a token, a key, or an absolute home path in it. Their reply comes \
+                      back to you as a direct message: watch for it with talk_read { scope: \
+                      \"direct\", wait_seconds }."
+            .into(),
+        input_schema: schema(
+            false,
+            json!({
+                "text": { "type": "string", "description": "The message, as markdown." },
+                "title": { "type": "string", "description": "A few words saying what this is about. Shown as the card's title; taken from a leading \"# \" line if you leave it out." },
+                "channel": { "type": "string", "description": "Which bound channel, by id. Defaults to the one marked default, or to the only one there is." },
             }),
             &["text"],
         ),
@@ -1246,6 +1280,49 @@ fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
          machine, ask the agent that lives there with message_agent — or ask a muxloom \
          moderator, whose surface reaches the whole fleet."
     )
+}
+
+/// The line a channel message is signed with: the machine, and the session on
+/// it that is speaking.
+///
+/// Read from the environment muxloom put the session in rather than asked for
+/// as an argument, for the same reason a parent session is: an agent naming
+/// itself could only get it wrong, and a person reading this on their phone has
+/// nothing else to tell one agent from another by. A process driving the
+/// surface from outside a session says only that it is muxloom, which is true.
+fn speaker() -> String {
+    let mut parts = vec!["muxloom".to_string()];
+    parts.extend(session_env("MUXLOOM_MACHINE_LABEL").or_else(|| session_env("MUXLOOM_MACHINE")));
+    parts
+        .extend(session_env("MUXLOOM_SESSION_LABEL").or_else(|| session_env("MUXLOOM_SESSION_ID")));
+    format!("*— {}*", parts.join(" · "))
+}
+
+/// Post one channel message and report what became of it.
+///
+/// Shared by both surfaces. Which machine dials the chat app differs — its own,
+/// for whoever is standing on it — but what the human receives must not, and a
+/// message that renders differently depending on who sent it is a message they
+/// have to work out rather than read.
+fn send_channel(
+    binding: &crate::channel::ChannelBinding,
+    arguments: &Value,
+    environment: &[(String, String)],
+) -> Result<String> {
+    let message = crate::channel::Outgoing {
+        title: optional_str(arguments, "title").unwrap_or_default().into(),
+        text: required_str(arguments, "text")?.into(),
+        signature: speaker(),
+    };
+    let sent = crate::channel::send(binding, &message, environment)?;
+    Ok(pretty(&json!({
+        "channel": sent.channel,
+        "through": sent.through,
+        "message_id": sent.message_id,
+        "signed": message.signature,
+        "note": "Sent to a person, not to an agent. Their answer comes back as a direct message: \
+                 talk_read { scope: \"direct\", wait_seconds }.",
+    })))
 }
 
 fn session_voice() -> TalkVoice {
@@ -2265,6 +2342,22 @@ impl ControllerControl {
         )
     }
 
+    /// The channel bindings as the dashboard last wrote them. Read on every
+    /// call rather than held: this surface outlives any one binding, and a
+    /// human who has just pressed `c` should not have to restart anything.
+    fn channels(&self) -> Result<crate::channel::ChannelSet> {
+        crate::channel::ChannelSet::load(&crate::channel::path_in(
+            self.state_path.parent().unwrap_or_else(|| Path::new(".")),
+        ))
+    }
+
+    fn send_channel_message(&self, arguments: &Value) -> Result<String> {
+        let channels = self.channels()?;
+        let binding = channels.pick(optional_str(arguments, "channel"))?;
+        let environment = self.config.environment_for(crate::model::LOCAL_TARGET_ID)?;
+        send_channel(binding, arguments, &environment)
+    }
+
     fn message_agent(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
@@ -2561,6 +2654,7 @@ impl ControlSurface for ControllerControl {
             "talk_read" => self.talk_read(arguments),
             "talk_post" => self.talk_post(arguments),
             "message_agent" => self.message_agent(arguments),
+            "send_channel_message" => self.send_channel_message(arguments),
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
@@ -2642,11 +2736,12 @@ mod daemon_surface {
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
         allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
         instructions, launch_path_within, launching_session, optional_bool, optional_str,
-        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page, session_env,
-        session_json, session_kind, shell_report, talk_draft, talk_filter, talk_json, talk_wait,
-        trigger_json, trigger_spec, wait_loop,
+        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page,
+        send_channel, session_env, session_json, session_kind, shell_report, talk_draft,
+        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
+        channel::ChannelSet,
         config::{Config, default_config_path},
         daemon::{DaemonPaths, connect_or_start},
         daemon_protocol::{
@@ -2898,6 +2993,36 @@ mod daemon_surface {
                 },
                 || self.sessions().unwrap_or_default(),
             )
+        }
+
+        /// Say something to the human, from this machine.
+        ///
+        /// The credentials live here because the message goes out from here:
+        /// this machine may be the only one awake, and borrowing a controller's
+        /// network to speak would make "tell me when it is done" depend on
+        /// somebody's laptop being open.
+        ///
+        /// Which leaves the window before the set arrives. Bindings are carried
+        /// on the same round as the talk board, so a machine that was enabled a
+        /// moment ago, or rebuilt, or whose daemon has just started, has none
+        /// for a second or two. Nothing has touched the network at that point,
+        /// so asking the controller to send instead costs nothing and cannot
+        /// deliver the message twice. Past that first step muxloom never tries
+        /// again from somewhere else: a post that failed may still have
+        /// arrived, and a person reading the same thing twice cannot tell which
+        /// of the two was the real one.
+        fn send_channel_message(&self, arguments: &Value) -> Result<String> {
+            let channels = ChannelSet::read(&self.paths.channels);
+            let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
+            match channels.pick(optional_str(arguments, "channel")) {
+                Ok(binding) => send_channel(binding, arguments, &environment),
+                Err(unbound) => self
+                    .relay("send_channel_message", arguments)
+                    // The controller could not help either. What a human can
+                    // act on is that nothing here is bound, not that an errand
+                    // went unanswered, so that is what comes back.
+                    .map_err(|_| unbound),
+            }
         }
 
         /// Whether these arguments name a machine other than this one, in
@@ -3178,6 +3303,7 @@ mod daemon_surface {
                 "talk_read" => self.talk_read(arguments),
                 "talk_post" => self.talk_post(arguments),
                 "message_agent" => self.message_agent(arguments),
+                "send_channel_message" => self.send_channel_message(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
                     let kind = self
@@ -3650,6 +3776,30 @@ mod tests {
             assert!(error.contains(outside), "{error}");
             assert!(error.contains("message_agent"), "{error}");
         }
+    }
+
+    #[test]
+    fn reaching_the_human_is_offered_everywhere_and_names_no_machine() {
+        for flavor in [Flavor::Controller, Flavor::Daemon] {
+            let tool = specs(flavor)
+                .into_iter()
+                .find(|tool| tool.name == "send_channel_message")
+                .expect("both surfaces can reach the human");
+            // The one tool that does not take a `machine`, on either surface:
+            // it ends up at a person's phone, and which machine dialled the
+            // API is muxloom's business, not the caller's.
+            assert!(
+                tool.input_schema["properties"].get("machine").is_none(),
+                "a channel message goes to a person, not to a machine"
+            );
+            assert_eq!(tool.input_schema["required"], json!(["text"]));
+        }
+        // It says something on a machine's behalf without changing anything
+        // there, which is exactly the shape of an errand a controller runs.
+        assert!(crate::relay::relayed("send_channel_message"));
+        // And speaking is acting, so read-only refuses it.
+        assert!(WRITE_TOOLS.contains(&"send_channel_message"));
+        assert!(instructions(Flavor::Daemon, &McpConfig::default()).contains("their phone"));
     }
 
     #[test]
@@ -4652,6 +4802,24 @@ mod tests {
                 );
             }
             let _ = std::fs::remove_file(&script);
+        }
+
+        #[test]
+        fn with_no_channel_bound_the_agent_is_told_who_can_bind_one() {
+            let mut surface = surface("channel");
+            // Nothing is bound here and no controller is watching, so the
+            // errand cannot be handed off either. What comes back has to be
+            // the useful half of that — where a human sets a channel up —
+            // and not a complaint about a relay the agent cannot act on.
+            let error = surface
+                .call(
+                    "send_channel_message",
+                    &json!({ "text": "the run is done" }),
+                )
+                .expect_err("nothing is bound to send through")
+                .to_string();
+            assert!(error.contains("press c"), "{error}");
+            assert!(!error.contains("controller"), "{error}");
         }
     }
 }
