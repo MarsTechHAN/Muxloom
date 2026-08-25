@@ -105,6 +105,14 @@ pub fn is_moderator_path(state_dir: &Path, path: &str) -> bool {
     under(&root(state_dir).to_string_lossy(), path, cfg!(windows))
 }
 
+/// Whether `path` names `root` itself or a place inside it, by this platform's
+/// spelling rules. The same question the moderator check asks, for the other
+/// caller that asks it: a daemon-flavor surface deciding whether a launch stays
+/// in the folder of the agent asking for it.
+pub fn within(root: &str, path: &str) -> bool {
+    under(root, path, cfg!(windows))
+}
+
 /// Whether `path` names `root` itself or something inside it. `windows` picks
 /// the spelling rules rather than the platform, so both sets are testable
 /// wherever the tests run.

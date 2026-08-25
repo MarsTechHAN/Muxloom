@@ -119,6 +119,12 @@ preserve.
   the controller beside it when the caller's working directory is a moderator's.
   An ordinary agent drives its own machine and talks to the rest; the fleet-wide
   flavor is the moderator's.
+- A launch on the daemon flavor lands in the caller's own folder or inside it,
+  and defaults to it, so starting a subagent needs no argument at all. Not a
+  sandbox — the same agent has a shell on that machine — but a statement of what
+  the surface is for: the sessions it starts are the caller's own. A refusal must
+  name both folders and point at the better move, which is to ask the agent that
+  already lives there.
 - Cross-machine capability belongs to the controller flavor. A daemon-flavor
   surface reaches other machines only by relaying through an attached
   controller, and only for the relay whitelist — never a shell, a machine

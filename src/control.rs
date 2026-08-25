@@ -524,26 +524,45 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "launch_session",
-        description: "Start a persistent codex, claude, or terminal session in a working \
-                      directory. Use this for anything long-running or interactive instead of \
-                      run_shell. `resume_id` resumes that agent-native conversation; \
-                      `initial_prompt` seeds a fresh agent instead. The session survives \
-                      this process: pair every launch with a later archive or delete. \
-                      A session you start is recorded as yours — it shows in the dashboard \
-                      indented under you, and it is part of your task on the talk board — so \
-                      this is how you hand work to a subagent rather than losing it in a list \
-                      of unrelated sessions."
-            .into(),
+        description: format!(
+            "Start a persistent codex, claude, or terminal session in a working directory. Use \
+             this for anything long-running or interactive instead of run_shell. `resume_id` \
+             resumes that agent-native conversation; `initial_prompt` seeds a fresh agent \
+             instead. The session survives this process: pair every launch with a later archive \
+             or delete. A session you start is recorded as yours — it shows in the dashboard \
+             indented under you, and it is part of your task on the talk board — so this is how \
+             you hand work to a subagent rather than losing it in a list of unrelated \
+             sessions.{}",
+            match flavor {
+                Flavor::Controller => "",
+                // The daemon surface starts subagents of the agent calling it,
+                // which is why `path` can be left out entirely.
+                Flavor::Daemon =>
+                    " Your own working directory is the only place you can start one: leave \
+                     `path` out for it, or name somewhere inside it. To get work done elsewhere, \
+                     or on another machine, ask the agent that lives there with message_agent.",
+            }
+        ),
         input_schema: schema(
             multi,
             json!({
                 "kind": { "type": "string", "enum": ["codex", "claude", "terminal"] },
-                "path": { "type": "string", "description": "Absolute working directory on the machine." },
+                "path": {
+                    "type": "string",
+                    "description": match flavor {
+                        Flavor::Controller => "Absolute working directory on the machine.",
+                        Flavor::Daemon => "Absolute working directory: your own folder, or one \
+                                           inside it. Defaults to your own.",
+                    },
+                },
                 "label": { "type": "string", "description": "Display name shown in the dashboard." },
                 "resume_id": { "type": "string", "description": "Agent-native session id to resume." },
                 "initial_prompt": { "type": "string", "description": "First prompt for a fresh agent." },
             }),
-            &["kind", "path"],
+            match flavor {
+                Flavor::Controller => &["kind", "path"][..],
+                Flavor::Daemon => &["kind"][..],
+            },
         ),
     });
     if multi {
@@ -1187,6 +1206,35 @@ fn session_env(key: &str) -> Option<String> {
 /// argument: an agent naming its own parent could only get it wrong.
 fn launching_session() -> Option<String> {
     session_env("MUXLOOM_SESSION_ID")
+}
+
+/// Where a launch asked for on the daemon surface may actually run: the
+/// caller's own folder, or somewhere inside it.
+///
+/// This is not a sandbox, and could not be one — the same agent has `run_shell`
+/// on this machine and could start whatever it liked by hand. It is a statement
+/// of what the surface is for. The daemon flavor is an agent's own machine and
+/// its own work: the sessions it starts are its subagents, and they belong
+/// beside the work rather than somewhere the user has to go looking for them.
+/// An agent asked to do something in another folder has a better move available
+/// — ask the agent that lives there — and saying so here is what makes it
+/// think of it. Reaching the whole fleet is the moderator's flavor.
+///
+/// Leaving `path` out is the ordinary case and means the caller's own folder,
+/// so starting a subagent takes no argument the agent has to look up.
+fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
+    let Some(path) = optional_str(arguments, "path") else {
+        return Ok(own.to_string());
+    };
+    if crate::moderator::within(own, path) {
+        return Ok(path.to_string());
+    }
+    bail!(
+        "launch_session starts sessions in your own folder, {own}, and {path} is outside it. \
+         Leave path out to start one where you are. For work in another folder or on another \
+         machine, ask the agent that lives there with message_agent — or ask a muxloom \
+         moderator, whose surface reaches the whole fleet."
+    )
 }
 
 fn session_voice() -> TalkVoice {
@@ -2565,9 +2613,10 @@ mod daemon_surface {
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
         allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
-        instructions, launching_session, optional_bool, optional_str, optional_usize, plain_screen,
-        pretty, preview_text, required_str, screen_page, session_json, session_kind, shell_report,
-        talk_draft, talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
+        instructions, launch_path_within, launching_session, optional_bool, optional_str,
+        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page, session_env,
+        session_json, session_kind, shell_report, talk_draft, talk_filter, talk_json, talk_wait,
+        trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         config::{Config, default_config_path},
@@ -2592,6 +2641,18 @@ mod daemon_surface {
     const RELAY_WAIT: Duration = Duration::from_secs(60);
     const RELAY_POLL: Duration = Duration::from_millis(250);
 
+    /// The folder the caller works in. muxloom put it in the session's
+    /// environment when it started it; a process driving the surface by hand
+    /// has no such session, and there its own working directory is the same
+    /// statement made a different way.
+    fn own_folder() -> Option<String> {
+        session_env("MUXLOOM_SESSION_PATH").or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+    }
+
     /// Serves the daemon on this machine over its Unix socket. Each call opens
     /// its own connection: a resident client would hold the daemon's client
     /// count up and defer generation handover indefinitely, and a fresh
@@ -2599,6 +2660,11 @@ mod daemon_surface {
     pub struct DaemonControl {
         paths: DaemonPaths,
         config: Config,
+        /// The folder the caller works in, which is as far as a launch on this
+        /// surface reaches. Settled once, when the surface is built: it comes
+        /// from the session's environment, and that does not change under a
+        /// running agent.
+        own_folder: Option<String>,
     }
 
     impl DaemonControl {
@@ -2606,13 +2672,18 @@ mod daemon_surface {
             Ok(Self {
                 paths: DaemonPaths::discover()?,
                 config: Config::load(&default_config_path())?,
+                own_folder: own_folder(),
             })
         }
 
         /// A surface over an explicit state directory and config, for tests
         /// and for pointing at a non-default daemon.
-        pub fn with_paths(paths: DaemonPaths, config: Config) -> Self {
-            Self { paths, config }
+        pub fn with_paths(paths: DaemonPaths, config: Config, own_folder: Option<String>) -> Self {
+            Self {
+                paths,
+                config,
+                own_folder,
+            }
         }
 
         /// Send one request and collect its response plus any stream data it
@@ -2888,7 +2959,12 @@ mod daemon_surface {
 
         fn launch_session(&self, arguments: &Value) -> Result<String> {
             let kind = agent_kind(arguments)?;
-            let path = required_str(arguments, "path")?;
+            let own = self.own_folder.as_deref().context(
+                "launch_session starts a session where you are, and muxloom cannot tell which \
+                 folder that is",
+            )?;
+            let path = launch_path_within(arguments, own)?;
+            let path = path.as_str();
             let command = self.config.command_for(LOCAL_TARGET_ID, kind).clone();
             if command.command.trim().is_empty() && kind != crate::model::AgentKind::Terminal {
                 bail!("command for {kind} is empty");
@@ -3419,6 +3495,15 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == tool.name)
                 .unwrap_or_else(|| panic!("{} missing from controller surface", tool.name));
+            // How far a launch reaches is the other difference, and the one
+            // this tool exists to state: the controller names any folder on
+            // any machine, and the daemon starts subagents where the caller
+            // already is, so there the folder is optional and bounded.
+            if tool.name == "launch_session" {
+                assert_eq!(tool.input_schema["required"], json!(["kind"]));
+                assert_eq!(twin.input_schema["required"], json!(["kind", "path"]));
+                continue;
+            }
             // Machine addressing is the difference between the surfaces: the
             // controller reaches every machine, and the daemon only the few
             // the controller will run errands for. Everything else matches.
@@ -3452,6 +3537,46 @@ mod tests {
         ] {
             assert!(controller.iter().any(|tool| tool.name == name));
             assert!(!daemon.iter().any(|tool| tool.name == name));
+        }
+    }
+
+    #[test]
+    fn a_daemon_surface_launch_stays_in_the_folder_it_was_called_from() {
+        let own = "/home/agent/project";
+        // The ordinary call: no folder named, so the caller's own.
+        assert_eq!(
+            launch_path_within(&json!({ "kind": "claude" }), own).unwrap(),
+            own
+        );
+        for inside in [
+            own,
+            "/home/agent/project/crates/core",
+            "/home/agent/project/",
+        ] {
+            assert_eq!(
+                launch_path_within(&json!({ "path": inside }), own).unwrap(),
+                inside,
+                "{inside} is inside {own}"
+            );
+        }
+        // A prefix in text is not a folder in the tree, and the parent, a
+        // sibling, and the root are all somebody else's work.
+        for outside in [
+            "/home/agent",
+            "/home/agent/project-notes",
+            "/home/agent/other",
+            "/",
+            "/etc",
+        ] {
+            let error = launch_path_within(&json!({ "path": outside }), own)
+                .expect_err("{outside} is outside {own}")
+                .to_string();
+            // Refusing is half of it: the answer has to say where the agent
+            // actually is, what it asked for, and what to do instead, or the
+            // next thing it tries is a guess.
+            assert!(error.contains(own), "{error}");
+            assert!(error.contains(outside), "{error}");
+            assert!(error.contains("message_agent"), "{error}");
         }
     }
 
@@ -3790,7 +3915,14 @@ mod tests {
                 assert!(Instant::now() < deadline, "daemon socket never came up");
                 thread::sleep(Duration::from_millis(20));
             }
-            (DaemonControl::with_paths(paths.clone(), config), paths)
+            // The temp dir stands in for the caller's own folder: it is where
+            // these tests start their sessions, and a launch on this surface
+            // reaches no further than that.
+            let own = std::env::temp_dir().to_string_lossy().into_owned();
+            (
+                DaemonControl::with_paths(paths.clone(), config, Some(own)),
+                paths,
+            )
         }
 
         /// One request to the daemon as something other than the surface under
