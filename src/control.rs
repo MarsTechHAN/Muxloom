@@ -1458,7 +1458,10 @@ fn talk_wait(
 /// "Answered" is the plain reading: a direct message back from that session
 /// after the one that was sent. Nothing here depends on `reply_to` being set,
 /// because most replies do not set it — the tools ask for it so a sender can
-/// match an answer to a question, not so muxloom can.
+/// match an answer to a question, not so muxloom can. It is honoured when it
+/// is there, which is what lets a bounce close the question it bounced: the
+/// daemon saying "this never arrived" is not that session talking, and by the
+/// author rule alone it would leave the sender waiting on it forever.
 fn unanswered(
     filter: &TalkFilter,
     read: &mut impl FnMut(&TalkFilter) -> Result<TalkPage>,
@@ -1486,18 +1489,25 @@ fn unanswered(
     // The last time each session said anything to me at all. Newer than what I
     // sent it means the exchange moved on, whatever it was about.
     let mut answered: BTreeMap<&str, u64> = BTreeMap::new();
+    // The particular messages something came back about, whoever it came from.
+    let mut closed: BTreeSet<&str> = BTreeSet::new();
     for message in &page.messages {
-        if message.to.as_ref().is_some_and(|to| to.session_id == me)
-            && let Some(from) = message.author.voice.session_id.as_deref()
-        {
+        if !message.to.as_ref().is_some_and(|to| to.session_id == me) {
+            continue;
+        }
+        if let Some(from) = message.author.voice.session_id.as_deref() {
             let seen = answered.entry(from).or_default();
             *seen = (*seen).max(message.ts);
+        }
+        if let Some(replied) = message.reply_to.as_deref() {
+            closed.insert(replied);
         }
     }
     let mut waiting: Vec<&TalkMessage> = page
         .messages
         .iter()
         .filter(|message| mine(message) && message.ts >= recent)
+        .filter(|message| !closed.contains(message.id.as_str()))
         .filter(|message| {
             message.to.as_ref().is_some_and(|to| {
                 answered.get(to.session_id.as_str()).copied().unwrap_or(0) < message.ts
@@ -3099,6 +3109,26 @@ mod tests {
         }
     }
 
+    /// What the daemon puts on the board when a message never arrived: a
+    /// direct from muxloom itself, naming the message it is about.
+    fn bounced(seq: u64, to: &str, about: &str, ts: u64) -> TalkMessage {
+        let mut message = direct(
+            seq,
+            "-",
+            to,
+            ts,
+            "[muxloom] Your message never reached it: the session ended.",
+        );
+        message.author.voice = TalkVoice {
+            session_id: None,
+            label: Some("muxloom".into()),
+            kind: None,
+            human: false,
+        };
+        message.reply_to = Some(about.into());
+        message
+    }
+
     fn probe_session(id: &str, working: bool, attention: bool) -> DaemonSession {
         DaemonSession {
             id: id.into(),
@@ -3140,6 +3170,16 @@ mod tests {
             direct(5, "me", "gone-quiet", now - 200_000, "still after those"),
             // Somebody else's exchange is none of this session's business.
             direct(6, "other", "thinking", now - 100_000, "and from me"),
+            // Bounced: nobody read it, and the daemon said so. It is not that
+            // session talking, so only the id it names closes the question.
+            direct(
+                7,
+                "me",
+                "vanished",
+                now - 150_000,
+                "still on for the merge?",
+            ),
+            bounced(8, "me", "here:7", now - 140_000),
         ];
         let filter = TalkFilter {
             session_id: Some("me".into()),
@@ -3196,6 +3236,8 @@ mod tests {
         )
         .unwrap();
         let waiting = answer["waiting_on"].as_array().unwrap();
+        // The bounced one is not among them: it was answered, by the only
+        // answer it was ever going to get.
         assert_eq!(waiting.len(), 2, "{answer:#}");
         // Oldest first, and the follow-up stands in for the pair.
         assert_eq!(waiting[0]["message_id"], "here:3");

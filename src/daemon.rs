@@ -42,8 +42,9 @@ mod platform {
             is_temporary_session_id,
         },
         talk::{
-            DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkKind, TalkMessage,
-            TalkPage, TalkQueued, TalkStore, folded, paste_bytes, render_delivery,
+            DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
+            TalkKind, TalkMessage, TalkPage, TalkQueued, TalkScope, TalkStore, TalkUndelivered,
+            TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
             CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
@@ -729,6 +730,17 @@ mod platform {
             body,
             queued_at: now_ms(),
             deliver,
+            // Only a sender that is itself a session can be written back to.
+            from: message
+                .author
+                .voice
+                .session_id
+                .clone()
+                .map(|session_id| TalkAddress {
+                    machine: message.author.machine.clone(),
+                    session_id,
+                }),
+            text: message.text.clone(),
         };
         if deliver == TalkDeliver::Now
             || queued.due(
@@ -846,6 +858,7 @@ mod platform {
             .clone();
         let now = now_ms();
         let mut due = Vec::new();
+        let mut lost = Vec::new();
         {
             let mut outbox = state
                 .outbox
@@ -854,19 +867,13 @@ mod platform {
             let before = outbox.len();
             outbox.retain(|queued| {
                 let Some(session) = sessions.get(&queued.session_id) else {
-                    eprintln!(
-                        "muxloomd dropped message {}: session {} is gone",
-                        queued.message_id, queued.session_id
-                    );
+                    lost.push((queued.clone(), TalkUndelivered::Gone));
                     return false;
                 };
                 let snapshot = session.snapshot();
                 let kind = snapshot.kind.parse::<AgentKind>().ok();
                 let Some(kind) = kind.filter(|_| !snapshot.dead && !snapshot.archived) else {
-                    eprintln!(
-                        "muxloomd dropped message {}: session {} has ended",
-                        queued.message_id, queued.session_id
-                    );
+                    lost.push((queued.clone(), TalkUndelivered::Ended));
                     return false;
                 };
                 if queued.due(
@@ -879,11 +886,7 @@ mod platform {
                     return false;
                 }
                 if queued.expired(now) {
-                    eprintln!(
-                        "muxloomd gave up on message {}: session {} never showed a prompt to put \
-                         it in",
-                        queued.message_id, queued.session_id
-                    );
+                    lost.push((queued.clone(), TalkUndelivered::NoPrompt));
                     return false;
                 }
                 true
@@ -896,11 +899,61 @@ mod platform {
         // queue must never be held across that.
         for (session, kind, queued) in due {
             if let Err(error) = type_message(&session, kind, &queued.body) {
-                eprintln!(
-                    "muxloomd could not deliver message {}: {error:#}",
-                    queued.message_id
-                );
+                lost.push((queued, TalkUndelivered::Failed(format!("{error:#}"))));
             }
+        }
+        for (queued, why) in lost {
+            bounce(state, &queued, &why);
+        }
+    }
+
+    /// Tell the sender that a message never arrived.
+    ///
+    /// This is the only end an undelivered message has that the sender can act
+    /// on. A line on stderr is kept too, because the person running the daemon
+    /// is entitled to see it, but the line that matters goes on the board.
+    fn bounce(state: &DaemonState, queued: &TalkQueued, why: &TalkUndelivered) {
+        eprintln!(
+            "muxloomd could not deliver message {} to session {}: {}",
+            queued.message_id,
+            queued.session_id,
+            why.reason()
+        );
+        let Some(from) = queued.from.clone() else {
+            return;
+        };
+        let posted = state.talk().and_then(|talk| {
+            talk.post(TalkDraft {
+                // The bounce belongs to the machine that failed to deliver it,
+                // and the sender reads it as a direct wherever they are.
+                scope: TalkScope::Machine {
+                    machine: String::new(),
+                },
+                author: TalkAuthor {
+                    machine: String::new(),
+                    machine_label: String::new(),
+                    // Not a session and not a person: muxloom itself, saying
+                    // what happened to something it was handed.
+                    voice: TalkVoice {
+                        session_id: None,
+                        label: Some("muxloom".into()),
+                        kind: None,
+                        human: false,
+                    },
+                },
+                kind: TalkKind::Direct,
+                to: Some(from),
+                // The id is what lets a sender's wait end on this rather than
+                // on the next thing anyone says.
+                reply_to: Some(queued.message_id.clone()),
+                text: render_bounce(queued, why),
+            })
+        });
+        if let Err(error) = posted {
+            eprintln!(
+                "muxloomd could not tell the sender of {} that it never arrived: {error:#}",
+                queued.message_id
+            );
         }
     }
 

@@ -983,6 +983,14 @@ pub struct TalkQueued {
     pub body: String,
     pub queued_at: u64,
     pub deliver: TalkDeliver,
+    /// Who sent it, so that a message which never arrives can be sent back to
+    /// them. A queue written down by an older daemon has nobody to tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<TalkAddress>,
+    /// What was said, kept beside the envelope so a bounce can quote it
+    /// without the sender having to go and look the message up.
+    #[serde(default)]
+    pub text: String,
 }
 
 impl TalkQueued {
@@ -1015,6 +1023,63 @@ impl TalkQueued {
     pub fn expired(&self, now: u64) -> bool {
         now.saturating_sub(self.queued_at) >= DELIVER_EXPIRY_MS
     }
+}
+
+/// Why a queued message never went in. Every one of these is the end of the
+/// road for it, and the sender is waiting: an agent that asked a question and
+/// hears nothing cannot tell "no" from "never arrived", so each of these is
+/// said out loud on the board rather than written to a log nobody reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TalkUndelivered {
+    /// The session is not on this machine any more.
+    Gone,
+    /// The session ended while the message was waiting for it.
+    Ended,
+    /// It waited out the whole expiry without the session ever showing a
+    /// prompt box to put it in.
+    NoPrompt,
+    /// Writing to the session failed.
+    Failed(String),
+}
+
+impl TalkUndelivered {
+    /// The half-sentence that finishes "never reached that session because …".
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Gone => "the session is no longer on that machine".into(),
+            Self::Ended => "the session ended while the message was waiting".into(),
+            Self::NoPrompt => format!(
+                "in {} minutes the session never showed a prompt box to put it in — it may have \
+                 been stopped on a question that whole time, or no longer be running an agent at \
+                 all",
+                DELIVER_EXPIRY_MS / 60_000
+            ),
+            Self::Failed(error) => format!("writing to the session failed: {error}"),
+        }
+    }
+}
+
+/// What the sender is told when a message never reached the session it was
+/// for.
+///
+/// Addressed back to the sender as a direct message, which is what a sender
+/// waiting on an answer is already reading. It is not typed into their prompt:
+/// the machine holding the undelivered message is usually not the one holding
+/// the sender, and a bounce that could itself fail to arrive and bounce again
+/// is not worth the trouble.
+pub fn render_bounce(queued: &TalkQueued, why: &TalkUndelivered) -> String {
+    let quoted = queued.text.trim();
+    let quoted = if quoted.is_empty() {
+        String::new()
+    } else {
+        format!("\n--- what you sent ---\n{quoted}\n--- end ---")
+    };
+    format!(
+        "[muxloom] Your message to session {} never reached it: {}. Nobody read it, so no answer \
+         is coming — stop waiting on it, and either do without or find another agent.{quoted}",
+        queued.session_id,
+        why.reason()
+    )
 }
 
 /// What a message from another agent looks like when it lands in a session.
@@ -1653,6 +1718,11 @@ mod tests {
             body: "[muxloom] Message from …".into(),
             queued_at: 1_000,
             deliver: TalkDeliver::Auto,
+            from: Some(TalkAddress {
+                machine: "far-away".into(),
+                session_id: "session-1".into(),
+            }),
+            text: "the parser is yours".into(),
         };
         // The turn in progress is beside the point: the prompt is empty, so the
         // message lands whole and is read when the turn ends.
@@ -1671,6 +1741,11 @@ mod tests {
             body: "[muxloom] Message from …".into(),
             queued_at: 1_000,
             deliver: TalkDeliver::Auto,
+            from: Some(TalkAddress {
+                machine: "far-away".into(),
+                session_id: "session-1".into(),
+            }),
+            text: "the parser is yours".into(),
         };
         // A runtime that has not drawn its prompt is usually still starting up.
         assert!(waiting.due(Composer::Absent, false, false, 1_000 + DELIVER_ABSENT_MS));
@@ -1694,5 +1769,51 @@ mod tests {
         assert!(!patient.due(Composer::Absent, false, false, 1_000 + DELIVER_OCCUPIED_MS));
         assert!(!patient.expired(1_000 + DELIVER_OCCUPIED_MS));
         assert!(patient.expired(1_000 + DELIVER_EXPIRY_MS));
+    }
+
+    #[test]
+    fn a_message_that_never_arrives_is_sent_back_saying_so() {
+        let queued = TalkQueued {
+            message_id: "far-away:1".into(),
+            session_id: "session-2".into(),
+            body: "[muxloom] Message from …".into(),
+            queued_at: 1_000,
+            deliver: TalkDeliver::Auto,
+            from: Some(TalkAddress {
+                machine: "far-away".into(),
+                session_id: "session-1".into(),
+            }),
+            text: "can you take the lexer?".into(),
+        };
+
+        let bounce = render_bounce(&queued, &TalkUndelivered::Ended);
+        // Which message, what became of it, and the one thing the sender needs
+        // to hear: nobody is going to answer.
+        assert!(bounce.contains("session session-2"), "{bounce}");
+        assert!(
+            bounce.contains("the session ended while the message was waiting"),
+            "{bounce}"
+        );
+        assert!(bounce.contains("no answer is coming"), "{bounce}");
+        // Quoted back, so the sender knows which question died without having
+        // to go and look the message up.
+        assert!(bounce.contains("can you take the lexer?"), "{bounce}");
+
+        // The expiry is quoted in the units the sender thinks in.
+        let waited = render_bounce(&queued, &TalkUndelivered::NoPrompt);
+        assert!(waited.contains("in 30 minutes"), "{waited}");
+
+        // Whatever the write failed with is passed through rather than
+        // flattened into "something went wrong".
+        let failed = render_bounce(&queued, &TalkUndelivered::Failed("broken pipe".into()));
+        assert!(failed.contains("broken pipe"), "{failed}");
+
+        // Nothing to quote is not an empty pair of markers.
+        let empty = TalkQueued {
+            text: String::new(),
+            ..queued
+        };
+        let bounce = render_bounce(&empty, &TalkUndelivered::Gone);
+        assert!(!bounce.contains("what you sent"), "{bounce}");
     }
 }
