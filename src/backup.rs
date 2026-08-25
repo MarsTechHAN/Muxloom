@@ -25,7 +25,7 @@
 //! delta; [`BackupStore::read_blob`] stitches the frames back into one stream.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -732,6 +732,22 @@ pub fn sync_target(
         .list_sessions(target)
         .with_context(|| format!("failed to list sessions on {}", target.id))?;
 
+    // The daemon already worked out which transcript belongs to which session,
+    // and it did it with facts the backup does not have: what each launch was
+    // told to resume, what each session was reading before a restart, which
+    // threads it has been moved off. Collect those matches before mirroring
+    // anything so that a session the daemon did not match cannot walk off with
+    // a transcript that is spoken for.
+    let mut spoken_for: HashMap<String, String> = sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .thread
+                .clone()
+                .map(|thread| (thread, session.id.clone()))
+        })
+        .collect();
+
     for session in sessions {
         if session.temporary || is_temporary_session_id(&session.id) {
             continue;
@@ -783,6 +799,7 @@ pub fn sync_target(
                 kind,
                 &session,
                 &mut record,
+                &mut spoken_for,
                 &mut stats,
             )
         {
@@ -869,12 +886,25 @@ fn sync_transcript(
     kind: AgentKind,
     session: &crate::daemon_protocol::DaemonSession,
     record: &mut BackupRecord,
+    spoken_for: &mut HashMap<String, String>,
     stats: &mut SyncSummary,
 ) -> Result<()> {
     let candidates = runtime.scan_resumes(target, kind, &session.path)?;
-    let Some(candidate) = pick_native_candidate(&candidates, record) else {
+    let Some(candidate) = pick_native_candidate(&candidates, session, record, spoken_for) else {
         return Ok(());
     };
+    spoken_for.insert(candidate.id.clone(), session.id.clone());
+    // A pairing that changes was a pairing that was wrong: the mirrored blobs,
+    // the message count and the title all describe the other conversation, so
+    // they go and the new transcript is pulled whole.
+    if !record.native_id.is_empty() && record.native_id != candidate.id {
+        store.remove_blob(partition, &session.id, TRANSCRIPT_BLOB)?;
+        store.remove_blob(partition, &session.id, MESSAGES_BLOB)?;
+        record.native_updated_at.clear();
+        record.jsonl_bytes_synced = 0;
+        record.message_count = 0;
+        record.title.clear();
+    }
     record.native_id = candidate.id.clone();
     record.native_path = candidate.source_path.clone();
     // Nothing to do if the transcript has not advanced since the last sync.
@@ -927,21 +957,42 @@ fn sync_transcript(
     Ok(())
 }
 
-/// Choose the native transcript for a session. Once resolved we keep the same
-/// id (stable); otherwise pick the most recently active candidate in that cwd.
-/// (A precise start-time join is a later refinement — many sessions can share a
-/// cwd.)
+/// Choose the native transcript for a session.
+///
+/// A folder holds every conversation ever held in it, and several agents can be
+/// running in one folder at once, so this is a matching problem and not a
+/// lookup. The daemon solves it properly - see
+/// [`crate::native_history::assign_threads`] - so its answer comes first here,
+/// and it is allowed to overrule an id this record settled on earlier: that is
+/// how a session that was mirroring its neighbour's conversation gets put back
+/// on its own.
+///
+/// The two fallbacks are for what the daemon could not answer: a companion too
+/// old to report a thread, or a session it left unmatched. They stay away from
+/// transcripts another session on this machine has already been paired with,
+/// because picking "the most recently active file in this folder" is exactly
+/// how two sessions in one repository ended up sharing one history.
 fn pick_native_candidate<'a>(
     candidates: &'a [crate::model::ResumeCandidate],
+    session: &crate::daemon_protocol::DaemonSession,
     record: &BackupRecord,
+    spoken_for: &HashMap<String, String>,
 ) -> Option<&'a crate::model::ResumeCandidate> {
+    let mine = |id: &str| spoken_for.get(id).is_none_or(|owner| *owner == session.id);
+    if let Some(thread) = session.thread.as_deref()
+        && let Some(matched) = candidates.iter().find(|c| c.id == thread)
+    {
+        return Some(matched);
+    }
     if !record.native_id.is_empty()
+        && mine(&record.native_id)
         && let Some(existing) = candidates.iter().find(|c| c.id == record.native_id)
     {
         return Some(existing);
     }
     candidates
         .iter()
+        .filter(|candidate| mine(&candidate.id))
         .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
 }
 
@@ -2086,6 +2137,125 @@ mod tests {
         assert_eq!(index.machine_key_for_alias("h20-alt"), "h20");
         // Unknown alias falls back to itself.
         assert_eq!(index.machine_key_for_alias("other"), "other");
+    }
+
+    fn live_session(id: &str, thread: Option<&str>) -> crate::daemon_protocol::DaemonSession {
+        crate::daemon_protocol::DaemonSession {
+            id: id.into(),
+            kind: "claude".into(),
+            path: "/home/me/work".into(),
+            label: id.into(),
+            temporary: false,
+            created_at: 0,
+            pid: None,
+            dead: false,
+            archived: false,
+            recap: None,
+            title: None,
+            thread: thread.map(str::to_string),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            composer: None,
+            parent: None,
+        }
+    }
+
+    fn transcript(id: &str, updated_at: &str) -> crate::model::ResumeCandidate {
+        crate::model::ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/me/.claude/projects/-home-me-work/{id}.jsonl"),
+            recap: None,
+            first_message: None,
+            last_message: None,
+            updated_at: updated_at.into(),
+        }
+    }
+
+    #[test]
+    fn two_sessions_in_one_folder_get_their_own_conversations() {
+        // Both agents are running in the same repository, so both see both
+        // transcripts. Only the daemon knows which is which.
+        let files = vec![
+            transcript("older", "2026-08-24T09:00:00Z"),
+            transcript("newer", "2026-08-25T09:00:00Z"),
+        ];
+        let sessions = [
+            live_session("s-one", Some("newer")),
+            live_session("s-two", Some("older")),
+        ];
+        let mut spoken_for: HashMap<String, String> = sessions
+            .iter()
+            .filter_map(|s| s.thread.clone().map(|thread| (thread, s.id.clone())))
+            .collect();
+        let mut picks = Vec::new();
+        for session in &sessions {
+            let record = BackupRecord::default();
+            let pick = pick_native_candidate(&files, session, &record, &spoken_for).unwrap();
+            spoken_for.insert(pick.id.clone(), session.id.clone());
+            picks.push(pick.id.clone());
+        }
+        assert_eq!(picks, vec!["newer".to_string(), "older".to_string()]);
+    }
+
+    #[test]
+    fn the_daemon_can_take_a_session_off_its_neighbours_conversation() {
+        // What a bad pairing left behind: this record has been mirroring the
+        // transcript that belongs to the session next to it.
+        let files = vec![
+            transcript("mine", "2026-08-24T09:00:00Z"),
+            transcript("theirs", "2026-08-25T09:00:00Z"),
+        ];
+        let session = live_session("s-one", Some("mine"));
+        let record = BackupRecord {
+            native_id: "theirs".into(),
+            ..Default::default()
+        };
+        let spoken_for = HashMap::from([("theirs".to_string(), "s-two".to_string())]);
+        let pick = pick_native_candidate(&files, &session, &record, &spoken_for).unwrap();
+        assert_eq!(pick.id, "mine");
+    }
+
+    #[test]
+    fn a_session_the_daemon_did_not_match_keeps_off_what_is_taken() {
+        let files = vec![
+            transcript("free", "2026-08-24T09:00:00Z"),
+            transcript("taken", "2026-08-25T09:00:00Z"),
+        ];
+        let session = live_session("s-one", None);
+        let spoken_for = HashMap::from([("taken".to_string(), "s-two".to_string())]);
+        // The newest file in the folder is the other session's; guessing takes
+        // the one that is not.
+        let pick =
+            pick_native_candidate(&files, &session, &BackupRecord::default(), &spoken_for).unwrap();
+        assert_eq!(pick.id, "free");
+        // And when every file is spoken for, it mirrors nothing rather than
+        // somebody else's conversation.
+        let all_taken = HashMap::from([
+            ("taken".to_string(), "s-two".to_string()),
+            ("free".to_string(), "s-three".to_string()),
+        ]);
+        assert!(
+            pick_native_candidate(&files, &session, &BackupRecord::default(), &all_taken).is_none()
+        );
+    }
+
+    #[test]
+    fn a_record_stays_on_its_transcript_when_no_one_can_name_one() {
+        // An older companion reports no thread at all; the id this record
+        // settled on before is still the best answer there is.
+        let files = vec![
+            transcript("mine", "2026-08-24T09:00:00Z"),
+            transcript("newest", "2026-08-25T09:00:00Z"),
+        ];
+        let session = live_session("s-one", None);
+        let record = BackupRecord {
+            native_id: "mine".into(),
+            ..Default::default()
+        };
+        let pick = pick_native_candidate(&files, &session, &record, &HashMap::new()).unwrap();
+        assert_eq!(pick.id, "mine");
     }
 
     #[test]
