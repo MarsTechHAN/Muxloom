@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
     bridge::{BridgeOptions, BridgePool},
@@ -45,6 +45,15 @@ static TUNNEL_START_LOCK: Mutex<()> = Mutex::new(());
 const CLAUDE_RELEASES: &str = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
 const CODEX_RELEASES: &str = "https://github.com/openai/codex/releases/download";
 const CODEX_LATEST: &str = "https://github.com/openai/codex/releases/latest";
+const PI_RELEASES: &str = "https://github.com/earendil-works/pi/releases/download";
+const PI_LATEST: &str = "https://github.com/earendil-works/pi/releases/latest";
+/// OpenCode's own release carries no checksum manifest for the command-line
+/// build, but the npm registry publishes one for the very bytes `npm install`
+/// would fetch: every `opencode-<platform>` package names its own integrity
+/// digest. So the registry is where the release is resolved from — the payload
+/// is the same self-contained binary, and it arrives with something to check
+/// it against.
+const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
 const CODEX_NO_HISTORY_CONFIG: &str = "history.persistence=\"none\"";
 
@@ -117,6 +126,77 @@ impl TargetPlatform {
             (os, arch) => bail!("Codex controller download does not support {os}/{arch}"),
         }
     }
+
+    /// Pi publishes one bundle per platform and no musl build at all, so a
+    /// machine running musl is told plainly rather than handed a binary that
+    /// cannot start — the install then falls through to Pi's own installer.
+    fn pi_name(&self) -> Result<String> {
+        if self.os == "linux" && self.musl {
+            bail!("Pi publishes no musl build");
+        }
+        let os = match self.os.as_str() {
+            "linux" => "linux",
+            "darwin" => "darwin",
+            other => bail!("Pi controller download does not support target OS {other}"),
+        };
+        let arch = match self.arch.as_str() {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => bail!("Pi controller download does not support architecture {other}"),
+        };
+        Ok(format!("{os}-{arch}"))
+    }
+
+    /// The npm package holding OpenCode's binary for this machine. There are
+    /// also `-baseline` variants, built for processors too old for the vector
+    /// instructions the ordinary build uses; nothing a machine tells us says
+    /// whether it is one of those, so the ordinary build is what it gets.
+    fn opencode_name(&self) -> Result<String> {
+        let os = match self.os.as_str() {
+            "linux" => "linux",
+            "darwin" => "darwin",
+            other => bail!("OpenCode controller download does not support target OS {other}"),
+        };
+        let arch = match self.arch.as_str() {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => bail!("OpenCode controller download does not support architecture {other}"),
+        };
+        Ok(format!(
+            "{os}-{arch}{}",
+            if self.os == "linux" && self.musl {
+                "-musl"
+            } else {
+                ""
+            }
+        ))
+    }
+}
+
+/// Which hash a publisher offers for its own payload. Nobody picks this:
+/// whichever manifest the release could be resolved from names the algorithm,
+/// and the controller and the target must then check the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestAlgorithm {
+    Sha256,
+    Sha512,
+}
+
+impl DigestAlgorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// Hex characters a digest of this width is written with.
+    fn hex_len(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
 }
 
 /// The release a target should end up running. The controller resolves this
@@ -131,7 +211,8 @@ struct RemoteRelease {
     /// segment of `url`.
     asset: String,
     url: String,
-    sha256: String,
+    digest: String,
+    algorithm: DigestAlgorithm,
 }
 
 #[derive(Debug, Clone)]
@@ -645,8 +726,7 @@ impl Runtime {
         let mut attempts: Vec<String> = Vec::new();
         // A configured command that names something else — a wrapper script, an
         // absolute path — is the operator's business, not a release we know how
-        // to fetch. Neither is a runtime muxloom has no release for: OpenCode
-        // and Pi go straight to their own installer.
+        // to fetch, so that install goes straight to the configured command.
         let built_in = kind.has_release_download()
             && !command.command.contains('/')
             && command.command == executable_name;
@@ -802,9 +882,8 @@ impl Runtime {
             .join(&release.asset);
         let download_label = format!("Downloading {kind} {}", release.version);
         self.controller_download_verified(
-            &release.url,
+            &release,
             &cache,
-            &release.sha256,
             &controller_environment,
             &download_label,
             progress,
@@ -821,19 +900,35 @@ impl Runtime {
                 progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
                 self.upload_runtime_binary(target, &cache, "claude")?;
             }
-            (AgentKind::Codex, Transport::Local) => {
-                progress(TaskProgress::pending(format!(
-                    "Installing {kind} {version}"
-                )));
-                install_local_codex_archive(&cache, version)?;
-            }
-            (AgentKind::Codex, Transport::Ssh { .. }) => {
+            // Codex and OpenCode each ship one self-contained executable
+            // inside their package, so only that file need cross the wire.
+            (AgentKind::Codex | AgentKind::OpenCode, Transport::Ssh { .. }) => {
                 progress(TaskProgress::pending(format!(
                     "Extracting {kind} {version}"
                 )));
-                let executable = extract_cached_codex_archive(&cache)?;
+                let executable = extract_cached_bundle_executable(&cache, kind)?;
                 progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
-                self.upload_runtime_binary(target, &executable, "codex")?;
+                self.upload_runtime_binary(target, &executable, kind.as_str())?;
+            }
+            (AgentKind::OpenCode, Transport::Local) => {
+                progress(TaskProgress::pending(format!(
+                    "Installing {kind} {version}"
+                )));
+                let executable = extract_cached_bundle_executable(&cache, kind)?;
+                install_local_runtime_binary(&executable, "opencode")?;
+            }
+            (AgentKind::Codex | AgentKind::Pi, Transport::Local) => {
+                progress(TaskProgress::pending(format!(
+                    "Installing {kind} {version}"
+                )));
+                install_local_bundle(&cache, kind, version)?;
+            }
+            // Pi's executable is no use on its own: the themes, assets and
+            // modules beside it are part of the runtime, so the package itself
+            // is what the machine is handed.
+            (AgentKind::Pi, Transport::Ssh { .. }) => {
+                progress(TaskProgress::pending(format!("Uploading {kind} {version}")));
+                self.upload_runtime_bundle(target, kind, &cache, version)?;
             }
             (kind, _) => bail!("{kind} has no downloadable agent runtime"),
         }
@@ -908,10 +1003,11 @@ impl Runtime {
                     .and_then(|platform| platform.get("checksum"))
                     .and_then(Value::as_str)
                     .context("Claude manifest has no checksum for the target platform")?;
-                validate_sha256(checksum)?;
+                validate_digest(checksum, DigestAlgorithm::Sha256)?;
                 Ok(RemoteRelease {
                     url: format!("{CLAUDE_RELEASES}/{version}/{platform_name}/claude"),
-                    sha256: checksum.to_ascii_lowercase(),
+                    digest: checksum.to_ascii_lowercase(),
+                    algorithm: DigestAlgorithm::Sha256,
                     asset: "claude".into(),
                     version,
                     platform_name,
@@ -939,14 +1035,74 @@ impl Runtime {
                     .context("Codex checksum manifest has no target package")?;
                 Ok(RemoteRelease {
                     url: format!("{release_root}/{asset}"),
-                    sha256: checksum,
+                    digest: checksum,
+                    algorithm: DigestAlgorithm::Sha256,
                     asset,
                     version,
                     platform_name,
                 })
             }
-            // OpenCode and Pi publish no release muxloom can hand a machine
-            // itself; their `install` command runs their own installer.
+            AgentKind::Pi => {
+                let platform_name = platform.pi_name()?;
+                progress(TaskProgress::pending("Resolving Pi release"));
+                let effective = self.controller_effective_url(PI_LATEST, controller_environment)?;
+                let version = effective
+                    .rsplit("/tag/v")
+                    .next()
+                    .filter(|value| *value != effective)
+                    .map(validate_release_name)
+                    .transpose()?
+                    .context("could not resolve the latest Pi release")?;
+                let asset = format!("pi-{platform_name}.tar.gz");
+                let release_root = format!("{PI_RELEASES}/v{version}");
+                let checksums = self.controller_fetch_text(
+                    &format!("{release_root}/SHA256SUMS"),
+                    controller_environment,
+                )?;
+                let checksum = checksum_for_asset(&checksums, &asset)
+                    .context("Pi checksum manifest has no target package")?;
+                Ok(RemoteRelease {
+                    url: format!("{release_root}/{asset}"),
+                    digest: checksum,
+                    algorithm: DigestAlgorithm::Sha256,
+                    asset,
+                    version,
+                    platform_name,
+                })
+            }
+            AgentKind::OpenCode => {
+                let platform_name = platform.opencode_name()?;
+                progress(TaskProgress::pending("Resolving OpenCode release"));
+                let latest = self.controller_fetch_text(
+                    &format!("{NPM_REGISTRY}/opencode-ai/latest"),
+                    controller_environment,
+                )?;
+                let latest: Value = serde_json::from_str(&latest)
+                    .context("the OpenCode registry entry is invalid JSON")?;
+                let version = validate_release_name(
+                    latest
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .context("the OpenCode registry entry names no version")?,
+                )?;
+                let package = format!("opencode-{platform_name}");
+                let manifest = self.controller_fetch_text(
+                    &format!("{NPM_REGISTRY}/{package}/{version}"),
+                    controller_environment,
+                )?;
+                let manifest: Value = serde_json::from_str(&manifest)
+                    .context("the OpenCode package manifest is invalid JSON")?;
+                let (url, digest, algorithm) = registry_distribution(&manifest)?;
+                Ok(RemoteRelease {
+                    asset: format!("{package}-{version}.tgz"),
+                    url,
+                    digest,
+                    algorithm,
+                    version,
+                    platform_name,
+                })
+            }
+            // An ordinary terminal is whatever shell the machine already has.
             kind => bail!("{kind} has no downloadable agent runtime"),
         }
     }
@@ -1029,15 +1185,21 @@ impl Runtime {
 
     fn controller_download_verified(
         &self,
-        url: &str,
+        release: &RemoteRelease,
         destination: &Path,
-        expected_sha256: &str,
         environment: &[(String, String)],
         progress_label: &str,
         progress: &mut impl FnMut(TaskProgress),
     ) -> Result<()> {
+        let RemoteRelease {
+            url,
+            digest: expected,
+            algorithm,
+            ..
+        } = release;
+        let algorithm = *algorithm;
         if destination.is_file()
-            && sha256_file(destination).is_ok_and(|digest| digest == expected_sha256)
+            && digest_file(destination, algorithm).is_ok_and(|digest| &digest == expected)
         {
             return Ok(());
         }
@@ -1057,10 +1219,10 @@ impl Runtime {
             let _ = fs::remove_file(&partial);
             return Err(error);
         }
-        let actual = sha256_file(&partial)?;
-        if actual != expected_sha256 {
+        let actual = digest_file(&partial, algorithm)?;
+        if &actual != expected {
             let _ = fs::remove_file(&partial);
-            bail!("download checksum mismatch: expected {expected_sha256}, got {actual}");
+            bail!("download checksum mismatch: expected {expected}, got {actual}");
         }
         if destination.exists() {
             fs::remove_file(destination).with_context(|| {
@@ -1073,6 +1235,33 @@ impl Runtime {
                 destination.display()
             )
         })?;
+        Ok(())
+    }
+
+    /// Hand a machine a runtime that is a directory rather than a file. The
+    /// package goes across whole and is unpacked there by the same script the
+    /// machine would have run had it fetched the package itself, so a runtime
+    /// ends up in the same place either way.
+    fn upload_runtime_bundle(
+        &self,
+        target: &Target,
+        kind: AgentKind,
+        archive: &Path,
+        version: &str,
+    ) -> Result<()> {
+        let Transport::Ssh { alias } = &target.transport else {
+            return Ok(());
+        };
+        let remote_home = self.remote_home(target)?;
+        let staging_dir = format!("{remote_home}/.cache/muxloom/install");
+        let payload = format!("{staging_dir}/{}.package", kind.as_str());
+        let prepare = format!("mkdir -p {}", shell_quote(&staging_dir));
+        let output = self.run_shell(target, &prepare, false)?;
+        ensure_success(&output, "prepare remote install directory")?;
+        self.scp_to(alias, archive, &payload)?;
+        let script = login_shell_command(&remote_unpack_script(kind, &payload, version));
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, &format!("unpack {kind} on {}", target.label))?;
         Ok(())
     }
 
@@ -2443,7 +2632,7 @@ payload="$cache/{name}.pull.$$"
 rm -f "$payload"
 fetch() {{
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 8 --max-time 150 --speed-limit 4096 --speed-time 20 -o "$2" "$1"
+        curl -fsSL --connect-timeout 8 --max-time 900 --speed-limit 4096 --speed-time 20 -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout=20 --tries=1 -O "$2" "$1"
     else
@@ -2452,14 +2641,14 @@ fetch() {{
     fi
 }}
 digest() {{
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
+    if command -v {sum_tool} >/dev/null 2>&1; then
+        {sum_tool} "$1" | cut -d' ' -f1
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | cut -d' ' -f1
+        shasum -a {bits} "$1" | cut -d' ' -f1
     elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 "$1" | awk '{{print $NF}}'
+        openssl dgst -{name_of_hash} "$1" | awk '{{print $NF}}'
     else
-        printf 'this machine has no sha256 tool\n' >&2
+        printf 'this machine has no {name_of_hash} tool\n' >&2
         return 69
     fi
 }}
@@ -2472,40 +2661,104 @@ if [ "$actual" != "$sum" ]; then
 fi
 "#,
         url = shell_quote(&release.url),
-        sum = shell_quote(&release.sha256),
+        sum = shell_quote(&release.digest),
         version = shell_quote(&release.version),
         name = kind.as_str(),
+        sum_tool = format_args!("{}sum", release.algorithm.as_str()),
+        bits = release.algorithm.hex_len() * 4,
+        name_of_hash = release.algorithm.as_str(),
     );
-    let install = match kind {
-        AgentKind::Codex => {
-            r#"releases="$HOME/.local/share/muxloom/codex/releases"
+    format!("{prelude}{}", remote_install_snippet(kind))
+}
+
+/// Put a package that is already on the machine into place. The controller
+/// uses this after handing a machine a payload it had no route to fetch for
+/// itself; everything past the download is the same either way.
+fn remote_unpack_script(kind: AgentKind, payload: &str, version: &str) -> String {
+    format!(
+        r#"set -e
+payload={payload}
+version={version}
+mkdir -p "$HOME/.local/bin"
+{install}"#,
+        payload = shell_quote(payload),
+        version = shell_quote(version),
+        install = remote_install_snippet(kind),
+    )
+}
+
+/// What a machine does with a verified payload sitting at `$payload`, for the
+/// release named by `$version`. Written once so a runtime lands in the same
+/// directories whether the machine fetched it or the controller shipped it.
+fn remote_install_snippet(kind: AgentKind) -> String {
+    match kind {
+        // Codex and Pi both ship a directory: the executable alone is not the
+        // runtime, so a whole release is unpacked and linked to.
+        AgentKind::Codex | AgentKind::Pi => {
+            let name = kind.as_str();
+            let inner = bundle_executable(kind);
+            format!(
+                r#"releases="$HOME/.local/share/muxloom/{name}/releases"
 stage="$releases/.pull.$$"
 rm -rf "$stage"
 mkdir -p "$stage"
 if ! tar -xzf "$payload" -C "$stage"; then
     rm -rf "$stage" "$payload"
-    printf 'could not unpack the Codex package\n' >&2
+    printf 'could not unpack the {name} package\n' >&2
     exit 65
 fi
-if [ ! -f "$stage/bin/codex" ]; then
+if [ ! -f "$stage/{inner}" ]; then
     rm -rf "$stage" "$payload"
-    printf 'the Codex package did not contain bin/codex\n' >&2
+    printf 'the {name} package did not contain {inner}\n' >&2
     exit 65
 fi
-chmod 755 "$stage/bin/codex"
+chmod 755 "$stage/{inner}"
 rm -rf "$releases/$version"
 mv "$stage" "$releases/$version"
-ln -sfn "$releases/$version/bin/codex" "$HOME/.local/bin/codex"
+ln -sfn "$releases/$version/{inner}" "$HOME/.local/bin/{name}"
 rm -f "$payload"
 "#
+            )
         }
-        _ => {
-            r#"chmod 755 "$payload"
+        // OpenCode arrives as an npm package wrapped around one binary.
+        AgentKind::OpenCode => {
+            let inner = bundle_executable(kind);
+            format!(
+                r#"stage="$HOME/.cache/muxloom/install/opencode.unpack.$$"
+rm -rf "$stage"
+mkdir -p "$stage"
+if ! tar -xzf "$payload" -C "$stage"; then
+    rm -rf "$stage" "$payload"
+    printf 'could not unpack the opencode package\n' >&2
+    exit 65
+fi
+if [ ! -f "$stage/{inner}" ]; then
+    rm -rf "$stage" "$payload"
+    printf 'the opencode package did not contain {inner}\n' >&2
+    exit 65
+fi
+chmod 755 "$stage/{inner}"
+mv -f "$stage/{inner}" "$HOME/.local/bin/opencode"
+rm -rf "$stage" "$payload"
+"#
+            )
+        }
+        _ => r#"chmod 755 "$payload"
 mv -f "$payload" "$HOME/.local/bin/claude"
 "#
-        }
-    };
-    format!("{prelude}{install}")
+        .to_string(),
+    }
+}
+
+/// Where a runtime's own executable sits inside the package its publisher
+/// ships. Empty for a runtime that publishes the bare executable.
+fn bundle_executable(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Codex => "bin/codex",
+        AgentKind::Pi => "pi/pi",
+        AgentKind::OpenCode => "package/bin/opencode",
+        _ => "",
+    }
 }
 
 fn controller_download_cache() -> PathBuf {
@@ -2522,13 +2775,20 @@ fn local_install_home() -> Result<PathBuf> {
         .context("HOME is unavailable while installing the local agent runtime")
 }
 
+/// Unpack a downloaded package beside its cache entry and hand back the one
+/// executable inside it, for the runtimes where that file is the whole runtime
+/// and is all a machine needs to be sent.
 #[cfg(feature = "controller")]
-fn extract_cached_codex_archive(archive: &Path) -> Result<PathBuf> {
+fn extract_cached_bundle_executable(archive: &Path, kind: AgentKind) -> Result<PathBuf> {
+    let inner = bundle_executable(kind);
+    if inner.is_empty() {
+        bail!("{kind} publishes no package to unpack");
+    }
     let parent = archive
         .parent()
-        .context("Codex package cache path has no parent")?;
+        .with_context(|| format!("{kind} package cache path has no parent"))?;
     let extracted = parent.join("extracted");
-    let executable = extracted.join("bin/codex");
+    let executable = extracted.join(inner);
     if executable.is_file() {
         return Ok(executable);
     }
@@ -2543,9 +2803,9 @@ fn extract_cached_codex_archive(archive: &Path) -> Result<PathBuf> {
         package
             .unpack(&staging)
             .with_context(|| format!("failed to unpack {}", archive.display()))?;
-        let staged_executable = staging.join("bin/codex");
+        let staged_executable = staging.join(inner);
         if !staged_executable.is_file() {
-            bail!("Codex package did not contain bin/codex");
+            bail!("{kind} package did not contain {inner}");
         }
         set_executable(&staged_executable)?;
         if extracted.exists() {
@@ -2561,8 +2821,8 @@ fn extract_cached_codex_archive(archive: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(not(feature = "controller"))]
-fn extract_cached_codex_archive(_archive: &Path) -> Result<PathBuf> {
-    bail!("Codex package extraction requires the controller feature")
+fn extract_cached_bundle_executable(_archive: &Path, _kind: AgentKind) -> Result<PathBuf> {
+    bail!("agent package extraction requires the controller feature")
 }
 
 #[cfg(feature = "controller")]
@@ -2597,18 +2857,31 @@ fn install_local_runtime_binary_at(source: &Path, executable: &str, home: &Path)
 }
 
 #[cfg(feature = "controller")]
-fn install_local_codex_archive(archive: &Path, version: &str) -> Result<()> {
-    install_local_codex_archive_at(archive, version, &local_install_home()?)
+fn install_local_bundle(archive: &Path, kind: AgentKind, version: &str) -> Result<()> {
+    install_local_bundle_at(archive, kind, version, &local_install_home()?)
 }
 
 #[cfg(not(feature = "controller"))]
-fn install_local_codex_archive(_archive: &Path, _version: &str) -> Result<()> {
-    bail!("local Codex installation requires the controller feature")
+fn install_local_bundle(_archive: &Path, _kind: AgentKind, _version: &str) -> Result<()> {
+    bail!("local agent installation requires the controller feature")
 }
 
+/// Unpack a runtime that ships as a directory into a release of its own and
+/// point this machine's `~/.local/bin` at it. Keeping each version whole is
+/// what lets the executable find the files its publisher put beside it.
 #[cfg(all(feature = "controller", unix))]
-fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) -> Result<()> {
-    let releases = home.join(".local/share/muxloom/codex/releases");
+fn install_local_bundle_at(
+    archive: &Path,
+    kind: AgentKind,
+    version: &str,
+    home: &Path,
+) -> Result<()> {
+    let name = kind.as_str();
+    let inner = bundle_executable(kind);
+    if inner.is_empty() {
+        bail!("{kind} publishes no package to unpack");
+    }
+    let releases = home.join(format!(".local/share/muxloom/{name}/releases"));
     let release = releases.join(version);
     let staging = releases.join(format!(".{version}.partial-{}", std::process::id()));
     let bin_dir = home.join(".local/bin");
@@ -2625,26 +2898,26 @@ fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) ->
         package
             .unpack(&staging)
             .with_context(|| format!("failed to unpack {}", archive.display()))?;
-        let executable = staging.join("bin/codex");
+        let executable = staging.join(inner);
         if !executable.is_file() {
-            bail!("Codex package did not contain bin/codex");
+            bail!("{kind} package did not contain {inner}");
         }
         set_executable(&executable)?;
         if release.exists() {
             fs::remove_dir_all(&release).with_context(|| {
                 format!(
-                    "failed to replace local Codex release {}",
+                    "failed to replace local {kind} release {}",
                     release.display()
                 )
             })?;
         }
         fs::rename(&staging, &release).with_context(|| {
             format!(
-                "failed to activate local Codex release {}",
+                "failed to activate local {kind} release {}",
                 release.display()
             )
         })?;
-        activate_local_codex_link(&release.join("bin/codex"), &bin_dir.join("codex"))?;
+        activate_local_runtime_link(&release.join(inner), &bin_dir.join(name))?;
         Ok(())
     })();
     if result.is_err() {
@@ -2654,18 +2927,27 @@ fn install_local_codex_archive_at(archive: &Path, version: &str, home: &Path) ->
 }
 
 #[cfg(all(feature = "controller", not(unix)))]
-fn install_local_codex_archive_at(_archive: &Path, _version: &str, _home: &Path) -> Result<()> {
-    bail!("local Codex package installation is unsupported on this platform")
+fn install_local_bundle_at(
+    _archive: &Path,
+    _kind: AgentKind,
+    _version: &str,
+    _home: &Path,
+) -> Result<()> {
+    bail!("local agent package installation is unsupported on this platform")
 }
 
 #[cfg(all(feature = "controller", unix))]
-fn activate_local_codex_link(source: &Path, destination: &Path) -> Result<()> {
+fn activate_local_runtime_link(source: &Path, destination: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
 
     let staging = destination.with_extension(format!("partial-{}", std::process::id()));
     let _ = fs::remove_file(&staging);
-    symlink(source, &staging)
-        .with_context(|| format!("failed to stage local Codex link from {}", source.display()))?;
+    symlink(source, &staging).with_context(|| {
+        format!(
+            "failed to stage local runtime link from {}",
+            source.display()
+        )
+    })?;
     fs::rename(&staging, destination)
         .with_context(|| format!("failed to activate {}", destination.display()))?;
     Ok(())
@@ -2726,11 +3008,14 @@ fn validate_release_name(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn validate_sha256(value: &str) -> Result<()> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+fn validate_digest(value: &str, algorithm: DigestAlgorithm) -> Result<()> {
+    if value.len() == algorithm.hex_len() && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        bail!("release manifest returned an invalid SHA-256 digest")
+        bail!(
+            "release manifest returned an invalid {} digest",
+            algorithm.as_str()
+        )
     }
 }
 
@@ -2739,15 +3024,92 @@ fn checksum_for_asset(manifest: &str, asset: &str) -> Option<String> {
         let mut fields = line.split_whitespace();
         let checksum = fields.next()?;
         let filename = fields.next()?.trim_start_matches('*');
-        (filename == asset && validate_sha256(checksum).is_ok())
+        (filename == asset && validate_digest(checksum, DigestAlgorithm::Sha256).is_ok())
             .then(|| checksum.to_ascii_lowercase())
     })
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+/// What a registry package manifest says to download, and what it must hash
+/// to. A manifest says *what* to fetch, not *where from*: only the registry
+/// the manifest was itself read from may serve the payload, so a tarball URL
+/// pointing anywhere else is refused rather than followed.
+fn registry_distribution(manifest: &Value) -> Result<(String, String, DigestAlgorithm)> {
+    let distribution = manifest
+        .get("dist")
+        .context("the package manifest carries no distribution")?;
+    let url = distribution
+        .get("tarball")
+        .and_then(Value::as_str)
+        .context("the package manifest names no tarball")?;
+    if !url.starts_with(&format!("{NPM_REGISTRY}/")) {
+        bail!("the package manifest points somewhere other than the registry");
+    }
+    let integrity = distribution
+        .get("integrity")
+        .and_then(Value::as_str)
+        .context("the package manifest carries no integrity digest")?;
+    let (digest, algorithm) = digest_from_integrity(integrity)?;
+    Ok((url.to_string(), digest, algorithm))
+}
+
+/// Turn an npm `integrity` string into the plain hex digest the rest of the
+/// install path speaks. The registry writes it as `<algorithm>-<base64>`,
+/// which is the same number in another alphabet — and it, not us, picks which
+/// algorithm that is, so the caller has to be told.
+fn digest_from_integrity(integrity: &str) -> Result<(String, DigestAlgorithm)> {
+    let (name, encoded) = integrity
+        .trim()
+        .split_once('-')
+        .context("package manifest carries no integrity digest")?;
+    let algorithm = match name {
+        "sha512" => DigestAlgorithm::Sha512,
+        "sha256" => DigestAlgorithm::Sha256,
+        other => bail!("package manifest uses an unsupported {other} integrity digest"),
+    };
+    let digest = hex_digest(&base64_decode(encoded)?);
+    validate_digest(&digest, algorithm)?;
+    Ok((digest, algorithm))
+}
+
+/// Standard base64, padded, no line breaks — the shape npm writes integrity
+/// digests in. Anything else is a manifest we should not be trusting.
+fn base64_decode(value: &str) -> Result<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let value = value.trim().as_bytes();
+    if value.is_empty() || value.len() % 4 != 0 {
+        bail!("package manifest carries a malformed base64 digest");
+    }
+    let body = value.strip_suffix(b"==").unwrap_or(value);
+    let body = body.strip_suffix(b"=").unwrap_or(body);
+    let padding = value.len() - body.len();
+    if padding > 2 || body.len() % 4 == 1 {
+        bail!("package manifest carries a malformed base64 digest");
+    }
+
+    let mut output = Vec::with_capacity(body.len() / 4 * 3);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0u32;
+    for byte in body {
+        let index = ALPHABET
+            .iter()
+            .position(|candidate| candidate == byte)
+            .context("package manifest carries a malformed base64 digest")?;
+        accumulator = (accumulator << 6) | index as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+        }
+    }
+    Ok(output)
+}
+
+fn digest_file(path: &Path, algorithm: DigestAlgorithm) -> Result<String> {
     let mut file = fs::File::open(path)
         .with_context(|| format!("failed to open {} for checksum", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut sha256 = Sha256::new();
+    let mut sha512 = Sha512::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
@@ -2756,9 +3118,15 @@ fn sha256_file(path: &Path) -> Result<String> {
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        match algorithm {
+            DigestAlgorithm::Sha256 => sha256.update(&buffer[..read]),
+            DigestAlgorithm::Sha512 => sha512.update(&buffer[..read]),
+        }
     }
-    Ok(hex_digest(&hasher.finalize()))
+    Ok(match algorithm {
+        DigestAlgorithm::Sha256 => hex_digest(&sha256.finalize()),
+        DigestAlgorithm::Sha512 => hex_digest(&sha512.finalize()),
+    })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -3808,10 +4176,18 @@ fn find_local_native_executable(command: &str) -> Option<PathBuf> {
     native.then_some(path)
 }
 
+/// Whether the copy of this runtime on the controller's own PATH is a thing
+/// that would still work somewhere else. Pi's executable is only half of a Pi:
+/// its themes, assets and modules sit beside it, so what is on PATH is never
+/// worth copying and the package has to be fetched instead.
 fn local_runtime_can_copy(kind: AgentKind, binary: &Path) -> bool {
-    kind != AgentKind::Codex
-        || std::env::consts::OS != "linux"
-        || find_codex_resource(binary, "bwrap").is_some()
+    match kind {
+        AgentKind::Pi => false,
+        AgentKind::Codex => {
+            std::env::consts::OS != "linux" || find_codex_resource(binary, "bwrap").is_some()
+        }
+        _ => true,
+    }
 }
 
 fn find_codex_resource(binary: &Path, name: &str) -> Option<PathBuf> {
@@ -4118,11 +4494,24 @@ mod tests {
         };
         assert_eq!(linux.claude_name().unwrap(), "linux-x64");
         assert_eq!(linux.codex_name().unwrap(), "x86_64-unknown-linux-musl");
+        assert_eq!(linux.pi_name().unwrap(), "linux-x64");
+        assert_eq!(linux.opencode_name().unwrap(), "linux-x64");
         let alpine = TargetPlatform {
             musl: true,
             ..linux
         };
         assert_eq!(alpine.claude_name().unwrap(), "linux-x64-musl");
+        // OpenCode publishes a musl build; Pi does not, and saying so is what
+        // sends that machine to Pi's own installer instead of a broken binary.
+        assert_eq!(alpine.opencode_name().unwrap(), "linux-x64-musl");
+        assert!(alpine.pi_name().is_err());
+        let mac = TargetPlatform {
+            os: "darwin".into(),
+            arch: "aarch64".into(),
+            musl: false,
+        };
+        assert_eq!(mac.pi_name().unwrap(), "darwin-arm64");
+        assert_eq!(mac.opencode_name().unwrap(), "darwin-arm64");
         let manifest = concat!(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other.tar.gz\n",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  codex-package.tar.gz\n",
@@ -4134,13 +4523,105 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_digest_a_registry_publishes_for_its_own_tarball() {
+        // The registry writes the digest in base64; the target checks it in
+        // hex. Same number, and these are the published digests of "muxloom".
+        assert_eq!(
+            digest_from_integrity(
+                "sha512-TNC3gdHJwIJiBN5a8CSFmJ1/aEuMnAs0GdFmGS1vjPqIfO6iqanZZemll91BQ6UZ9m8J/VzGkQjO0A74uQGHbQ=="
+            )
+            .unwrap(),
+            (
+                "4cd0b781d1c9c0826204de5af02485989d7f684b8c9c0b3419d166192d6f8cfa\
+                 887ceea2a9a9d965e9a597dd4143a519f66f09fd5cc69108ced00ef8b901876d"
+                    .to_string(),
+                DigestAlgorithm::Sha512,
+            )
+        );
+        // Which algorithm is the registry's call, not ours: the target has to
+        // be told to check the same one.
+        assert_eq!(
+            digest_from_integrity("sha256-n7nOfVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=")
+                .unwrap()
+                .1,
+            DigestAlgorithm::Sha256
+        );
+        for rejected in [
+            "",
+            "sha512",
+            "md5-n7nOfVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=",
+            // Right alphabet, wrong width: a digest that is not 512 bits long
+            "sha512-n7nOfVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=",
+            // Not the alphabet at all.
+            "sha512-****fVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=",
+        ] {
+            assert!(
+                digest_from_integrity(rejected).is_err(),
+                "accepted {rejected}"
+            );
+        }
+
+        // A manifest says what to fetch, not where from.
+        let manifest = serde_json::json!({
+            "dist": {
+                "tarball": format!("{NPM_REGISTRY}/opencode-linux-x64/-/opencode-linux-x64-1.0.0.tgz"),
+                "integrity": "sha256-n7nOfVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=",
+            }
+        });
+        let (url, digest, algorithm) = registry_distribution(&manifest).unwrap();
+        assert!(url.starts_with(NPM_REGISTRY));
+        assert_eq!(
+            digest,
+            "9fb9ce7d59fb6e180448626cb8ae2126c13daab0f22839a2b9c43d03bb0c808e"
+        );
+        assert_eq!(algorithm, DigestAlgorithm::Sha256);
+        let elsewhere = serde_json::json!({
+            "dist": {
+                "tarball": "https://example.invalid/opencode-linux-x64-1.0.0.tgz",
+                "integrity": "sha256-n7nOfVn7bhgESGJsuK4hJsE9qrDyKDmiucQ9A7sMgI4=",
+            }
+        });
+        assert!(
+            registry_distribution(&elsewhere)
+                .unwrap_err()
+                .to_string()
+                .contains("somewhere other than the registry")
+        );
+    }
+
+    #[test]
+    fn a_shipped_package_is_unpacked_where_a_fetched_one_would_have_been() {
+        let pulled = remote_pull_script(
+            AgentKind::Pi,
+            &RemoteRelease {
+                version: "0.84.3".into(),
+                platform_name: "linux-x64".into(),
+                asset: "pi-linux-x64.tar.gz".into(),
+                url: "https://example.invalid/pi-linux-x64.tar.gz".into(),
+                digest: "ef".repeat(32),
+                algorithm: DigestAlgorithm::Sha256,
+            },
+            "",
+        );
+        let shipped = remote_unpack_script(AgentKind::Pi, "/tmp/staging/pi.package", "0.84.3");
+        // However the payload got there, what happens to it afterwards is the
+        // same text, so a runtime lands in the same place either way.
+        let installing = remote_install_snippet(AgentKind::Pi);
+        assert!(pulled.ends_with(&installing));
+        assert!(shipped.ends_with(&installing));
+        assert!(shipped.contains("payload=/tmp/staging/pi.package\n"));
+        assert!(shipped.contains("version=0.84.3\n"));
+    }
+
+    #[test]
     fn a_target_pulls_its_own_runtime_into_the_directories_an_upload_would_use() {
         let claude = RemoteRelease {
             version: "1.2.3".into(),
             platform_name: "linux-x64".into(),
             asset: "claude".into(),
             url: "https://example.invalid/1.2.3/linux-x64/claude".into(),
-            sha256: "ab".repeat(32),
+            digest: "ab".repeat(32),
+            algorithm: DigestAlgorithm::Sha256,
         };
         let script = remote_pull_script(AgentKind::Claude, &claude, "export HTTPS_PROXY='p';");
         // The proxy the operator configured for this host is what the target
@@ -4162,12 +4643,44 @@ mod tests {
             platform_name: "aarch64-apple-darwin".into(),
             asset: "codex-package-aarch64-apple-darwin.tar.gz".into(),
             url: "https://example.invalid/codex-package-aarch64-apple-darwin.tar.gz".into(),
-            sha256: "cd".repeat(32),
+            digest: "cd".repeat(32),
+            algorithm: DigestAlgorithm::Sha256,
         };
         let script = remote_pull_script(AgentKind::Codex, &codex, "");
         assert!(script.contains(r#"tar -xzf "$payload" -C "$stage""#));
         assert!(
             script.contains(r#"ln -sfn "$releases/$version/bin/codex" "$HOME/.local/bin/codex""#)
+        );
+
+        // Pi keeps its themes and modules beside the executable, so the link
+        // has to point into the release rather than at a copied-out file.
+        let pi = RemoteRelease {
+            version: "0.84.3".into(),
+            platform_name: "linux-x64".into(),
+            asset: "pi-linux-x64.tar.gz".into(),
+            url: "https://example.invalid/pi-linux-x64.tar.gz".into(),
+            digest: "ef".repeat(32),
+            algorithm: DigestAlgorithm::Sha256,
+        };
+        let script = remote_pull_script(AgentKind::Pi, &pi, "");
+        assert!(script.contains(r#"ln -sfn "$releases/$version/pi/pi" "$HOME/.local/bin/pi""#));
+
+        // OpenCode's package is verified against the digest npm publishes for
+        // it, which is a SHA-512, so the target has to check that one.
+        let opencode = RemoteRelease {
+            version: "0.5.0".into(),
+            platform_name: "linux-x64".into(),
+            asset: "opencode-linux-x64-0.5.0.tgz".into(),
+            url: "https://example.invalid/opencode-linux-x64-0.5.0.tgz".into(),
+            digest: "12".repeat(64),
+            algorithm: DigestAlgorithm::Sha512,
+        };
+        let script = remote_pull_script(AgentKind::OpenCode, &opencode, "");
+        assert!(script.contains("sha512sum"));
+        assert!(script.contains("shasum -a 512"));
+        assert!(script.contains(&format!("sum={}\n", "12".repeat(64))));
+        assert!(
+            script.contains(r#"mv -f "$stage/package/bin/opencode" "$HOME/.local/bin/opencode""#)
         );
     }
 
@@ -4198,13 +4711,14 @@ mod tests {
             platform_name: "linux-x64".into(),
             asset: "claude".into(),
             url: format!("file://{}", binary.display()),
-            sha256: sha256_file(&binary).unwrap(),
+            digest: digest_file(&binary, DigestAlgorithm::Sha256).unwrap(),
+            algorithm: DigestAlgorithm::Sha256,
         };
 
         // A digest that does not match what lands is the one thing that must
         // never leave a runtime behind.
         let tampered = RemoteRelease {
-            sha256: "ab".repeat(32),
+            digest: "ab".repeat(32),
             ..claude.clone()
         };
         let status = Command::new("sh")
@@ -4251,7 +4765,8 @@ mod tests {
             platform_name: "aarch64-apple-darwin".into(),
             asset: "codex-package.tar.gz".into(),
             url: format!("file://{}", archive.display()),
-            sha256: sha256_file(&archive).unwrap(),
+            digest: digest_file(&archive, DigestAlgorithm::Sha256).unwrap(),
+            algorithm: DigestAlgorithm::Sha256,
         };
         let output = Command::new("sh")
             .arg("-c")
@@ -4269,6 +4784,93 @@ mod tests {
             fs::read_link(&linked).unwrap(),
             home.join(".local/share/muxloom/codex/releases/0.9.0/bin/codex")
         );
+
+        // Pi's executable is no use without the files its publisher put beside
+        // it, so the whole release stays together and the link points into it.
+        let pi_root = root.join("pi-package");
+        fs::create_dir_all(pi_root.join("pi/theme")).unwrap();
+        fs::write(pi_root.join("pi/pi"), b"pi-binary").unwrap();
+        fs::write(pi_root.join("pi/theme/dark.json"), b"{}").unwrap();
+        let pi_archive = root.join("pi-linux-x64.tar.gz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&pi_archive)
+                .arg("-C")
+                .arg(&pi_root)
+                .arg("pi")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pi = RemoteRelease {
+            version: "0.84.3".into(),
+            platform_name: "linux-x64".into(),
+            asset: "pi-linux-x64.tar.gz".into(),
+            url: format!("file://{}", pi_archive.display()),
+            digest: digest_file(&pi_archive, DigestAlgorithm::Sha256).unwrap(),
+            algorithm: DigestAlgorithm::Sha256,
+        };
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(remote_pull_script(AgentKind::Pi, &pi, &exports))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(home.join(".local/bin/pi")).unwrap(), b"pi-binary");
+        assert!(
+            home.join(".local/share/muxloom/pi/releases/0.84.3/pi/theme/dark.json")
+                .is_file()
+        );
+
+        // OpenCode is verified against the SHA-512 npm publishes for the very
+        // bytes it serves, so the target has to reach for the other tool.
+        let opencode_root = root.join("opencode-package");
+        fs::create_dir_all(opencode_root.join("package/bin")).unwrap();
+        fs::write(
+            opencode_root.join("package/bin/opencode"),
+            b"opencode-binary",
+        )
+        .unwrap();
+        let opencode_archive = root.join("opencode.tgz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&opencode_archive)
+                .arg("-C")
+                .arg(&opencode_root)
+                .arg("package")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let opencode = RemoteRelease {
+            version: "0.5.0".into(),
+            platform_name: "linux-x64".into(),
+            asset: "opencode-linux-x64-0.5.0.tgz".into(),
+            url: format!("file://{}", opencode_archive.display()),
+            digest: digest_file(&opencode_archive, DigestAlgorithm::Sha512).unwrap(),
+            algorithm: DigestAlgorithm::Sha512,
+        };
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(remote_pull_script(AgentKind::OpenCode, &opencode, &exports))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(home.join(".local/bin/opencode")).unwrap(),
+            b"opencode-binary"
+        );
+
         // Nothing is left in the staging directory the payload passed through.
         assert!(
             fs::read_dir(home.join(".cache/muxloom/install"))
@@ -4318,11 +4920,11 @@ mod tests {
             .unwrap();
         package.into_inner().unwrap().finish().unwrap();
 
-        let extracted = extract_cached_codex_archive(&archive).unwrap();
+        let extracted = extract_cached_bundle_executable(&archive, AgentKind::Codex).unwrap();
         assert_eq!(fs::read(extracted).unwrap(), b"codex-binary");
         #[cfg(unix)]
         {
-            install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap();
+            install_local_bundle_at(&archive, AgentKind::Codex, "1.2.3", &home).unwrap();
             assert_eq!(
                 fs::read(home.join(".local/bin/codex")).unwrap(),
                 b"codex-binary"
@@ -4334,12 +4936,42 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let error = install_local_codex_archive_at(&archive, "1.2.3", &home).unwrap_err();
+            let error =
+                install_local_bundle_at(&archive, AgentKind::Codex, "1.2.3", &home).unwrap_err();
             assert!(error.to_string().contains("unsupported on this platform"));
             assert!(
                 !home
                     .join(".local/share/muxloom/codex/releases/1.2.3")
                     .exists()
+            );
+        }
+
+        // The same unpacking serves every runtime that ships a directory: only
+        // where its executable sits inside the package differs.
+        let pi_archive = root.join("pi.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            File::create(&pi_archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut package = tar::Builder::new(encoder);
+        for (name, payload) in [
+            ("pi/pi", &b"pi-binary"[..]),
+            ("pi/theme/dark.json", &b"{}"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            package.append_data(&mut header, name, payload).unwrap();
+        }
+        package.into_inner().unwrap().finish().unwrap();
+        #[cfg(unix)]
+        {
+            install_local_bundle_at(&pi_archive, AgentKind::Pi, "0.84.3", &home).unwrap();
+            assert_eq!(fs::read(home.join(".local/bin/pi")).unwrap(), b"pi-binary");
+            assert!(
+                home.join(".local/share/muxloom/pi/releases/0.84.3/pi/theme/dark.json")
+                    .is_file()
             );
         }
 

@@ -163,11 +163,13 @@ impl Default for AgentCommands {
                 install: String::new(),
                 sync_files: vec!["~/.claude/settings.json".into()],
             },
-            // OpenCode ships no release muxloom can hand a machine itself, so
-            // the install command is the runtime's own installer. npm first
-            // because it is the one that works without reaching GitHub, and
-            // its platform binary lives behind an install script recent npm
-            // blocks unless it is named.
+            // Every agent here is installed from its published release, which
+            // muxloom resolves and hands the machine itself. These two keep an
+            // install command anyway, as the fallback for a machine muxloom
+            // cannot fetch the release for — a platform with no published
+            // build, say. npm first because it needs no reachable GitHub, and
+            // OpenCode's platform binary lives behind an install script recent
+            // npm blocks unless it is named.
             opencode: CommandConfig {
                 command: "opencode".into(),
                 args: Vec::new(),
@@ -597,9 +599,10 @@ args = []
 install = ""
 sync_files = ["~/.claude/settings.json"]
 
-# Codex and Claude Code are installed from their published releases, which
-# muxloom hands the machine itself. The runtimes below have none, so `install`
-# is the shell command the settings panel runs to put them on a machine.
+# Every agent is installed from its published release, which muxloom resolves
+# and hands the machine itself. `install` is the shell command the settings
+# panel falls back to when that cannot be done — no published build for the
+# platform, or no route to the release from here or from there.
 [agents.opencode]
 command = "opencode"
 args = []
@@ -676,23 +679,24 @@ mod tests {
     #[test]
     fn built_in_agent_installers_do_not_require_system_download_tools() {
         let config = Config::default();
-        // Codex and Claude Code arrive as published releases muxloom fetches
-        // and hands over itself, so the machine downloads nothing.
-        for kind in AgentKind::agents().filter(|kind| kind.has_release_download()) {
+        // Every agent arrives as a published release muxloom resolves and
+        // hands the machine itself, so nothing has to be installed by a
+        // machine that has neither npm nor a route to the vendor.
+        for kind in AgentKind::agents() {
             assert!(
-                config.agents.get(kind).install.is_empty(),
-                "{kind} is provisioned by muxloom and needs no installer"
+                kind.has_release_download(),
+                "{kind} could only be installed by the machine itself"
             );
         }
-        // The rest publish no release muxloom can fetch, so each one must name
-        // the installer the settings panel runs in its place.
-        for kind in AgentKind::agents().filter(|kind| !kind.has_release_download()) {
+        // Where a vendor leaves a platform without a build, `install` is what
+        // the settings panel falls back to — never the only way in.
+        for kind in [AgentKind::OpenCode, AgentKind::Pi] {
             assert!(
                 !config.agents.get(kind).install.trim().is_empty(),
-                "{kind} has no release to fetch and no installer to fall back on"
+                "{kind} has no installer to fall back on"
             );
         }
-        // A download tool may only appear inside such a vendor installer.
+        // A download tool may only appear inside such a fallback installer.
         for line in EXAMPLE_CONFIG.lines().filter(|line| line.contains("curl")) {
             assert!(
                 line.starts_with("install ="),

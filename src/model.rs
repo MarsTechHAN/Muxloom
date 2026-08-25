@@ -71,10 +71,12 @@ impl AgentKind {
     }
 
     /// Whether muxloom can resolve a published release for this runtime and
-    /// have the machine fetch it. The rest install through their own
-    /// installer, which is what the `install` command in the config runs.
+    /// hand it to a machine itself. Every agent publishes one; a terminal is
+    /// whatever shell the machine already has, so there is nothing to fetch.
+    /// The `install` command in the config stays as the fallback for when the
+    /// release cannot be reached from here or from there.
     pub fn has_release_download(self) -> bool {
-        matches!(self, Self::Codex | Self::Claude)
+        self != Self::Terminal
     }
 
     pub fn toggle(self) -> Self {

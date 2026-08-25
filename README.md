@@ -384,24 +384,32 @@ only when it is genuinely ahead of what is running.
    modifier plus an arrow, or click **Back**.
 6. Press `q` to leave — managed sessions keep running.
 
-If Codex or Claude is missing, the New flow asks before installing it; if the
-target companion is missing or stale, the controller provisions the matching
-binary automatically over the existing SSH connection.
+If an agent is missing, the New flow asks before installing it; if the target
+companion is missing or stale, the controller provisions the matching binary
+automatically over the existing SSH connection.
 
 Either way the target downloads for itself first. The controller resolves only
-the release metadata — the version, the URL, the SHA-256 — and the machine
-fetches the payload over its own network path and checks what landed against
-that digest before anything moves into place. The fetch is bounded (eight
-seconds to connect, and it gives up if the transfer stalls), so a machine with
-no route to the release falls back in seconds rather than hanging the install:
-first to uploading a matching binary already on the controller, then to the
-controller downloading and pushing it, then to any `install` command configured
-for that runtime. If all of them fail, the error names each attempt.
+the release metadata — the version, the URL, the digest its publisher stands
+behind — and the machine fetches the payload over its own network path and
+checks what landed against that digest before anything moves into place. The
+fetch is bounded (eight seconds to connect, and it gives up if the transfer
+stalls), so a machine with no route to the release falls back in seconds rather
+than hanging the install: first to uploading a matching binary already on the
+controller, then to the controller downloading and pushing it, then to any
+`install` command configured for that runtime. If all of them fail, the error
+names each attempt.
 
-OpenCode and Pi publish no release Muxloom can hand over, so they skip straight
-to their `install` command. Press `,` on a machine and its settings panel shows
-an **Install …** action under every runtime that machine is missing; `Enter`
-runs it and closes the panel so the footer gauge can report the progress.
+All four agents come this way: Codex and Claude Code from their GitHub
+releases, Pi from its own, OpenCode from the npm registry — which is the only
+place that publishes a digest for the binary `npm install` would have fetched
+anyway. Pi and OpenCode ship a directory rather than a bare executable, and it
+stays whole: the release is unpacked under `~/.local/share/muxloom` and linked
+from `~/.local/bin`, so the executable still finds the themes and modules its
+publisher put beside it. A platform its vendor publishes no build for — Pi on
+musl, say — is where the configured `install` command takes over. Press `,` on
+a machine and its settings panel shows an **Install …** action under every
+runtime that machine is missing; `Enter` runs it and closes the panel so the
+footer gauge can report the progress.
 
 ## Controls
 
@@ -560,9 +568,10 @@ args = []
 install = ""
 sync_files = ["~/.claude/settings.json"]
 
-# Codex and Claude Code come from published releases Muxloom hands over itself,
-# so their `install` is empty. The runtimes below have none, so `install` is the
-# shell command the settings panel runs to put them on a machine.
+# Every agent comes from a published release Muxloom resolves and hands over
+# itself. `install` is the shell command the settings panel falls back to when
+# that cannot be done — no published build for the platform, or no route to the
+# release from here or from there.
 [agents.opencode]
 command = "opencode"
 args = []

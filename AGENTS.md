@@ -48,6 +48,11 @@ preserve.
   target verifies the payload against that digest before installing it, and a
   companion pull is offered only when the published digest equals the asset we
   would otherwise send, so a pull can never install different bytes than a push.
+- A publisher's manifest says what to download, not where from: a payload URL
+  that leaves the host the manifest was itself read from must be refused rather
+  than followed. Which digest a publisher stands behind is its call, not ours,
+  so the algorithm travels with the release and the controller and the target
+  must check the same one.
 - Every target-side fetch must be bounded — connect timeout, total timeout, and
   a stall guard — so a machine with no route to the release fails in seconds
   instead of hanging the install. When every built-in path fails, the reported
