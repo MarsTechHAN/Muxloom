@@ -907,6 +907,18 @@ fn sync_transcript(
     }
     record.native_id = candidate.id.clone();
     record.native_path = candidate.source_path.clone();
+    // A name taken before muxloom could tell machinery from speech - the
+    // caveat pinned in front of a local command, a slash command and what it
+    // printed. It says nothing about the conversation, so take the guess again
+    // off the messages already mirrored here rather than leave it standing
+    // until a transcript nobody is adding to grows again.
+    if !record.title.is_empty() && !crate::native_history::is_spoken(&record.title) {
+        record.title = store
+            .read_blob(partition, &session.id, MESSAGES_BLOB)
+            .ok()
+            .and_then(|raw| guess_title(&messages_from_jsonl(&raw)))
+            .unwrap_or_default();
+    }
     // Nothing to do if the transcript has not advanced since the last sync.
     if !candidate.updated_at.is_empty()
         && candidate.updated_at == record.native_updated_at
@@ -948,10 +960,12 @@ fn sync_transcript(
     record.message_count = messages.len();
     record.jsonl_bytes_synced = data.len() as u64;
     record.native_updated_at = updated_at;
-    if record.title.is_empty()
-        && let Some(title) = title
-    {
-        record.title = title;
+    match title {
+        // A runtime renames a conversation as it learns what it is about, and
+        // the newest name it gave is the truth about it now.
+        Some(Title::Named(named)) => record.title = named,
+        Some(Title::Guessed(guess)) if record.title.is_empty() => record.title = guess,
+        _ => {}
     }
     stats.transcripts += 1;
     Ok(())
@@ -1014,14 +1028,42 @@ fn messages_to_jsonl(messages: &[ExtractedMessage]) -> String {
     out
 }
 
+/// Read back what [`messages_to_jsonl`] wrote. A line that no longer parses is
+/// skipped, the same way the transcript it came from is read.
+fn messages_from_jsonl(raw: &[u8]) -> Vec<ExtractedMessage> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ExtractedMessage>(line).ok())
+        .collect()
+}
+
+/// What a backed-up conversation is called, and how much that is worth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Title {
+    /// The name the runtime gave it. Rewritten as the conversation goes on,
+    /// so a newer one always replaces what is on the record.
+    Named(String),
+    /// The opening of the first thing anyone actually said, for a runtime that
+    /// never named it. A guess, and it only fills an empty slot.
+    Guessed(String),
+}
+
+impl Title {
+    pub fn text(&self) -> &str {
+        match self {
+            Title::Named(text) | Title::Guessed(text) => text,
+        }
+    }
+}
+
 /// Parse an agent-native transcript into a flat message list plus an optional
 /// title. Best-effort: unknown line shapes are skipped, consecutive exact
 /// duplicates (Codex emits both an `event_msg` and a `response_item` for the
 /// same user turn) are collapsed.
-pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>, Option<String>) {
+pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>, Option<Title>) {
     let text = String::from_utf8_lossy(jsonl);
     let mut messages: Vec<ExtractedMessage> = Vec::new();
-    let mut title: Option<String> = None;
+    let mut title: Option<Title> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1076,11 +1118,11 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                 // so the last name in the file wins; an older transcript names
                 // it once, and that only stands if there is no newer form.
                 if let Some(named) = crate::native_history::claude_ai_title(&value) {
-                    title = Some(named.to_string());
+                    title = Some(Title::Named(named.to_string()));
                 } else if title.is_none()
                     && let Some(explicit) = crate::native_history::claude_legacy_title(&value)
                 {
-                    title = Some(explicit.to_string());
+                    title = Some(Title::Named(explicit.to_string()));
                 }
                 if let Some(role) = value.get("type").and_then(Value::as_str)
                     && (role == "user" || role == "assistant")
@@ -1096,7 +1138,7 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                 // pi lets a conversation be named and renamed on a line of its
                 // own, so the last name in the file is the one it goes by.
                 if let Some(named) = crate::native_history::pi_session_name(&value) {
-                    title = Some(named.to_string());
+                    title = Some(Title::Named(named.to_string()));
                 }
                 if value.get("type").and_then(Value::as_str) == Some("message")
                     && let Some(message) = value.get("message")
@@ -1113,12 +1155,24 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
         }
     }
     if title.is_none() {
-        title = messages
-            .iter()
-            .find(|message| message.role == "user")
-            .map(|message| truncate_title(&message.text));
+        title = guess_title(&messages).map(Title::Guessed);
     }
     (messages, title)
+}
+
+/// What to call a conversation whose runtime never named it: the opening of
+/// the first thing a person said in it. Everything a runtime files under the
+/// person's own role is skipped - see
+/// [`crate::native_history::is_spoken`] - or a folder of conversations all
+/// end up called the same thing.
+fn guess_title(messages: &[ExtractedMessage]) -> Option<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        // Judged whole, before it is cut down: a bracketed note that runs past
+        // the cut would lose the bracket that gives it away.
+        .find(|message| crate::native_history::is_spoken(&message.text))
+        .map(|message| truncate_title(&message.text))
 }
 
 /// Append a message, dropping empties and collapsing a duplicate of the
@@ -1754,7 +1808,47 @@ mod tests {
         assert_eq!(messages[0].text, "how do I scroll?");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text, "press Ctrl+T");
-        assert_eq!(title.as_deref(), Some("how do I scroll?"));
+        assert_eq!(title, Some(Title::Guessed("how do I scroll?".into())));
+    }
+
+    /// What a runtime files under the person's own role is not a name for the
+    /// conversation, and a guess at one is only worth keeping until the
+    /// runtime says what it is really about.
+    #[test]
+    fn a_guessed_name_skips_the_machinery_and_gives_way_to_a_real_one() {
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"t1","message":{"content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"t2","message":{"content":"<command-name>/clear</command-name>"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"t3","message":{"content":"why does the daemon lose the title?"}}"#,
+            "\n",
+        );
+        let (_, guessed) = extract_messages(AgentKind::Claude, jsonl.as_bytes());
+        assert_eq!(
+            guessed,
+            Some(Title::Guessed("why does the daemon lose the title?".into()))
+        );
+
+        let named = format!(
+            "{jsonl}{}\n",
+            r#"{"type":"ai-title","aiTitle":"reading the daemon"}"#
+        );
+        assert_eq!(
+            extract_messages(AgentKind::Claude, named.as_bytes()).1,
+            Some(Title::Named("reading the daemon".into())),
+            "once the runtime names it, the guess is beside the point"
+        );
+
+        // Nothing was said that anybody said, so there is nothing to call it.
+        let only_machinery = concat!(
+            r#"{"type":"user","timestamp":"t1","message":{"content":"[Request interrupted by user]"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract_messages(AgentKind::Claude, only_machinery.as_bytes()).1,
+            None
+        );
     }
 
     #[test]
@@ -1772,7 +1866,7 @@ mod tests {
         assert_eq!(messages[0].text, "hello there");
         // Text blocks concatenated, tool block skipped.
         assert_eq!(messages[1].text, "hi\nworld");
-        assert_eq!(title.as_deref(), Some("scrolling help"));
+        assert_eq!(title, Some(Title::Named("scrolling help".into())));
     }
 
     /// The name a current Claude Code writes outranks a summary from an older
@@ -1790,7 +1884,10 @@ mod tests {
             "\n",
         );
         let (_, title) = extract_messages(AgentKind::Claude, jsonl.as_bytes());
-        assert_eq!(title.as_deref(), Some("recap from the transcript"));
+        assert_eq!(
+            title,
+            Some(Title::Named("recap from the transcript".into()))
+        );
     }
 
     #[test]
