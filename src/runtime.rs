@@ -2273,11 +2273,14 @@ END {
         if !kind.has_native_history() {
             return Ok(Vec::new());
         }
+        if kind == AgentKind::OpenCode {
+            return self.scan_opencode_resumes(target, path);
+        }
         let root = match kind {
             AgentKind::Codex => "$HOME/.codex/sessions",
             AgentKind::Claude => "$HOME/.claude/projects",
             AgentKind::Pi => "$HOME/.pi/agent/sessions",
-            _ => unreachable!("only a runtime with native history is scanned"),
+            _ => unreachable!("only a runtime that writes transcripts is scanned for files"),
         };
         let index = if kind == AgentKind::Codex {
             r#"printf '\036INDEX\n'; if [ -f "$HOME/.codex/session_index.jsonl" ]; then cat "$HOME/.codex/session_index.jsonl"; fi;"#
@@ -2297,6 +2300,34 @@ END {
             path,
             &String::from_utf8_lossy(&output.stdout),
         ))
+    }
+
+    /// The conversations OpenCode has had in `path`, asked for rather than
+    /// found.
+    ///
+    /// Nothing OpenCode writes is a file muxloom may read: its sessions and its
+    /// provider credentials are rows in one store. So this asks OpenCode about
+    /// itself, in a single query - see
+    /// [`crate::native_history::opencode_query`] - and the answer is the
+    /// conversations and nothing else. A machine with no OpenCode on it answers
+    /// nothing, which is the same as having no conversations to resume.
+    fn scan_opencode_resumes(&self, target: &Target, path: &str) -> Result<Vec<ResumeCandidate>> {
+        let query = crate::native_history::opencode_query(crate::native_history::OPENCODE_SCANNED);
+        let script = format!(
+            "PATH=\"$HOME/.local/bin:$PATH\"; command -v opencode >/dev/null 2>&1 || exit 0; {} </dev/null 2>/dev/null",
+            shell_join(&["opencode", "db", "--format", "json", &query])
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "scan resumable sessions")?;
+        let normalized_path = normalize_path(path);
+        let mut candidates: Vec<ResumeCandidate> =
+            crate::native_history::opencode_rows(&String::from_utf8_lossy(&output.stdout))
+                .iter()
+                .filter_map(|row| parse_opencode_resume(row, &normalized_path))
+                .collect();
+        candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        candidates.truncate(50);
+        Ok(candidates)
     }
 
     pub fn kill(&self, target: &Target, session_id: &str) -> Result<()> {
@@ -4023,6 +4054,44 @@ fn parse_pi_resume(session: &str, path: &str, source_path: &str) -> Option<Resum
     })
 }
 
+/// One row of OpenCode's answer as a conversation that could be resumed, or
+/// nothing if it was held somewhere else.
+///
+/// The source path is left empty on purpose. Every other runtime can point at
+/// the file it wrote, and a reader - a person, or an agent of another kind
+/// being handed this conversation as context - can go and read it. OpenCode's
+/// is a row in a store that also holds its credentials, so there is no path
+/// here worth giving out, and what needs the conversation asks OpenCode for it
+/// by id.
+fn parse_opencode_resume(row: &Value, path: &str) -> Option<ResumeCandidate> {
+    if row
+        .get("directory")
+        .and_then(Value::as_str)
+        .map(normalize_path)
+        .as_deref()
+        != Some(path)
+    {
+        return None;
+    }
+    let said = |field: &str| {
+        row.get(field)
+            .and_then(Value::as_str)
+            .map(clean_recap)
+            .filter(|text| crate::native_history::is_spoken(text))
+    };
+    Some(ResumeCandidate {
+        id: row.get("id").and_then(Value::as_str)?.to_string(),
+        kind: AgentKind::OpenCode,
+        source_path: String::new(),
+        recap: crate::native_history::opencode_title(row).map(clean_recap),
+        first_message: said("first_text"),
+        last_message: said("last_text"),
+        updated_at: crate::native_history::iso_timestamp(
+            row.get("updated").and_then(Value::as_u64).unwrap_or(0),
+        ),
+    })
+}
+
 fn parse_json_line(line: &str) -> Option<Value> {
     serde_json::from_str(line).ok()
 }
@@ -4122,9 +4191,12 @@ pub(crate) fn launch_arguments(
         match kind {
             AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
             AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
-            AgentKind::Pi => args.extend(["--session".into(), resume_id.into()]),
-            // Only a runtime with native history hands back a resume id.
-            AgentKind::OpenCode | AgentKind::Terminal => {}
+            AgentKind::Pi | AgentKind::OpenCode => {
+                args.extend(["--session".into(), resume_id.into()])
+            }
+            // Only a runtime that remembers its own conversations hands back a
+            // resume id.
+            AgentKind::Terminal => {}
         }
     }
     if resume_id.is_none()
@@ -5551,6 +5623,52 @@ mod tests {
             parse_resume_candidates(AgentKind::Pi, "/other", sessions).is_empty(),
             "resume candidates must match the exact working directory"
         );
+    }
+
+    #[test]
+    fn opencode_resume_candidates_come_from_what_opencode_says_about_itself() {
+        let answer = r#"[
+          {"id":"ses_here","directory":"/work/project","title":"What it is really about",
+           "created":1787659401726,"updated":1787659402199,
+           "first_text":"first opencode prompt","last_text":"The keeper spawn is what fails."},
+          {"id":"ses_unnamed","directory":"/work/project",
+           "title":"New session - 2026-08-25T12:03:21.726Z",
+           "created":1787659401726,"updated":1787659402199,
+           "first_text":"<system-reminder>a plan file exists</system-reminder>","last_text":null},
+          {"id":"ses_elsewhere","directory":"/work/other","title":"Somewhere else entirely",
+           "created":1787659401726,"updated":1787659402199,
+           "first_text":null,"last_text":null}
+        ]"#;
+        let rows = crate::native_history::opencode_rows(answer);
+        let candidates: Vec<_> = rows
+            .iter()
+            .filter_map(|row| parse_opencode_resume(row, "/work/project"))
+            .collect();
+
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert_eq!(candidates[0].id, "ses_here");
+        assert_eq!(candidates[0].kind, AgentKind::OpenCode);
+        assert_eq!(
+            candidates[0].recap.as_deref(),
+            Some("What it is really about")
+        );
+        assert_eq!(
+            candidates[0].first_message.as_deref(),
+            Some("first opencode prompt")
+        );
+        assert_eq!(
+            candidates[0].last_message.as_deref(),
+            Some("The keeper spawn is what fails.")
+        );
+        // The one runtime with no file to point anybody at.
+        assert!(candidates[0].source_path.is_empty());
+        // Written the way every other runtime writes a time, so the sort and
+        // the "has this moved on?" check both still work.
+        assert_eq!(candidates[0].updated_at, "2026-08-25T12:03:22.199Z");
+        // A name it has not given yet is no name, and what the runtime files
+        // under the person's own role is not the person talking.
+        assert_eq!(candidates[1].recap, None);
+        assert_eq!(candidates[1].first_message, None);
     }
 
     #[test]

@@ -1,19 +1,25 @@
 //! What an agent CLI records about its own sessions.
 //!
 //! Codex, Claude Code and pi each keep a transcript of every session they run,
-//! and each names the session in it. muxloom reads those files in four places
-//! (the resume picker, the backup index, the session list, and the recap under
-//! it), so the rules for reading one live here rather than in each reader.
+//! and each names the session in it. OpenCode keeps the same thing as rows in a
+//! store of its own. muxloom reads all of it in four places (the resume picker,
+//! the backup index, the session list, and the recap under it), so the rules
+//! for reading one live here rather than in each reader.
 //!
-//! Nothing here talks to a session: it reads files the CLI wrote, on the
-//! machine the CLI ran on, and the reading is bounded. Transcripts reach tens
-//! of megabytes, so a scan looks at the end of a file, not the file.
+//! Nothing here talks to a session. Three of the four runtimes wrote files, so
+//! reading them is reading files, and the reading is bounded: transcripts reach
+//! tens of megabytes, so a scan looks at the end of a file, not the file. The
+//! fourth wrote a database with its provider credentials in it, so muxloom asks
+//! OpenCode for the conversation instead of opening the file - see
+//! [`opencode_query`].
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -31,6 +37,11 @@ const HEAD_BYTES: u64 = 64 * 1024;
 /// every conversation ever held in it; the ones a live session could be
 /// writing are at the top of that list.
 const MAX_SCANNED: usize = 64;
+/// How many of OpenCode's conversations one query asks for. It keeps every
+/// conversation ever held on the machine in one store rather than a folder per
+/// working directory, so this bound spans every folder at once and is set well
+/// above [`MAX_SCANNED`] to leave room for the folders nobody is asking about.
+pub const OPENCODE_SCANNED: usize = 200;
 /// How much of a message is kept, matching what a screen-scraped recap keeps.
 const MAX_MESSAGE_CHARS: usize = 180;
 /// A session and the transcript it writes begin with the same keystroke, but
@@ -73,15 +84,16 @@ pub fn threads_for(kind: AgentKind, cwd: &str, since: u64) -> Vec<NativeThread> 
         AgentKind::Claude => claude_threads(&home.join(".claude").join("projects"), cwd, since),
         AgentKind::Codex => codex_threads(&home.join(".codex"), cwd, since),
         AgentKind::Pi => pi_threads(&home.join(".pi").join("agent").join("sessions"), cwd, since),
-        // The rest keep no transcript of their own; muxloom's history is all
+        AgentKind::OpenCode => opencode_threads(cwd, since),
+        // A terminal keeps no transcript of its own; muxloom's history is all
         // there is to read.
-        AgentKind::OpenCode | AgentKind::Terminal => Vec::new(),
+        AgentKind::Terminal => Vec::new(),
     }
 }
 
-/// Read one transcript that is already spoken for. A session that knows which
-/// file it is writing never rescans the folder for it.
-pub fn reread(kind: AgentKind, path: &Path) -> Option<NativeThread> {
+/// Read one conversation that is already spoken for. A session that knows which
+/// one is its own never rescans the folder for it.
+pub fn reread(kind: AgentKind, path: &Path, id: &str) -> Option<NativeThread> {
     let updated_at = last_written(path)?;
     match kind {
         AgentKind::Claude => claude_thread(path, updated_at),
@@ -90,19 +102,24 @@ pub fn reread(kind: AgentKind, path: &Path) -> Option<NativeThread> {
             codex_thread(path, updated_at, &names)
         }
         AgentKind::Pi => pi_thread(path, updated_at),
-        AgentKind::OpenCode | AgentKind::Terminal => None,
+        // Nothing here is a file of its own, so the id is what picks the
+        // conversation back out of the store the whole machine shares.
+        AgentKind::OpenCode => opencode_snapshot()
+            .into_iter()
+            .find(|thread| thread.id == id),
+        AgentKind::Terminal => None,
     }
 }
 
 /// The thread a launch was told to reopen, read out of the command line the
 /// daemon is about to run: `claude --resume <id>`, `codex resume <id>`,
-/// `pi --session <id>`.
+/// `pi --session <id>`, `opencode --session <id>`.
 pub fn resume_seed(kind: AgentKind, args: &[String]) -> Option<String> {
     let flag = match kind {
         AgentKind::Claude => "--resume",
         AgentKind::Codex => "resume",
-        AgentKind::Pi => "--session",
-        AgentKind::OpenCode | AgentKind::Terminal => return None,
+        AgentKind::Pi | AgentKind::OpenCode => "--session",
+        AgentKind::Terminal => return None,
     };
     // `--flag=value` is only a form a flag has; Codex's is a subcommand.
     let joined = flag.starts_with("--").then(|| format!("{flag}="));
@@ -679,6 +696,173 @@ fn pi_agent_text(value: &Value) -> Option<String> {
         .next_back()
 }
 
+/// Everything muxloom wants to know about OpenCode's conversations, as one
+/// query OpenCode can answer about itself.
+///
+/// OpenCode writes no transcript. It keeps its sessions, the messages in them
+/// and the parts those are made of as rows in one SQLite store - and beside
+/// them, in the same file, the credentials it talks to providers with. So
+/// muxloom neither opens that file nor copies it: it asks OpenCode, through the
+/// query tool OpenCode publishes for the purpose, and what comes back is the
+/// conversation and nothing else.
+///
+/// Only a number is ever put into the text of the query. The folder a session
+/// ran in is what decides which conversation belongs to it, and that comparison
+/// is made here rather than in SQL, so no path ever reaches the parser.
+///
+/// A session with a parent is left out. OpenCode gives a sub-session the id of
+/// the conversation that spawned it, and that conversation is the one a person
+/// is having; compaction happens in place, on the session's own row, so nothing
+/// a muxloom session is doing ever moves to a child.
+pub fn opencode_query(limit: usize) -> String {
+    let said = |role: &str, order: &str| {
+        format!(
+            "(select json_extract(p.data, '$.text') from part p \
+             join message m on m.id = p.message_id where m.session_id = s.id \
+             and json_extract(m.data, '$.role') = '{role}' \
+             and json_extract(p.data, '$.type') = 'text' \
+             order by p.time_created {order} limit 1)"
+        )
+    };
+    format!(
+        "select s.id as id, s.directory as directory, s.title as title, \
+         s.time_created as created, s.time_updated as updated, \
+         {} as first_text, {} as last_text \
+         from session s where s.parent_id is null \
+         order by s.time_updated desc limit {limit}",
+        said("user", "asc"),
+        said("assistant", "desc"),
+    )
+}
+
+/// The rows in an `opencode db --format json` answer. Anything that is not the
+/// array that was asked for - a build too old for the query tool, an error
+/// where the answer should be - reads as no rows at all, and the caller falls
+/// back to what it can see on the session's screen.
+pub fn opencode_rows(stdout: &str) -> Vec<Value> {
+    match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(Value::Array(rows)) => rows,
+        _ => Vec::new(),
+    }
+}
+
+/// The name OpenCode has for a conversation, when it is a name at all. Until
+/// the model gets round to naming one it is called `New session - <the moment
+/// it began>`, which is not something anyone wants to read in a list.
+pub fn opencode_title(row: &Value) -> Option<&str> {
+    row.get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && !title.starts_with("New session - "))
+}
+
+fn opencode_threads(cwd: &str, since: u64) -> Vec<NativeThread> {
+    let cwd = normalize_path(cwd);
+    opencode_snapshot()
+        .into_iter()
+        .filter(|thread| thread.cwd == cwd && thread.updated_at >= since)
+        .collect()
+}
+
+/// The last answer OpenCode gave about itself, and how its store stood when it
+/// gave it.
+///
+/// Every session in a folder wants the same answer, and here asking costs a
+/// process rather than a read, so one answer serves all of them until the store
+/// changes underneath. Whoever finds it stale is the one who asks again, with
+/// the rest waiting on the same lock rather than each starting an OpenCode of
+/// their own.
+static OPENCODE_SNAPSHOT: Mutex<Option<(u64, Vec<NativeThread>)>> = Mutex::new(None);
+
+fn opencode_snapshot() -> Vec<NativeThread> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let store = opencode_store(&home);
+    let stamped = last_written(&store).unwrap_or_default();
+    let mut cached = OPENCODE_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((taken_at, threads)) = cached.as_ref()
+        && *taken_at == stamped
+    {
+        return threads.clone();
+    }
+    let threads = opencode_ask(&store);
+    *cached = Some((stamped, threads.clone()));
+    threads
+}
+
+fn opencode_ask(store: &Path) -> Vec<NativeThread> {
+    let Ok(answer) = Command::new(opencode_command())
+        .args(["db", "--format", "json", &opencode_query(OPENCODE_SCANNED)])
+        // A query is not a conversation: nothing here should be able to wait on
+        // a terminal that is not there, or write over the daemon's own.
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    opencode_rows(&String::from_utf8_lossy(&answer.stdout))
+        .iter()
+        .filter_map(|row| opencode_thread(row, store))
+        .collect()
+}
+
+fn opencode_thread(row: &Value, store: &Path) -> Option<NativeThread> {
+    Some(NativeThread {
+        id: row.get("id").and_then(Value::as_str)?.to_string(),
+        // Every conversation on the machine lives in the one store, so this is
+        // what a claim is pinned to: the store changing is what tells a session
+        // its conversation may have moved on, and the id is what picks that
+        // conversation back out of it.
+        path: store.to_path_buf(),
+        cwd: row
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(normalize_path)
+            .unwrap_or_default(),
+        started_at: row.get("created").and_then(Value::as_u64).unwrap_or(0),
+        updated_at: row.get("updated").and_then(Value::as_u64).unwrap_or(0),
+        // muxloom never asks OpenCode to fork, and a sub-session is left to the
+        // conversation that spawned it, so nothing here descends from anything
+        // else here.
+        forked_from: None,
+        title: opencode_title(row).and_then(clean_message),
+        last_message: row
+            .get("last_text")
+            .and_then(Value::as_str)
+            .and_then(clean_message),
+    })
+}
+
+/// Which OpenCode to ask. muxloom installs the runtimes it provisions into
+/// `~/.local/bin`, which is not on the PATH of every process that ends up here,
+/// so that copy is tried first and the PATH is the fallback rather than the
+/// other way round.
+fn opencode_command() -> PathBuf {
+    if let Some(home) = home_dir() {
+        let installed = home.join(".local").join("bin").join("opencode");
+        if installed.is_file() {
+            return installed;
+        }
+    }
+    PathBuf::from("opencode")
+}
+
+/// Where OpenCode keeps its store. Only ever used as a marker for when the
+/// store last changed, and as the path a claim is pinned to - what is in it is
+/// read by asking OpenCode, never by opening this file.
+fn opencode_store(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".local").join("share"))
+        .join("opencode")
+        .join("opencode.db")
+}
+
 /// The `*.jsonl` files in a folder that have grown since `since`, newest
 /// first and bounded: a folder holds every conversation ever held there.
 fn recent_files(folder: &Path, since: u64) -> Vec<(PathBuf, u64)> {
@@ -829,6 +1013,39 @@ fn parse_timestamp(value: &str) -> Option<u64> {
         - offset_minutes * 60;
     let stamped = seconds * 1_000 + millis;
     (stamped >= 0).then_some(stamped as u64)
+}
+
+/// Epoch milliseconds written the way the runtimes that keep transcripts write
+/// a time. The inverse of [`parse_timestamp`], for the one runtime that records
+/// a number where the others record a date: a resume candidate carries its
+/// stamp as text, is sorted as text and is shown as text, so OpenCode's has to
+/// arrive in the same form as everyone else's.
+pub fn iso_timestamp(epoch_ms: u64) -> String {
+    let seconds = (epoch_ms / 1_000) as i64;
+    let millis = epoch_ms % 1_000;
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let time = seconds.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        time / 3_600,
+        (time % 3_600) / 60,
+        time % 60
+    )
+}
+
+/// The calendar date `days` after 1970-01-01: the inverse of
+/// [`days_from_civil`], and the other half of the same algorithm.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let months = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * months + 2) / 5 + 1;
+    let month = if months < 10 { months + 3 } else { months - 9 };
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
 }
 
 /// Days between 1970-01-01 and a calendar date, by Howard Hinnant's civil
@@ -1069,6 +1286,100 @@ mod tests {
     }
 
     #[test]
+    fn what_opencode_is_asked_carries_no_path_and_no_sub_session() {
+        let query = opencode_query(200);
+        assert!(query.ends_with("limit 200"), "{query}");
+        assert!(query.contains("s.parent_id is null"), "{query}");
+        // The one thing muxloom puts in the text of a query is a number. A
+        // folder is compared against what came back, never asked about, so
+        // there is nothing here for a path to be mistaken for.
+        assert!(!query.contains('/'), "a path reached the query: {query}");
+        assert_eq!(query.matches('\'').count() % 2, 0, "unbalanced quotes");
+    }
+
+    #[test]
+    fn an_answer_opencode_could_not_give_reads_as_no_conversations() {
+        assert!(opencode_rows("[]").is_empty());
+        assert!(opencode_rows("").is_empty());
+        // A build too old for the query tool, or one that failed the query.
+        assert!(opencode_rows("error: unknown command 'db'").is_empty());
+        assert!(opencode_rows(r#"{"id":"ses_one"}"#).is_empty());
+        assert_eq!(opencode_rows(r#"[{"id":"ses_one"}]"#).len(), 1);
+    }
+
+    #[test]
+    fn a_conversation_opencode_has_not_named_yet_is_not_named() {
+        let named = json(r#"{"title":"  chase the flaky keeper  "}"#);
+        assert_eq!(opencode_title(&named), Some("chase the flaky keeper"));
+        // What it calls one until the model gets round to it.
+        let unnamed = json(r#"{"title":"New session - 2026-08-25T12:03:21.726Z"}"#);
+        assert_eq!(opencode_title(&unnamed), None);
+        assert_eq!(opencode_title(&json(r#"{"title":""}"#)), None);
+        assert_eq!(opencode_title(&json("{}")), None);
+    }
+
+    #[test]
+    fn a_row_of_opencodes_answer_is_a_conversation_pinned_to_its_store() {
+        let store = PathBuf::from("/home/me/.local/share/opencode/opencode.db");
+        let rows = opencode_rows(
+            r#"[
+              {"id":"ses_one","directory":"/work/Terminal/","title":"what it is really about",
+               "created":1787659401726,"updated":1787659402199,
+               "first_text":"What's the star?","last_text":"The keeper spawn is what fails."},
+              {"id":"ses_two","directory":"/work/Terminal",
+               "title":"New session - 2026-08-25T12:03:21.726Z",
+               "created":1787659401726,"updated":1787659402199,
+               "first_text":null,"last_text":null}
+            ]"#,
+        );
+        let first = opencode_thread(&rows[0], &store).unwrap();
+        assert_eq!(first.id, "ses_one");
+        assert_eq!(first.cwd, "/work/Terminal");
+        assert_eq!(first.path, store);
+        assert_eq!(first.started_at, 1_787_659_401_726);
+        assert_eq!(first.updated_at, 1_787_659_402_199);
+        assert_eq!(first.title.as_deref(), Some("what it is really about"));
+        assert_eq!(
+            first.last_message.as_deref(),
+            Some("The keeper spawn is what fails.")
+        );
+        // Nothing here descends from anything else here: a sub-session was
+        // never asked for.
+        assert_eq!(first.forked_from, None);
+
+        let second = opencode_thread(&rows[1], &store).unwrap();
+        assert_eq!(second.title, None);
+        assert_eq!(second.last_message, None);
+
+        assert_eq!(
+            opencode_thread(&json(r#"{"directory":"/work"}"#), &store),
+            None
+        );
+    }
+
+    #[test]
+    fn a_time_written_as_a_number_reads_as_the_date_everyone_else_writes() {
+        assert_eq!(iso_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_787_111_285_620), "2026-08-19T03:48:05.620Z");
+        // Whatever it is written from, it has to come back the same.
+        for stamped in [
+            1_u64,
+            951_782_400_000,   // 2000-02-29, the leap day a century rule keeps
+            1_787_659_402_199, // what OpenCode recorded on this machine
+            4_102_444_800_000, // 2100-01-01, the leap day a century rule drops
+        ] {
+            assert_eq!(
+                parse_timestamp(&iso_timestamp(stamped)),
+                Some(stamped),
+                "{stamped} did not survive being written out"
+            );
+        }
+        // And it sorts as text the way the number sorts, which is what a
+        // resume list and a "has this moved on?" check both rely on.
+        assert!(iso_timestamp(999) < iso_timestamp(1_000));
+    }
+
+    #[test]
     fn a_transcript_read_from_the_middle_of_a_line_still_reads() {
         let root = scratch("truncated");
         let path = root.join("ccc.jsonl");
@@ -1159,7 +1470,7 @@ mod tests {
             threads[1].title.as_deref(),
             Some("chase the flaky keeper (2)")
         );
-        assert_eq!(reread(AgentKind::Terminal, &threads[1].path), None);
+        assert_eq!(reread(AgentKind::Terminal, &threads[1].path, "two"), None);
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1183,6 +1494,10 @@ mod tests {
         assert_eq!(
             resume_seed(AgentKind::Pi, &["--session=aaa".into()]),
             Some("aaa".into())
+        );
+        assert_eq!(
+            resume_seed(AgentKind::OpenCode, &["--session".into(), "ses_one".into()]),
+            Some("ses_one".into())
         );
         assert_eq!(resume_seed(AgentKind::Claude, &["--resume".into()]), None);
         assert_eq!(

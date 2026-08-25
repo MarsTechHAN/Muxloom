@@ -62,12 +62,13 @@ impl AgentKind {
         Self::ALL.into_iter().filter(|kind| *kind != Self::Terminal)
     }
 
-    /// Whether the CLI keeps its own transcripts on the machine, which is what
-    /// makes a session resumable by its own id and worth mirroring into the
-    /// local backup. The others are still archived and searched through
-    /// muxloom's own history.
+    /// Whether the CLI keeps its own record of the conversations it has had on
+    /// the machine, which is what makes a session resumable by its own id and
+    /// worth mirroring into the local backup. Three of them write transcripts
+    /// and OpenCode keeps a store, but a terminal remembers nothing, so it is
+    /// archived and searched through muxloom's own history alone.
     pub fn has_native_history(self) -> bool {
-        matches!(self, Self::Codex | Self::Claude | Self::Pi)
+        self != Self::Terminal
     }
 
     /// Whether muxloom can resolve a published release for this runtime and

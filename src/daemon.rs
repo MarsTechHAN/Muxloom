@@ -2816,7 +2816,7 @@ mod platform {
         };
         let written = crate::native_history::last_written(&path).unwrap_or_default();
         if written > read_at {
-            let Some(thread) = crate::native_history::reread(kind, &path) else {
+            let Some(thread) = crate::native_history::reread(kind, &path, &id) else {
                 return false;
             };
             {
