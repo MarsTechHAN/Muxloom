@@ -1100,6 +1100,11 @@ pub enum Route {
     /// whether the human meant to — `/all` — or whether it simply had nowhere
     /// better to go. Nothing a person says is dropped.
     Board { asked: bool },
+    /// A word that was meant as a command and is not one. Answered rather than
+    /// sent: somebody who mistypes `/select` and has it delivered to an agent
+    /// as the literal word believes they aimed this chat, and every sentence
+    /// after it goes somewhere they did not intend.
+    Unknown(String),
 }
 
 /// Where one incoming message goes, and what is left of it once the command
@@ -1131,6 +1136,9 @@ pub fn route(
         "/who" | "/help" => return (Route::Who, rest),
         "/clear" => return (Route::Clear, rest),
         "/all" => return (Route::Board { asked: true }, rest),
+        other if meant_as_a_command(other) => {
+            return (Route::Unknown(other.to_string()), rest);
+        }
         _ => {}
     }
     // Replying to a card is the shortest way to answer the agent that wrote it,
@@ -1145,6 +1153,24 @@ pub fn route(
         return (Route::Agent(who), text.to_string());
     }
     (Route::Board { asked: false }, text.to_string())
+}
+
+/// Whether a word that is not one of the commands was nonetheless typed as
+/// one.
+///
+/// A slash and letters, and nothing else: `/slect` is a mistyped command,
+/// `/tmp/x` and `/etc/hosts` and `/usr/bin/env` are paths somebody is talking
+/// about. A bare `/tmp` at the very start of a message is the one case this
+/// reads wrongly, and the answer it gets says how to send it anyway — which is
+/// a far smaller price than a silently misdelivered `/slect`.
+fn meant_as_a_command(word: &str) -> bool {
+    let Some(name) = word.strip_prefix('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 /// What one push round did, for the debug log and for the panel's count.
@@ -1695,6 +1721,10 @@ fn handle(
             Some(who) => format!("· no longer aimed at {}", who.name()),
             None => "· nothing was aimed".into(),
         },
+        Route::Unknown(word) => format!(
+            "· there is no `{word}` — `/who` lists what there is. To say that to an agent \
+             instead, take the slash off."
+        ),
         Route::Aim(words) if words.is_empty() => {
             "· `/select` needs a name — `/who` lists them".into()
         }
@@ -2207,6 +2237,29 @@ mod tests {
             route("/all standup in five", None, "lark-1", false, &inbox),
             (Route::Board { asked: true }, "standup in five".into())
         );
+        // A mistyped command is answered rather than delivered. Sending it on
+        // as text is the worst of both: the person believes they aimed this
+        // chat, and every sentence after it lands somewhere they did not mean.
+        assert_eq!(
+            route("/slect lexer", None, "lark-1", false, &inbox).0,
+            Route::Unknown("/slect".into())
+        );
+        assert_eq!(
+            route("/SELECT lexer", None, "lark-1", false, &inbox).0,
+            Route::Aim("lexer".into()),
+            "the commands are not case sensitive; a phone capitalises for you"
+        );
+        // A path is not a command, however it starts. Somebody saying where a
+        // file is must not be answered with a list of commands.
+        for path in ["/etc/hosts is wrong", "/usr/bin/env python", "/x.y broke"] {
+            assert!(
+                matches!(
+                    route(path, None, "lark-1", false, &inbox).0,
+                    Route::Board { asked: false }
+                ),
+                "{path} is a path somebody is talking about"
+            );
+        }
 
         // A reply reaches whoever wrote the card, without anyone having aimed
         // anything: this is the shortest way to answer, and the one a person
