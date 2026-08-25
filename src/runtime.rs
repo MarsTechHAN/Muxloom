@@ -22,7 +22,7 @@ use crate::{
     daemon_protocol::DaemonSession,
     debug,
     model::{
-        AgentKind, AgentSession, DirectoryListing, FileEntry, FileEntryKind, FileListing,
+        AgentKind, AgentSession, Composer, DirectoryListing, FileEntry, FileEntryKind, FileListing,
         FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
         Probe, ResumeCandidate, Target, TaskProgress, Transport,
     },
@@ -2984,6 +2984,116 @@ fn spinner_status_line(line: &str) -> bool {
             .all(|character| character.is_ascii_digit() || " hms".contains(character))
 }
 
+/// How far up from the bottom of a screen a prompt box is looked for. Both
+/// CLIs draw theirs against the footer; anything higher is transcript.
+const COMPOSER_TAIL_LINES: usize = 16;
+/// Rows Claude Code draws below its prompt box — a hint line, sometimes two.
+const CLAUDE_FOOTER_LINES: usize = 3;
+/// Rows its box may hold before what is between two rules stops being a prompt
+/// and starts being transcript that happens to sit between two separators.
+const CLAUDE_BOX_LINES: usize = 10;
+/// The shortest run of box-drawing horizontal that reads as a rule rather than
+/// as prose that happens to contain one.
+const RULE_MIN_LEN: usize = 20;
+
+/// The placeholders Codex greys into an empty composer. Text there is not text
+/// anybody typed.
+const CODEX_PLACEHOLDERS: [&str; 3] = [
+    "Ask Codex to do anything",
+    "Send a message",
+    "Type a message",
+];
+
+/// Read a session's prompt box off its screen.
+///
+/// [`Composer::Absent`] means the box was looked for and is not there — a
+/// dialog is up, the CLI is still starting, something else has the pty. `None`
+/// means it was never looked for, because this is a runtime whose box muxloom
+/// has not learned; callers read that as "no reason to hold anything back",
+/// which is what muxloom did for every runtime before it could read one.
+pub(crate) fn composer(kind: AgentKind, screen: &str) -> Option<Composer> {
+    let mut lines: Vec<&str> = screen.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let tail = &lines[lines.len().saturating_sub(COMPOSER_TAIL_LINES)..];
+    match kind {
+        AgentKind::Claude => Some(claude_composer(tail)),
+        AgentKind::Codex => Some(codex_composer(tail)),
+        _ => None,
+    }
+}
+
+/// Claude Code fences its prompt between two full-width rules, with its hint
+/// line below the lower one:
+///
+/// ```text
+/// ────────────────────────────────────────
+/// ❯ half a sentence nobody has sent yet
+/// ────────────────────────────────────────
+///   ⏵⏵ bypass permissions on · esc to interrupt
+/// ```
+fn claude_composer(tail: &[&str]) -> Composer {
+    let Some(bottom) = tail.iter().rposition(|line| is_rule(line)) else {
+        return Composer::Absent;
+    };
+    // A rule with a screenful under it is a separator in the transcript, not
+    // the underside of the prompt.
+    if tail.len() - bottom - 1 > CLAUDE_FOOTER_LINES {
+        return Composer::Absent;
+    }
+    let Some(top) = tail[..bottom].iter().rposition(|line| is_rule(line)) else {
+        return Composer::Absent;
+    };
+    let rows = &tail[top + 1..bottom];
+    if rows.is_empty() || rows.len() > CLAUDE_BOX_LINES {
+        return Composer::Absent;
+    }
+    let typed: String = rows
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line.trim();
+            if index == 0 {
+                line.strip_prefix(['❯', '›', '>']).unwrap_or(line).trim()
+            } else {
+                line
+            }
+        })
+        .collect();
+    if typed.is_empty() {
+        Composer::Ready
+    } else {
+        Composer::Occupied
+    }
+}
+
+/// Codex draws its prompt on a `»` line above its own footer. `›` is not the
+/// same thing: it marks a message already taken, and a dialog's choices.
+fn codex_composer(tail: &[&str]) -> Composer {
+    let Some(row) = tail
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('»'))
+    else {
+        return Composer::Absent;
+    };
+    let typed = tail[row].trim_start().trim_start_matches('»').trim();
+    if typed.is_empty()
+        || CODEX_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| typed.starts_with(placeholder))
+    {
+        Composer::Ready
+    } else {
+        Composer::Occupied
+    }
+}
+
+fn is_rule(line: &str) -> bool {
+    let line = line.trim();
+    line.chars().count() >= RULE_MIN_LEN && line.chars().all(|character| character == '─')
+}
+
 fn attention_tail(screen: &str) -> String {
     let mut lines: Vec<_> = screen.lines().collect();
     // Drop trailing blank rows first. A full-height TUI (e.g. Claude Code in an
@@ -4324,6 +4434,116 @@ mod tests {
         );
         assert_eq!(attention_reason(AgentKind::Codex, &stale_prompt, &[]), None);
         assert!(attention_reason(AgentKind::Codex, "working...", &[]).is_none());
+    }
+
+    /// A rule as wide as Claude Code draws one.
+    fn rule() -> String {
+        "─".repeat(120)
+    }
+
+    #[test]
+    fn an_empty_prompt_box_is_ready_whether_or_not_a_turn_is_running() {
+        // Both frames are Claude Code v2.1.233, read off a live session: idle
+        // after a turn, and mid-turn with the interrupt hint up. The box is
+        // drawn and empty either way, which is the whole point — a message
+        // delivered during a turn is held and read when the turn ends.
+        let idle = format!(
+            "⏺ A\n\n✻ Baked for 6s\n\n{}\n❯\n{}\n  ⏸ manual mode on · ? for shortcuts · ← for agents\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(composer(AgentKind::Claude, &idle), Some(Composer::Ready));
+
+        let working = format!(
+            "⏺ one\n  two\n\n✻ Discombobulating… (10s · thinking with xhigh effort)\n\n{}\n❯\n{}\n  \
+             ⏸ manual mode on · esc to interrupt · ← for agents\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(composer(AgentKind::Claude, &working), Some(Composer::Ready));
+        assert!(agent_is_working(AgentKind::Claude, &working));
+    }
+
+    #[test]
+    fn a_prompt_box_somebody_is_still_typing_in_is_occupied() {
+        // What muxloom's own send_input used to leave behind: text in the box
+        // and no submission. Anything pasted now joins it and goes in as one
+        // message.
+        let stranded = format!(
+            "⏺ A\n\n{}\n❯ Reply with exactly the single word BEE and nothing else, no preamble.\n{}\n \
+             ⏸ manual mode on\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(
+            composer(AgentKind::Claude, &stranded),
+            Some(Composer::Occupied)
+        );
+
+        // Wrapped over two rows, as a long line is drawn.
+        let wrapped = format!(
+            "{}\n❯ Without using any tools at all, write out the numbers 1 through 120 as English \
+             words,\n  one per line.\n{}\n  ⏸ manual mode on\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(
+            composer(AgentKind::Claude, &wrapped),
+            Some(Composer::Occupied)
+        );
+    }
+
+    #[test]
+    fn a_dialog_leaves_no_prompt_box_to_deliver_into() {
+        // Claude Code replaces the box with the question while it asks one, so
+        // a paste would answer the question. Read off a live permission prompt.
+        let dialog = format!(
+            "⏺ Write(probe.txt)\n\n{}\n Create file\n probe.txt\n{}\n  1 hi\n{}\n Do you want to \
+             create probe.txt?\n ❯ 1. Yes\n   2. Yes, allow all edits during this session \
+             (shift+tab)\n   3. No\n\n Esc to cancel · Tab to amend\n",
+            rule(),
+            "╌".repeat(120),
+            "╌".repeat(120)
+        );
+        assert_eq!(composer(AgentKind::Claude, &dialog), Some(Composer::Absent));
+        assert!(attention_reason(AgentKind::Claude, &dialog, &[]).is_some());
+    }
+
+    #[test]
+    fn a_runtime_that_is_not_on_the_pty_yet_has_no_prompt_box() {
+        // A launch that ran an upgrade first: the kind says codex, the screen
+        // is a package manager. Bracketed paste into this lands as literal
+        // escape codes in a shell.
+        let updating = "Updating Codex via `brew upgrade --cask codex`...\n==> Auto-updating \
+                        Homebrew...\nYou have 61 outdated formulae and 3 outdated casks \
+                        installed.\n";
+        assert_eq!(composer(AgentKind::Codex, updating), Some(Composer::Absent));
+        assert_eq!(
+            composer(AgentKind::Claude, updating),
+            Some(Composer::Absent)
+        );
+        // A runtime with no box muxloom has learned is not read at all, and
+        // says so rather than claiming the box is missing.
+        assert_eq!(composer(AgentKind::OpenCode, updating), None);
+        assert_eq!(composer(AgentKind::Terminal, "tiger $ "), None);
+    }
+
+    #[test]
+    fn codex_reads_its_own_prompt_line() {
+        // Codex v0.149.1, live: the placeholder is not something anybody typed.
+        let empty = "• Reconnecting... 1/5 (4s • esc to interrupt)\n\n» Ask Codex to do \
+                     anything\n\n  gpt-5.6-sol ultra · /private/tmp/muxprobe\n";
+        assert_eq!(composer(AgentKind::Codex, empty), Some(Composer::Ready));
+
+        let typed = "»  with exactly the single word BEE and nothing else. No tools, no \
+                     preamble.\n\n  tab to queue message                        100% context \
+                     left\n";
+        assert_eq!(composer(AgentKind::Codex, typed), Some(Composer::Occupied));
+
+        // Its trust dialog draws choices with `›`, and no composer at all.
+        let trust = "  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. \
+                     No, quit\n\n  Press enter to continue\n";
+        assert_eq!(composer(AgentKind::Codex, trust), Some(Composer::Absent));
     }
 
     #[test]

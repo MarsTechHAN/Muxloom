@@ -3685,12 +3685,38 @@ mod tests {
 
         #[test]
         fn a_message_waits_for_a_working_agent_and_the_board_keeps_the_receipt() {
-            // A shell standing in for an agent: what makes a session an
-            // agent's here is its kind, and what makes it look busy is the
-            // marker both CLIs keep on screen while they work.
+            // A stand-in for Claude Code, because a bare shell no longer is
+            // one: what decides whether a message goes in is the prompt box on
+            // screen, so the stand-in draws a prompt box. It echoes each line
+            // it is handed, and carries the marker muxloom reads as working
+            // only once it has been told to look busy.
+            let script = std::env::temp_dir().join(format!(
+                "mxl-fake-claude-{}-{}.sh",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+            ));
+            std::fs::write(
+                &script,
+                "rule='────────────────────────────────────────'\n\
+                 hint='  ⏵⏵ accepts edits on'\n\
+                 draw() { printf '%s\\n❯ \\n%s\\n%s\\n' \"$rule\" \"$rule\" \"$hint\"; }\n\
+                 draw\n\
+                 while IFS= read -r line; do\n\
+                 \x20 printf '%s\\n' \"$line\"\n\
+                 \x20 case $line in\n\
+                 \x20   *look-busy*) hint='  esc to interrupt' ;;\n\
+                 \x20   *settled*) hint='  ⏵⏵ accepts edits on' ;;\n\
+                 \x20 esac\n\
+                 \x20 draw\n\
+                 done\n",
+            )
+            .unwrap();
             let mut config = Config::default();
             config.agents.claude.command = "sh".into();
-            config.agents.claude.args = Vec::new();
+            config.agents.claude.args = vec![script.to_str().unwrap().to_string()];
             let mut surface = surface_with("msg", config);
             let workdir = std::env::temp_dir().to_str().unwrap().to_string();
 
@@ -3748,16 +3774,13 @@ mod tests {
             assert_eq!(sent["delivery"], "delivered", "{sent:#}");
             until(&mut surface, &idle, "Message from");
 
-            // A working session is left alone until it stops.
+            // A working session is left alone by a when_idle message, even
+            // though its prompt box is empty and an ordinary one would go in.
             let busy = launch(&mut surface, "claude");
             call(
                 &mut surface,
                 "send_input",
-                json!({
-                    "session_id": busy,
-                    "text": "printf 'esc to interrupt\\n'",
-                    "submit": true,
-                }),
+                json!({ "session_id": busy, "text": "look-busy", "submit": true }),
             );
             until(&mut surface, &busy, "esc to interrupt");
             let queued: Value = serde_json::from_str(&call(
@@ -3782,16 +3805,12 @@ mod tests {
                 .to_string();
             assert!(too_soon.contains("wait"), "{too_soon}");
 
-            // Enough output to push the marker off the bottom of the screen is
-            // the session going quiet, and the queue notices within a second.
+            // The marker going off the screen is the session going quiet, and
+            // the queue notices within a second.
             call(
                 &mut surface,
                 "send_input",
-                json!({
-                    "session_id": busy,
-                    "text": "for i in $(seq 30); do echo settled-$i; done",
-                    "submit": true,
-                }),
+                json!({ "session_id": busy, "text": "settled", "submit": true }),
             );
             until(&mut surface, &busy, "Message from");
 
@@ -3827,6 +3846,7 @@ mod tests {
                     json!({ "session_id": session }),
                 );
             }
+            let _ = std::fs::remove_file(&script);
         }
     }
 }

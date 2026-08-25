@@ -31,14 +31,15 @@ mod platform {
         },
         keeper,
         model::{
-            AgentKind, DirectoryListing, FileEntry, FileEntryKind, FileListing, FilePreview,
-            FilePreviewKind,
+            AgentKind, Composer, DirectoryListing, FileEntry, FileEntryKind, FileListing,
+            FilePreview, FilePreviewKind,
         },
         native_history::SessionFacts as NativeFacts,
         recap::extract_recap,
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
-            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, is_temporary_session_id,
+            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer,
+            is_temporary_session_id,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkKind, TalkMessage,
@@ -716,11 +717,28 @@ mod platform {
         draft.kind = TalkKind::Direct;
         let message = state.talk()?.post(draft)?;
         let body = render_delivery(&message, reply_expected);
-        // A session waiting on a prompt is not free: the paste would be typed
-        // into whatever question is on the screen and answer it with this.
-        let free = !snapshot.working && !snapshot.needs_attention;
-        if deliver == TalkDeliver::Now || free {
-            return Ok(match type_message(&session, kind, &body) {
+        // Whether this can go in is a question about the prompt box, not about
+        // whether a turn is running: an empty box takes a paste whole and the
+        // agent reads it when the turn it is in the middle of ends. What cannot
+        // take one is a box holding a sentence nobody has sent, and a screen
+        // with no box on it at all.
+        let composer = snapshot.composer.unwrap_or(Composer::Ready);
+        let queued = TalkQueued {
+            message_id: message.id.clone(),
+            session_id: to.session_id.clone(),
+            body,
+            queued_at: now_ms(),
+            deliver,
+        };
+        if deliver == TalkDeliver::Now
+            || queued.due(
+                composer,
+                snapshot.working,
+                snapshot.needs_attention,
+                queued.queued_at,
+            )
+        {
+            return Ok(match type_message(&session, kind, &queued.body) {
                 Ok(()) => (message, "delivered".into(), None),
                 Err(error) => (message, "failed".into(), Some(format!("{error:#}"))),
             });
@@ -736,19 +754,24 @@ mod platform {
                      here are not reading them"
                 );
             }
-            outbox.push(TalkQueued {
-                message_id: message.id.clone(),
-                session_id: to.session_id,
-                body,
-                queued_at: now_ms(),
-                deliver,
-            });
+            outbox.push(queued);
             state.save_outbox(&outbox);
         }
         spawn_outbox_drainer(state);
-        let reason = match deliver {
-            TalkDeliver::WhenIdle => "the session is busy; the message goes in when it is free",
-            _ => "the session is busy; the message goes in when it is free, or in a minute anyway",
+        // An empty prompt only queues for a `when_idle` sender, who asked for
+        // exactly this.
+        let reason = match composer {
+            Composer::Ready => "that session is mid-turn; the message goes in when it finishes",
+            Composer::Occupied => {
+                "that session's prompt already holds something unsent, and this would be submitted \
+                 together with it; it goes in as soon as the prompt clears, or in a few minutes \
+                 anyway"
+            }
+            Composer::Absent => {
+                "that session is not showing a prompt to type into — it is asking a question, \
+                 starting up, or no longer running its agent; the message goes in as soon as one \
+                 appears"
+            }
         };
         Ok((message, "queued".into(), Some(reason.into())))
     }
@@ -846,13 +869,19 @@ mod platform {
                     );
                     return false;
                 };
-                if queued.due(!snapshot.working && !snapshot.needs_attention, now) {
+                if queued.due(
+                    snapshot.composer.unwrap_or(Composer::Ready),
+                    snapshot.working,
+                    snapshot.needs_attention,
+                    now,
+                ) {
                     due.push((Arc::clone(session), kind, queued.clone()));
                     return false;
                 }
                 if queued.expired(now) {
                     eprintln!(
-                        "muxloomd gave up on message {}: session {} stayed busy",
+                        "muxloomd gave up on message {}: session {} never showed a prompt to put \
+                         it in",
                         queued.message_id, queued.session_id
                     );
                     return false;
@@ -1174,6 +1203,7 @@ mod platform {
                 working: false,
                 needs_attention: false,
                 attention_reason: None,
+                composer: None,
             };
             if let Err(error) = persist_session_metadata(&metadata_path, &metadata) {
                 eprintln!("muxloomd could not record recovered session {id}: {error:#}");
@@ -2835,6 +2865,7 @@ mod platform {
             working: false,
             needs_attention: false,
             attention_reason: None,
+            composer: None,
         };
         // The record precedes the keeper so a crash between the two leaves a
         // session that can be retired, never a keeper nothing knows about.
@@ -3796,7 +3827,9 @@ mod platform {
                     snapshot.working = false;
                     snapshot.needs_attention = false;
                     snapshot.attention_reason = None;
+                    snapshot.composer = None;
                 } else {
+                    snapshot.composer = composer(kind, &visible_screen);
                     let patterns = self
                         .attention_patterns
                         .lock()
@@ -6180,6 +6213,7 @@ mod platform {
                     working: false,
                     needs_attention: false,
                     attention_reason: None,
+                    composer: None,
                 },
             )
             .unwrap();
@@ -6231,6 +6265,7 @@ mod platform {
                 working: true,
                 needs_attention: false,
                 attention_reason: None,
+                composer: None,
             }
         }
 

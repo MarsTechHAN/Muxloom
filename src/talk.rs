@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     bridge::BridgePool,
     debug,
-    model::{Target, Transport},
+    model::{Composer, Target, Transport},
     runtime::Runtime,
 };
 
@@ -959,9 +959,17 @@ impl TalkDeliver {
     }
 }
 
-/// How long an `auto` delivery waits for a busy session before it interrupts,
-/// and how long a `when_idle` one waits before it gives up and says so.
-pub const DELIVER_FORCE_MS: u64 = 60 * 1000;
+/// How long an `auto` delivery waits for a prompt box it can safely use.
+///
+/// A box that is drawn but holds something has usually been abandoned
+/// half-typed, and appending to it is only worth risking once it is clear
+/// nobody is coming back. A box that is not drawn at all is a runtime still
+/// starting up, or one whose screen muxloom no longer recognises; both resolve
+/// sooner, and neither is made better by waiting.
+pub const DELIVER_OCCUPIED_MS: u64 = 5 * 60 * 1000;
+pub const DELIVER_ABSENT_MS: u64 = 60 * 1000;
+/// How long anything waits before delivering it would be stranger than saying
+/// it never arrived.
 pub const DELIVER_EXPIRY_MS: u64 = 30 * 60 * 1000;
 
 /// A message waiting for the session it is addressed to to be free. Held by
@@ -978,11 +986,28 @@ pub struct TalkQueued {
 }
 
 impl TalkQueued {
-    /// Whether a queued message goes in now, given how the session looks and
-    /// how long it has been waiting.
-    pub fn due(&self, idle: bool, now: u64) -> bool {
-        idle || (self.deliver == TalkDeliver::Auto
-            && now.saturating_sub(self.queued_at) >= DELIVER_FORCE_MS)
+    /// Whether a queued message goes in now, given what the session's prompt
+    /// box says and how long this has been waiting for it.
+    ///
+    /// A running turn is not in itself a reason to wait: both CLIs hold what
+    /// arrives mid-turn in an empty prompt and read it when the turn ends. Only
+    /// `when_idle`, which was asked for precisely that, waits one out.
+    pub fn due(&self, composer: Composer, working: bool, attention: bool, now: u64) -> bool {
+        if composer == Composer::Ready {
+            return self.deliver != TalkDeliver::WhenIdle || !working;
+        }
+        // A question on screen is answered by whatever is typed next, and no
+        // length of waiting makes answering it with somebody else's message
+        // the right thing to do.
+        if attention || self.deliver == TalkDeliver::WhenIdle {
+            return false;
+        }
+        let patience = if composer == Composer::Occupied {
+            DELIVER_OCCUPIED_MS
+        } else {
+            DELIVER_ABSENT_MS
+        };
+        now.saturating_sub(self.queued_at) >= patience
     }
 
     /// Whether it has waited so long that delivering it would be stranger than
@@ -1590,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_message_waits_for_a_free_session_but_not_forever() {
+    fn a_queued_message_goes_in_on_an_empty_prompt_however_busy_the_agent_is() {
         let waiting = TalkQueued {
             message_id: "far-away:1".into(),
             session_id: "session-2".into(),
@@ -1598,17 +1623,45 @@ mod tests {
             queued_at: 1_000,
             deliver: TalkDeliver::Auto,
         };
-        assert!(!waiting.due(false, 1_000));
-        assert!(waiting.due(true, 1_000));
-        // Busy for a whole minute is treated as busy for good.
-        assert!(waiting.due(false, 1_000 + DELIVER_FORCE_MS));
+        // The turn in progress is beside the point: the prompt is empty, so the
+        // message lands whole and is read when the turn ends.
+        assert!(waiting.due(Composer::Ready, true, false, 1_000));
+        assert!(waiting.due(Composer::Ready, false, false, 1_000));
+        // Half a sentence somebody has not sent yet is worth waiting out.
+        assert!(!waiting.due(Composer::Occupied, false, false, 1_000));
+        assert!(!waiting.due(Composer::Absent, false, false, 1_000));
+    }
+
+    #[test]
+    fn a_queued_message_waits_out_a_busy_prompt_but_not_forever() {
+        let waiting = TalkQueued {
+            message_id: "far-away:1".into(),
+            session_id: "session-2".into(),
+            body: "[muxloom] Message from …".into(),
+            queued_at: 1_000,
+            deliver: TalkDeliver::Auto,
+        };
+        // A runtime that has not drawn its prompt is usually still starting up.
+        assert!(waiting.due(Composer::Absent, false, false, 1_000 + DELIVER_ABSENT_MS));
+        // A half-typed prompt gets longer, since going in means joining it.
+        assert!(!waiting.due(Composer::Occupied, false, false, 1_000 + DELIVER_ABSENT_MS));
+        assert!(waiting.due(
+            Composer::Occupied,
+            false,
+            false,
+            1_000 + DELIVER_OCCUPIED_MS
+        ));
+        // A question on screen is never answered by somebody else's message.
+        assert!(!waiting.due(Composer::Absent, false, true, 1_000 + DELIVER_EXPIRY_MS));
 
         let patient = TalkQueued {
             deliver: TalkDeliver::WhenIdle,
             ..waiting.clone()
         };
-        assert!(!patient.due(false, 1_000 + DELIVER_FORCE_MS));
-        assert!(!patient.expired(1_000 + DELIVER_FORCE_MS));
+        assert!(!patient.due(Composer::Ready, true, false, 1_000 + DELIVER_OCCUPIED_MS));
+        assert!(patient.due(Composer::Ready, false, false, 1_000));
+        assert!(!patient.due(Composer::Absent, false, false, 1_000 + DELIVER_OCCUPIED_MS));
+        assert!(!patient.expired(1_000 + DELIVER_OCCUPIED_MS));
         assert!(patient.expired(1_000 + DELIVER_EXPIRY_MS));
     }
 }

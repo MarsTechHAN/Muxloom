@@ -109,6 +109,45 @@ impl std::str::FromStr for AgentKind {
     }
 }
 
+/// What an agent's prompt box says about a message typed into it right now.
+///
+/// This, and not "is the agent working", is the question worth asking before
+/// putting something in front of a session. Both CLIs keep an empty prompt box
+/// on screen for the whole of a turn and hold what arrives during one until
+/// that turn ends, so a message delivered mid-turn is read a moment later, in
+/// order, with nothing lost. What loses a message is the box being otherwise
+/// engaged: already holding a sentence somebody has not sent yet, or not drawn
+/// at all because the CLI is asking a question, still starting up, or no longer
+/// the process on the pty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Composer {
+    /// Drawn and empty: a paste lands whole, and lands on its own.
+    Ready,
+    /// Drawn with something already in it. A paste would be appended to that
+    /// and submitted together with it, as one message neither party wrote.
+    Occupied,
+    /// Not drawn where this runtime draws it. Whatever is typed now goes to
+    /// whatever is there instead — a dialog's answer, an installer, a shell.
+    Absent,
+}
+
+impl Composer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Occupied => "occupied",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+impl fmt::Display for Composer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Disabled,

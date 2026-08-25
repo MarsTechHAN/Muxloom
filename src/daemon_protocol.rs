@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    model::{DirectoryListing, FileListing, FilePreview},
+    model::{Composer, DirectoryListing, FileListing, FilePreview},
     relay::{RelayAnswer, RelayJob},
     talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
 };
@@ -545,6 +545,11 @@ pub struct DaemonSession {
     pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,
+    /// Where the runtime's prompt box is and what is in it, which is what
+    /// decides whether a message can be put in front of this session right now.
+    /// Absent from a daemon too old to read one.
+    #[serde(default)]
+    pub composer: Option<Composer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
