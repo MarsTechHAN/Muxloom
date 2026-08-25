@@ -320,6 +320,9 @@ pub enum Event {
     TalkSynced {
         result: Result<String, String>,
         board: Option<TalkPage>,
+        /// Machines another controller told one of these daemons it could
+        /// reach, which this one cannot. Shown, never opened.
+        forwarded: Vec<crate::relay::RelayPeer>,
     },
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
@@ -1072,20 +1075,27 @@ impl Worker {
                         }
                         // Errands run whether or not the board moved: an agent
                         // waiting on one is waiting on this round.
-                        match crate::relay::run_pump(&runtime, &config, &targets) {
-                            Ok(round) if round != Default::default() => {
-                                debug::log("relay", round.to_string());
+                        let forwarded = match crate::relay::run_pump(&runtime, &config, &targets) {
+                            Ok(round) => {
+                                if round.busy() {
+                                    debug::log("relay", round.to_string());
+                                }
+                                round.heard
                             }
-                            Ok(_) => {}
                             Err(error) => {
                                 debug::log("relay", format!("errands failed: {error:#}"));
+                                Vec::new()
                             }
-                        }
+                        };
                         // Whatever the round pulled is on the local board by
                         // now, so the dashboard reads one board rather than
                         // every machine in turn.
                         let board = read_board(&runtime, &board_since);
-                        let _ = events.send(Event::TalkSynced { result, board });
+                        let _ = events.send(Event::TalkSynced {
+                            result,
+                            board,
+                            forwarded,
+                        });
                     }
                 });
             }

@@ -117,6 +117,11 @@ pub struct RelayPeer {
     /// does not have to be relayed to.
     #[serde(default)]
     pub own: bool,
+    /// What the controller offering this reach calls itself. Filled in on the
+    /// way out of a daemon, not on the way in: on the way in the poll says who
+    /// is asking, and every peer in it is theirs.
+    #[serde(default)]
+    pub via: String,
 }
 
 /// What came back, or that nothing has yet.
@@ -165,6 +170,17 @@ struct Entry {
     answer: Option<RelayAnswer>,
 }
 
+/// What one controller says it can reach, and when it last said so. Kept per
+/// controller rather than as one list: two dashboards may watch the same
+/// machine, and one of them naming its fleet must not erase the other's.
+#[derive(Debug)]
+struct Reach {
+    /// What that controller calls itself.
+    via: String,
+    peers: Vec<RelayPeer>,
+    at: u64,
+}
+
 /// The daemon's side of the relay: jobs waiting, jobs answered, and when a
 /// controller last showed itself.
 #[derive(Debug, Default)]
@@ -173,12 +189,8 @@ pub struct RelayQueue {
     next: u64,
     /// When a controller last asked for work. Zero until one ever has.
     last_poll: u64,
-    /// Where the last controller to come round said it could reach, and who it
-    /// said this machine was.
-    peers: Vec<RelayPeer>,
-    /// What the controller calls itself, for saying which way a machine is
-    /// reached. Empty until a controller new enough to say has been round.
-    via: String,
+    /// Where each controller that has been round said it could reach.
+    reaches: Vec<Reach>,
 }
 
 impl RelayQueue {
@@ -187,12 +199,41 @@ impl RelayQueue {
         self.last_poll > 0 && now.saturating_sub(self.last_poll) <= ATTACHED_MS
     }
 
-    /// The machines a controller has said it can reach for this one, and what
-    /// to call the way there. Empty when no controller has ever been round, or
-    /// when the one that has is too old to say — the caller falls back to
-    /// asking the controller directly, which is what it always did.
-    pub fn peers(&self) -> (&[RelayPeer], &str) {
-        (&self.peers, &self.via)
+    /// Every machine a controller here right now says it can reach, each
+    /// stamped with the way there. A machine two controllers both offer is
+    /// listed once; whichever spoke last carries it, and either is a route.
+    ///
+    /// Empty when no controller has been round lately, or when the ones that
+    /// have are too old to say — the caller falls back to asking a controller
+    /// directly, which is what it always did.
+    pub fn peers(&self, now: u64) -> Vec<RelayPeer> {
+        let mut merged: Vec<RelayPeer> = Vec::new();
+        for reach in self.live(now) {
+            for peer in &reach.peers {
+                let peer = RelayPeer {
+                    via: reach.via.clone(),
+                    ..peer.clone()
+                };
+                match merged.iter_mut().find(|seen| seen.id == peer.id) {
+                    // `own` is the daemon's own machine, and one controller
+                    // knowing which that is settles it for all of them.
+                    Some(seen) => {
+                        *seen = RelayPeer {
+                            own: seen.own || peer.own,
+                            ..peer
+                        }
+                    }
+                    None => merged.push(peer),
+                }
+            }
+        }
+        merged
+    }
+
+    fn live(&self, now: u64) -> impl Iterator<Item = &Reach> {
+        self.reaches
+            .iter()
+            .filter(move |reach| now.saturating_sub(reach.at) <= ATTACHED_MS)
     }
 
     /// Queue a job, or say why it cannot be queued. Failing here rather than
@@ -234,14 +275,27 @@ impl RelayQueue {
     ///
     /// An empty peer list is not the same as no machines: a controller can
     /// always reach the one it is polling, so nothing to say means a build from
-    /// before there was anything to say. Keep what the last controller that
-    /// could talk about it said, rather than forgetting the fleet because an
-    /// older one came round.
+    /// before there was anything to say. Such a poll leaves the fleet alone
+    /// rather than emptying it.
     pub fn poll(&mut self, now: u64, peers: Vec<RelayPeer>, via: &str) -> Vec<RelayJob> {
         self.last_poll = now;
         if !peers.is_empty() {
-            self.peers = peers;
-            self.via = via.to_string();
+            match self.reaches.iter_mut().find(|reach| reach.via == via) {
+                Some(reach) => {
+                    reach.peers = peers;
+                    reach.at = now;
+                }
+                None => self.reaches.push(Reach {
+                    via: via.to_string(),
+                    peers,
+                    at: now,
+                }),
+            }
+            // A controller that stopped coming round is not a route any more,
+            // and its entry would otherwise sit here for the life of the
+            // daemon offering machines nothing can carry a call to.
+            self.reaches
+                .retain(|reach| now.saturating_sub(reach.at) <= EXPIRY_MS);
         }
         self.expire(now);
         self.entries
@@ -292,12 +346,26 @@ impl RelayQueue {
     }
 }
 
-/// What one round of errand-running did, for the debug log.
+/// What one round of errand-running did, for the debug log — and what it heard
+/// about while it was there.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RelayRound {
     pub ran: usize,
     pub refused: usize,
     pub failed: usize,
+    /// Machines some other controller told these daemons it could reach, and
+    /// this one cannot. A dashboard shows them so the fleet does not look
+    /// smaller than it is; it cannot open a session on one, because the way
+    /// there belongs to the controller named on it.
+    pub heard: Vec<RelayPeer>,
+}
+
+impl RelayRound {
+    /// Whether any errand actually happened, which is what the debug log is
+    /// about. Hearing about a machine is not work done.
+    pub fn busy(&self) -> bool {
+        self.ran + self.refused + self.failed > 0
+    }
 }
 
 impl fmt::Display for RelayRound {
@@ -347,6 +415,9 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                     target.label.clone()
                 },
                 own: false,
+                // The asking controller names itself in the poll, and every
+                // peer in one is its own; a daemon stamps them on the way out.
+                via: String::new(),
             }
         })
         .collect();
@@ -359,13 +430,14 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 ..peer.clone()
             })
             .collect();
-        let jobs = match pool.relay_poll(target, peers, &via) {
-            Ok(jobs) => jobs,
+        let (jobs, known) = match pool.relay_poll(target, peers, &via) {
+            Ok(answer) => answer,
             Err(error) => {
                 debug::log("relay", format!("{}: no relay ({error})", target.id));
                 continue;
             }
         };
+        hear(&mut round.heard, known, &reach, &via);
         for job in jobs {
             let (ok, output) = if relayed(&job.tool) {
                 let surface = match &mut surface {
@@ -401,6 +473,22 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
         }
     }
     Ok(round)
+}
+
+/// What a daemon's answer adds to the list of machines this controller cannot
+/// reach itself. Its own reach is not news, the machine it is talking to is
+/// not news, and a machine two daemons both know about is one machine.
+fn hear(heard: &mut Vec<RelayPeer>, known: Vec<RelayPeer>, mine: &[RelayPeer], via: &str) {
+    for peer in known {
+        if peer.via == via
+            || peer.own
+            || mine.iter().any(|carried| carried.id == peer.id)
+            || heard.iter().any(|seen| seen.id == peer.id)
+        {
+            continue;
+        }
+        heard.push(peer);
+    }
 }
 
 /// Run one job against the controller's own tools. The arguments crossed the
@@ -531,24 +619,33 @@ mod tests {
 
         // Nothing has been round: this machine knows of no other, and the
         // caller is left to ask the controller the old way.
-        assert!(queue.peers().0.is_empty());
+        assert!(queue.peers(t0).is_empty());
 
         let fleet = vec![
             RelayPeer {
-                id: "local".into(),
-                label: "This machine".into(),
-                own: false,
+                id: "laptop".into(),
+                label: "laptop".into(),
+                ..Default::default()
             },
             RelayPeer {
                 id: "seed".into(),
                 label: "seed".into(),
                 own: true,
+                ..Default::default()
             },
         ];
         queue.poll(t0, fleet.clone(), "laptop");
-        let (peers, via) = queue.peers();
-        assert_eq!(peers, fleet);
-        assert_eq!(via, "laptop");
+        let peers = queue.peers(t0);
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| peer.id.as_str())
+                .collect::<Vec<_>>(),
+            ["laptop", "seed"]
+        );
+        // Each one carries the way to it, which is the controller that named
+        // it — the daemon stamps that on, since the peers arrived unsigned.
+        assert!(peers.iter().all(|peer| peer.via == "laptop"));
         // Exactly one of them is this machine, and it is not somewhere to be
         // relayed to.
         assert_eq!(peers.iter().filter(|peer| peer.own).count(), 1);
@@ -557,8 +654,104 @@ mod tests {
         // alone rather than emptying it: it cannot reach nothing at all, so an
         // empty list is silence, not news.
         queue.poll(t0 + 1, Vec::new(), "");
-        assert_eq!(queue.peers().0, fleet);
-        assert_eq!(queue.peers().1, "laptop");
+        assert_eq!(queue.peers(t0 + 1).len(), 2);
+
+        // A second dashboard watching the same machine adds what only it can
+        // reach; it does not replace what the first one offers.
+        queue.poll(
+            t0 + 2,
+            vec![
+                RelayPeer {
+                    id: "seed".into(),
+                    label: "seed".into(),
+                    own: true,
+                    ..Default::default()
+                },
+                RelayPeer {
+                    id: "gpu".into(),
+                    label: "gpu".into(),
+                    ..Default::default()
+                },
+            ],
+            "desk",
+        );
+        let peers = queue.peers(t0 + 2);
+        let named = |id: &str| {
+            peers
+                .iter()
+                .find(|peer| peer.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .clone()
+        };
+        assert_eq!(peers.len(), 3);
+        assert_eq!(named("laptop").via, "laptop");
+        assert_eq!(named("gpu").via, "desk");
+        assert!(named("seed").own);
+
+        // A controller that stopped coming round stops being a way anywhere.
+        let later = t0 + ATTACHED_MS + 1;
+        queue.poll(
+            later,
+            vec![RelayPeer {
+                id: "gpu".into(),
+                label: "gpu".into(),
+                ..Default::default()
+            }],
+            "desk",
+        );
+        assert_eq!(
+            queue
+                .peers(later)
+                .iter()
+                .map(|peer| peer.id.clone())
+                .collect::<Vec<_>>(),
+            ["gpu"]
+        );
+    }
+
+    #[test]
+    fn a_controller_hears_about_the_machines_it_cannot_reach_and_only_those() {
+        let peer = |id: &str, via: &str, own: bool| RelayPeer {
+            id: id.into(),
+            label: id.into(),
+            own,
+            via: via.into(),
+        };
+        // What this controller carries: itself and one machine it can ssh to.
+        let mine = vec![peer("laptop", "", false), peer("seed", "", false)];
+        let mut heard = Vec::new();
+
+        hear(
+            &mut heard,
+            vec![
+                // Its own reach, read back off the daemon it just told.
+                peer("laptop", "laptop", false),
+                peer("seed", "laptop", true),
+                // Another dashboard's, which is the only news here.
+                peer("seed", "desk", true),
+                peer("gpu", "desk", false),
+                peer("desk", "desk", false),
+            ],
+            &mine,
+            "laptop",
+        );
+        assert_eq!(
+            heard
+                .iter()
+                .map(|peer| peer.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpu", "desk"]
+        );
+        assert_eq!(heard[0].via, "desk");
+
+        // A second daemon that hears about the same machine adds nothing.
+        hear(
+            &mut heard,
+            vec![peer("gpu", "desk", false)],
+            &mine,
+            "laptop",
+        );
+        assert_eq!(heard.len(), 2);
     }
 
     #[test]

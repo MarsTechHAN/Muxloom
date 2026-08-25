@@ -631,6 +631,37 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         rows.push((MachineRow::Machine(*target_index), lines.len() as u16));
         items.push(ListItem::new(lines));
     }
+    // Machines this dashboard only knows about: some other controller told a
+    // daemon here that it can reach them. They carry no entry in `rows`, so
+    // the cursor steps over them and a click lands on nothing — there is
+    // nothing here to enable, and no session to start over a route this
+    // muxloom does not have. Saying they exist is the whole of the offer.
+    for peer in &app.forwarded {
+        let name_lines = wrap_display(&peer.label, name_width);
+        let first_name = name_lines.first().map(String::as_str).unwrap_or("");
+        let mut lines = vec![Line::from(vec![
+            Span::styled("» ", Style::default().fg(Color::Cyan)),
+            // Four spaces where a machine draws its `[x]`, so the names line
+            // up with the machines this dashboard does reach.
+            Span::raw("    "),
+            Span::styled(first_name.to_string(), Style::default().fg(MUTED)),
+        ])];
+        for continuation in name_lines.iter().skip(1) {
+            lines.push(Line::styled(
+                format!("      {continuation}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        lines.push(Line::styled(
+            if peer.via.is_empty() {
+                "    via another muxloom".to_string()
+            } else {
+                format!("    via {}", truncate(&peer.via, name_width))
+            },
+            Style::default().fg(MUTED),
+        ));
+        items.push(ListItem::new(lines));
+    }
     // Trails the rows it explains, and carries no entry in `rows`, so a click
     // on it lands on nothing rather than on the last machine.
     if visible.is_empty() {
@@ -3120,6 +3151,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row("v / Ctrl-h", "Hide disabled machines or show all"),
         help_row("r / Ctrl-r", "Refresh enabled machines now"),
+        help_row(
+            "» at the bottom",
+            "A machine another muxloom reaches; agents here can look at it",
+        ),
         Line::raw(""),
         help_header("Moderators"),
         help_row(
@@ -5048,6 +5083,57 @@ mod tests {
             running_agent_effect(AgentKind::Codex, 0),
             running_agent_effect(AgentKind::Codex, 20)
         );
+    }
+
+    #[test]
+    fn a_machine_only_another_muxloom_reaches_is_shown_but_not_offered() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.forwarded = vec![crate::relay::RelayPeer {
+            id: "gpu".into(),
+            label: "gpu".into(),
+            via: "desk".into(),
+            own: false,
+        }];
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_machines(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // It is on screen, marked for what it is and named with the way there.
+        assert!(screen.contains("» "), "{screen}");
+        assert!(screen.contains("gpu"), "{screen}");
+        assert!(screen.contains("via desk"), "{screen}");
+        // And it is not a row: nothing selects it, so nothing offers to
+        // enable it or start a session on it over a route muxloom has not got.
+        assert!(
+            app.machine_rows
+                .iter()
+                .all(|(row, _)| *row != MachineRow::Machine(1)),
+            "{:?}",
+            app.machine_rows
+        );
+        assert_eq!(app.machine_rows.len(), 2);
     }
 
     #[test]

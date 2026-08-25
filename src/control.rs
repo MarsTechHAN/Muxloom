@@ -2975,22 +2975,13 @@ mod daemon_surface {
         /// to answer from, and then the question goes to it, exactly as it
         /// always did.
         fn list_machines(&self) -> Result<String> {
-            let (peers, via, attached) = match self.transact(&DaemonRequest::RelayPeers)?.0 {
-                DaemonResponse::RelayReach {
-                    peers,
-                    via,
-                    attached,
-                } => (peers, via, attached),
+            let (peers, attached) = match self.transact(&DaemonRequest::RelayPeers)?.0 {
+                DaemonResponse::RelayReach { peers, attached } => (peers, attached),
                 response => bail!("unexpected relay response: {response:?}"),
             };
             if peers.is_empty() {
                 return self.relay("list_machines", &json!({}));
             }
-            let via = if via.is_empty() {
-                "the muxloom controller".to_string()
-            } else {
-                via
-            };
             let own = peers.iter().find(|peer| peer.own);
             let mut machines = vec![json!({
                 "id": LOCAL_TARGET_ID,
@@ -3004,7 +2995,7 @@ mod daemon_surface {
                     "id": peer.id,
                     "label": peer.label,
                     "remote": true,
-                    "via": via,
+                    "via": if peer.via.is_empty() { "the muxloom controller" } else { &peer.via },
                     "connected": attached,
                 }));
             }
@@ -4374,13 +4365,13 @@ mod tests {
                     },
                 );
                 assert!(
-                    matches!(&first, DaemonResponse::RelayWork { jobs } if jobs.is_empty()),
+                    matches!(&first, DaemonResponse::RelayWork { jobs, .. } if jobs.is_empty()),
                     "{first:?}"
                 );
                 ready.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
-                    if let DaemonResponse::RelayWork { jobs } = ask(
+                    if let DaemonResponse::RelayWork { jobs, .. } = ask(
                         &controller,
                         &DaemonRequest::RelayPoll {
                             peers: Vec::new(),
@@ -4430,11 +4421,12 @@ mod tests {
                         id: "seed".into(),
                         label: "seed".into(),
                         own: true,
+                        ..Default::default()
                     },
                     crate::relay::RelayPeer {
                         id: "laptop".into(),
                         label: "laptop".into(),
-                        own: false,
+                        ..Default::default()
                     },
                 ],
                 via: "laptop".into(),

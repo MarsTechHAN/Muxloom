@@ -898,12 +898,17 @@ impl BridgeConnection {
         }
     }
 
-    /// Take whatever work this machine's agents have left for a controller.
-    /// A daemon too old to have a relay simply has no work: an agent there
-    /// never had a way to ask for any.
-    pub fn relay_poll(&self, peers: Vec<RelayPeer>, via: &str) -> Result<Vec<RelayJob>> {
+    /// Take whatever work this machine's agents have left for a controller,
+    /// and whatever it has heard about where else a call can go. A daemon too
+    /// old to have a relay simply has no work: an agent there never had a way
+    /// to ask for any.
+    pub fn relay_poll(
+        &self,
+        peers: Vec<RelayPeer>,
+        via: &str,
+    ) -> Result<(Vec<RelayJob>, Vec<RelayPeer>)> {
         if !self.has_capability(RELAY_CAPABILITY) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         match self
             .request(DaemonRequest::RelayPoll {
@@ -912,7 +917,7 @@ impl BridgeConnection {
             })?
             .response
         {
-            DaemonResponse::RelayWork { jobs } => Ok(jobs),
+            DaemonResponse::RelayWork { jobs, known } => Ok((jobs, known)),
             response => bail!("unexpected relay response: {response:?}"),
         }
     }
@@ -2268,7 +2273,7 @@ impl BridgePool {
         target: &Target,
         peers: Vec<RelayPeer>,
         via: &str,
-    ) -> Result<Vec<RelayJob>> {
+    ) -> Result<(Vec<RelayJob>, Vec<RelayPeer>)> {
         self.connection_for_target(target)?.relay_poll(peers, via)
     }
 

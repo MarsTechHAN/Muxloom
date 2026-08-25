@@ -520,7 +520,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 79;
+pub const HELP_CONTENT_ROWS: usize = 80;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1163,6 +1163,11 @@ pub struct App {
     pub state: State,
     pub state_path: PathBuf,
     pub targets: Vec<TargetStatus>,
+    /// Machines this dashboard knows of but cannot reach: another controller
+    /// told a daemon here that it can reach them, and the daemon repeated it.
+    /// Shown so the fleet does not look smaller than it is, and never more
+    /// than shown — the way there belongs to whoever is named on it.
+    pub forwarded: Vec<crate::relay::RelayPeer>,
     pub sessions: Vec<AgentSession>,
     pub focus: Focus,
     pub selected_target: usize,
@@ -1359,6 +1364,7 @@ impl App {
             state,
             state_path,
             targets: statuses,
+            forwarded: Vec::new(),
             sessions: Vec::new(),
             focus: Focus::Machines,
             selected_target: 0,
@@ -5153,12 +5159,28 @@ impl App {
                     }
                 }
             }
-            Event::TalkSynced { result, board } => {
+            Event::TalkSynced {
+                result,
+                board,
+                forwarded,
+            } => {
                 self.talk_in_flight = false;
                 match result {
                     Ok(summary) => debug::log("talk", summary),
                     Err(error) => debug::log("talk", format!("sync failed: {error}")),
                 }
+                // A machine this dashboard has of its own is not forwarded,
+                // even while it is disabled: the row for it is already there,
+                // and it says what it is.
+                self.forwarded = forwarded
+                    .into_iter()
+                    .filter(|peer| {
+                        !self
+                            .targets
+                            .iter()
+                            .any(|status| status.target.id == peer.id)
+                    })
+                    .collect();
                 if let Some(page) = board {
                     self.absorb_board(page);
                 }

@@ -530,18 +530,24 @@ pub enum DaemonResponse {
     RelayWork {
         #[serde(default)]
         jobs: Vec<RelayJob>,
+        /// Machines this daemon has been told about, each stamped with the
+        /// controller offering it. A controller reads back its own reach here
+        /// and ignores it; what is left are the machines somebody else can
+        /// carry a call to, which is how a dashboard learns the fleet is
+        /// bigger than the machines it can open itself.
+        #[serde(default)]
+        known: Vec<RelayPeer>,
     },
     /// Answers `RelayResult`.
     Relayed {
         answer: RelayAnswer,
     },
-    /// Answers `RelayPeers`: where the last controller round said it could
-    /// reach, what to call the way there, and whether it is still there.
+    /// Answers `RelayPeers`: every machine a controller has come round and
+    /// said it could reach, each stamped with the way there, and whether a
+    /// controller is here at all right now.
     RelayReach {
         #[serde(default)]
         peers: Vec<RelayPeer>,
-        #[serde(default)]
-        via: String,
         #[serde(default)]
         attached: bool,
     },
