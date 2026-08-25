@@ -1124,7 +1124,18 @@ pub fn render_bounce(queued: &TalkQueued, why: &TalkUndelivered) -> String {
 /// an agent reading its own terminal must be able to tell at a glance that
 /// this is another agent talking and not the person it works for, and must be
 /// told how to answer without having to guess.
-pub fn render_delivery(message: &TalkMessage, reply_expected: bool) -> String {
+///
+/// `here` is the machine this is being typed on. It is what decides whether the
+/// reply has to name a machine at all, and it has to, because a machine is
+/// called different things depending on who is asking: the sender knows its own
+/// machine by the name its own daemon gave it, while from inside a session on
+/// that same machine the only name that answers is `local`. Repeating the
+/// sender's name for it would hand the reader an address its own tools reject.
+/// Between two agents on one machine — which is most of them — the reply names
+/// no machine, and the name is spelled out only when the message really did
+/// cross a machine, where what the controller sank into the sender's board is
+/// the name it is addressed by from here too.
+pub fn render_delivery(message: &TalkMessage, reply_expected: bool, here: &str) -> String {
     let author = &message.author;
     let who = author.voice.name();
     let kind = author.voice.kind.as_deref().unwrap_or("agent");
@@ -1132,6 +1143,11 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool) -> String {
         author.machine.as_str()
     } else {
         author.machine_label.as_str()
+    };
+    let addressed = if author.machine.is_empty() || author.machine == here {
+        String::new()
+    } else {
+        format!("machine: \"{machine}\", ")
     };
     let session = author
         .voice
@@ -1145,8 +1161,8 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool) -> String {
     // thing anyone happens to say.
     let call = |session: &str| {
         format!(
-            "message_agent {{ machine: \"{machine}\", session_id: \"{session}\", reply_to: \
-             \"{}\", text: \"…\" }}",
+            "message_agent {{ {addressed}session_id: \"{session}\", reply_to: \"{}\", text: \"…\" \
+             }}",
             message.id
         )
     };
@@ -1776,7 +1792,7 @@ mod tests {
         });
         let message = store.post(sent).unwrap();
 
-        let envelope = render_delivery(&message, false);
+        let envelope = render_delivery(&message, false, "nearby");
         assert!(
             envelope.starts_with(
                 "[muxloom] Message from claude \"builder\" on gpu-box (session \
@@ -1800,7 +1816,7 @@ mod tests {
             )),
             "{envelope}"
         );
-        let awaited = render_delivery(&message, true);
+        let awaited = render_delivery(&message, true, "nearby");
         assert!(
             awaited.contains("blocked waiting on this answer"),
             "{awaited}"
@@ -1811,11 +1827,27 @@ mod tests {
             "{awaited}"
         );
 
+        // The same message read on the machine it was sent from names no
+        // machine to reply to. The sender's name for its own machine is not a
+        // name the reader's tools answer to — from in here that machine is
+        // `local` — so spelling it out would be handing over an address that
+        // fails. The prose still says where the sender is sitting.
+        let home = render_delivery(&message, false, "far-away");
+        assert!(
+            home.contains(&format!(
+                "message_agent {{ session_id: \"session-1\", reply_to: \"{}\", text: \"…\" }}",
+                message.id
+            )),
+            "{home}"
+        );
+        assert!(!home.contains("machine: "), "{home}");
+        assert!(home.contains("\"builder\" on gpu-box"), "{home}");
+
         // A message from something that is not a session says so instead of
         // pointing at a reply address that does not exist.
         let mut anonymous = message.clone();
         anonymous.author.voice.session_id = None;
-        assert!(render_delivery(&anonymous, true).contains("nowhere to reply directly"));
+        assert!(render_delivery(&anonymous, true, "nearby").contains("nowhere to reply directly"));
 
         fs::remove_dir_all(&store.root).ok();
     }

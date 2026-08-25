@@ -749,8 +749,10 @@ mod platform {
         }
         rate_limit_direct(state, &draft, &to.session_id)?;
         draft.kind = TalkKind::Direct;
-        let message = state.talk()?.post(draft)?;
-        let body = render_delivery(&message, reply_expected);
+        let talk = state.talk()?;
+        let here = talk.origin();
+        let message = talk.post(draft)?;
+        let body = render_delivery(&message, reply_expected, &here);
         // Whether this can go in is a question about the prompt box, not about
         // whether a turn is running: an empty box takes a paste whole and the
         // agent reads it when the turn it is in the middle of ends. What cannot
