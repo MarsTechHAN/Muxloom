@@ -2136,7 +2136,52 @@ impl BridgePool {
         created_at: u64,
         parent: Option<String>,
     ) -> Result<DaemonSession> {
-        self.connection_for_target(target)?.launch(
+        let connection = self.connection_for_target(target)?;
+        let error = match connection.launch(
+            session_id.clone(),
+            kind.clone(),
+            path.clone(),
+            label.clone(),
+            temporary,
+            executable.clone(),
+            args.clone(),
+            environment.clone(),
+            created_at,
+            parent.clone(),
+        ) {
+            Ok(session) => return Ok(session),
+            Err(error) => error,
+        };
+        // A bridge that died under the request is not a machine without a
+        // companion on it. The ordinary reason is a generation handover on the
+        // far side, which costs every attached client its connection and hands
+        // the sessions to the next daemon; remaking the connection is what a
+        // client is for. Falling through to legacy tmux instead would leave a
+        // session on the compatibility path for the rest of its life over a
+        // gap measured in milliseconds.
+        if connection.is_alive() {
+            return Err(error);
+        }
+        crate::debug::log(
+            "bridge",
+            format!(
+                "target={} lost the bridge under a launch ({error:#}); retrying on a new one",
+                target.id
+            ),
+        );
+        self.invalidate(&target.id, &connection);
+        let connection = self.connection_for_target(target)?;
+        // The daemon may well have started it before the connection went: the
+        // keeper survives a handover and the next generation adopts it, so ask
+        // before asking again.
+        if let Ok(sessions) = connection.list_sessions()
+            && let Some(started) = sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+        {
+            return Ok(started);
+        }
+        connection.launch(
             session_id,
             kind,
             path,
