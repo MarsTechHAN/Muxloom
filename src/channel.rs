@@ -710,6 +710,35 @@ fn send_lark(
     })
 }
 
+/// Where a Lark app is made, and the one page both of its strings are copied
+/// out of. Written down rather than described: somebody who has to find it by
+/// searching has already spent longer than the whole of the rest of this takes.
+pub const LARK_CONSOLE: &str = "https://open.feishu.cn/app";
+
+/// The link that opens a chat with one app's bot in the Lark client.
+///
+/// An AppLink rather than a page: `applink.feishu.cn` addresses are handled by
+/// the client itself, so a phone that scans this lands on the bot instead of in
+/// a browser. It takes the app id and nothing else, and wants a client from
+/// 3.40 on; an older one, or an account the app was never released to, is shown
+/// Lark's own explanation rather than a blank screen.
+///
+/// The chat it opens is the one-to-one one, which is not a chat this dashboard
+/// can bind: [`chats`] asks `im/v1/chats`, and that answers with groups and only
+/// groups, so a bot spoken to privately is a bot nothing here can find. What the
+/// link is for is getting to the bot at all — from there, adding it to a group
+/// is a tap, and that group is what the chooser then has to offer.
+///
+/// The id is trimmed and otherwise used as it stands. Nothing reaches here until
+/// Lark has issued a token for that very id, so an id that would need escaping
+/// is an id that never gets this far.
+pub fn lark_bot_link(app_id: &str) -> String {
+    format!(
+        "https://applink.feishu.cn/client/bot/open?appId={}",
+        app_id.trim()
+    )
+}
+
 /// One chat a Lark app's bot has been added to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
@@ -2137,6 +2166,17 @@ mod tests {
         assert_eq!(card["header"]["title"]["content"], "Nightly");
         // No title, no header: an empty one would render as a bare grey bar.
         assert!(lark_card("", "hello").get("header").is_none());
+    }
+
+    #[test]
+    fn the_bot_link_carries_the_app_id_and_nothing_else() {
+        // One parameter is the whole of it. The temptation is to add the chat
+        // or the tenant, and an AppLink with anything else on it is one the
+        // client declines to open.
+        assert_eq!(
+            lark_bot_link("  cli_9c21a4767c305107\n"),
+            "https://applink.feishu.cn/client/bot/open?appId=cli_9c21a4767c305107"
+        );
     }
 
     #[test]

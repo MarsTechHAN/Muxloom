@@ -386,6 +386,17 @@ pub struct ChannelChats {
     /// None while Lark is still being asked.
     pub found: Option<Vec<crate::channel::Chat>>,
     pub selected: usize,
+    /// The link that opens this app's bot in Lark, and the grid it becomes.
+    /// Both, so a window with no room to draw the code still has something a
+    /// phone can be pointed at.
+    ///
+    /// Only ever shown when the app turns out to be in no chats at all. That is
+    /// the one dead end this step has — there is nothing to choose and nothing
+    /// to type, because a chat id is not a thing Lark lets anybody copy — and
+    /// the way out of it is on a phone: open the bot, add it to a group, ask
+    /// again.
+    pub link: String,
+    pub code: Option<crate::qr::Code>,
 }
 
 /// The communication panel: what this fleet can reach a human through.
@@ -7901,11 +7912,20 @@ impl App {
             form.error = Some("The worker is gone; Lark was not asked".into());
             form.step = Some(ChannelStep::Keys(keys));
         } else {
+            // Drawn once here rather than once a frame, and before the answer
+            // is back, because the case it is for is the one where the answer
+            // is a list with nothing in it. A code that cannot be built is not
+            // worth an error: the link is shown instead, and it is the same
+            // link.
+            let link = crate::channel::lark_bot_link(&keys.app_id);
+            let code = crate::qr::encode(&link).ok();
             form.step = Some(ChannelStep::Chats(Box::new(ChannelChats {
                 attempt: self.channel_attempt,
                 keys,
                 found: None,
                 selected: 0,
+                link,
+                code,
             })));
         }
         self.modal = Some(Modal::Channels(form));
@@ -8001,9 +8021,11 @@ impl App {
                     .position(|chat| chat.id == chats.keys.route.trim())
                     .unwrap_or_default();
                 if found.is_empty() {
+                    // Short enough to survive a narrow panel, because on one
+                    // too small to draw the code this line is the whole of the
+                    // instructions.
                     form.note = Some(
-                        "That app is not in any chat yet. Add its bot to a group in Lark, \
-                         then press r."
+                        "Not in any chat yet — scan to open its bot, add it to a group, press r."
                             .into(),
                     );
                 }
@@ -14779,7 +14801,23 @@ mod tests {
             result: Ok(Vec::new()),
         });
         let note = channels_form(&app).note.clone().unwrap_or_default();
-        assert!(note.contains("Add its bot to a group"), "{note}");
+        assert!(note.contains("add it to a group"), "{note}");
+        // Nothing to choose from and no chat id anybody could type — Lark shows
+        // one nowhere. So what this screen has instead is the bot itself, as
+        // something to point a phone at.
+        match channel_step(&app) {
+            ChannelStep::Chats(chats) => {
+                assert_eq!(
+                    chats.link, "https://applink.feishu.cn/client/bot/open?appId=cli_9",
+                    "the bot those two strings belong to, and no other"
+                );
+                assert!(
+                    chats.code.is_some(),
+                    "drawn, not just written out: the point is a phone, not a keyboard"
+                );
+            }
+            other => panic!("still on the chooser: {other:?}"),
+        }
         // Enter on nothing binds nothing, and says what to do instead.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(channels_form(&app).set.bindings.is_empty());

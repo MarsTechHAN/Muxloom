@@ -4694,6 +4694,13 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
     // else on that screen to make room for.
     let area = match &form.step {
         Some(ChannelStep::Scan(_)) => centered_rect(76, 40, outer),
+        // A chooser with nothing to choose from turns into a code as well, and
+        // a code has to come out square and big enough to read across a desk.
+        Some(ChannelStep::Chats(chats))
+            if chats.found.as_deref().is_some_and(|found| found.is_empty()) =>
+        {
+            centered_rect(76, 40, outer)
+        }
         _ => centered_rect(76, 18, outer),
     };
     frame.render_widget(Clear, area);
@@ -4718,7 +4725,12 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
         Some(ChannelStep::Pick { .. }) => "Up/Down choose   Enter start   Esc back",
         Some(ChannelStep::Scan(_)) => "r new code   Esc back",
         Some(ChannelStep::Keys(_)) => "Tab field   Enter find my chats   Esc back",
-        Some(ChannelStep::Chats(_)) => "Up/Down choose   Enter bind   r ask again   Esc back",
+        Some(ChannelStep::Chats(chats)) => match chats.found.as_deref() {
+            // Nothing to move through and nothing to bind: the only key that
+            // does anything here is the one that asks Lark again.
+            Some([]) => "r I have added it   Esc back",
+            _ => "Up/Down choose   Enter bind   r ask again   Esc back",
+        },
         Some(ChannelStep::Rename { .. }) => "Enter rename   Esc back",
     };
     let message = match (&form.error, &form.note) {
@@ -4990,7 +5002,13 @@ fn draw_channel_keys(frame: &mut Frame<'_>, form: &ChannelsForm, keys: &ChannelK
     if let Some(row) = modal_row(inner, 0) {
         frame.render_widget(
             Paragraph::new(truncate(
-                "Lark has no code to scan: an app is a thing only open.feishu.cn can make.",
+                // Not "Lark has no code to scan": there is one, a step further
+                // on, once these two strings have said which bot it should be
+                // a code for.
+                &format!(
+                    "Only Lark can make an app. Make one at {}, then:",
+                    crate::channel::LARK_CONSOLE
+                ),
                 inner.width as usize,
             ))
             .style(Style::default().fg(MUTED)),
@@ -5087,24 +5105,7 @@ fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) 
         return;
     };
     if found.is_empty() {
-        for (offset, line) in [
-            "That app is in no chats yet.",
-            "",
-            "In Lark, open the group you want and add the app's bot to it —",
-            "群设置 › 群机器人 › 添加机器人. Then press r.",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let Some(row) = modal_row(inner, offset as u16) else {
-                break;
-            };
-            frame.render_widget(
-                Paragraph::new(truncate(line, inner.width as usize))
-                    .style(Style::default().fg(if offset == 0 { Color::Yellow } else { MUTED })),
-                row,
-            );
-        }
+        draw_channel_bot_code(frame, chats, inner);
         return;
     }
     if let Some(row) = modal_row(inner, 0) {
@@ -5135,6 +5136,63 @@ fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) 
                         Color::Reset
                     }),
             ),
+            row,
+        );
+    }
+}
+
+/// The way out of "that app is in no chats": the bot itself, as a code.
+///
+/// This is the one screen in the Lark flow with nothing on it to choose and
+/// nothing to type — a chat id exists nowhere a person can copy it from, so the
+/// only route to a bindable chat is to put the bot in a group and ask again.
+/// Scanning opens the bot in Lark, where adding it to a group is a tap; the link
+/// under it is the same thing for a window with no room to draw a code, or for
+/// somebody who would rather paste than scan.
+fn draw_channel_bot_code(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) {
+    for (offset, (line, colour)) in [
+        ("That app is in no chats yet.", Color::Yellow),
+        ("", MUTED),
+        (
+            "Scan to open its bot in Lark, then add the bot to a group —",
+            MUTED,
+        ),
+        ("群设置 › 群机器人 › 添加机器人. Then press r.", MUTED),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let Some(row) = modal_row(inner, offset as u16) else {
+            return;
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(line, inner.width as usize))
+                .style(Style::default().fg(*colour)),
+            row,
+        );
+    }
+    let grid = Rect {
+        y: inner.y.saturating_add(5),
+        height: inner.height.saturating_sub(6),
+        ..inner
+    };
+    let drawn = chats
+        .code
+        .as_ref()
+        .is_some_and(|code| draw_qr(frame, grid, code));
+    if !drawn
+        && !chats.link.is_empty()
+        && let Some(row) = modal_row(inner, inner.height.saturating_sub(1))
+    {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                &format!(
+                    "No room for the code here. Open on your phone: {}",
+                    chats.link
+                ),
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
             row,
         );
     }
