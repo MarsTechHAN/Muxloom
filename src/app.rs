@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -520,7 +520,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 77;
+pub const HELP_CONTENT_ROWS: usize = 78;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1109,6 +1109,29 @@ impl TerminalSelection {
             (self.cursor, self.anchor)
         }
     }
+}
+
+/// How deep the agent list indents a chain of subagents before the indentation
+/// costs more panel width than the shape of the tree is worth. Deeper sessions
+/// are still listed, drawn at this depth.
+const MAX_SUBAGENT_DEPTH: usize = 4;
+
+/// Where a session sits in the tree its subagents make, and what a fold under
+/// it hides. One of these accompanies every row the agent list draws.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowShape {
+    /// How many agents up the chain started this one, capped for the drawing.
+    pub depth: usize,
+    /// Sessions this one started, counted at every level under it.
+    pub descendants: usize,
+    /// Whether they are folded away rather than listed under it.
+    pub folded: bool,
+    /// Whether anything folded away is waiting for an answer, so that a fold
+    /// never hides a prompt. False whenever nothing is folded away — what is on
+    /// screen says how it is doing itself.
+    pub attention: bool,
+    /// Whether anything folded away is working, on the same terms.
+    pub working: bool,
 }
 
 pub struct App {
@@ -2116,6 +2139,10 @@ impl App {
             KeyCode::Enter if matches!(self.focus, Focus::Agents | Focus::Recap) => {
                 self.focus = Focus::Recap;
                 self.activate_terminal();
+                Action::Continue
+            }
+            KeyCode::Char(' ') if self.focus == Focus::Agents => {
+                self.toggle_task_fold();
                 Action::Continue
             }
             KeyCode::Char(' ') if self.focus == Focus::Machines => {
@@ -3259,7 +3286,23 @@ impl App {
     }
 
     pub fn visible_sessions(&self) -> Vec<&AgentSession> {
-        let mut sessions: Vec<_> = self
+        self.visible_session_rows()
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect()
+    }
+
+    /// The visible sessions in the order the agent list draws them: each
+    /// session followed by the ones it started, indented under it, with a
+    /// folded task's subagents left out entirely.
+    ///
+    /// A subagent hangs off its parent rather than off its own folder, because
+    /// what an agent started is part of that agent's work wherever it happens
+    /// to run. A parent this view does not show — one on another machine, or
+    /// archived while its subagent is still going — cannot be indented under,
+    /// so the subagent stands on its own instead of disappearing with it.
+    pub fn visible_session_rows(&self) -> Vec<(&AgentSession, RowShape)> {
+        let mut sessions: Vec<&AgentSession> = self
             .sessions
             .iter()
             .filter(|session| {
@@ -3281,7 +3324,70 @@ impl App {
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| right.created_at.cmp(&left.created_at))
         });
-        sessions
+
+        let by_id: HashMap<&str, &AgentSession> = sessions
+            .iter()
+            .map(|session| (session.id.as_str(), *session))
+            .collect();
+        let mut children: HashMap<&str, Vec<&AgentSession>> = HashMap::new();
+        let mut roots: Vec<&AgentSession> = Vec::new();
+        for session in &sessions {
+            // An archived subagent belongs with the archive rather than
+            // indented under a session that is still running, so a parent only
+            // counts while the two are on the same side of that line.
+            let parent = session.parent.as_deref().filter(|parent| {
+                *parent != session.id
+                    && by_id
+                        .get(parent)
+                        .is_some_and(|parent| parent.dead == session.dead)
+            });
+            match parent {
+                Some(parent) => children.entry(parent).or_default().push(session),
+                None => roots.push(session),
+            }
+        }
+        for siblings in children.values_mut() {
+            // Inside a task the folder has stopped deciding anything: these are
+            // the agents one agent started, so they go newest first the way
+            // everything else in this list does.
+            siblings.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+
+        let mut rows = Vec::with_capacity(sessions.len());
+        let mut seen = HashSet::new();
+        for root in &roots {
+            push_session_row(
+                root,
+                0,
+                true,
+                &children,
+                &self.state.folded_tasks,
+                &mut rows,
+                &mut seen,
+            );
+        }
+        // Two sessions naming each other as parent belong to no root and would
+        // otherwise be listed nowhere. Whatever the chain says, they are still
+        // sessions somebody has to be able to reach, so they go in flat.
+        for session in &sessions {
+            if !seen.contains(session.id.as_str()) {
+                rows.push((*session, RowShape::default()));
+            }
+        }
+        rows
+    }
+
+    /// Whether anything in the agent list has subagents under it, which is the
+    /// only time the fold key has anything to do.
+    pub fn has_subagents(&self) -> bool {
+        self.visible_session_rows()
+            .iter()
+            .any(|(_, shape)| shape.descendants > 0)
     }
 
     pub fn archived_count(&self) -> usize {
@@ -4078,6 +4184,7 @@ impl App {
                     .terminal_session_id
                     .clone()
                     .filter(|_| self.interactive);
+                let mut forgot_folds = false;
                 if let Some(target) = self
                     .targets
                     .iter_mut()
@@ -4148,6 +4255,25 @@ impl App {
                                     }
                                 }
                             }
+                            // A fold means nothing once the task it folds is
+                            // gone. The machine has just said everything it
+                            // has, so whatever it used to have and no longer
+                            // lists will not be back, and the fold goes with
+                            // it rather than sitting in the state file for ever.
+                            let gone: Vec<String> = self
+                                .sessions
+                                .iter()
+                                .filter(|session| {
+                                    session.target_id == target_id
+                                        && !here.contains(session.id.as_str())
+                                        && self.state.folded_tasks.contains(&session.id)
+                                })
+                                .map(|session| session.id.clone())
+                                .collect();
+                            forgot_folds |= !gone.is_empty();
+                            self.state
+                                .folded_tasks
+                                .retain(|folded| !gone.contains(folded));
                             self.sessions
                                 .retain(|session| session.target_id != target_id);
                             self.sessions.extend(sessions);
@@ -4169,6 +4295,9 @@ impl App {
                             ));
                         }
                     }
+                }
+                if forgot_folds {
+                    self.persist_state();
                 }
                 if scan_succeeded {
                     // A machine that comes back without its sessions has not lost
@@ -5139,6 +5268,9 @@ impl App {
                 attention_reason: None,
                 recap,
                 title,
+                // The backup mirrors a transcript, not the machine's session
+                // list, so it cannot say who started this one.
+                parent: None,
             });
         }
     }
@@ -5783,6 +5915,55 @@ impl App {
             "Disabled machines hidden; Ctrl-h or v shows all".into()
         } else {
             "All SSH machines visible".into()
+        };
+    }
+
+    /// Fold the subagents of the highlighted task away, or bring them back.
+    ///
+    /// A subagent has none of its own to fold, so the key folds the task it is
+    /// part of instead and leaves the cursor on the parent: pressing it on a
+    /// row of the tree means "put this away" wherever in the tree that row is.
+    fn toggle_task_fold(&mut self) {
+        let Some(selected) = self.selected_session_id.clone() else {
+            return;
+        };
+        let rows = self.visible_session_rows();
+        let Some(position) = rows.iter().position(|(session, _)| session.id == selected) else {
+            return;
+        };
+        let target = if rows[position].1.descendants > 0 {
+            selected
+        } else {
+            // Walk back to the row this one is indented under.
+            let depth = rows[position].1.depth;
+            let parent = rows[..position]
+                .iter()
+                .rev()
+                .find(|(_, shape)| shape.depth < depth)
+                .map(|(session, _)| session.id.clone());
+            match parent {
+                Some(parent) => parent,
+                None => {
+                    self.status_message = "No subagents under this one to fold".into();
+                    return;
+                }
+            }
+        };
+        let folded = if self.state.folded_tasks.remove(&target) {
+            false
+        } else {
+            self.state.folded_tasks.insert(target.clone());
+            true
+        };
+        self.persist_state();
+        // Whatever was highlighted may have just been folded away, and the
+        // task it belonged to is the honest place to leave the cursor.
+        self.select_session(target);
+        self.ensure_session_selection();
+        self.status_message = if folded {
+            "Subagents folded away; space brings them back".into()
+        } else {
+            "Subagents listed; space folds them away".into()
         };
     }
 
@@ -10237,6 +10418,62 @@ fn matched_directories(form: &PathPickerForm) -> Vec<String> {
         .collect()
 }
 
+/// Put a session on the list, then everything it started, indented under it.
+///
+/// A folded task is walked all the same and only its rows are left out: the
+/// count and the state on the parent row are the whole point of folding one,
+/// and both come from the walk. Returns what is under this session — how many
+/// sessions, and whether any of them wants an answer or is working.
+fn push_session_row<'a>(
+    session: &'a AgentSession,
+    depth: usize,
+    draw: bool,
+    children: &HashMap<&'a str, Vec<&'a AgentSession>>,
+    folded: &BTreeSet<String>,
+    rows: &mut Vec<(&'a AgentSession, RowShape)>,
+    seen: &mut HashSet<&'a str>,
+) -> (usize, bool, bool) {
+    if !seen.insert(session.id.as_str()) {
+        // A chain that loops back on itself would otherwise be walked for
+        // ever. Whichever place the session reached first is the one it keeps.
+        return (0, false, false);
+    }
+    let folded_here = folded.contains(&session.id);
+    let slot = draw.then(|| {
+        rows.push((
+            session,
+            RowShape {
+                depth,
+                ..RowShape::default()
+            },
+        ));
+        rows.len() - 1
+    });
+    let (mut descendants, mut attention, mut working) = (0, false, false);
+    for child in children.get(session.id.as_str()).into_iter().flatten() {
+        let (under, waiting, busy) = push_session_row(
+            child,
+            (depth + 1).min(MAX_SUBAGENT_DEPTH),
+            draw && !folded_here,
+            children,
+            folded,
+            rows,
+            seen,
+        );
+        descendants += under + 1;
+        attention |= waiting || child.needs_attention;
+        working |= busy || (child.working && !child.dead);
+    }
+    if let Some(slot) = slot {
+        let shape = &mut rows[slot].1;
+        shape.descendants = descendants;
+        shape.folded = folded_here && descendants > 0;
+        shape.attention = shape.folded && attention;
+        shape.working = shape.folded && working;
+    }
+    (descendants, attention, working)
+}
+
 fn folder_match_rank(name: &str, query: &str) -> Option<(u8, usize, usize)> {
     let name = name.to_lowercase();
     let query = query.trim().to_lowercase();
@@ -10441,6 +10678,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
 
         app.sync_live_agent_activity(
@@ -10536,6 +10774,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                parent: None,
             },
             AgentSession {
                 id: "muxloomd-terminal-old-2".into(),
@@ -10551,6 +10790,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                parent: None,
             },
         ];
 
@@ -10796,6 +11036,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                parent: None,
             },
             AgentSession {
                 id: "muxloomd-claude-background".into(),
@@ -10811,6 +11052,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                parent: None,
             },
         ];
         app.pending_activity_refreshes.insert("local".into());
@@ -10862,6 +11104,7 @@ mod tests {
             attention_reason: Some(reason.into()),
             recap: None,
             title: None,
+            parent: None,
         }
     }
 
@@ -10891,6 +11134,184 @@ mod tests {
             ..anonymous
         };
         assert_eq!(unnamed.display_label(), "work");
+    }
+
+    /// A session in a tree test: only the fields the ordering reads matter, so
+    /// the rest come from one place and stay out of the way.
+    fn tree_session(id: &str, parent: Option<&str>, created_at: u64) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work".into(),
+            label: id.into(),
+            created_at,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            parent: parent.map(Into::into),
+        }
+    }
+
+    fn tree_shape(app: &App) -> Vec<(String, usize, usize)> {
+        app.visible_session_rows()
+            .into_iter()
+            .map(|(session, shape)| (session.id.clone(), shape.depth, shape.descendants))
+            .collect()
+    }
+
+    /// What an agent starts is part of that agent's work, so it is listed under
+    /// it rather than alongside it in the folder.
+    #[test]
+    fn a_subagent_is_listed_indented_under_the_agent_that_started_it() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions = vec![
+            tree_session("lead", None, 30),
+            tree_session("helper", Some("lead"), 20),
+            tree_session("deeper", Some("helper"), 15),
+            tree_session("alone", None, 10),
+        ];
+
+        assert_eq!(
+            tree_shape(&app),
+            vec![
+                ("lead".into(), 0, 2),
+                ("helper".into(), 1, 1),
+                ("deeper".into(), 2, 0),
+                ("alone".into(), 0, 0),
+            ]
+        );
+
+        // A subagent whose parent is not in this list has nothing to hang off,
+        // and disappearing with it would be worse than standing on its own.
+        app.sessions[1].parent = Some("gone-with-the-machine".into());
+        assert_eq!(
+            tree_shape(&app),
+            vec![
+                ("lead".into(), 0, 0),
+                ("helper".into(), 0, 1),
+                ("deeper".into(), 1, 0),
+                ("alone".into(), 0, 0),
+            ]
+        );
+
+        // Neither does a chain that loops back on itself lose anybody.
+        app.sessions[0].parent = Some("deeper".into());
+        app.sessions[1].parent = Some("lead".into());
+        app.sessions[2].parent = Some("helper".into());
+        let listed: Vec<_> = tree_shape(&app)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(listed, vec!["alone", "deeper", "helper", "lead"]);
+    }
+
+    /// An archived subagent belongs with the archive. Indenting it under a
+    /// session that is still running would put it above the archive header and
+    /// make the fold that hides the archive a lie.
+    #[test]
+    fn an_archived_subagent_is_not_indented_under_a_live_parent() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.state.show_archived = true;
+        app.sessions = vec![
+            tree_session("lead", None, 30),
+            AgentSession {
+                dead: true,
+                ..tree_session("helper", Some("lead"), 20)
+            },
+        ];
+
+        assert_eq!(
+            tree_shape(&app),
+            vec![("lead".into(), 0, 0), ("helper".into(), 0, 0)]
+        );
+    }
+
+    /// A fold puts the subagents away and leaves their count on the row that
+    /// hides them -- and says when one of them is waiting for an answer, which
+    /// is the one thing a fold must never swallow.
+    #[test]
+    fn a_folded_task_reports_the_subagents_it_hides() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.sessions = vec![
+            tree_session("lead", None, 30),
+            tree_session("helper", Some("lead"), 20),
+            tree_session("alone", None, 10),
+        ];
+        app.selected_session_id = Some("helper".into());
+
+        // Pressed on a subagent, the key folds the task the subagent is part
+        // of: there is nothing under the subagent itself to put away.
+        app.toggle_task_fold();
+        assert_eq!(
+            tree_shape(&app),
+            vec![("lead".into(), 0, 1), ("alone".into(), 0, 0)]
+        );
+        assert_eq!(app.selected_session_id.as_deref(), Some("lead"));
+        let folded = app.visible_session_rows()[0].1;
+        assert!(folded.folded);
+        assert!(!folded.attention);
+
+        // Whatever the hidden subagent is doing shows on the row hiding it.
+        app.sessions[1].needs_attention = true;
+        app.sessions[1].working = true;
+        let shape = app.visible_session_rows()[0].1;
+        assert!(shape.attention && shape.working);
+
+        app.toggle_task_fold();
+        assert_eq!(
+            tree_shape(&app),
+            vec![
+                ("lead".into(), 0, 1),
+                ("helper".into(), 1, 0),
+                ("alone".into(), 0, 0),
+            ]
+        );
+        // Nothing is hidden now, so the row has nothing of its own to report:
+        // the subagent is on screen saying it itself.
+        let listed = app.visible_session_rows()[0].1;
+        assert!(!listed.folded && !listed.attention && !listed.working);
+
+        // An agent with no subagents and no task around it has nothing to fold.
+        app.select_session("alone".into());
+        app.toggle_task_fold();
+        assert!(app.state.folded_tasks.is_empty());
+        assert!(app.status_message.contains("No subagents"));
+    }
+
+    /// A fold outlives the session it hides things under only for as long as
+    /// the machine still has that session. Otherwise the state file collects
+    /// folds for tasks nobody can ever unfold.
+    #[test]
+    fn a_fold_is_forgotten_once_its_task_is_gone_from_the_machine() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        let scan = |sessions: Vec<AgentSession>| Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((crate::model::Probe::default(), sessions)),
+        };
+        app.handle_worker_event(scan(vec![
+            tree_session("lead", None, 30),
+            tree_session("helper", Some("lead"), 20),
+        ]));
+        app.select_session("lead".into());
+        app.toggle_task_fold();
+        assert!(app.state.folded_tasks.contains("lead"));
+
+        // A machine that merely goes quiet says nothing about the task.
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Err("offline".into()),
+        });
+        assert!(app.state.folded_tasks.contains("lead"));
+
+        app.handle_worker_event(scan(vec![tree_session("later", None, 40)]));
+        assert!(app.state.folded_tasks.is_empty());
     }
 
     /// The daemon reads the turn as the runtime recorded it. What the terminal
@@ -11012,6 +11433,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
 
         app.refresh_daemon_activity();
@@ -11051,6 +11473,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("ad-codex-old".into());
         app.selected_target = 1;
@@ -12100,6 +12523,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloomd-claude-long-history".into());
         app.terminal_session_id = Some("muxloomd-claude-long-history".into());
@@ -12241,6 +12665,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.sessions.push(AgentSession {
             id: "muxloom-terminal-dead".into(),
@@ -12256,6 +12681,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         assert!(app.visible_sessions().is_empty());
         assert_eq!(app.archived_count(), 1);
@@ -12316,6 +12742,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-dead".into());
         app.focus = Focus::Agents;
@@ -12488,6 +12915,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
 
         app.handle_worker_event(Event::Launched {
@@ -12534,6 +12962,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.handle_worker_event(Event::Launched {
             target_id: "local".into(),
@@ -12582,6 +13011,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-live".into());
         app.focus = Focus::Agents;
@@ -12674,6 +13104,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-files".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -12858,6 +13289,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-modal".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -12927,6 +13359,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-nav".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -13576,6 +14009,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         for failure in 1..=2 {
             app.handle_worker_event(Event::Scanned {
@@ -13832,6 +14266,7 @@ mod tests {
             attention_reason: Some(reason.into()),
             recap: None,
             title: None,
+            parent: None,
         }
     }
 
@@ -14018,6 +14453,7 @@ mod tests {
                     attention_reason: None,
                     recap: None,
                     title: None,
+                    parent: None,
                 }],
             )),
         });
@@ -14082,6 +14518,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloomd-codex-current".into());
         app.focus = Focus::Agents;
@@ -14159,6 +14596,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-test".into());
         app.request_history();
@@ -14225,6 +14663,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloomd-claude-forward".into());
         app.focus = Focus::Agents;
@@ -14357,6 +14796,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         };
         app.sessions = vec![
             session("worker", "/work/Terminal"),
@@ -14424,6 +14864,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         };
         app.sessions = vec![session("far", "gpu"), session("near", "local")];
         app.select_machine_row(MachineRow::Moderators);
@@ -14732,6 +15173,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         app.submit_rename_agent("s1".into(), "  My Bot  ".into());
         assert_eq!(
@@ -14837,6 +15279,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         };
         app.sessions = vec![
             session("local-a", "local", 1),

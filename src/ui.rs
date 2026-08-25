@@ -663,11 +663,28 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_file_browser(frame, form, area, app.focus == Focus::Agents);
         return;
     }
-    let sessions: Vec<_> = app.visible_sessions().into_iter().cloned().collect();
+    let sessions: Vec<_> = app
+        .visible_session_rows()
+        .into_iter()
+        .map(|(session, shape)| (session.clone(), shape))
+        .collect();
+    // Which rows are the last subagent of the task they sit in, so the tree
+    // draws an elbow there and a tee everywhere else. A row is not the last one
+    // while another at the same depth follows it before the list climbs back
+    // out to the parent.
+    let last_child: Vec<bool> = (0..sessions.len())
+        .map(|index| {
+            let depth = sessions[index].1.depth;
+            !sessions[index + 1..]
+                .iter()
+                .take_while(|(_, shape)| shape.depth >= depth)
+                .any(|(_, shape)| shape.depth == depth)
+        })
+        .collect();
     // Group rows carry their children's state as a steady row colour:
     // attention outranks working. Animation stays on the agent rows alone.
     let mut state_by_group = HashMap::<String, (bool, bool)>::new();
-    for session in &sessions {
+    for (session, _) in &sessions {
         if session.dead || !(session.working || session.needs_attention) {
             continue;
         }
@@ -697,7 +714,9 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut archive_header_added = false;
     app.archive_row = None;
 
-    for session in sessions {
+    for (index, (session, shape)) in sessions.iter().enumerate() {
+        let session = session.clone();
+        let shape = *shape;
         if session.dead && !archive_header_added {
             app.archive_row = Some(items.len());
             items.push(archive_item(archived_count, true));
@@ -715,7 +734,10 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             folder.to_string()
         };
-        if group != previous_group {
+        // A subagent belongs to the task it was started from, not to its own
+        // folder, so it stays inside the block its parent opened even when it
+        // runs somewhere else. Its folder is on its own row when it is selected.
+        if shape.depth == 0 && group != previous_group {
             let (attention, working) = state_by_group.get(&group).copied().unwrap_or_default();
             let colour = if attention {
                 Color::Yellow
@@ -783,7 +805,31 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             icon
         };
-        let mut lines = vec![Line::from(vec![
+        // The elbow says where the session came from: an agent started it, and
+        // it is that agent's work rather than another entry in the folder.
+        let branch = if shape.depth == 0 {
+            String::new()
+        } else {
+            format!(
+                "{}{} ",
+                "  ".repeat(shape.depth - 1),
+                if last_child[index] { '└' } else { '├' }
+            )
+        };
+        // What a fold is hiding, on the row that hides it: how many sessions,
+        // and whether any of them is waiting for an answer. A fold that could
+        // swallow a prompt without a word would not be worth having.
+        let count = (shape.descendants > 0).then(|| {
+            let mark = if shape.folded { '+' } else { '-' };
+            let mut text = format!("  [{mark}] {}", shape.descendants);
+            if shape.attention {
+                text.push_str(" !");
+            }
+            text
+        });
+        let count_width = count.as_deref().map(str::len).unwrap_or_default();
+        let mut label = vec![
+            Span::styled(branch.clone(), Style::default().fg(MUTED)),
             Span::styled(
                 activity,
                 agent_style(
@@ -800,11 +846,26 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::styled(
                 truncate(
                     session.display_label(),
-                    area.width.saturating_sub(10) as usize,
+                    (area.width as usize).saturating_sub(10 + branch.chars().count() + count_width),
                 ),
                 agent_style(Style::default().fg(Color::White)),
             ),
-        ])];
+        ];
+        if let Some(count) = count {
+            label.push(Span::styled(
+                count,
+                if shape.attention {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if shape.working {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ));
+        }
+        let mut lines = vec![Line::from(label)];
         if selected {
             let value_width = area.width.saturating_sub(14) as usize;
             lines.push(Line::from(vec![
@@ -832,6 +893,20 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     agent_style(Style::default().fg(state_color)),
                 ),
             ]));
+            if shape.descendants > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("    task    ", agent_style(Style::default().fg(MUTED))),
+                    Span::styled(
+                        format!(
+                            "{} subagent{}  space {}",
+                            shape.descendants,
+                            if shape.descendants == 1 { "" } else { "s" },
+                            if shape.folded { "lists" } else { "folds" }
+                        ),
+                        agent_style(Style::default().fg(Color::Gray)),
+                    ),
+                ]));
+            }
         }
         let height = lines.len() as u16;
         items.push(ListItem::new(lines).style(if session.needs_attention {
@@ -1325,17 +1400,32 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Focus::Machines => {
                 "  Space toggle  n new  , settings  / search  b board  q quit  ? more"
             }
-            Focus::Agents => {
-                if app.archived_count() > 0 {
-                    if app.state.show_archived {
-                        "  Enter open  a collapse  p ports  / search  n new  t temporal  q quit"
-                    } else {
-                        "  Enter open  a expand  p ports  / search  n new  t temporal  q quit"
-                    }
-                } else {
+            // The fold key is only worth a place in the line while something
+            // in the list has subagents to fold away.
+            Focus::Agents => match (
+                app.archived_count() > 0,
+                app.state.show_archived,
+                app.has_subagents(),
+            ) {
+                (true, true, true) => {
+                    "  Enter open  a collapse  space fold  / search  n new  q quit"
+                }
+                (true, true, false) => {
+                    "  Enter open  a collapse  p ports  / search  n new  t temporal  q quit"
+                }
+                (true, false, true) => {
+                    "  Enter open  a expand  space fold  / search  n new  q quit"
+                }
+                (true, false, false) => {
+                    "  Enter open  a expand  p ports  / search  n new  t temporal  q quit"
+                }
+                (false, _, true) => {
+                    "  Enter open  space fold  p ports  / search  n new  t temporal  q quit"
+                }
+                (false, _, false) => {
                     "  Enter open  p ports  / search  n new  t temporal  b board  q quit  ? more"
                 }
-            }
+            },
             Focus::Recap => {
                 "  Cmd/Opt+Arrow panes  PgUp history  / search  b board  q quit  ? more"
             }
@@ -3010,6 +3100,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row("x", "Archive live agents; directly destroy a Temporal Chat"),
         help_row("a", "Expand or collapse Archived sessions"),
+        help_row(
+            "Space",
+            "Fold away the subagents an agent started, or list them",
+        ),
         help_row("e", "Rename the selected agent's display name"),
         help_row("p", "Configure local forwarding to the selected machine"),
         help_row("d in Ports", "Stop the highlighted active forward"),
@@ -4835,6 +4929,7 @@ mod tests {
                 attention_reason: Some("approve".into()),
                 recap: None,
                 title: None,
+                parent: None,
             });
             app.selected_session_id = Some("ad-codex-1-1-1".into());
 
@@ -4916,6 +5011,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                parent: None,
             });
         }
         app.targets[0].probe.set(AgentKind::Codex, true);
@@ -4986,6 +5082,102 @@ mod tests {
         assert_eq!(colour_at(&terminal, "/work/project"), Some(Color::Yellow));
     }
 
+    /// The agent list draws a task as a task: the subagents indented under the
+    /// agent that started them, in that agent's block whatever folder they run
+    /// in, and a count on the row that can put them away.
+    #[test]
+    fn subagents_are_drawn_under_their_agent_with_a_count_that_folds_them() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let session = |id: &str, path: &str, parent: Option<&str>, created_at: u64| AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: path.into(),
+            label: id.into(),
+            created_at,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            parent: parent.map(Into::into),
+        };
+        app.sessions = vec![
+            session("lead", "/work/project", None, 30),
+            session("helper", "/work/project", Some("lead"), 20),
+            // A subagent sent off to another folder is still the lead's work.
+            session("scout", "/work/other", Some("lead"), 10),
+        ];
+
+        let rows = |terminal: &Terminal<TestBackend>| -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        let backend = TestBackend::new(46, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        let drawn = rows(&terminal);
+        let row = |needle: &str| {
+            drawn
+                .iter()
+                .find(|text| text.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle} in {drawn:?}"))
+                .clone()
+        };
+        assert!(row("lead").contains("[-] 2"), "{drawn:?}");
+        assert!(row("helper").contains('├'), "{drawn:?}");
+        assert!(row("scout").contains('└'), "{drawn:?}");
+        assert!(
+            row("helper").find('├') < row("helper").find("helper"),
+            "the elbow comes before the name"
+        );
+        // The subagent's own folder never opens a band of its own: it belongs
+        // to the block the lead opened.
+        assert!(
+            !drawn.iter().any(|text| text.contains("/work/other")),
+            "{drawn:?}"
+        );
+
+        // Folded, the row says how many it is holding and the rows are gone.
+        app.state.folded_tasks.insert("lead".into());
+        app.sessions[2].needs_attention = true;
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        let drawn = rows(&terminal);
+        assert!(
+            drawn.iter().any(|text| text.contains("[+] 2 !")),
+            "a fold must say when it is hiding a prompt: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|text| text.contains("helper")),
+            "{drawn:?}"
+        );
+    }
+
     #[test]
     fn waiting_agent_item_is_entirely_yellow_bold() {
         let config = Config::default();
@@ -5015,6 +5207,7 @@ mod tests {
             attention_reason: Some("command approval".into()),
             recap: Some("approve the command".into()),
             title: None,
+            parent: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-waiting".into());
 
@@ -5345,6 +5538,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            parent: None,
         });
         let backend = TestBackend::new(150, 30);
         let mut terminal = Terminal::new(backend).unwrap();

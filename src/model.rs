@@ -330,6 +330,10 @@ pub struct AgentSession {
     /// keeps. Absent while it has not named one yet, from runtimes that write
     /// no transcript, and from daemons too old to read one.
     pub title: Option<String>,
+    /// The session that started this one, when an agent did. A person's launch
+    /// from the dashboard has none, and neither has anything a daemon too old
+    /// to record one reports.
+    pub parent: Option<String>,
 }
 
 impl AgentSession {

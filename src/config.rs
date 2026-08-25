@@ -419,6 +419,11 @@ pub struct State {
     pub portrait_terminal_percent: u16,
     pub portrait_machine_percent: u16,
     pub show_archived: bool,
+    /// Sessions whose subagents are folded away in the agent list, by session
+    /// id. A fold is a view of somebody's own work rather than anything about
+    /// the machine, so it belongs here with the rest of the view and comes back
+    /// with it.
+    pub folded_tasks: BTreeSet<String>,
     /// Whether a successful resume removes the superseded Archived entry.
     pub remove_archive_after_resume: bool,
     /// Last working directory used to launch an agent, per machine (target id).
@@ -442,6 +447,7 @@ impl Default for State {
             portrait_terminal_percent: 65,
             portrait_machine_percent: 45,
             show_archived: false,
+            folded_tasks: BTreeSet::new(),
             remove_archive_after_resume: true,
             last_launch_dirs: BTreeMap::new(),
             last_launch_kinds: BTreeMap::new(),
