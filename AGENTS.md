@@ -71,6 +71,13 @@ preserve.
   agent launch. Once draining starts, reject new work, acknowledge handover,
   exit voluntarily, and treat the keeper hanging up as the transfer it is —
   never as a session death.
+- An upgrade must land without anyone pressing anything. A handover is asked
+  for by the arriving build and answered by the one being replaced, so every
+  improvement to the answer reaches only daemons newer than the ones that need
+  it: the arriving build must keep its own patience and, after waiting longer
+  than a daemon able to retire itself would ever need, stop the running one and
+  serve in its place. Only a newer version may insist — two builds of one
+  version take turns by design — and only because the keepers make it free.
 - A keeper that outlives its record must be dismissed, and a record that
   outlives its keeper must be retired into the archive with its history; no
   session may end up unaccounted for on either side.

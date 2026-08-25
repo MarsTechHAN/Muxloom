@@ -106,6 +106,9 @@ mod platform {
         pub pid: PathBuf,
         pub log: PathBuf,
         pub generation: PathBuf,
+        /// Which generation a newer build has asked to replace, and when it
+        /// first asked. See [`handover_ask_age`].
+        pub handover: PathBuf,
         pub history: PathBuf,
         pub sessions: PathBuf,
         pub keepers: PathBuf,
@@ -161,6 +164,7 @@ mod platform {
                 pid: root.join("muxloomd.pid"),
                 log: root.join("muxloomd.log"),
                 generation: root.join("muxloomd.generation"),
+                handover: root.join("muxloomd.handover"),
                 history: root.join("history"),
                 sessions: root.join("sessions"),
                 keepers: root.join("keepers"),
@@ -1355,6 +1359,10 @@ mod platform {
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
         fs::write(&paths.pid, format!("{}\n", std::process::id()))?;
         fs::write(&paths.generation, format!("{}\n", current_generation()))?;
+        // Whatever generation was being asked to make way, it has. The ask is
+        // keyed by generation and would be ignored anyway, but leaving it lying
+        // around only makes the state directory harder to read.
+        forget_handover_ask(paths);
         let _guard = SocketGuard {
             socket: paths.socket.clone(),
             pid: paths.pid.clone(),
@@ -4851,23 +4859,71 @@ mod platform {
     /// up early sends the launch down the legacy fallback for no reason.
     const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
 
+    /// How long a superseded daemon may go on deferring before the build that
+    /// asked stops waiting and takes its place.
+    ///
+    /// A handover is a request, and everything that decides how it is answered
+    /// runs inside the daemon being replaced — which is, by definition, the
+    /// older build. So every improvement to the answer arrives too late for
+    /// the daemons that need it: one from before [`spawn_retirement_watcher`]
+    /// refuses outright while more than one client is attached, and on a
+    /// machine with agents on it there always is one, because every SSH bridge
+    /// holds a connection open. Left to cooperation alone such a daemon serves
+    /// forever, the machine reads as outdated for the rest of its life, and
+    /// the only way out is the user pressing the forced-update key.
+    ///
+    /// So the patience lives on this side too, where the *new* build runs: ask,
+    /// wait longer than a daemon that can retire itself would ever need, then
+    /// stop it. Nothing is lost by that — the keepers own the sessions and the
+    /// next generation adopts them — beyond the connections of clients that
+    /// already know how to make new ones.
+    const HANDOVER_PATIENCE: Duration = Duration::from_secs(10 * 60);
+
     pub fn connect_or_start(paths: &DaemonPaths) -> Result<UnixStream> {
         if let Ok(mut stream) = UnixStream::connect(&paths.socket) {
             if generation_is_current_after_settling(paths) {
+                forget_handover_ask(paths);
                 return Ok(stream);
             }
             match prepare_atomic_handover(&mut stream)? {
-                Some(false) => return Ok(stream),
-                Some(true) => {
-                    drop(stream);
-                    wait_for_daemon_stop(paths)?;
-                }
-                None => {
-                    if !daemon_is_idle_for_handover(&mut stream).unwrap_or(false) {
+                // Deferred: a daemon that knows the request means to stand
+                // down as soon as nothing would be lost. Give it that time,
+                // and take its place if it never does.
+                Some(false) => {
+                    if !handover_is_overdue(paths) {
                         return Ok(stream);
                     }
                     drop(stream);
-                    stop_running_daemon(paths)?;
+                    if !take_the_place_of_the_running_daemon(paths)
+                        && let Ok(stream) = UnixStream::connect(&paths.socket)
+                    {
+                        return Ok(stream);
+                    }
+                }
+                Some(true) => {
+                    drop(stream);
+                    wait_for_daemon_stop(paths)?;
+                    forget_handover_ask(paths);
+                }
+                // Too old to know the request at all. Handing over used to
+                // want an idle daemon, which a machine with agents on it never
+                // is, so the same patience decides the rest.
+                None => {
+                    if daemon_is_idle_for_handover(&mut stream).unwrap_or(false) {
+                        drop(stream);
+                        stop_running_daemon(paths)?;
+                        forget_handover_ask(paths);
+                    } else {
+                        if !handover_is_overdue(paths) {
+                            return Ok(stream);
+                        }
+                        drop(stream);
+                        if !take_the_place_of_the_running_daemon(paths)
+                            && let Ok(stream) = UnixStream::connect(&paths.socket)
+                        {
+                            return Ok(stream);
+                        }
+                    }
                 }
             }
         }
@@ -5048,6 +5104,91 @@ mod platform {
             // No stamp at all: either a daemon from before they existed, or one
             // that has not finished starting. Settling tells them apart.
             Err(_) => false,
+        }
+    }
+
+    /// Whether this build is a newer *version* than the one running, which is
+    /// the only case that justifies stopping a daemon that will not step aside
+    /// on its own. Two builds of the same version take turns by design — a
+    /// developer's working tree beside an installed release — and forcing the
+    /// question there would only make the turns violent.
+    fn outranks_running_version(running: &str) -> bool {
+        match (
+            generation_rank(running),
+            generation_rank(&current_generation()),
+        ) {
+            (Some(running), Some(current)) => running.version < current.version,
+            // Nothing legible to order it by: a stamp from before there were
+            // any, which every build since outranks.
+            (None, _) => true,
+            _ => false,
+        }
+    }
+
+    /// How long this build has been asking the daemon now running to make way,
+    /// recording the ask when it is the first one. `None` when the running
+    /// generation is not one this build may force out at all.
+    ///
+    /// The ask outlives the process that makes it: a bridge is remade whenever
+    /// the controller reconnects, and an MCP call opens and closes a connection
+    /// of its own, so no one client is around long enough to keep count. The
+    /// state directory is, and the daemon it describes is the one serving it.
+    fn handover_ask_age(paths: &DaemonPaths) -> Option<Duration> {
+        let running = fs::read_to_string(&paths.generation).unwrap_or_default();
+        let running = running.trim();
+        if !outranks_running_version(running) {
+            return None;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        let asked_at = fs::read_to_string(&paths.handover)
+            .ok()
+            .and_then(|noted| {
+                let (generation, since) = noted.trim().rsplit_once('\t')?;
+                (generation == running).then(|| since.trim().parse::<u64>().ok())?
+            })
+            // A clock that moved backwards would otherwise hold the ask open
+            // forever; treat it as a fresh one.
+            .filter(|asked_at| *asked_at <= now);
+        match asked_at {
+            Some(asked_at) => Some(Duration::from_millis(now - asked_at)),
+            None => {
+                let _ = fs::write(&paths.handover, format!("{running}\t{now}"));
+                Some(Duration::ZERO)
+            }
+        }
+    }
+
+    fn handover_is_overdue(paths: &DaemonPaths) -> bool {
+        handover_ask_age(paths).is_some_and(|age| age >= HANDOVER_PATIENCE)
+    }
+
+    fn forget_handover_ask(paths: &DaemonPaths) {
+        let _ = fs::remove_file(&paths.handover);
+    }
+
+    /// Stop a superseded daemon that has had long enough to stand down by
+    /// itself and has not, so this build can serve in its place.
+    ///
+    /// Best effort, and deliberately so: if it cannot be stopped the caller
+    /// goes on using it, which is exactly what it would have done anyway.
+    fn take_the_place_of_the_running_daemon(paths: &DaemonPaths) -> bool {
+        eprintln!(
+            "muxloomd {} is taking over from a daemon that has deferred the handover for {} minutes; its sessions keep running",
+            env!("CARGO_PKG_VERSION"),
+            HANDOVER_PATIENCE.as_secs() / 60
+        );
+        match stop_running_daemon(paths) {
+            Ok(()) => {
+                forget_handover_ask(paths);
+                true
+            }
+            Err(error) => {
+                eprintln!("muxloomd could not stop the daemon it is replacing: {error:#}");
+                false
+            }
         }
     }
 
@@ -5958,6 +6099,96 @@ mod platform {
             let mut fields: Vec<&str> = current.split(':').collect();
             fields[2] = "a-different-commit";
             assert!(should_replace_generation(&fields.join(":")));
+        }
+
+        /// Asking is not the same as being allowed to insist. A rebuild of the
+        /// same version asks and waits; only a newer version may end the
+        /// argument, because only there is somebody actually being upgraded.
+        #[test]
+        fn only_a_newer_version_may_stop_a_daemon_that_will_not_step_aside() {
+            let current = current_generation();
+            assert!(!outranks_running_version(&current), "itself");
+            assert!(outranks_running_version("0.0.1:protocol-1:abc123:1"));
+            assert!(
+                outranks_running_version("0.5.4:protocol-1:96012c2"),
+                "the stamp a daemon from before heights were recorded leaves"
+            );
+            assert!(!outranks_running_version("999.0.0:protocol-3:abc123:99999"));
+            assert!(
+                outranks_running_version(""),
+                "no stamp at all predates generations, and every build outranks that"
+            );
+
+            // A developer's tree and an installed release of the same version
+            // replace each other all day; neither gets to shoot the other.
+            let mut fields: Vec<&str> = current.split(':').collect();
+            fields[2] = "a-different-commit";
+            fields[3] = "1";
+            assert!(
+                !outranks_running_version(&fields.join(":")),
+                "same version, different build: ask, do not insist"
+            );
+        }
+
+        /// The ask has to survive the client that made it: every bridge and
+        /// every MCP call is a new process, so patience kept in memory would
+        /// restart from zero each time and never run out.
+        #[test]
+        fn the_ask_to_make_way_is_remembered_across_the_clients_that_make_it() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloomd-ask-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let paths = DaemonPaths::under(root.clone());
+            paths.prepare().unwrap();
+
+            // Nothing running yet: no stamp is a daemon from before there were
+            // any, and it gets asked like every other.
+            assert_eq!(handover_ask_age(&paths), Some(Duration::ZERO));
+            assert!(!handover_is_overdue(&paths));
+
+            fs::write(&paths.generation, "0.5.4:protocol-1:96012c2\n").unwrap();
+            assert_eq!(handover_ask_age(&paths), Some(Duration::ZERO));
+            let noted = fs::read_to_string(&paths.handover).unwrap();
+            assert!(
+                noted.starts_with("0.5.4:protocol-1:96012c2\t"),
+                "the ask names the generation it is about: {noted}"
+            );
+
+            // A second client finds the first client's ask rather than making
+            // its own, which is what lets the wait actually accumulate.
+            let long_ago = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                - (HANDOVER_PATIENCE.as_millis() as u64 + 1_000);
+            fs::write(
+                &paths.handover,
+                format!("0.5.4:protocol-1:96012c2\t{long_ago}"),
+            )
+            .unwrap();
+            assert!(handover_is_overdue(&paths));
+
+            // Another daemon took over in the meantime: the wait is about the
+            // one that was refusing, so it starts again for the new one.
+            fs::write(&paths.generation, "0.5.4:protocol-1:something-else\n").unwrap();
+            assert_eq!(handover_ask_age(&paths), Some(Duration::ZERO));
+            assert!(!handover_is_overdue(&paths));
+
+            // A build this one cannot be newer than is never asked at all, so
+            // there is nothing to grow overdue.
+            fs::write(&paths.generation, "999.0.0:protocol-3:abc123:99999\n").unwrap();
+            assert_eq!(handover_ask_age(&paths), None);
+            assert!(!handover_is_overdue(&paths));
+
+            forget_handover_ask(&paths);
+            assert!(!paths.handover.exists());
+
+            fs::remove_dir_all(&root).ok();
         }
 
         /// A handover the asking client never hears about still has to happen.
