@@ -49,6 +49,11 @@ const ZSTD_LEVEL: i32 = 12;
 
 /// Blob file names within a session directory.
 pub const CAPTURE_BLOB: &str = "capture.ansi.zst";
+/// Whatever the runtime calls a conversation, mirrored byte for byte: the jsonl
+/// transcript for the three runtimes that write one, and the single JSON
+/// document OpenCode exports for a session, which keeps the old name because it
+/// is the same slot — one blob per session, one path through retention, search
+/// and restore, whatever shape the bytes inside it have.
 pub const TRANSCRIPT_BLOB: &str = "transcript.jsonl.zst";
 pub const MESSAGES_BLOB: &str = "messages.zst";
 
@@ -59,7 +64,8 @@ pub const MESSAGES_BLOB: &str = "messages.zst";
 pub struct BackupRecord {
     pub target_id: String,
     pub session_id: String,
-    /// Agent kind as a string (`codex` | `claude` | `terminal`).
+    /// Agent kind as a string (`codex` | `claude` | `pi` | `opencode` |
+    /// `terminal`).
     pub kind: String,
     /// Working directory the agent was launched in.
     pub cwd: String,
@@ -874,8 +880,10 @@ fn sync_capture(
 }
 
 /// Resolve and mirror the agent-native transcript (Codex rollout / Claude
-/// jsonl). Local files are read directly; remote files are pulled over the
-/// bridge. Skips work when the transcript's update marker is unchanged.
+/// jsonl / Pi jsonl). Local files are read directly; remote files are pulled
+/// over the bridge; OpenCode, which has no file to copy, is asked for its
+/// session instead. Skips work when the transcript's update marker is
+/// unchanged.
 #[allow(clippy::too_many_arguments)]
 fn sync_transcript(
     runtime: &Runtime,
@@ -929,7 +937,20 @@ fn sync_transcript(
     let updated_at = candidate.updated_at.clone();
     let source_path = candidate.source_path.clone();
 
-    let data = if is_local {
+    // OpenCode has no transcript to copy. Its conversations are rows in one
+    // store shared by every folder on the machine, and that same file holds the
+    // tokens it signs in to its providers with, so the store is never an
+    // artifact — what gets mirrored is the document OpenCode hands out when
+    // asked for that one session, which is also what it takes back on restore.
+    let data = if kind == AgentKind::OpenCode {
+        match runtime.export_opencode_session(target, &candidate.id)? {
+            Some(document) => document,
+            // The session was deleted, or the machine no longer has opencode on
+            // it. Either way there is nothing new to mirror and what is already
+            // backed up is still the best record of that conversation.
+            None => return Ok(()),
+        }
+    } else if is_local {
         match fs::read(&source_path) {
             Ok(data) => data,
             Err(_) => return Ok(()), // transcript vanished; leave prior backup intact
@@ -1061,6 +1082,11 @@ impl Title {
 /// duplicates (Codex emits both an `event_msg` and a `response_item` for the
 /// same user turn) are collapsed.
 pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>, Option<Title>) {
+    // OpenCode's mirror is one document rather than a line per event, so it is
+    // read whole instead of walked line by line.
+    if kind == AgentKind::OpenCode {
+        return extract_opencode_messages(jsonl);
+    }
     let text = String::from_utf8_lossy(jsonl);
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut title: Option<Title> = None;
@@ -1151,12 +1177,77 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                     push_message(&mut messages, role, body, string_field(&value, "timestamp"));
                 }
             }
+            // OpenCode was read whole above, and a terminal is a screen rather
+            // than a conversation - what was said in one is only ever the
+            // capture.
             AgentKind::OpenCode | AgentKind::Terminal => {}
         }
     }
     if title.is_none() {
         title = guess_title(&messages).map(Title::Guessed);
     }
+    (messages, title)
+}
+
+/// The same flat message list, read out of the document OpenCode exports.
+///
+/// The shape is one `info` block for the session and a `messages` array, each
+/// entry an `info` of its own plus the `parts` it was assembled from. Only the
+/// text parts are speech: the rest are the tool calls, the reasoning and the
+/// step markers the runtime keeps to rebuild its own view, and none of them is
+/// something either party said.
+fn extract_opencode_messages(document: &[u8]) -> (Vec<ExtractedMessage>, Option<Title>) {
+    let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let Ok(value) = serde_json::from_slice::<Value>(document) else {
+        return (messages, None);
+    };
+    // OpenCode names a session itself and renames it as it learns what it is
+    // about, so the name in the document is the name it goes by - unless it is
+    // still the placeholder it was filed under before it had one.
+    let title = value
+        .pointer("/info")
+        .and_then(crate::native_history::opencode_title)
+        .map(|named| Title::Named(named.to_string()));
+    for entry in value
+        .pointer("/messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let info = entry.pointer("/info");
+        let role = info
+            .and_then(|info| info.get("role"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let ts = info
+            .and_then(|info| info.pointer("/time/created"))
+            .and_then(Value::as_u64)
+            .map(crate::native_history::iso_timestamp)
+            .unwrap_or_default();
+        let mut spoken = String::new();
+        for part in entry
+            .pointer("/parts")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            if part.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if !spoken.is_empty() {
+                spoken.push('\n');
+            }
+            spoken.push_str(text);
+        }
+        push_message(&mut messages, role, spoken, ts);
+    }
+    let title = title.or_else(|| guess_title(&messages).map(Title::Guessed));
     (messages, title)
 }
 
@@ -1295,9 +1386,28 @@ pub fn recoverable_records(
 /// Whether a record carries the structured transcript a restore needs. Records
 /// with only a terminal capture are readable but cannot be resumed.
 pub fn is_restorable(record: &BackupRecord) -> bool {
-    !record.native_id.is_empty()
-        && native_relative_path(&record.native_path).is_some()
-        && record.jsonl_bytes_synced > 0
+    !record.native_id.is_empty() && restore_route(record).is_some() && record.jsonl_bytes_synced > 0
+}
+
+/// How a backed-up conversation gets back onto a machine.
+///
+/// Three of the runtimes read a file, so putting one back is writing that file
+/// where the runtime looks for it. OpenCode reads a store it shares with every
+/// folder on the machine and keeps its provider tokens in, so nothing muxloom
+/// holds may be written over it: the document goes back through OpenCode's own
+/// import, which is the only thing entitled to touch that file.
+enum RestoreRoute {
+    /// The `$HOME`-relative path to write the mirrored bytes to.
+    File(String),
+    /// Hand the document to OpenCode and let it file the session itself.
+    Import,
+}
+
+fn restore_route(record: &BackupRecord) -> Option<RestoreRoute> {
+    if record.kind == AgentKind::OpenCode.as_str() {
+        return Some(RestoreRoute::Import);
+    }
+    native_relative_path(&record.native_path).map(RestoreRoute::File)
 }
 
 /// Restore one session of one machine from the default store, looked up by the
@@ -1317,8 +1427,9 @@ pub fn restore_session(
     restore_transcript(runtime, &store, target, &record)
 }
 
-/// Write a backed-up transcript back onto `target` at the agent-native location
-/// so the agent's own resume can find it again, and return the id to resume
+/// Put a backed-up conversation back onto `target` where the runtime's own
+/// resume will find it — written to the agent-native location, or handed to
+/// OpenCode to file itself, per [`RestoreRoute`] — and return the id to resume
 /// with. The local blob is left untouched — this copies out, it does not move.
 pub fn restore_transcript(
     runtime: &Runtime,
@@ -1329,12 +1440,20 @@ pub fn restore_transcript(
     if record.native_id.is_empty() {
         bail!("only this session's terminal output was backed up, not a resumable transcript");
     }
-    let relative = native_relative_path(&record.native_path).with_context(|| {
+    let route = restore_route(record).with_context(|| {
         format!(
             "cannot place a transcript from an unrecognised path: {}",
             record.native_path
         )
     })?;
+    if let RestoreRoute::Import = route
+        && record.cwd.is_empty()
+    {
+        bail!(
+            "the backup does not say which folder this opencode session belongs to, and one \
+             filed under the wrong folder is one nobody working there is offered"
+        );
+    }
     let data = store.read_blob(&record.target_id, &record.session_id, TRANSCRIPT_BLOB)?;
     if data.is_empty() {
         bail!("the backed-up transcript is empty");
@@ -1342,17 +1461,40 @@ pub fn restore_transcript(
     // The path is rebuilt from the target's own HOME rather than replayed
     // verbatim: the same machine can come back with a different home, and a
     // record may be restored onto a box that is not the one it came from.
-    let destination = runtime.home_relative_path(target, &relative)?;
+    let placement = match &route {
+        RestoreRoute::File(relative) => Some(runtime.home_relative_path(target, relative)?),
+        RestoreRoute::Import => None,
+    };
     let temp = std::env::temp_dir().join(format!(
-        "muxloom-restore-{}-{}.jsonl",
+        "muxloom-restore-{}-{}.{}",
         sanitize(&record.target_id),
-        sanitize(&record.session_id)
+        sanitize(&record.session_id),
+        match route {
+            RestoreRoute::File(_) => "jsonl",
+            RestoreRoute::Import => "json",
+        }
     ));
     fs::write(&temp, &data)
         .with_context(|| format!("failed to stage restore in {}", temp.display()))?;
-    let placed = runtime.place_file(target, &temp, &destination);
-    let _ = fs::remove_file(&temp);
-    placed.with_context(|| format!("failed to restore transcript to {destination}"))?;
+    let destination = match placement {
+        Some(destination) => {
+            let placed = runtime.place_file(target, &temp, &destination);
+            let _ = fs::remove_file(&temp);
+            placed.with_context(|| format!("failed to restore transcript to {destination}"))?;
+            destination
+        }
+        None => {
+            let imported =
+                runtime.import_opencode_session(target, &record.cwd, &record.native_id, &temp);
+            let _ = fs::remove_file(&temp);
+            imported.with_context(|| {
+                format!(
+                    "failed to hand the session back to opencode in {} on {}",
+                    record.cwd, target.id
+                )
+            })?
+        }
+    };
     crate::debug::log(
         "backup",
         format!(
@@ -1888,6 +2030,83 @@ mod tests {
             title,
             Some(Title::Named("recap from the transcript".into()))
         );
+    }
+
+    /// OpenCode's mirror is one document, not a line per event, and only the
+    /// text parts of a message are speech - the tool call it made and the
+    /// thinking it did on the way are how it got there, not what it said.
+    #[test]
+    fn extracts_what_was_said_in_an_opencode_session() {
+        let document = r#"{
+          "info": { "id": "ses_1", "title": "reading the store", "directory": "/work" },
+          "messages": [
+            { "info": { "role": "user", "time": { "created": 1750000000000 } },
+              "parts": [ { "type": "text", "text": "where does it keep them" } ] },
+            { "info": { "role": "assistant", "time": { "created": 1750000001000 } },
+              "parts": [ { "type": "reasoning", "text": "think" },
+                         { "type": "text", "text": "in one store" },
+                         { "type": "tool", "tool": "bash" },
+                         { "type": "text", "text": "shared by every folder" },
+                         { "type": "step-finish" } ] },
+            { "info": { "role": "system" }, "parts": [ { "type": "text", "text": "ignored" } ] }
+          ]
+        }"#;
+        let (messages, title) = extract_messages(AgentKind::OpenCode, document.as_bytes());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text, "where does it keep them");
+        assert_eq!(messages[0].ts, "2025-06-15T15:06:40.000Z");
+        assert_eq!(messages[1].text, "in one store\nshared by every folder");
+        assert_eq!(title, Some(Title::Named("reading the store".into())));
+
+        // Nothing OpenCode could hand over is worth a panic: a document that is
+        // not one comes back empty rather than taking the sync down with it.
+        let (nothing, unnamed) = extract_messages(AgentKind::OpenCode, b"not a document");
+        assert!(nothing.is_empty());
+        assert_eq!(unnamed, None);
+    }
+
+    /// A session OpenCode has not named yet is filed under a placeholder, and
+    /// letting that stand would call a folder of conversations the same thing.
+    #[test]
+    fn an_unnamed_opencode_session_is_titled_from_what_was_said() {
+        let document = r#"{
+          "info": { "id": "ses_2", "title": "New session - 2026-08-25" },
+          "messages": [
+            { "info": { "role": "user" },
+              "parts": [ { "type": "text", "text": "trace the resume path" } ] }
+          ]
+        }"#;
+        let (_, title) = extract_messages(AgentKind::OpenCode, document.as_bytes());
+        assert_eq!(title, Some(Title::Guessed("trace the resume path".into())));
+    }
+
+    /// An OpenCode record has no transcript path to put back, because there is
+    /// no file - it goes home through OpenCode's own import, and the folder it
+    /// belonged to is part of the address.
+    #[test]
+    fn an_opencode_session_is_restored_by_handing_it_back() {
+        let mut record = BackupRecord {
+            kind: AgentKind::OpenCode.as_str().into(),
+            native_id: "ses_1".into(),
+            native_path: String::new(),
+            cwd: "/work".into(),
+            jsonl_bytes_synced: 40,
+            ..Default::default()
+        };
+        assert!(matches!(restore_route(&record), Some(RestoreRoute::Import)));
+        assert!(is_restorable(&record));
+
+        // The same record from a runtime that does write a file is not
+        // restorable without one, which is what it was before.
+        record.kind = AgentKind::Claude.as_str().into();
+        assert!(restore_route(&record).is_none());
+        assert!(!is_restorable(&record));
+        record.native_path = "/home/someone/.claude/projects/work/ses.jsonl".into();
+        assert!(matches!(
+            restore_route(&record),
+            Some(RestoreRoute::File(relative)) if relative == ".claude/projects/work/ses.jsonl"
+        ));
     }
 
     #[test]

@@ -2330,6 +2330,94 @@ END {
         Ok(candidates)
     }
 
+    /// One OpenCode session as a document, asked for by id.
+    ///
+    /// The other three runtimes keep a transcript file and a backup is that
+    /// file copied. OpenCode keeps rows in one store shared by every folder on
+    /// the machine, and that same file holds the provider tokens it signs in
+    /// with, so copying it is out of the question — what comes back here is
+    /// what `opencode export` says about one session and nothing else.
+    ///
+    /// `Ok(None)` when the machine has no `opencode` on it or the session is
+    /// gone: a backup run sweeps every session it knows of, and a machine that
+    /// has since dropped the CLI is not an error worth failing the sweep over.
+    pub fn export_opencode_session(&self, target: &Target, id: &str) -> Result<Option<Vec<u8>>> {
+        let script = format!(
+            "PATH=\"$HOME/.local/bin:$PATH\"; command -v opencode >/dev/null 2>&1 || exit 0; {} \
+             </dev/null 2>/dev/null",
+            shell_join(&["opencode", "export", id])
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "export an opencode session")?;
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout))
+    }
+
+    /// Put an exported document back into OpenCode's store on a machine.
+    ///
+    /// `opencode import` keeps the session's own id, which is what makes the
+    /// restored session resumable by the id the backup recorded, and it files
+    /// the session under the folder it is run from — hence the `cd`, because a
+    /// session restored into the wrong folder is a session the agent working
+    /// there will never be offered.
+    ///
+    /// The document goes through a staging file under the cache directory
+    /// rather than down a pipe, because [`Runtime::place_file`] is the one
+    /// tested way muxloom gets bytes onto a machine. It is removed again
+    /// whether or not the import worked. Returns where OpenCode says its store
+    /// is, for the record of what was written.
+    pub fn import_opencode_session(
+        &self,
+        target: &Target,
+        cwd: &str,
+        id: &str,
+        document: &Path,
+    ) -> Result<String> {
+        let safe: String = id
+            .chars()
+            .map(|char| {
+                if char.is_ascii_alphanumeric() || matches!(char, '.' | '_' | '-') {
+                    char
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let staged =
+            self.home_relative_path(target, &format!(".cache/muxloom/opencode-{safe}.json"))?;
+        self.place_file(target, document, &staged)?;
+        // The import runs from the folder the session belongs to, and the
+        // staging file is cleaned up before the exit status is honoured so a
+        // failed import does not leave someone's conversation lying around.
+        let script = format!(
+            "PATH=\"$HOME/.local/bin:$PATH\"; command -v opencode >/dev/null 2>&1 || {{ echo \
+             'opencode is not installed on this machine, so there is nowhere to put the session \
+             back' >&2; exit 127; }}; mkdir -p {cwd} && cd {cwd} && {import} </dev/null \
+             >/dev/null 2>&1; status=$?; rm -f {staged}; [ $status -eq 0 ] || exit $status; \
+             opencode db path </dev/null 2>/dev/null || true",
+            cwd = shell_quote(cwd),
+            import = shell_join(&["opencode", "import", &staged]),
+            staged = shell_quote(&staged),
+        );
+        let output = self.run_shell(target, &script, false)?;
+        ensure_success(&output, "import an opencode session")?;
+        let store = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .rfind(|line| line.starts_with('/'))
+            .map(str::to_string);
+        match store {
+            Some(store) => Ok(store),
+            // Older builds may not answer `db path`. The default location is
+            // still the truth for all but a machine with XDG_DATA_HOME moved,
+            // and this string is a record of what happened, not an address
+            // anything reads back.
+            None => self.home_relative_path(target, ".local/share/opencode/opencode.db"),
+        }
+    }
+
     pub fn kill(&self, target: &Target, session_id: &str) -> Result<()> {
         debug::log(
             "runtime",
