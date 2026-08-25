@@ -2087,6 +2087,7 @@ END {
         let root = match kind {
             AgentKind::Codex => "$HOME/.codex/sessions",
             AgentKind::Claude => "$HOME/.claude/projects",
+            AgentKind::Pi => "$HOME/.pi/agent/sessions",
             _ => unreachable!("only a runtime with native history is scanned"),
         };
         let index = if kind == AgentKind::Codex {
@@ -3408,6 +3409,7 @@ fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<Res
         let candidate = match kind {
             AgentKind::Codex => parse_codex_resume(session, &normalized_path, source_path, &titles),
             AgentKind::Claude => parse_claude_resume(session, &normalized_path, source_path),
+            AgentKind::Pi => parse_pi_resume(session, &normalized_path, source_path),
             _ => None,
         };
         if let Some(candidate) = candidate {
@@ -3589,6 +3591,72 @@ fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<R
     })
 }
 
+fn parse_pi_resume(session: &str, path: &str, source_path: &str) -> Option<ResumeCandidate> {
+    let mut id = None;
+    let mut cwd = None;
+    let mut updated_at = String::new();
+    let mut title = None;
+    let mut first_message = None;
+    let mut last_message = None;
+    for value in session.lines().filter_map(parse_json_line) {
+        if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str)
+            && timestamp > updated_at.as_str()
+        {
+            updated_at = timestamp.to_string();
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                id = value.get("id").and_then(Value::as_str).map(str::to_string);
+                cwd = value.get("cwd").and_then(Value::as_str).map(normalize_path);
+            }
+            // The name can be written again whenever it changes, so the last
+            // one wins.
+            Some("session_info") => {
+                if let Some(named) = crate::native_history::pi_session_name(&value) {
+                    let named = clean_recap(named);
+                    if !named.is_empty() {
+                        title = Some(named);
+                    }
+                }
+            }
+            Some("message") => {
+                // A tool's answer is filed as a message too, under a role of
+                // its own; only what the person typed is worth showing here.
+                let message = value.get("message");
+                if message
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    != Some("user")
+                {
+                    continue;
+                }
+                let text = message
+                    .and_then(|message| message.get("content"))
+                    .and_then(extract_message_text)
+                    .map(|text| clean_recap(&text))
+                    .filter(|text| !text.is_empty());
+                if let Some(text) = text {
+                    first_message.get_or_insert_with(|| text.clone());
+                    last_message = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if cwd.as_deref() != Some(path) {
+        return None;
+    }
+    Some(ResumeCandidate {
+        id: id?,
+        kind: AgentKind::Pi,
+        source_path: source_path.to_string(),
+        recap: title,
+        first_message,
+        last_message,
+        updated_at,
+    })
+}
+
 fn parse_json_line(line: &str) -> Option<Value> {
     serde_json::from_str(line).ok()
 }
@@ -3688,8 +3756,9 @@ pub(crate) fn launch_arguments(
         match kind {
             AgentKind::Codex => args.extend(["resume".into(), resume_id.into()]),
             AgentKind::Claude => args.extend(["--resume".into(), resume_id.into()]),
+            AgentKind::Pi => args.extend(["--session".into(), resume_id.into()]),
             // Only a runtime with native history hands back a resume id.
-            AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => {}
+            AgentKind::OpenCode | AgentKind::Terminal => {}
         }
     }
     if resume_id.is_none()
@@ -4772,6 +4841,47 @@ mod tests {
         );
     }
 
+    /// pi opens a transcript with a header line that carries the id and the
+    /// folder, names the conversation on a line of its own whenever the name
+    /// changes, and files a tool's answer as a message under a role of its own.
+    #[test]
+    fn pi_resume_candidates_come_from_the_header_the_name_and_what_the_person_typed() {
+        let sessions = concat!(
+            "\u{1e}SESSION\n",
+            "/home/test/.pi/agent/sessions/--work-project--/2026-07-20T09-00-00-000Z_pi-id.jsonl\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"pi-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T09:00:00.000Z\"}\n",
+            "{\"type\":\"session_info\",\"name\":\"A first guess at a name\",\"timestamp\":\"2026-07-20T09:00:01.000Z\"}\n",
+            "{\"type\":\"message\",\"timestamp\":\"2026-07-20T09:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first pi prompt\"}]}}\n",
+            "{\"type\":\"message\",\"timestamp\":\"2026-07-20T09:00:03.000Z\",\"message\":{\"role\":\"tool\",\"content\":[{\"type\":\"text\",\"text\":\"a tool answered\"}]}}\n",
+            "{\"type\":\"message\",\"timestamp\":\"2026-07-20T09:00:04.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second pi prompt\"}]}}\n",
+            "{\"type\":\"session_info\",\"name\":\"What it is really about\",\"timestamp\":\"2026-07-20T09:00:05.000Z\"}\n",
+        );
+
+        let candidates = parse_resume_candidates(AgentKind::Pi, "/work/project", sessions);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "pi-id");
+        assert_eq!(candidates[0].kind, AgentKind::Pi);
+        assert_eq!(
+            candidates[0].recap.as_deref(),
+            Some("What it is really about")
+        );
+        assert_eq!(
+            candidates[0].first_message.as_deref(),
+            Some("first pi prompt")
+        );
+        assert_eq!(
+            candidates[0].last_message.as_deref(),
+            Some("second pi prompt"),
+            "a tool's answer is not something either party said"
+        );
+        assert_eq!(candidates[0].updated_at, "2026-07-20T09:00:05.000Z");
+        assert!(
+            parse_resume_candidates(AgentKind::Pi, "/other", sessions).is_empty(),
+            "resume candidates must match the exact working directory"
+        );
+    }
+
     #[test]
     fn codex_resume_candidates_exclude_newer_subagent_threads() {
         let sessions = concat!(
@@ -4821,6 +4931,15 @@ mod tests {
                 Some("Read /tmp/source history.jsonl")
             ),
             "claude 'Read /tmp/source history.jsonl'"
+        );
+        let command = CommandConfig {
+            command: "pi".into(),
+            args: Vec::new(),
+            ..CommandConfig::default()
+        };
+        assert_eq!(
+            command_line(&command, AgentKind::Pi, false, Some("abc"), None),
+            "pi --session abc"
         );
     }
 

@@ -1,9 +1,9 @@
 //! What an agent CLI records about its own sessions.
 //!
-//! Codex and Claude Code both keep a transcript of every session they run, and
-//! both name the session in it. muxloom reads those files in four places -
-//! the resume picker, the backup index, the session list, and the recap under
-//! it - so the rules for reading one live here rather than in each reader.
+//! Codex, Claude Code and pi each keep a transcript of every session they run,
+//! and each names the session in it. muxloom reads those files in four places
+//! (the resume picker, the backup index, the session list, and the recap under
+//! it), so the rules for reading one live here rather than in each reader.
 //!
 //! Nothing here talks to a session: it reads files the CLI wrote, on the
 //! machine the CLI ran on, and the reading is bounded. Transcripts reach tens
@@ -72,9 +72,10 @@ pub fn threads_for(kind: AgentKind, cwd: &str, since: u64) -> Vec<NativeThread> 
     match kind {
         AgentKind::Claude => claude_threads(&home.join(".claude").join("projects"), cwd, since),
         AgentKind::Codex => codex_threads(&home.join(".codex"), cwd, since),
+        AgentKind::Pi => pi_threads(&home.join(".pi").join("agent").join("sessions"), cwd, since),
         // The rest keep no transcript of their own; muxloom's history is all
         // there is to read.
-        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => Vec::new(),
+        AgentKind::OpenCode | AgentKind::Terminal => Vec::new(),
     }
 }
 
@@ -88,20 +89,28 @@ pub fn reread(kind: AgentKind, path: &Path) -> Option<NativeThread> {
             let names = codex_names(&home_dir()?.join(".codex"));
             codex_thread(path, updated_at, &names)
         }
-        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => None,
+        AgentKind::Pi => pi_thread(path, updated_at),
+        AgentKind::OpenCode | AgentKind::Terminal => None,
     }
 }
 
 /// The thread a launch was told to reopen, read out of the command line the
-/// daemon is about to run: `claude --resume <id>`, `codex resume <id>`.
+/// daemon is about to run: `claude --resume <id>`, `codex resume <id>`,
+/// `pi --session <id>`.
 pub fn resume_seed(kind: AgentKind, args: &[String]) -> Option<String> {
     let flag = match kind {
         AgentKind::Claude => "--resume",
         AgentKind::Codex => "resume",
-        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => return None,
+        AgentKind::Pi => "--session",
+        AgentKind::OpenCode | AgentKind::Terminal => return None,
     };
+    // `--flag=value` is only a form a flag has; Codex's is a subcommand.
+    let joined = flag.starts_with("--").then(|| format!("{flag}="));
     for (index, argument) in args.iter().enumerate() {
-        if let Some(id) = argument.strip_prefix("--resume=") {
+        if let Some(id) = joined
+            .as_deref()
+            .and_then(|joined| argument.strip_prefix(joined))
+        {
             return (!id.is_empty()).then(|| id.to_string());
         }
         if argument == flag {
@@ -494,6 +503,119 @@ fn codex_agent_text(value: &Value) -> Option<String> {
     clean_message(payload.get("message").and_then(Value::as_str)?)
 }
 
+fn pi_threads(sessions: &Path, cwd: &str, since: u64) -> Vec<NativeThread> {
+    let cwd = normalize_path(cwd);
+    let folder = sessions.join(pi_session_slug(&cwd));
+    recent_files(&folder, since)
+        .into_iter()
+        .filter_map(|(path, updated_at)| pi_thread(&path, updated_at))
+        .filter(|thread| thread.cwd == cwd)
+        .collect()
+}
+
+/// pi keeps one folder per working directory, named after the path itself: the
+/// leading separator dropped, every separator and colon after it turned into a
+/// dash, and the whole wrapped in a pair of dashes. Lossy in the same way
+/// Claude Code's is, so this only says where to look, and what the transcript
+/// says about its own cwd decides.
+fn pi_session_slug(cwd: &str) -> String {
+    let body: String = cwd
+        .strip_prefix(['/', '\\'])
+        .unwrap_or(cwd)
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect();
+    format!("--{body}--")
+}
+
+/// The name pi was given for a conversation. It is a line of its own that can
+/// be written again whenever the name changes, so the last one in the file is
+/// the one that describes it now.
+pub fn pi_session_name(value: &Value) -> Option<&str> {
+    (value.get("type").and_then(Value::as_str) == Some("session_info"))
+        .then(|| value.get("name").and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn pi_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
+    let head = read_head(path, HEAD_BYTES)?;
+    let header = head
+        .lines()
+        .filter_map(parse_line)
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"))?;
+    let id = header.get("id").and_then(Value::as_str)?.to_string();
+    let cwd = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(normalize_path)
+        .unwrap_or_default();
+    let started_at = header
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp)
+        .unwrap_or(0);
+    // pi goes on writing the same file when it reopens one; a transcript here
+    // is a fork only when it was asked for as one.
+    let forked_from = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // A name given at the start sits in the head of a transcript long enough
+    // that the tail no longer reaches it, so both ends are read for one.
+    let mut title = head
+        .lines()
+        .filter_map(parse_line)
+        .filter_map(|value| pi_session_name(&value).and_then(clean_message))
+        .next_back();
+    let mut last_message = None;
+    for value in read_tail(path, TAIL_BYTES)?.lines().filter_map(parse_line) {
+        if let Some(named) = pi_session_name(&value).and_then(clean_message) {
+            title = Some(named);
+        }
+        if let Some(said) = pi_agent_text(&value) {
+            last_message = Some(said);
+        }
+    }
+
+    Some(NativeThread {
+        id,
+        path: path.to_path_buf(),
+        cwd,
+        started_at,
+        updated_at,
+        forked_from,
+        title,
+        last_message,
+    })
+}
+
+/// What the agent itself said on a transcript line. pi files a tool's answer
+/// as a message too, under a role of its own, so the role is what tells the
+/// two apart; a tool call inside an answer is a block without text.
+fn pi_agent_text(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    message
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter_map(clean_message)
+        .next_back()
+}
+
 /// The `*.jsonl` files in a folder that have grown since `since`, newest
 /// first and bounded: a folder holds every conversation ever held there.
 fn recent_files(folder: &Path, since: u64) -> Vec<(PathBuf, u64)> {
@@ -792,6 +914,60 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_of_pi_sessions_gives_up_its_names_forks_and_last_answers() {
+        let root = scratch("pi");
+        let sessions = root.join("sessions");
+        let folder = sessions.join(pi_session_slug("/Users/me/Works/Terminal"));
+        assert_eq!(
+            folder.file_name().unwrap().to_str().unwrap(),
+            "--Users-me-Works-Terminal--"
+        );
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("2026-08-25T06-59-08-453Z_aaa.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"aaa","timestamp":"2026-08-25T06:59:08.453Z","cwd":"/Users/me/Works/Terminal","parentSession":"older"}"#, "\n",
+                r#"{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-25T06:59:08.456Z","provider":"anthropic","modelId":"claude-opus-4-8"}"#, "\n",
+                r#"{"type":"session_info","id":"n1","parentId":"m1","timestamp":"2026-08-25T06:59:20.000Z","name":"first guess at a name"}"#, "\n",
+                r#"{"type":"message","id":"u1","parentId":"n1","timestamp":"2026-08-25T06:59:30.000Z","message":{"role":"user","content":[{"type":"text","text":"What's the star?"}]}}"#, "\n",
+                r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-25T06:59:31.000Z","message":{"role":"assistant","content":[{"type":"text","text":"An early answer."}]}}"#, "\n",
+                r#"{"type":"session_info","id":"n2","parentId":"a1","timestamp":"2026-08-25T07:00:00.000Z","name":"what it is really about"}"#, "\n",
+                r#"{"type":"message","id":"t1","parentId":"n2","timestamp":"2026-08-25T07:00:01.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"total 98729032"}]}}"#, "\n",
+                r#"{"type":"message","id":"a2","parentId":"t1","timestamp":"2026-08-25T07:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The keeper spawn is what fails."},{"type":"toolCall","id":"c1","name":"bash"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // Another folder slugs to this same name; only what the transcript says
+        // about its own cwd tells them apart.
+        fs::write(
+            folder.join("2026-08-25T07-02-08-614Z_bbb.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"bbb","timestamp":"2026-08-25T07:02:08.614Z","cwd":"/Users/me/Works-Terminal"}"#, "\n",
+                r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-25T07:02:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Somewhere else entirely."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let threads = pi_threads(&sessions, "/Users/me/Works/Terminal/", 0);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        let found = &threads[0];
+        assert_eq!(found.id, "aaa");
+        assert_eq!(found.cwd, "/Users/me/Works/Terminal");
+        assert_eq!(found.title.as_deref(), Some("what it is really about"));
+        assert_eq!(found.forked_from.as_deref(), Some("older"));
+        assert_eq!(
+            found.last_message.as_deref(),
+            Some("The keeper spawn is what fails."),
+            "a tool's answer is not the agent speaking"
+        );
+        assert_eq!(
+            found.started_at,
+            parse_timestamp("2026-08-25T06:59:08.453Z").unwrap()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_transcript_read_from_the_middle_of_a_line_still_reads() {
         let root = scratch("truncated");
         let path = root.join("ccc.jsonl");
@@ -898,6 +1074,14 @@ mod tests {
                 &["--foo".into(), "resume".into(), "one".into()]
             ),
             Some("one".into())
+        );
+        assert_eq!(
+            resume_seed(AgentKind::Pi, &["--session".into(), "aaa".into()]),
+            Some("aaa".into())
+        );
+        assert_eq!(
+            resume_seed(AgentKind::Pi, &["--session=aaa".into()]),
+            Some("aaa".into())
         );
         assert_eq!(resume_seed(AgentKind::Claude, &["--resume".into()]), None);
         assert_eq!(

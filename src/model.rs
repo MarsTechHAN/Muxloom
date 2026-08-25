@@ -67,7 +67,7 @@ impl AgentKind {
     /// local backup. The others are still archived and searched through
     /// muxloom's own history.
     pub fn has_native_history(self) -> bool {
-        matches!(self, Self::Codex | Self::Claude)
+        matches!(self, Self::Codex | Self::Claude | Self::Pi)
     }
 
     /// Whether muxloom can resolve a published release for this runtime and

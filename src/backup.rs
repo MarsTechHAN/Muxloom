@@ -1092,7 +1092,24 @@ pub fn extract_messages(kind: AgentKind, jsonl: &[u8]) -> (Vec<ExtractedMessage>
                     push_message(&mut messages, role, body, string_field(&value, "timestamp"));
                 }
             }
-            AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => {}
+            AgentKind::Pi => {
+                // pi lets a conversation be named and renamed on a line of its
+                // own, so the last name in the file is the one it goes by.
+                if let Some(named) = crate::native_history::pi_session_name(&value) {
+                    title = Some(named.to_string());
+                }
+                if value.get("type").and_then(Value::as_str) == Some("message")
+                    && let Some(message) = value.get("message")
+                    && let Some(role) = message.get("role").and_then(Value::as_str)
+                    // A tool's answer is a message here too, under a role of
+                    // its own. It is not something either party said.
+                    && (role == "user" || role == "assistant")
+                {
+                    let body = content_to_text(message.get("content"));
+                    push_message(&mut messages, role, body, string_field(&value, "timestamp"));
+                }
+            }
+            AgentKind::OpenCode | AgentKind::Terminal => {}
         }
     }
     if title.is_none() {
@@ -1299,14 +1316,16 @@ pub fn restore_transcript(
 }
 
 /// The `$HOME`-relative tail of an agent-native transcript path
-/// (`.claude/projects/…` or `.codex/sessions/…`), or None if the path is not
-/// one an agent would look in.
+/// (`.claude/projects/…`, `.codex/sessions/…` or `.pi/agent/sessions/…`), or
+/// None if the path is not one an agent would look in.
 fn native_relative_path(native_path: &str) -> Option<String> {
-    [".claude/", ".codex/"].into_iter().find_map(|marker| {
-        native_path
-            .find(marker)
-            .map(|position| native_path[position..].to_string())
-    })
+    [".claude/", ".codex/", ".pi/"]
+        .into_iter()
+        .find_map(|marker| {
+            native_path
+                .find(marker)
+                .map(|position| native_path[position..].to_string())
+        })
 }
 
 // ---------------------------------------------------------------------------
