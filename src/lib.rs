@@ -7,7 +7,6 @@ pub mod control;
 pub mod daemon;
 pub mod daemon_protocol;
 pub mod debug;
-#[cfg(feature = "controller")]
 pub mod http;
 #[cfg(unix)]
 pub mod keeper;

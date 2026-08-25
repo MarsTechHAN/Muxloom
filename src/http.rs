@@ -2,7 +2,15 @@
 //!
 //! muxloom ships this instead of shelling out to `curl`, so a stock machine
 //! with no `curl` installed can still fetch companion binaries, agent packages,
-//! and self-updates. Only four shapes are needed:
+//! and self-updates — and so any machine can reach a chat API on its own.
+//!
+//! Every build gets the JSON pair, because the companion sends channel messages
+//! itself rather than borrowing the controller's network:
+//!
+//! - [`get_json`] and [`post_json`] for a chat API request and its answer.
+//!
+//! The download shapes are the controller's, since unpacking what they fetch
+//! needs `flate2`/`tar`/`zstd`, which only the controller build carries:
 //!
 //! - [`fetch_text`] for a short body (e.g. a `.sha256` sidecar),
 //! - [`redirect_location`] to read a redirect target without downloading it
@@ -13,16 +21,16 @@
 //! - [`download`] to stream a file to disk with byte-level progress.
 //!
 //! Every request honors the standard `*_PROXY` and `NO_PROXY` variables. Values
-//! explicitly carried in `environment` override the controller process's own
+//! explicitly carried in `environment` override the calling process's own
 //! environment, matching the behavior of the former curl subprocess.
 
+#[cfg(feature = "controller")]
 use std::{
     fs::File,
     io::{BufWriter, Read, Write},
     path::Path,
-    thread,
-    time::Duration,
 };
+use std::{thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -33,12 +41,15 @@ const REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Package downloads can be hundreds of MiB. minreq applies its timeout to the
 /// whole response rather than each socket read, so use a larger bounded window
 /// for streamed assets.
+#[cfg(feature = "controller")]
 const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 /// Match the retry budget used by the former `curl --retry 3` paths.
 const ATTEMPTS: usize = 3;
 /// Download copy buffer size.
+#[cfg(feature = "controller")]
 const CHUNK: usize = 64 * 1024;
 
+#[cfg(feature = "controller")]
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -136,8 +147,12 @@ fn proxy_for(url: &str, environment: &[(String, String)]) -> Option<minreq::Prox
         .flatten()
 }
 
-fn request(url: &str, environment: &[(String, String)]) -> minreq::Request {
-    let mut request = minreq::get(url)
+fn prepare(
+    request: minreq::Request,
+    url: &str,
+    environment: &[(String, String)],
+) -> minreq::Request {
+    let mut request = request
         .with_header("User-Agent", USER_AGENT)
         .with_header("Accept", "*/*")
         .with_timeout(REQUEST_TIMEOUT_SECS);
@@ -145,6 +160,16 @@ fn request(url: &str, environment: &[(String, String)]) -> minreq::Request {
         request = request.with_proxy(proxy);
     }
     request
+}
+
+fn request(url: &str, environment: &[(String, String)]) -> minreq::Request {
+    prepare(minreq::get(url), url, environment)
+}
+
+fn headed(request: minreq::Request, headers: &[(&str, &str)]) -> minreq::Request {
+    headers.iter().fold(request, |request, (name, value)| {
+        request.with_header(*name, *value)
+    })
 }
 
 fn retry_delay(attempt: usize) {
@@ -178,7 +203,61 @@ fn send(
     Err(last_error.unwrap_or_else(|| anyhow!("request to {url} failed")))
 }
 
+/// Keep an error readable. A chat API puts the reason in the body, not in the
+/// status line, so the body has to travel with the error — but it can also be
+/// kilobytes of echoed request, which nobody wants in a log line.
+fn excerpt(body: &str) -> String {
+    const LIMIT: usize = 240;
+    let body = body.trim();
+    if body.is_empty() {
+        return "(empty body)".to_string();
+    }
+    match body.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &body[..cut]),
+        None => body.to_string(),
+    }
+}
+
+fn json(response: minreq::Response, url: &str) -> Result<serde_json::Value> {
+    let status = response.status_code;
+    let body = response.as_str().unwrap_or_default().trim();
+    if !(200..300).contains(&status) {
+        bail!("{url} returned HTTP {status}: {}", excerpt(body));
+    }
+    serde_json::from_str(body)
+        .with_context(|| format!("{url} did not answer with JSON: {}", excerpt(body)))
+}
+
+/// GET a JSON document, with caller-supplied headers (an `Authorization`, say).
+pub fn get_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    environment: &[(String, String)],
+) -> Result<serde_json::Value> {
+    let response = headed(request(url, environment), headers);
+    // A read can be replayed, so a server that is briefly unwell is worth
+    // waiting out.
+    json(send(response, url, |status| status < 500)?, url)
+}
+
+/// POST a JSON document and read the JSON answer.
+pub fn post_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+    environment: &[(String, String)],
+) -> Result<serde_json::Value> {
+    let request = headed(prepare(minreq::post(url), url, environment), headers)
+        .with_header("Content-Type", "application/json; charset=utf-8")
+        .with_body(serde_json::to_vec(body).context("failed to encode the request body")?);
+    // Unlike a GET, this is not replayable: a 5xx may still have posted the
+    // message, so only a request that never reached the server is retried —
+    // which is exactly what `send` does when the transport itself fails.
+    json(send(request, url, |_| true)?, url)
+}
+
 /// Fetch a small text body (follows redirects).
+#[cfg(feature = "controller")]
 pub fn fetch_text(url: &str, environment: &[(String, String)]) -> Result<String> {
     let response = send(request(url, environment), url, |status| {
         (200..300).contains(&status)
@@ -191,6 +270,7 @@ pub fn fetch_text(url: &str, environment: &[(String, String)]) -> Result<String>
 
 /// Return the `Location` a URL redirects to, without downloading the target.
 /// Used to read the newest release tag from `.../releases/latest`.
+#[cfg(feature = "controller")]
 pub fn redirect_location(url: &str, environment: &[(String, String)]) -> Result<String> {
     let response = send(
         request(url, environment).with_follow_redirects(false),
@@ -204,6 +284,7 @@ pub fn redirect_location(url: &str, environment: &[(String, String)]) -> Result<
 
 /// Follow redirects and return the final response URL without buffering its
 /// body. This replaces `curl -w %{url_effective}` for release discovery.
+#[cfg(feature = "controller")]
 pub fn effective_url(url: &str, environment: &[(String, String)]) -> Result<String> {
     let mut last_error = None;
     for attempt in 1..=ATTEMPTS {
@@ -230,6 +311,7 @@ pub fn effective_url(url: &str, environment: &[(String, String)]) -> Result<Stri
 /// Stream `url` into `destination`, invoking `on_progress(downloaded, total)` as
 /// bytes arrive (`total` is the Content-Length when the server reports it).
 /// Follows redirects, since release asset URLs redirect to a CDN.
+#[cfg(feature = "controller")]
 pub fn download<F>(
     url: &str,
     destination: &Path,
@@ -252,6 +334,7 @@ where
     Err(last_error.unwrap_or_else(|| anyhow!("download from {url} failed")))
 }
 
+#[cfg(feature = "controller")]
 fn download_once(
     url: &str,
     destination: &Path,
@@ -328,7 +411,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn error_excerpts_stay_short_and_never_split_a_character() {
+        assert_eq!(excerpt("  "), "(empty body)");
+        assert_eq!(excerpt(" {\"code\":99991663} "), "{\"code\":99991663}");
+        let long = "验".repeat(400);
+        let cut = excerpt(&long);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), 241);
+    }
+
     // Network smoke test; run explicitly: cargo test --lib http -- --ignored --nocapture
+    #[cfg(feature = "controller")]
     #[test]
     #[ignore]
     fn hits_github_release_endpoints() {

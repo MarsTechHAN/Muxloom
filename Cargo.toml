@@ -16,7 +16,7 @@ flate2 = { version = "1.1.9", optional = true }
 image = { version = "=0.25.5", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.11"
-minreq = { version = "3.0.0", default-features = false, features = ["https-rustls", "proxy"], optional = true }
+minreq = { version = "3.0.0", default-features = false, features = ["https-rustls", "proxy"] }
 portable-pty = "0.8"
 ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
@@ -34,10 +34,13 @@ vt100 = "0.15"
 zstd = { version = "0.13", optional = true }
 
 [features]
-# The `controller` feature carries everything only the `muxloom` dashboard
-# needs to talk to the network (in-process HTTPS via rustls: companion/agent
-# downloads and self-update) plus the local history backup store (zstd). The
-# `muxloomd` companion is built with `--no-default-features` so it never links
-# the TLS stack — nor the backup store — it does not use.
+# The `controller` feature carries what only the `muxloom` dashboard does:
+# fetching and unpacking companion/agent packages and self-updates
+# (flate2/tar), plus the local history backup store (zstd). The `muxloomd`
+# companion is built with `--no-default-features` and links neither.
+#
+# HTTPS (rustls, via minreq) is *not* behind the feature: every build needs it,
+# because an agent on any machine sends its channel messages from the machine
+# it runs on rather than borrowing the controller's network.
 default = ["controller"]
-controller = ["dep:minreq", "dep:flate2", "dep:tar", "dep:zstd"]
+controller = ["dep:flate2", "dep:tar", "dep:zstd"]
