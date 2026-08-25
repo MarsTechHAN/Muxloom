@@ -102,11 +102,16 @@ preserve.
   explicit opt-out from the environment. The skill it installs follows the same
   rule under its own revision stamp: no stamp means the file is the user's.
 - That entry belongs to the machine, not to a process: one per machine, pointing
-  at the controller when one is installed beside the daemon and at the companion
-  otherwise, and claimed only by the daemon serving the machine's own state
-  directory. A daemon handed someone else's state directory stays out unless it
-  is told otherwise, so no test, scratch instance, or second daemon can quietly
-  repoint the user's agents at a fleet that isn't theirs.
+  at the daemon on every machine including the controller's own, and claimed
+  only by the daemon serving the machine's own state directory. A daemon handed
+  someone else's state directory stays out unless it is told otherwise, so no
+  test, scratch instance, or second daemon can quietly repoint the user's agents
+  at a fleet that isn't theirs.
+- Which surface a session gets is decided when it calls, not by a second entry.
+  The daemon serves its own flavor to every agent, and hands the session over to
+  the controller beside it when the caller's working directory is a moderator's.
+  An ordinary agent drives its own machine and talks to the rest; the fleet-wide
+  flavor is the moderator's.
 - Cross-machine capability belongs to the controller flavor. A daemon-flavor
   surface reaches other machines only by relaying through an attached
   controller, and only for the relay whitelist — never a shell, a machine

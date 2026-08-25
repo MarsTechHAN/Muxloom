@@ -28,6 +28,31 @@ fn keeper_entry() -> Result<()> {
     bail!("muxloomd is currently supported on Unix targets")
 }
 
+/// Serve this MCP session from the controller instead. `exec` rather than a
+/// child process: the agent is already talking to this process's stdin and
+/// stdout, and replacing the image hands it the same pipes with nothing left in
+/// the middle to keep alive or to lose an error through.
+#[cfg(unix)]
+fn hand_over(controller: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(controller).arg("mcp").exec();
+    Err(anyhow::Error::new(error).context(format!("failed to run {controller} mcp")))
+}
+
+#[cfg(not(unix))]
+fn hand_over(controller: &str) -> Result<()> {
+    use anyhow::Context;
+    let status = std::process::Command::new(controller)
+        .arg("mcp")
+        .status()
+        .with_context(|| format!("failed to run {controller} mcp"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("{controller} mcp exited with {status}")
+    }
+}
+
 fn run() -> Result<()> {
     let paths = DaemonPaths::discover()?;
     match std::env::args().nth(1).as_deref() {
@@ -36,6 +61,19 @@ fn run() -> Result<()> {
         Some("keeper") => keeper_entry(),
         Some("stop") => stop(&paths),
         Some("mcp") => {
+            // Every agent on this machine has the same entry, and it points
+            // here. A moderator is the exception: its work is the fleet, so it
+            // is handed to the controller beside this daemon before anything is
+            // served, taking over these very pipes.
+            let session_path = std::env::var("MUXLOOM_SESSION_PATH").ok();
+            let daemon = std::env::current_exe().unwrap_or_default();
+            if let Some(controller) = muxloom::mcp_register::handover_to_controller(
+                &paths.root,
+                session_path.as_deref(),
+                &daemon,
+            ) {
+                return hand_over(&controller);
+            }
             let mut surface = muxloom::control::DaemonControl::new()?;
             muxloom::mcp::serve(
                 &mut surface,

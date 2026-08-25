@@ -41,21 +41,17 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
-    /// The entry for this machine's control surface. There is one entry and it
-    /// is the machine's, so a machine that has the controller registers that:
-    /// `muxloom mcp` reaches every machine the user enabled directly, where the
-    /// daemon's own surface has to relay through an attached controller for
-    /// anything off this machine. A target that only ever received the
-    /// companion has no controller to point at, and the daemon serves it.
+    /// The entry for this machine's control surface, which is the daemon's —
+    /// on every machine, including the one the controller runs on. An ordinary
+    /// agent is one worker among the fleet: its own machine is what it drives,
+    /// and everything beyond it is somebody else it talks to. That is what the
+    /// daemon's surface is shaped like, so that is what gets registered.
+    ///
+    /// A moderator needs the other shape, and gets it without a second entry:
+    /// `muxloomd mcp` hands the session over to the controller beside it when
+    /// the caller turns out to be one. See [`handover_to_controller`].
     pub fn for_this_machine() -> Result<Self> {
         let daemon = std::env::current_exe().context("failed to locate the running muxloomd")?;
-        if let Some(controller) = controller_beside(&daemon) {
-            return Ok(Self {
-                command: controller,
-                args: vec!["mcp".into()],
-                environment: BTreeMap::new(),
-            });
-        }
         let mut environment = BTreeMap::new();
         if let Some(state_dir) = std::env::var_os("MUXLOOMD_STATE_DIR") {
             environment.insert(
@@ -69,6 +65,32 @@ impl ServerEntry {
             environment,
         })
     }
+}
+
+/// The controller this MCP session should be served by instead of the daemon,
+/// if any. One entry per machine points at `muxloomd mcp`, and this is where
+/// the two surfaces part: a session running out of a moderator's project
+/// directory is coordinating the whole fleet, so it is handed to the `muxloom`
+/// beside the daemon, which can reach every enabled machine directly and knows
+/// how to read the backup store.
+///
+/// `session_path` is the folder the daemon launched the calling session in, as
+/// it put it in the session's environment; a session muxloom did not start has
+/// none and is served by the daemon. Nothing here is a security boundary — an
+/// agent on this machine can run the controller itself — it decides which tool
+/// list and which instructions the session is handed.
+pub fn handover_to_controller(
+    state_dir: &Path,
+    session_path: Option<&str>,
+    daemon: &Path,
+) -> Option<String> {
+    let path = session_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    if !crate::moderator::is_moderator_path(state_dir, path) {
+        return None;
+    }
+    controller_beside(daemon)
 }
 
 /// The controller installed alongside this daemon, if there is one. The same
@@ -500,6 +522,41 @@ mod tests {
             args: vec!["mcp".into()],
             environment: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn only_a_moderator_is_handed_to_the_controller_beside_the_daemon() {
+        let state = scratch("handover");
+        let bin = state.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let daemon = bin.join(format!("muxloomd{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&daemon, "").unwrap();
+        let controller = bin.join(format!("muxloom{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&controller, "").unwrap();
+        let moderator = state.join("projects/fleet-lead");
+        let moderator = moderator.to_string_lossy().into_owned();
+
+        assert_eq!(
+            handover_to_controller(&state, Some(&moderator), &daemon).as_deref(),
+            Some(controller.to_string_lossy().as_ref()),
+        );
+        // Everyone else keeps the daemon's own surface, and so does a session
+        // muxloom did not start, which has no folder to judge.
+        for path in [Some("/home/me/Works/Terminal"), Some("  "), Some(""), None] {
+            assert_eq!(
+                handover_to_controller(&state, path, &daemon),
+                None,
+                "{path:?}"
+            );
+        }
+        // A machine that only ever received the companion has nothing to hand
+        // the session to, and serves it itself rather than failing.
+        fs::remove_file(&controller).unwrap();
+        assert_eq!(
+            handover_to_controller(&state, Some(&moderator), &daemon),
+            None
+        );
+        let _ = fs::remove_dir_all(&state);
     }
 
     fn scratch(name: &str) -> PathBuf {

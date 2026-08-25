@@ -6,17 +6,25 @@
 //! machines and which agents it was asked to look after, and pointing it at the
 //! `muxloom` MCP tools it coordinates them with.
 //!
-//! The scope is a briefing, not a sandbox. Nothing here narrows what the MCP
-//! surface will answer: a moderator can reach every machine the user has
-//! enabled, exactly like any other agent on this machine. Saying so plainly in
-//! the briefing is the whole of the enforcement, and the launch form says the
-//! same thing to the user.
+//! Living here is also what decides which surface it is handed. Every agent on
+//! a machine shares one `muxloom` MCP entry and that entry points at the local
+//! daemon, whose tools are about this machine and about talking to the agents
+//! on the others. A session started in one of these folders is handed on to the
+//! `muxloom` beside the daemon instead (see
+//! [`crate::mcp_register::handover_to_controller`]), and that one addresses
+//! every enabled machine directly: it can start a session in any folder on any
+//! of them, and it reads the backup store the search tools answer from.
 //!
-//! Nothing here registers those tools. The local daemon writes the `muxloom`
-//! MCP entry and the skill into this user's Codex and Claude configuration when
-//! it starts (see [`crate::mcp_register`]), and it has to be running before
-//! anything can be launched at all — so a moderator inherits them the way every
-//! other agent on this machine does. That is also why the launch form offers
+//! Which machines and which agents a particular moderator was asked to look
+//! after is still a briefing, not a sandbox: the surface it holds will answer
+//! for the whole fleet whatever the briefing names. Saying so plainly in the
+//! briefing is the whole of the enforcement, and the launch form says the same
+//! thing to the user.
+//!
+//! Nothing here registers any of it. The local daemon writes the `muxloom` MCP
+//! entry and the skill into this user's Codex and Claude configuration when it
+//! starts (see [`crate::mcp_register`]), and it has to be running before
+//! anything can be launched at all. That is also why the launch form offers
 //! only those two runtimes: a moderator that cannot call the tools has nothing
 //! to moderate with.
 
@@ -152,6 +160,15 @@ fn briefing(moderator: &Moderator) -> String {
          This folder is yours: muxloom made it for you, and nothing else lives\n\
          in it. Keep notes here if they help you, but the shared record belongs\n\
          on the talk board, where the others can read it.\n\
+         \n\
+         Because you are in it, your `muxloom` tools are the fleet's rather than\n\
+         one machine's. Every tool takes a `machine` argument, and\n\
+         `launch_session` will start a session in any folder on any enabled\n\
+         machine. The agents you coordinate hold the narrower surface: their own\n\
+         machine, their own folder, and messages to everyone else. So work they\n\
+         cannot do themselves is yours to do or to arrange — and a machine you\n\
+         reach that they cannot is a reason to tell them what you found, not to\n\
+         assume they already know.\n\
          \n",
         name = moderator.name
     );
