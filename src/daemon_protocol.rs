@@ -238,6 +238,11 @@ pub enum DaemonRequest {
         created_at: u64,
         columns: u16,
         rows: u16,
+        /// The session that asked for this one, when an agent started it
+        /// rather than a person. Absent from a client too old to send one, and
+        /// from every launch a human makes.
+        #[serde(default)]
+        parent: Option<String>,
     },
     Resize {
         session_id: String,
@@ -550,6 +555,16 @@ pub struct DaemonSession {
     /// Absent from a daemon too old to read one.
     #[serde(default)]
     pub composer: Option<Composer>,
+    /// The session that started this one, when an agent did. Work an agent
+    /// hands off is still that agent's work, and this is the only record of
+    /// which agent it was: the child's own transcript never mentions it.
+    ///
+    /// It names a session id and nothing else. A child started on another
+    /// machine keeps the id of the agent that asked for it even though the two
+    /// are not on the same daemon; the id is enough to say they belong to the
+    /// same piece of work, which is what a reader wants to know.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

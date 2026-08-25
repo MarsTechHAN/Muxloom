@@ -521,7 +521,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       directory. Use this for anything long-running or interactive instead of \
                       run_shell. `resume_id` resumes that agent-native conversation; \
                       `initial_prompt` seeds a fresh agent instead. The session survives \
-                      this process: pair every launch with a later archive or delete."
+                      this process: pair every launch with a later archive or delete. \
+                      A session you start is recorded as yours — it shows in the dashboard \
+                      indented under you, and it is part of your task on the talk board — so \
+                      this is how you hand work to a subagent rather than losing it in a list \
+                      of unrelated sessions."
             .into(),
         input_schema: schema(
             multi,
@@ -1165,6 +1169,19 @@ fn session_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The session this tool call is being made from, which is the session a
+/// launch it asks for belongs under.
+///
+/// An agent starting a subagent is handing off part of what it is doing, and
+/// the two are one piece of work however many sessions it takes. Nothing about
+/// the child says so — its transcript begins with the task, not with who set
+/// it — so the only chance to record it is here, where muxloom already knows
+/// who is calling. Read from the environment rather than asked for as an
+/// argument: an agent naming its own parent could only get it wrong.
+fn launching_session() -> Option<String> {
+    session_env("MUXLOOM_SESSION_ID")
+}
+
 fn session_voice() -> TalkVoice {
     TalkVoice {
         session_id: session_env("MUXLOOM_SESSION_ID"),
@@ -1617,6 +1634,8 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
         "needs_attention": session.needs_attention,
         "attention_reason": session.attention_reason,
         "recap": session.recap,
+        // The agent that started this one; null when a person did.
+        "parent": session.parent,
     })
 }
 
@@ -2165,6 +2184,7 @@ impl ControllerControl {
             temporary: false,
             resume_id: optional_str(arguments, "resume_id").map(Into::into),
             initial_prompt: optional_str(arguments, "initial_prompt").map(Into::into),
+            parent: launching_session(),
         };
         let command = self.config.command_for(&target.id, kind).clone();
         let environment = self.config.environment_for(&target.id)?;
@@ -2174,6 +2194,7 @@ impl ControllerControl {
             "machine": target.id,
             "kind": kind.as_str(),
             "path": request.path,
+            "parent": request.parent,
         })))
     }
 
@@ -2517,8 +2538,8 @@ mod daemon_surface {
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
         allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
-        instructions, optional_bool, optional_str, optional_usize, plain_screen, pretty,
-        preview_text, required_str, screen_page, session_json, session_kind, shell_report,
+        instructions, launching_session, optional_bool, optional_str, optional_usize, plain_screen,
+        pretty, preview_text, required_str, screen_page, session_json, session_kind, shell_report,
         talk_draft, talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
@@ -2869,6 +2890,7 @@ mod daemon_surface {
                     created_at,
                     columns: 120,
                     rows: 40,
+                    parent: launching_session(),
                 })?
                 .0;
             match response {
@@ -2877,6 +2899,7 @@ mod daemon_surface {
                     "machine": LOCAL_TARGET_ID,
                     "kind": session.kind,
                     "path": session.path,
+                    "parent": session.parent,
                 }))),
                 response => bail!("unexpected launch response: {response:?}"),
             }
@@ -3147,6 +3170,7 @@ mod tests {
             needs_attention: attention,
             attention_reason: attention.then(|| "waiting on a person".into()),
             composer: None,
+            parent: None,
         }
     }
 

@@ -194,6 +194,7 @@ fn a_live_session_survives_a_generation_handover_with_its_process() {
                 created_at: 1,
                 columns: 80,
                 rows: 24,
+                parent: None,
             },
         );
         let DaemonResponse::Launched { session } = response else {

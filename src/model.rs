@@ -366,6 +366,9 @@ pub struct LaunchRequest {
     /// Initial prompt for a fresh session. Used when another agent runtime's
     /// history is referenced instead of passed as an incompatible resume id.
     pub initial_prompt: Option<String>,
+    /// The session asking for this one, when an agent is. A launch a person
+    /// makes from the dashboard has no parent: it is its own piece of work.
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

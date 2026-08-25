@@ -1839,6 +1839,8 @@ impl App {
                 temporary: false,
                 resume_id: Some(resume_id),
                 initial_prompt: None,
+                // A person at the dashboard is nobody's subagent.
+                parent: None,
             };
             let remove_archive_session_id = self
                 .state
@@ -8804,6 +8806,7 @@ impl App {
             temporary: form.temporary,
             resume_id,
             initial_prompt,
+            parent: None,
         };
         if self
             .worker

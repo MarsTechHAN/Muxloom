@@ -49,6 +49,7 @@ fn target_native_companion_launches_and_recovers_history_over_one_bridge() {
         temporary: false,
         resume_id: None,
         initial_prompt: None,
+        parent: None,
     };
     let agent = CommandConfig {
         command: "sh".into(),

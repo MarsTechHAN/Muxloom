@@ -1249,14 +1249,16 @@ mod platform {
                 dead: true,
                 archived: true,
                 recap,
-                // Nothing is left to say who the session was talking to: the
-                // metadata that recorded its folder is what went missing.
+                // Nothing is left to say who the session was talking to, or
+                // who started it: the metadata that recorded its folder is
+                // what went missing.
                 title: None,
                 thread: None,
                 working: false,
                 needs_attention: false,
                 attention_reason: None,
                 composer: None,
+                parent: None,
             };
             if let Err(error) = persist_session_metadata(&metadata_path, &metadata) {
                 eprintln!("muxloomd could not record recovered session {id}: {error:#}");
@@ -2022,6 +2024,7 @@ mod platform {
                 created_at,
                 columns,
                 rows,
+                parent,
             } => {
                 let _launch_guard = state
                     .client_gate
@@ -2043,6 +2046,7 @@ mod platform {
                     created_at,
                     columns,
                     rows,
+                    parent,
                 )?;
                 write_response(
                     writer,
@@ -2775,8 +2779,17 @@ mod platform {
         created_at: u64,
         columns: u16,
         rows: u16,
+        parent: Option<String>,
     ) -> Result<Arc<ManagedSession>> {
         validate_session_id(&session_id)?;
+        // A parent is a session id and is written down as given, even when it
+        // names a session on another machine: it says which piece of work this
+        // belongs to, and that is true wherever the parent runs. What it must
+        // never be is this session, which would make a tree with a loop in it.
+        let parent = parent
+            .map(|parent| validate_session_id(&parent).map(|()| parent))
+            .transpose()?
+            .filter(|parent| *parent != session_id);
         let path = if path == "~" {
             std::env::var("HOME").unwrap_or_else(|_| ".".into())
         } else {
@@ -2919,6 +2932,7 @@ mod platform {
             needs_attention: false,
             attention_reason: None,
             composer: None,
+            parent,
         };
         // The record precedes the keeper so a crash between the two leaves a
         // session that can be retired, never a keeper nothing knows about.
@@ -5540,6 +5554,67 @@ mod platform {
         }
 
         #[test]
+        fn a_session_started_by_an_agent_is_recorded_under_it() {
+            let state = test_state("subagent");
+            let root = state.paths.root.clone();
+            let start = |id: &str, parent: Option<&str>| {
+                launch_session(
+                    &state,
+                    id.into(),
+                    "terminal".into(),
+                    "/tmp".into(),
+                    id.into(),
+                    false,
+                    "/bin/cat".into(),
+                    vec![],
+                    vec![],
+                    1,
+                    80,
+                    24,
+                    parent.map(Into::into),
+                )
+                .unwrap()
+            };
+
+            let lead = start("muxloomd-terminal-lead", None);
+            // A person's session belongs to nobody.
+            assert_eq!(lead.snapshot().parent, None);
+
+            let child = start("muxloomd-terminal-child", Some("muxloomd-terminal-lead"));
+            assert_eq!(
+                child.snapshot().parent.as_deref(),
+                Some("muxloomd-terminal-lead")
+            );
+            // And it survives the daemon that recorded it: a tree that only
+            // existed in memory would come back flat after every restart.
+            let reloaded: DaemonSession = serde_json::from_str(
+                &fs::read_to_string(state.paths.sessions.join("muxloomd-terminal-child.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reloaded.parent.as_deref(), Some("muxloomd-terminal-lead"));
+
+            // A parent naming itself is not a tree, and is dropped rather than
+            // refused: the launch is fine, only the claim about it is not.
+            let loop_back = start("muxloomd-terminal-loop", Some("muxloomd-terminal-loop"));
+            assert_eq!(loop_back.snapshot().parent, None);
+
+            // The parent it names does not have to be a session this daemon
+            // holds — an agent on another machine is still the agent whose
+            // work this is.
+            let far = start("muxloomd-terminal-far", Some("muxloomd-claude-elsewhere"));
+            assert_eq!(
+                far.snapshot().parent.as_deref(),
+                Some("muxloomd-claude-elsewhere")
+            );
+
+            for session in [lead, child, loop_back, far] {
+                session.stop().ok();
+            }
+            fs::remove_dir_all(&root).ok();
+        }
+
+        #[test]
         fn send_input_types_into_the_pty_without_attaching_a_stream() {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
@@ -5563,6 +5638,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
             let before = session.snapshot();
@@ -5698,6 +5774,7 @@ mod platform {
                     created_at: 1,
                     columns: 80,
                     rows: 24,
+                    parent: None,
                 },
             )
             .unwrap()
@@ -5861,6 +5938,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -5892,6 +5970,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
             session.record_output("\x1b[2J\x1b[H• Working (2s • esc to interrupt)".as_bytes());
@@ -5945,6 +6024,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
 
@@ -6024,6 +6104,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
 
@@ -6101,6 +6182,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
 
@@ -6136,6 +6218,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
 
@@ -6185,6 +6268,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
             )
             .unwrap();
             assert_eq!(session.snapshot().path, scratch.to_string_lossy());
@@ -6267,6 +6351,7 @@ mod platform {
                     needs_attention: false,
                     attention_reason: None,
                     composer: None,
+                    parent: None,
                 },
             )
             .unwrap();
@@ -6319,6 +6404,7 @@ mod platform {
                 needs_attention: false,
                 attention_reason: None,
                 composer: None,
+                parent: None,
             }
         }
 
@@ -6474,6 +6560,7 @@ mod platform {
                 5,
                 80,
                 24,
+                None,
             )
             .unwrap();
             let child_pid = launched.snapshot().pid.expect("launched session has a pid");
@@ -6553,6 +6640,7 @@ mod platform {
                     created_at: 1,
                     columns: 80,
                     rows: 24,
+                    parent: None,
                 },
             )
             .unwrap()

@@ -138,6 +138,7 @@ fn launch(stream: &mut UnixStream, request_id: u64, session_id: &str, script: &s
             created_at: 1_700_000_000,
             columns: 80,
             rows: 24,
+            parent: None,
         },
     );
     match response {

@@ -750,6 +750,7 @@ impl BridgeConnection {
         args: Vec<String>,
         environment: Vec<(String, String)>,
         created_at: u64,
+        parent: Option<String>,
     ) -> Result<DaemonSession> {
         match self
             .request(DaemonRequest::Launch {
@@ -764,6 +765,7 @@ impl BridgeConnection {
                 created_at,
                 columns: 120,
                 rows: 40,
+                parent,
             })?
             .response
         {
@@ -2132,6 +2134,7 @@ impl BridgePool {
         args: Vec<String>,
         environment: Vec<(String, String)>,
         created_at: u64,
+        parent: Option<String>,
     ) -> Result<DaemonSession> {
         self.connection_for_target(target)?.launch(
             session_id,
@@ -2143,6 +2146,7 @@ impl BridgePool {
             args,
             environment,
             created_at,
+            parent,
         )
     }
 
