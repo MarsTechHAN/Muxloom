@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod daemon_protocol;
 pub mod debug;
 pub mod http;
+pub mod ilink;
 #[cfg(unix)]
 pub mod keeper;
 pub mod mcp;

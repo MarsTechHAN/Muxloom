@@ -240,6 +240,35 @@ pub fn get_json(
     json(send(response, url, |status| status < 500)?, url)
 }
 
+/// GET or POST a JSON document from an endpoint that holds the request open
+/// until it has something to say.
+///
+/// A long poll ending in silence is the ordinary case, not a failure, so the
+/// deadline running out answers `Ok(None)` and the caller simply asks again.
+/// One attempt only: retrying a request that was *meant* to take a while would
+/// turn a quiet minute into three of them.
+pub fn poll_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&serde_json::Value>,
+    seconds: u64,
+    environment: &[(String, String)],
+) -> Result<Option<serde_json::Value>> {
+    let request = match body {
+        Some(body) => headed(prepare(minreq::post(url), url, environment), headers)
+            .with_header("Content-Type", "application/json; charset=utf-8")
+            .with_body(serde_json::to_vec(body).context("failed to encode the request body")?),
+        None => headed(request(url, environment), headers),
+    };
+    match request.with_timeout(seconds).send() {
+        Ok(response) => json(response, url).map(Some),
+        Err(minreq::Error::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Ok(None)
+        }
+        Err(error) => Err(anyhow!(error).context(format!("request to {url} failed"))),
+    }
+}
+
 /// POST a JSON document and read the JSON answer.
 pub fn post_json(
     url: &str,
