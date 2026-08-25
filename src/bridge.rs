@@ -23,7 +23,7 @@ use crate::{
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
-    relay::{RELAY_CAPABILITY, RelayJob},
+    relay::{RELAY_CAPABILITY, RelayJob, RelayPeer},
     talk::{
         DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
         TalkPage, TalkState, TalkVector,
@@ -901,11 +901,17 @@ impl BridgeConnection {
     /// Take whatever work this machine's agents have left for a controller.
     /// A daemon too old to have a relay simply has no work: an agent there
     /// never had a way to ask for any.
-    pub fn relay_poll(&self) -> Result<Vec<RelayJob>> {
+    pub fn relay_poll(&self, peers: Vec<RelayPeer>, via: &str) -> Result<Vec<RelayJob>> {
         if !self.has_capability(RELAY_CAPABILITY) {
             return Ok(Vec::new());
         }
-        match self.request(DaemonRequest::RelayPoll)?.response {
+        match self
+            .request(DaemonRequest::RelayPoll {
+                peers,
+                via: via.to_string(),
+            })?
+            .response
+        {
             DaemonResponse::RelayWork { jobs } => Ok(jobs),
             response => bail!("unexpected relay response: {response:?}"),
         }
@@ -2257,8 +2263,13 @@ impl BridgePool {
         self.connection_for_target(target)?.talk_append(messages)
     }
 
-    pub fn relay_poll(&self, target: &Target) -> Result<Vec<RelayJob>> {
-        self.connection_for_target(target)?.relay_poll()
+    pub fn relay_poll(
+        &self,
+        target: &Target,
+        peers: Vec<RelayPeer>,
+        via: &str,
+    ) -> Result<Vec<RelayJob>> {
+        self.connection_for_target(target)?.relay_poll(peers, via)
     }
 
     pub fn relay_complete(

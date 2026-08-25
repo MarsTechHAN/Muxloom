@@ -167,11 +167,12 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              the `machine` argument; see list_machines)"
         }
         Flavor::Daemon => {
-            "on this machine, which a muxloom controller may be watching along with others. While \
-             it is attached you can also see what is on those machines and speak to the agents \
-             there — list_machines, list_sessions, search_conversations, read_conversation and \
-             message_agent take a `machine` argument, and the controller runs them for you. \
-             Everything else happens here"
+            "on this machine, which a muxloom controller may be watching along with others. \
+             list_machines shows the others as `remote`: while the controller is attached you can \
+             look at them and speak to the agents on them — every tool that reads, plus \
+             message_agent and the talk board, takes a `machine` argument and the controller runs \
+             it for you. Changing one of those machines is not yours to do; that is what the \
+             agents living there are for. Everything else happens here"
         }
     };
     // Which machines exist, and how to reach them, is only the controller's to
@@ -184,10 +185,10 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              when the human asked for that change.\n"
         }
         Flavor::Daemon => {
-            "- Another machine is only ever reached through the controller, and only for those \
-             few tools. If it is not attached you are told so immediately — that is the whole \
-             answer, not a reason to retry. To have something else done over there, ask an agent \
-             on that machine with message_agent.\n"
+            "- A remote machine is only ever reached through the controller, and only to look or \
+             to say something. If it is not attached you are told so immediately — that is the \
+             whole answer, not a reason to retry. Nothing that changes a machine travels: to have \
+             something done over there, ask an agent on that machine with message_agent.\n"
         }
     };
     let mut text = format!(
@@ -256,9 +257,19 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     let mut tools = Vec::new();
     tools.push(ToolSpec {
         name: "list_machines",
-        description: "List the machines muxloom manages: the local host and enabled SSH \
-                      aliases. Other tools address a machine by its id."
-            .into(),
+        description: match flavor {
+            Flavor::Controller => {
+                "List the machines muxloom manages: the local host and enabled SSH aliases. Other \
+                 tools address a machine by its id."
+            }
+            Flavor::Daemon => {
+                "List the machines you can reach: this one, and any a muxloom controller has said \
+                 it can carry for you. Those are marked `remote` with the `via` that carries \
+                 them — reaching one costs a round trip and only works while that controller is \
+                 running. Other tools address a machine by its id."
+            }
+        }
+        .into(),
         input_schema: schema(false, json!({}), &[]),
     });
     if multi {
@@ -1900,11 +1911,27 @@ impl ControllerControl {
         })
     }
 
+    /// The name a machine argument goes by here. This machine is `local` to
+    /// the controller, but every daemon already calls its own machine that, so
+    /// the fleet was told this one's hostname instead (see `relay::run_pump`).
+    /// A relayed call naming the hostname means here, not a machine that is
+    /// missing. An ssh alias of the same spelling wins: it is the more
+    /// deliberate answer, and it points at this host anyway.
+    fn spelled_here<'a>(&self, machine: &'a str) -> &'a str {
+        if !self.state.enabled_hosts.contains(machine)
+            && machine.eq_ignore_ascii_case(&crate::talk::hostname())
+        {
+            return crate::model::LOCAL_TARGET_ID;
+        }
+        machine
+    }
+
     /// The machine an argument set addresses. Only enabled machines are
     /// reachable: a disabled target must never be touched, not even by an
     /// agent that knows its name.
     fn target(&self, arguments: &Value) -> Result<Target> {
         let machine = optional_str(arguments, "machine").unwrap_or(crate::model::LOCAL_TARGET_ID);
+        let machine = self.spelled_here(machine);
         if !self.state.enabled_hosts.contains(machine) {
             bail!("machine {machine} is not enabled in muxloom");
         }
@@ -2380,7 +2407,8 @@ impl ControllerControl {
         asked
             .iter()
             .map(|machine| {
-                if !self.state.enabled_hosts.contains(machine.as_str()) {
+                let machine = self.spelled_here(machine);
+                if !self.state.enabled_hosts.contains(machine) {
                     bail!(
                         "machine {machine} is not enabled in muxloom; ask the user to enable it \
                          rather than working around it"
@@ -2873,13 +2901,17 @@ mod daemon_surface {
         }
 
         /// Whether these arguments name a machine other than this one, in
-        /// which case the call is the controller's to make. The board knows
-        /// both names this machine goes by: the key it mints messages under
-        /// and the label the controller calls it. Not knowing them is not
-        /// fatal — the errand comes back to this daemon and is answered here,
-        /// one hop later than it needed to be.
+        /// which case the call is the controller's to make. `local` is what
+        /// this surface calls the machine it runs on, so it never travels.
+        /// Past that the board knows both names this machine goes by: the key
+        /// it mints messages under and the label the controller calls it. Not
+        /// knowing them is not fatal — the errand comes back to this daemon
+        /// and is answered here, one hop later than it needed to be.
         fn elsewhere(&self, arguments: &Value) -> Option<String> {
             let machine = optional_str(arguments, "machine")?;
+            if machine == LOCAL_TARGET_ID {
+                return None;
+            }
             let here = match self.transact(&DaemonRequest::TalkStatus { label: None }) {
                 Ok((DaemonResponse::TalkBoard { state }, _)) => state,
                 _ => return Some(machine.into()),
@@ -2927,6 +2959,56 @@ mod daemon_surface {
                     );
                 }
             }
+        }
+
+        /// Which machines this agent can reach, and which way.
+        ///
+        /// A daemon has no idea another machine exists until a controller comes
+        /// round and names one, so this is a record of the last round rather
+        /// than a search. The machines that are not this one are marked as what
+        /// they are: reachable only because something else is carrying, and
+        /// only while it still is. An agent that reads `remote` knows the calls
+        /// it makes there cost a round trip through a controller, and that the
+        /// short list of tools it can make is not the machine being poor.
+        ///
+        /// A controller too old to say anything about the fleet leaves nothing
+        /// to answer from, and then the question goes to it, exactly as it
+        /// always did.
+        fn list_machines(&self) -> Result<String> {
+            let (peers, via, attached) = match self.transact(&DaemonRequest::RelayPeers)?.0 {
+                DaemonResponse::RelayReach {
+                    peers,
+                    via,
+                    attached,
+                } => (peers, via, attached),
+                response => bail!("unexpected relay response: {response:?}"),
+            };
+            if peers.is_empty() {
+                return self.relay("list_machines", &json!({}));
+            }
+            let via = if via.is_empty() {
+                "the muxloom controller".to_string()
+            } else {
+                via
+            };
+            let own = peers.iter().find(|peer| peer.own);
+            let mut machines = vec![json!({
+                "id": LOCAL_TARGET_ID,
+                "label": own.map_or("This machine", |peer| peer.label.as_str()),
+                "fleet_id": own.map(|peer| peer.id.clone()),
+                "remote": false,
+                "connected": true,
+            })];
+            for peer in peers.iter().filter(|peer| !peer.own) {
+                machines.push(json!({
+                    "id": peer.id,
+                    "label": peer.label,
+                    "remote": true,
+                    "via": via,
+                    "connected": attached,
+                }));
+            }
+            Ok(pretty(&Value::Array(machines)))
         }
 
         fn message_agent(&self, arguments: &Value) -> Result<String> {
@@ -3082,14 +3164,13 @@ mod daemon_surface {
             // What another machine holds is the controller's to answer. The
             // two that are only ever about other machines go straight out;
             // the rest go out only when they name one.
-            if matches!(
-                name,
-                "list_machines" | "search_conversations" | "read_conversation"
-            ) || (crate::relay::relayed(name) && self.elsewhere(arguments).is_some())
+            if matches!(name, "search_conversations" | "read_conversation")
+                || (crate::relay::relayed(name) && self.elsewhere(arguments).is_some())
             {
                 return self.relay(name, arguments);
             }
             match name {
+                "list_machines" => self.list_machines(),
                 "list_sessions" => {
                     let include_archived = optional_bool(arguments, "include_archived");
                     let sessions = self.sessions()?;
@@ -3647,12 +3728,15 @@ mod tests {
         assert!(text.contains("not enabled") || text.contains("has not enabled"));
         assert!(!text.contains("disabled these tools"));
         // The daemon surface reaches other machines only through the
-        // controller, and only for the errands it will run.
+        // controller, and only for the errands it will run. The list of those
+        // is too long to recite now, so the instructions state the rule
+        // instead: look and speak, but do not change.
         let daemon = instructions(Flavor::Daemon, &McpConfig::default());
         assert!(daemon.contains("`machine` argument"));
-        for tool in crate::relay::RELAYED_TOOLS {
-            assert!(daemon.contains(tool), "{tool} goes unmentioned");
-        }
+        assert!(daemon.contains("remote"));
+        assert!(daemon.contains("every tool that reads"));
+        assert!(daemon.contains("message_agent"));
+        assert!(daemon.contains("not yours to do"));
         assert!(daemon.contains("not a reason to retry"));
     }
 
@@ -3720,6 +3804,29 @@ mod tests {
         assert_eq!(
             control.targets(&json!({ "machine": "gpu" })).unwrap().len(),
             1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_call_coming_back_from_the_fleet_calls_this_machine_by_its_hostname() {
+        let (control, root) = controller_over_temp("hostname");
+        let host = crate::talk::hostname();
+
+        // The name every daemon was handed for this machine, because `local`
+        // out there means the machine the agent is already sitting on.
+        assert_eq!(
+            control
+                .target(&json!({ "machine": host.clone() }))
+                .unwrap()
+                .id,
+            "local"
+        );
+        // A name nobody handed out is still a machine that is not enabled.
+        assert!(
+            control
+                .target(&json!({ "machine": format!("{host}-elsewhere") }))
+                .is_err()
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4259,7 +4366,13 @@ mod tests {
             let controller = paths.clone();
             let (ready, attached) = std::sync::mpsc::channel();
             let round = thread::spawn(move || {
-                let first = ask(&controller, &DaemonRequest::RelayPoll);
+                let first = ask(
+                    &controller,
+                    &DaemonRequest::RelayPoll {
+                        peers: Vec::new(),
+                        via: String::new(),
+                    },
+                );
                 assert!(
                     matches!(&first, DaemonResponse::RelayWork { jobs } if jobs.is_empty()),
                     "{first:?}"
@@ -4267,9 +4380,13 @@ mod tests {
                 ready.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
-                    if let DaemonResponse::RelayWork { jobs } =
-                        ask(&controller, &DaemonRequest::RelayPoll)
-                        && let Some(job) = jobs.into_iter().next()
+                    if let DaemonResponse::RelayWork { jobs } = ask(
+                        &controller,
+                        &DaemonRequest::RelayPoll {
+                            peers: Vec::new(),
+                            via: String::new(),
+                        },
+                    ) && let Some(job) = jobs.into_iter().next()
                     {
                         assert_eq!(job.tool, "search_conversations");
                         let arguments: Value = serde_json::from_str(&job.arguments).unwrap();
@@ -4299,6 +4416,54 @@ mod tests {
             );
             assert_eq!(answer, "[]");
             round.join().unwrap();
+        }
+
+        #[test]
+        fn the_fleet_an_agent_sees_is_the_one_a_controller_came_round_and_named() {
+            let (mut surface, paths) = surface_and_paths("reach", Config::default());
+
+            // A controller comes round and says where it can reach, which is
+            // the only way this daemon ever learns another machine exists.
+            let poll = DaemonRequest::RelayPoll {
+                peers: vec![
+                    crate::relay::RelayPeer {
+                        id: "seed".into(),
+                        label: "seed".into(),
+                        own: true,
+                    },
+                    crate::relay::RelayPeer {
+                        id: "laptop".into(),
+                        label: "laptop".into(),
+                        own: false,
+                    },
+                ],
+                via: "laptop".into(),
+            };
+            assert!(matches!(
+                ask(&paths, &poll),
+                DaemonResponse::RelayWork { .. }
+            ));
+
+            let listed: Value =
+                serde_json::from_str(&call(&mut surface, "list_machines", json!({}))).unwrap();
+            let machines = listed.as_array().unwrap();
+            assert_eq!(machines.len(), 2);
+
+            // This machine answers as itself, under the id every tool here
+            // takes, and carries the name the fleet knows it by as well.
+            assert_eq!(machines[0]["id"], "local");
+            assert_eq!(machines[0]["remote"], false);
+            assert_eq!(machines[0]["fleet_id"], "seed");
+            assert_eq!(machines[0]["label"], "seed");
+
+            // Everywhere else is marked for what it is: borrowed reach, named
+            // with what is doing the carrying, and only while it is there. The
+            // controller's own machine is not `local` out here — that word is
+            // taken, by the machine the agent asking is sitting on.
+            assert_eq!(machines[1]["id"], "laptop");
+            assert_eq!(machines[1]["remote"], true);
+            assert_eq!(machines[1]["via"], "laptop");
+            assert_eq!(machines[1]["connected"], true);
         }
 
         #[test]

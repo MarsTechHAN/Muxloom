@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     model::{Composer, DirectoryListing, FileListing, FilePreview},
-    relay::{RelayAnswer, RelayJob},
+    relay::{RelayAnswer, RelayJob, RelayPeer},
     talk::{TalkDeliver, TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkState, TalkVector},
 };
 
@@ -356,9 +356,21 @@ pub enum DaemonRequest {
         tool: String,
         arguments: String,
     },
-    /// A controller asking what it can carry. Answering it is also how a
-    /// daemon learns a controller is there at all.
-    RelayPoll,
+    /// A controller asking what it can carry, and saying where it can reach
+    /// while it is here. Answering it is also how a daemon learns a controller
+    /// is there at all, and the peer list is the only way it ever learns that
+    /// another machine exists — it never looks for one itself.
+    ///
+    /// Both fields are additions: a daemon from before them reads this as the
+    /// bare ask it always was, and simply goes on knowing only itself.
+    RelayPoll {
+        #[serde(default)]
+        peers: Vec<RelayPeer>,
+        /// What the controller calls itself, for saying which way a machine is
+        /// reached.
+        #[serde(default)]
+        via: String,
+    },
     /// A controller handing back what a job produced.
     RelayComplete {
         id: String,
@@ -369,6 +381,9 @@ pub enum DaemonRequest {
     RelayResult {
         id: String,
     },
+    /// An agent on this machine asking which other machines it can reach, which
+    /// is whatever the last controller round named.
+    RelayPeers,
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -519,6 +534,16 @@ pub enum DaemonResponse {
     /// Answers `RelayResult`.
     Relayed {
         answer: RelayAnswer,
+    },
+    /// Answers `RelayPeers`: where the last controller round said it could
+    /// reach, what to call the way there, and whether it is still there.
+    RelayReach {
+        #[serde(default)]
+        peers: Vec<RelayPeer>,
+        #[serde(default)]
+        via: String,
+        #[serde(default)]
+        attached: bool,
     },
     Error {
         message: String,

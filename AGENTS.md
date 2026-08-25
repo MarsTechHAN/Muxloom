@@ -129,7 +129,18 @@ preserve.
   surface reaches other machines only by relaying through an attached
   controller, and only for the relay whitelist — never a shell, a machine
   enablement, or an SSH edit. With no controller attached those calls fail
-  immediately rather than waiting.
+  immediately rather than waiting. The line is look and speak, not change: a
+  tool that only reports, plus the ones that say something, may be relayed;
+  everything that alters the far machine belongs to the agents living there.
+  Nothing that waits is relayed either — a relayed job runs on the controller's
+  own round, and a tool that sits there holds up every other machine's errands.
+- A daemon learns the fleet only from a controller coming round to ask for
+  work, and never goes looking: no SSH from a daemon, no discovery. Two machines
+  with no route between them are neighbours for exactly as long as a controller
+  that sees both is running, and machines reached that way are marked `remote`
+  with the name of the way there. `local` is what a daemon calls the machine it
+  runs on, so a controller names its own machine to the fleet by its hostname
+  and reads that name back as itself.
 - The talk store is append-only per origin, idempotent by message id, and
   replicated by version vector. Only the controller drives a sync round, since
   it is the only side that can open a connection. Compaction raises the low

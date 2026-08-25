@@ -2181,13 +2181,27 @@ mod platform {
                     .submit(&tool, &arguments, crate::relay::now_ms())?;
                 write_response(writer, request_id, &DaemonResponse::RelayTicket { id })
             }
-            DaemonRequest::RelayPoll => {
+            DaemonRequest::RelayPoll { peers, via } => {
                 let jobs = state
                     .relay
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .poll(crate::relay::now_ms());
+                    .poll(crate::relay::now_ms(), peers, &via);
                 write_response(writer, request_id, &DaemonResponse::RelayWork { jobs })
+            }
+            DaemonRequest::RelayPeers => {
+                let relay = state
+                    .relay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (peers, via) = relay.peers();
+                let response = DaemonResponse::RelayReach {
+                    peers: peers.to_vec(),
+                    via: via.to_string(),
+                    attached: relay.attached(crate::relay::now_ms()),
+                };
+                drop(relay);
+                write_response(writer, request_id, &response)
             }
             DaemonRequest::RelayComplete { id, ok, output } => {
                 state
