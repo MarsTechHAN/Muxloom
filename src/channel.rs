@@ -527,11 +527,17 @@ impl Outgoing {
             text = remainder.trim_start();
         }
         let signature = self.signature.trim();
-        let mut body = clip(text, limit.saturating_sub(signature.len() + 2));
+        // The source goes at the very front, so whoever picks their phone up
+        // sees who is talking before anything it said. It is a line of its
+        // own, not part of the prose, and it stays even when the message is
+        // cut to fit.
+        let mut body = String::new();
         if !signature.is_empty() {
-            body.push_str("\n\n");
             body.push_str(signature);
+            body.push_str("\n\n");
         }
+        let body_limit = limit.saturating_sub(body.len());
+        body.push_str(&clip(text, body_limit));
         (title, body)
     }
 }
@@ -582,6 +588,30 @@ pub fn send(
         ChannelKind::Lark => send_lark(binding, message, environment),
         ChannelKind::WeChat => send_wechat(binding, message, environment),
     }
+}
+
+/// Send, then leave the human a sign that it arrived. Lark can hang a small
+/// reaction on the message itself; WeChat, which has nothing to hang anything
+/// on, gets one short message. The receipt never fails the send — a message
+/// that reached the chat is worth more than a receipt that did not — but the
+/// failure is not silent.
+pub fn send_with_receipt(
+    binding: &ChannelBinding,
+    message: &Outgoing,
+    environment: &[(String, String)],
+) -> Result<Sent> {
+    let sent = send(binding, message, environment)?;
+    let receipt = match binding.kind {
+        ChannelKind::Lark => ack_lark(binding, &sent.message_id, environment),
+        ChannelKind::WeChat => ack_wechat(binding, environment),
+    };
+    if let Err(error) = receipt {
+        crate::debug::log(
+            "channel",
+            format!("receipt through {} failed: {error:#}", binding.id),
+        );
+    }
+    Ok(sent)
 }
 
 /// Lark answers HTTP 200 with a non-zero `code` for everything it refuses, so
@@ -710,6 +740,58 @@ fn send_lark(
     })
 }
 
+/// A reaction a human reads as "the bot has this". Deliberately friendly: the
+/// point is to say the work landed, not to fill the chat with a formal sticker.
+const LARK_RECEIPT_EMOJI: &str = "FINGERHEART";
+
+/// Put a small reaction on a message already delivered, so whoever is watching
+/// the chat sees that it was received. Lark can mark a message without saying
+/// a word; this is that mark. Failing here is never worth the original message
+/// being read as undelivered, so a refusal is reported and the message stands.
+fn ack_lark(
+    binding: &ChannelBinding,
+    message_id: &str,
+    environment: &[(String, String)],
+) -> Result<()> {
+    if message_id.trim().is_empty() {
+        return Ok(());
+    }
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let answer = http::post_json(
+        &format!(
+            "{LARK_HOST}/open-apis/im/v1/messages/{}/reactions",
+            message_id.trim()
+        ),
+        &[("Authorization", authorization.as_str())],
+        &json!({
+            "reaction_type": { "emoji_type": LARK_RECEIPT_EMOJI },
+        }),
+        environment,
+    )?;
+    lark_ok(&answer, "a receipt reaction").context("Lark would not mark the message as received")
+}
+
+/// The text a WeChat bot sends to mean "this arrived", because WeChat has no
+/// reaction to hang on a message and no quoted reply to attach. Kept to one
+/// word so a batch of receipts does not bury the messages they acknowledge.
+const WECHAT_RECEIPT: &str = "☕️ 收到";
+
+/// Tell the person a WeChat message arrived. It is a separate short message —
+/// the smallest thing WeChat has — and it is sent directly on the wire rather
+/// than through the whole send path, so it cannot retrigger its own receipt.
+fn ack_wechat(binding: &ChannelBinding, environment: &[(String, String)]) -> Result<()> {
+    let account = wechat_account(binding);
+    let message_id = ilink::send_text(
+        &account,
+        binding.context_token.trim(),
+        WECHAT_RECEIPT,
+        environment,
+    )
+    .context("the message went out but the WeChat receipt did not")?;
+    let _ = message_id;
+    Ok(())
+}
+
 /// Where a Lark app is made, and the one page both of its strings are copied
 /// out of. Written down rather than described: somebody who has to find it by
 /// searching has already spent longer than the whole of the rest of this takes.
@@ -769,7 +851,7 @@ pub fn chats(app_id: &str, secret: &str, environment: &[(String, String)]) -> Re
     };
     let authorization = format!("Bearer {}", tenant_token(&asking, environment)?);
     let answer = http::get_json(
-        &format!("{LARK_HOST}/open-apis/im/v1/chats?page_size=100&sort_type=ByCreateTimeDesc"),
+        &format!("{LARK_HOST}/open-apis/im/v1/chats?page_size=100&sort_type=ByActiveTimeDesc"),
         &[("Authorization", authorization.as_str())],
         environment,
     )
@@ -2108,7 +2190,7 @@ mod tests {
         };
         let (title, body) = message.compose(LARK_LIMIT);
         assert_eq!(title, "构建完成");
-        assert_eq!(body, "42 tests passed.\n\n*— gpu-1 · claude*");
+        assert_eq!(body, "*— gpu-1 · claude*\n\n42 tests passed.");
 
         let named = Outgoing {
             title: "Nightly".into(),
@@ -2117,7 +2199,11 @@ mod tests {
         let (title, body) = named.compose(LARK_LIMIT);
         assert_eq!(title, "Nightly");
         assert!(
-            body.starts_with("# 构建完成"),
+            body.trim_start().starts_with("*— gpu-1 · claude*"),
+            "the source must stay on top: {body}"
+        );
+        assert!(
+            body.contains("# 构建完成"),
             "a heading the title did not take must stay in the text: {body}"
         );
 
@@ -2144,12 +2230,12 @@ mod tests {
         assert!(body.len() <= WECHAT_LIMIT, "{} bytes", body.len());
         assert!(body.contains("cut to fit"));
         assert!(
-            body.ends_with("*— gpu-1*"),
-            "the signature must survive the cut: {body}"
+            body.starts_with("*— gpu-1*"),
+            "the source must survive the cut: {body}"
         );
         // A cut that landed inside one of those three-byte characters would
         // have panicked on the way out of `clip`.
-        assert!(body.starts_with('あ'));
+        assert!(body.contains('あ'));
     }
 
     #[test]

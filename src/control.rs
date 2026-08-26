@@ -1295,20 +1295,49 @@ fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
     )
 }
 
-/// The line a channel message is signed with: the machine, and the session on
-/// it that is speaking.
+/// Who a channel message says it is from, as the human should read it: the
+/// assigned name when the session has one, and the folder it runs in when it
+/// does not — a session renamed is somebody, a session left at its defaults is
+/// where the work is. A machine label is added when there is one, so two
+/// machines talking into the same chat stay tellable apart.
 ///
 /// Read from the environment muxloom put the session in rather than asked for
 /// as an argument, for the same reason a parent session is: an agent naming
 /// itself could only get it wrong, and a person reading this on their phone has
 /// nothing else to tell one agent from another by. A process driving the
-/// surface from outside a session says only that it is muxloom, which is true.
+/// surface from outside a session says only that it is the default, which is
+/// true.
 fn speaker() -> String {
-    let mut parts = vec!["muxloom".to_string()];
-    parts.extend(session_env("MUXLOOM_MACHINE_LABEL").or_else(|| session_env("MUXLOOM_MACHINE")));
+    let name = session_env("MUXLOOM_SESSION_LABEL")
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| {
+            session_env("MUXLOOM_SESSION_PATH")
+                .filter(|path| !path.trim().is_empty())
+                .as_deref()
+                .and_then(folder_name)
+        })
+        .unwrap_or_else(|| session_env("MUXLOOM_SESSION_ID").unwrap_or_default());
+    let mut parts = vec![name];
+    if let Some(machine) = session_env("MUXLOOM_MACHINE_LABEL")
+        .or_else(|| session_env("MUXLOOM_MACHINE"))
+        .filter(|machine| !machine.trim().is_empty())
+    {
+        parts.push(machine);
+    }
     parts
-        .extend(session_env("MUXLOOM_SESSION_LABEL").or_else(|| session_env("MUXLOOM_SESSION_ID")));
-    format!("*— {}*", parts.join(" · "))
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The last path component of a working directory, the name a session falls
+/// back on when nobody has given it one.
+fn folder_name(path: &str) -> Option<String> {
+    std::path::Path::new(path.trim_end_matches(['/', '\\']))
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty() && name != "/")
 }
 
 /// Post one channel message and report what became of it.
@@ -1328,7 +1357,7 @@ fn send_channel(
         text: required_str(arguments, "text")?.into(),
         signature: speaker(),
     };
-    let sent = crate::channel::send(binding, &message, environment)?;
+    let sent = crate::channel::send_with_receipt(binding, &message, environment)?;
     // A receipt is what turns the human's reply into an answer: without one it
     // lands on the board, which is not wrong but is not this conversation. It
     // needs a session to name, so a call from outside a session leaves none.
