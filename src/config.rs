@@ -161,7 +161,12 @@ impl Default for AgentCommands {
                 command: "claude".into(),
                 args: Vec::new(),
                 install: String::new(),
-                sync_files: vec!["~/.claude/settings.json".into()],
+                // Claude keeps its user settings (permissions, hooks) in
+                // settings.json and its per-user MCP servers in `claude.json`
+                // (the agent-wide `mcpServers`). Both travel, so a fresh
+                // install on a target starts with the same model preferences
+                // and the same fleet wiring as this machine.
+                sync_files: vec!["~/.claude/settings.json".into(), "~/.claude.json".into()],
             },
             // Every agent here is installed from its published release, which
             // muxloom resolves and hands the machine itself. These two keep an
@@ -185,7 +190,15 @@ impl Default for AgentCommands {
                 command: "pi".into(),
                 args: Vec::new(),
                 install: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent".into(),
-                sync_files: vec!["~/.pi/agent/auth.json".into()],
+                // Pi's connectivity is its auth and its model/provider
+                // preferences; the muxloom bridge extension that drives the
+                // fleet is written by `muxloomd register` on the target and is
+                // not copied from here, so it points at that machine's own
+                // muxloomd.
+                sync_files: vec![
+                    "~/.pi/agent/auth.json".into(),
+                    "~/.pi/agent/settings.json".into(),
+                ],
             },
             terminal: CommandConfig::default(),
         }
@@ -597,7 +610,7 @@ sync_files = ["~/.codex/config.toml", "~/.codex/auth.json"]
 command = "claude"
 args = []
 install = ""
-sync_files = ["~/.claude/settings.json"]
+sync_files = ["~/.claude/settings.json", "~/.claude.json"]
 
 # Every agent is installed from its published release, which muxloom resolves
 # and hands the machine itself. `install` is the shell command the settings
@@ -613,7 +626,7 @@ sync_files = ["~/.config/opencode/opencode.json", "~/.local/share/opencode/auth.
 command = "pi"
 args = []
 install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
-sync_files = ["~/.pi/agent/auth.json"]
+sync_files = ["~/.pi/agent/auth.json", "~/.pi/agent/settings.json"]
 
 # Empty command means the user's SHELL (or /bin/sh).
 [agents.terminal]

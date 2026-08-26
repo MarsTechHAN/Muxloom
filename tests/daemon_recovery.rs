@@ -361,3 +361,52 @@ fn a_session_whose_keeper_died_is_recovered_into_the_archive() {
         "muxloomd must stop when it is asked to"
     );
 }
+
+/// `muxloomd register` writes the machine's control surface into the agents it
+/// runs as, without needing a serve daemon. A controller uses exactly this to
+/// wire a target whose own muxloomd is only ever a bridge: it re-points the
+/// agents' muxloom entries at the muxloomd that actually runs there, and lays
+/// down the same skill files and Pi extension a serve daemon would.
+#[test]
+fn register_writes_the_control_surface_into_agents() {
+    let state = TestState::new();
+    let home = state.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_muxloomd"))
+        .env("MUXLOOMD_STATE_DIR", &state.root)
+        .env("HOME", &home)
+        // Explicit opt-in: a scratch state directory is not the machine's, so
+        // without this the daemon would keep out of the way by design.
+        .env("MUXLOOM_MCP_REGISTER", "1")
+        .arg("register")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Every agent that speaks MCP points at this machine's muxloomd.
+    let claude: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude["mcpServers"]["muxloom"]["args"][0].as_str(),
+        Some("mcp")
+    );
+    let opencode: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(opencode["mcp"]["muxloom"]["type"], "local");
+
+    // The skill reaches every agent that loads it, and Pi also gets the bridge
+    // extension since it has no MCP of its own.
+    assert!(home.join(".claude/skills/muxloom/SKILL.md").is_file());
+    assert!(home.join(".codex/skills/muxloom/SKILL.md").is_file());
+    assert!(home.join(".pi/agent/skills/muxloom/SKILL.md").is_file());
+    assert!(home.join(".pi/agent/extensions/muxloom/index.ts").is_file());
+
+    let _ = fs::remove_dir_all(&state.root);
+}

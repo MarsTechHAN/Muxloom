@@ -846,6 +846,28 @@ impl Runtime {
         } else {
             0
         };
+        // A target whose own muxloomd runs as a bridge never registers its
+        // agents for itself; the daemon only does that when it starts serving.
+        // The configuration just copied over came from this machine and, if it
+        // was ever registered here, carries muxloom entries that point back at
+        // us. Re-point that target's agents at the muxloomd that actually lives
+        // there, and give them the same skill and Pi extension a serve daemon
+        // would — its home directory is where its agents run, so this is what
+        // "copy the necessary configuration over" means in full.
+        if matches!(target.transport, Transport::Ssh { .. }) {
+            progress(TaskProgress::pending(format!(
+                "Wiring {kind} into the fleet"
+            )));
+            if let Err(error) = self.register_target_agents(target) {
+                debug::log(
+                    "install",
+                    format!(
+                        "agent registration failed target={} kind={kind}: {error:#}; the CLI is installed but not wired into muxloom",
+                        target.id
+                    ),
+                );
+            }
+        }
         let verify = login_shell_command(&format!(
             "{exports} command -v {} >/dev/null 2>&1",
             shell_quote(&command.command)
@@ -1396,6 +1418,27 @@ impl Runtime {
             synced += 1;
         }
         Ok(synced)
+    }
+
+    /// Run `muxloomd register` on the target, wiring every agent's own control
+    /// surface there to the muxloomd that actually runs on it. Idempotent, and
+    /// safe to run even where the target's muxloomd is older and has no
+    /// `register` subcommand: finding nothing to run is reported but is not a
+    /// failure, so the install that asked for it still completes.
+    fn register_target_agents(&self, target: &Target) -> Result<()> {
+        let Transport::Ssh { .. } = &target.transport else {
+            return Ok(());
+        };
+        let script = r#"found=xroot="${{XDG_DATA_HOME:-$HOME/.local/share}}/muxloom/bin/muxloomd"
+if command -v muxloomd >/dev/null 2>&1; then found="$(command -v muxloomd)";
+elif [ -x "$xroot" ]; then found="$xroot";
+elif [ -x "$HOME/.local/bin/muxloomd" ]; then found="$HOME/.local/bin/muxloomd";
+fi
+if [ -z "$found" ]; then exit 69; fi
+"$found" register"#
+            .to_string();
+        let output = self.run_shell(target, &login_shell_command(&script), false)?;
+        ensure_success(&output, "register target agents")
     }
 
     pub fn remote_home(&self, target: &Target) -> Result<String> {

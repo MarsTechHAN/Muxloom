@@ -89,6 +89,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some("register") => register_this_machine(&paths),
         Some("--version" | "-V" | "version") => {
             println!("muxloomd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -113,11 +114,29 @@ fn run() -> Result<()> {
         }
         Some("--help" | "-h" | "help") | None => {
             println!(
-                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd mcp\n    muxloomd status\n    muxloomd stop            stop the running daemon; sessions keep running\n    muxloomd protocol-version\n    muxloomd binary-sha256",
+                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd mcp\n    muxloomd register        write this machine's control surface into its agents\n    muxloomd status\n    muxloomd stop            stop the running daemon; sessions keep running\n    muxloomd protocol-version\n    muxloomd binary-sha256",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
         }
         Some(command) => bail!("unknown command {command:?}"),
     }
+}
+
+/// Write this machine's control surface into every agent on it — the same
+/// step the daemon takes when it starts serving. Running it again is safe:
+/// entries that already point here are left alone, and a config that does not
+/// parse is left untouched.
+///
+/// A controller uses this after provisioning a runtime on a target whose own
+/// muxloomd is running as a `bridge` (never `serve`), because a bridge never
+/// registers its agents for itself. This stand-alone path gives the target the
+/// same fleet wiring its own daemon would have, pointing at the muxloomd that
+/// is actually on that machine.
+fn register_this_machine(paths: &DaemonPaths) -> Result<()> {
+    let written = muxloom::mcp_register::register_for_this_daemon(paths.is_the_machines_own())?;
+    for path in written {
+        println!("wrote {}", path.display());
+    }
+    Ok(())
 }
