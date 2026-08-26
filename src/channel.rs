@@ -1001,6 +1001,17 @@ impl Correspondent {
         format!("{called} · {}", self.machine)
     }
 
+    /// The same session without the machine qualifier — for a list that is
+    /// already grouped under a machine, where repeating the machine on every
+    /// row is noise.
+    fn name_without_machine(&self) -> String {
+        if self.label.trim().is_empty() {
+            self.session_id.as_str().to_string()
+        } else {
+            self.label.trim().to_string()
+        }
+    }
+
     /// Whether a `/select` word picks this session out.
     fn answers_to(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
@@ -1159,6 +1170,9 @@ pub enum Route {
     Agent(Correspondent),
     /// Point this chat at whoever matches these words, from here on.
     Aim(String),
+    /// List the machines, or (with a machine number) the agents on one of
+    /// them. `arg` carries the part after `/list`.
+    List(String),
     /// Say what there is to talk to.
     Who,
     /// Stop pointing anywhere; plain messages go back to the board.
@@ -1200,6 +1214,7 @@ pub fn route(
     // word `/who` to an agent.
     match word.to_lowercase().as_str() {
         "/select" | "/s" => return (Route::Aim(rest.clone()), rest),
+        "/list" | "/l" => return (Route::List(rest.clone()), rest),
         "/who" | "/help" => return (Route::Who, rest),
         "/clear" => return (Route::Clear, rest),
         "/all" => return (Route::Board { asked: true }, rest),
@@ -1760,6 +1775,45 @@ impl<'a> Desk<'a> {
         self.machines.iter().find(|it| it.id == machine)
     }
 
+    /// Machines in the stable order `/list` numbers by. Sorted by id so any
+    /// node computing it reaches the same numbering: whatever the local
+    /// session-dialler happens to have listed first does not leak into what a
+    /// human is asked to type. `local` sorts by its own id like everything
+    /// else.
+    fn machines_ordered(&self) -> Vec<Target> {
+        let mut machines = self.machines.clone();
+        machines.sort_by(|a, b| a.id.cmp(&b.id));
+        machines
+    }
+
+    /// The agents (non-temporary sessions) on one machine, in a stable order.
+    /// Numbering within a machine is 1-based over this order, so a numbering
+    /// already printed is re-entered unchanged.
+    fn agents_on(&mut self, machine: &str) -> Vec<Correspondent> {
+        self.sessions()
+            .iter()
+            .filter(|it| it.machine == machine)
+            .cloned()
+            .collect()
+    }
+
+    /// Resolve a `/select <machine>-<agent>` pair of 1-based numbers to the
+    /// agent they name, from the same orderings `/list` printed.
+    fn resolve_numbered(&mut self, machine_no: usize, agent_no: usize) -> Option<Correspondent> {
+        let machines = self.machines_ordered();
+        let target = machines.get(machine_no.checked_sub(1)?)?.clone();
+        let agents = self.agents_on(&target.id);
+        agents.get(agent_no.checked_sub(1)?).cloned()
+    }
+
+    /// Parse a `/select machine-agent` string of two numbers and resolve it.
+    fn resolve_numbered_from(&mut self, words: &str) -> Option<Correspondent> {
+        let (machine, agent) = words.trim().split_once('-')?;
+        let machine: usize = machine.trim().parse().ok()?;
+        let agent: usize = agent.trim().parse().ok()?;
+        self.resolve_numbered(machine, agent)
+    }
+
     /// A human speaking, as the board records them. Asked of the local board
     /// once, because what this machine is called is not something a chat knows.
     fn author(&mut self, called: &str) -> crate::talk::TalkAuthor {
@@ -1834,6 +1888,59 @@ fn handle(
             });
             lines.join("\n")
         }
+        Route::List(arg) if arg.trim().is_empty() => {
+            // Numbered over the stable ordering, so the same list reads the
+            // same wherever it is printed and a number a human re-types names
+            // the same machine on any node.
+            let machines = desk.machines_ordered();
+            if machines.is_empty() {
+                "· no machines to list".into()
+            } else {
+                let mut lines: Vec<String> = machines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, m)| format!("{}  {}", index + 1, m.label_or_id()))
+                    .collect();
+                lines.push(String::new());
+                lines.push("`/list <number>` shows one machine's agents · `/select <machine>-<agent>` aims this chat".into());
+                lines.join("\n")
+            }
+        }
+        Route::List(arg) => {
+            // A machine number lists the agents on it, in a stable order.
+            match arg.trim().parse::<usize>() {
+                Ok(number) => {
+                    let machines = desk.machines_ordered();
+                    match machines.get(number.checked_sub(1).unwrap_or(usize::MAX)) {
+                        Some(m) => {
+                            let agents = desk.agents_on(&m.id);
+                            if agents.is_empty() {
+                                format!("· {} has nobody running", m.label_or_id())
+                            } else {
+                                let mut lines: Vec<String> = agents
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, who)| {
+                                        format!("{}  {}", index + 1, who.name_without_machine())
+                                    })
+                                    .collect();
+                                lines.push(String::new());
+                                lines.push(format!(
+                                    "`/select {}-<agent>` aims this chat",
+                                    number
+                                ));
+                                lines.join("\n")
+                            }
+                        }
+                        None => format!("· no machine numbered `{arg}` — `/list` shows them"),
+                    }
+                }
+                Err(_) => format!(
+                    "· `/list` takes a machine number from `/list` — `{}` is not one",
+                    arg.trim()
+                ),
+            }
+        }
         Route::Clear => match inbox.aimed.remove(&binding.id) {
             Some(who) => format!("· no longer aimed at {}", who.name()),
             None => "· nothing was aimed".into(),
@@ -1846,6 +1953,16 @@ fn handle(
             "· `/select` needs a name — `/who` lists them".into()
         }
         Route::Aim(words) => {
+            // A numbered `machine-agent` pair, as `/list` printed it, aims at
+            // one agent without needing to match names. Numbers are settled
+            // before names so a session whose id looks like two numbers still
+            // yields to what the human was just shown.
+            if let Some(only) = desk.resolve_numbered_from(&words) {
+                let name = only.name();
+                desk.last_agent = Some(only.clone());
+                inbox.aimed.insert(binding.id.clone(), only.clone());
+                return format!("· aimed at {name}");
+            }
             let found: Vec<Correspondent> = desk
                 .sessions()
                 .iter()

@@ -211,6 +211,17 @@ impl Target {
             transport: Transport::Ssh { alias },
         }
     }
+
+    /// A human-facing name for a machine list: the label if it says something
+    /// other than the id, otherwise the id itself.
+    pub fn label_or_id(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() || label == self.id {
+            self.id.as_str()
+        } else {
+            label
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

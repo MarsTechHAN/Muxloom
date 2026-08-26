@@ -3896,7 +3896,9 @@ mod tests {
             .find(|tool| tool.name == "talk_post")
             .expect("the board is always offered");
         assert!(
-            board.description.contains("never reaches a person's chat app"),
+            board
+                .description
+                .contains("never reaches a person's chat app"),
             "{}",
             board.description
         );
