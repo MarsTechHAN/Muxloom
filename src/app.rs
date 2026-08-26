@@ -2308,6 +2308,16 @@ impl App {
         {
             return Action::Continue;
         }
+        // The other half of that pair, and it has to be caught here rather
+        // than left to the emulator. muxloom asks for the enhanced keyboard
+        // protocol, and a terminal that grants it stops swallowing Cmd+V and
+        // reports it as a key instead — so the paste that used to arrive as
+        // committed text arrives as a plain "v", and a field that looks like
+        // it refuses the clipboard is really a field being typed into.
+        if is_paste_shortcut(key) {
+            self.clipboard_paste = true;
+            return Action::Continue;
+        }
         if let Some(modal) = self.modal.take() {
             return self.handle_modal(key, modal);
         }
@@ -2841,6 +2851,12 @@ impl App {
                     self.click_modal(column, row);
                 }
             }
+            // The same clipboard button it is over the terminal, minus the
+            // copy half: a modal has no selection to take, so the one thing
+            // the button can mean here is paste. Without this a right-click
+            // over a text field does nothing at all, which reads as the field
+            // being broken rather than as the button being unbound.
+            MouseEventKind::Down(MouseButton::Right) => self.clipboard_paste = true,
             MouseEventKind::ScrollUp => self.scroll_modal(true),
             MouseEventKind::ScrollDown => self.scroll_modal(false),
             _ => {}
@@ -3495,6 +3511,28 @@ impl App {
                     port_forward_value(form).push_str(&text);
                     form.error = None;
                 }
+                // An app secret is sixty-four characters of noise that exists
+                // in exactly one place: the page it was generated on. Nobody
+                // reads one off a screen and types it, so a credentials step
+                // that cannot be pasted into is a credentials step nobody can
+                // get past.
+                Modal::Channels(form) => match form.step.as_mut() {
+                    Some(ChannelStep::Keys(keys)) => {
+                        keys.typed().push_str(&text);
+                        // Same reasoning as typing a character: what is on
+                        // screen is no longer what was borrowed from the old
+                        // cc-connect configuration.
+                        keys.borrowed = None;
+                        form.error = None;
+                    }
+                    Some(ChannelStep::Rename { label, .. }) => {
+                        label.push_str(&text);
+                        form.error = None;
+                    }
+                    _ => {
+                        self.status_message = "Select a text field before pasting".into();
+                    }
+                },
                 _ => {
                     self.status_message = "Select a text field before pasting".into();
                 }
@@ -11524,6 +11562,18 @@ fn is_copy_shortcut(key: KeyEvent) -> bool {
                 && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// Cmd+V, or Ctrl+Shift+V where there is no Cmd.
+///
+/// Deliberately not bare Ctrl+V: that is a key a terminal application is
+/// entitled to — readline reads the next keystroke literally with it — and
+/// muxloom is drawn over the top of real terminals.
+fn is_paste_shortcut(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('v')
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 fn mark_search_edited(form: &mut SearchForm) {
     form.submitted_query.clear();
     form.results.clear();
@@ -14998,6 +15048,55 @@ mod tests {
         }
         assert!(form.set.bindings.is_empty(), "nothing was bound");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_app_secret_can_be_pasted_because_nobody_is_going_to_type_one() {
+        let (mut app, _requests, path) = channels_app("paste", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Committed text, which is what a terminal that handles the paste
+        // itself sends.
+        app.handle_paste("cli_a9f2\n".into());
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        // Cmd+V, which is what a terminal that granted the enhanced keyboard
+        // protocol sends instead — as a key, so the panel has to ask for the
+        // clipboard rather than wait for text that is never coming.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER));
+        assert!(
+            app.take_clipboard_paste_request(),
+            "Cmd+V asks for the clipboard"
+        );
+        app.deliver_clipboard_paste(Some("s".repeat(64)));
+
+        match channel_step(&app) {
+            ChannelStep::Keys(keys) => {
+                assert_eq!(keys.app_id, "cli_a9f2", "the newline is not part of it");
+                assert_eq!(
+                    keys.secret,
+                    "s".repeat(64),
+                    "and not a lone 'v', which is what typing the shortcut used to leave"
+                );
+            }
+            other => panic!("still on the credentials: {other:?}"),
+        }
+
+        // Right-click means the same thing here as it does over the terminal.
+        // There is no selection in a modal, so it can only mean paste.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.take_clipboard_paste_request(),
+            "right-click asks for it too"
+        );
+        drop(path);
     }
 
     #[test]
