@@ -392,10 +392,16 @@ pub struct ChannelChats {
     /// Only ever shown when the app turns out to be in no chats at all. That is
     /// the one dead end this step has — there is nothing to choose and nothing
     /// to type, because a chat id is not a thing Lark lets anybody copy — and
-    /// the way out of it is on a phone: open the bot, add it to a group, ask
-    /// again.
+    /// the way out of it is on a phone: open the bot, add it to a group.
     pub link: String,
     pub code: Option<crate::qr::Code>,
+    /// Whether an ask is out and its answer still to come. Only ever one at a
+    /// time: the watch asks again after an answer, not on a timer of its own,
+    /// so a slow reply cannot pile requests up behind it.
+    pub asking: bool,
+    /// When the last answer landed, which is what paces the watch and what the
+    /// screen counts from. `None` until the first one does.
+    pub checked: Option<Instant>,
 }
 
 /// The communication panel: what this fleet can reach a human through.
@@ -758,6 +764,12 @@ const TALK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a chat app is asked what the human said. Long enough not to be a
 /// nuisance to the platform, short enough that an answer feels like an answer.
 const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a Lark app with no chats is asked again whether it has one yet.
+///
+/// Faster than the inbox, because somebody is standing there with a phone
+/// watching for the screen to change, and only ever while that screen is open —
+/// the watch stops the moment the panel moves on.
+const CHAT_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 /// How long one phase of a forced daemon update may take before the
 /// orchestration gives up and says so. Generous: the cycle can carry a
 /// companion upload over a slow link, and the escalation waits out a
@@ -2280,6 +2292,7 @@ impl App {
         self.maybe_submit_file_search();
         self.maybe_monitor_open_file();
         self.maybe_search_resume_history();
+        self.maybe_watch_for_a_chat();
         if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
             self.refresh_daemon_activity();
         }
@@ -8012,8 +8025,95 @@ impl App {
                 selected: 0,
                 link,
                 code,
+                asking: true,
+                checked: None,
             })));
         }
+        self.modal = Some(Modal::Channels(form));
+    }
+
+    /// Ask Lark again, quietly, while somebody is off adding the bot to a group.
+    ///
+    /// Quietly is the whole point: the screen it runs behind is a QR code and a
+    /// sentence, and neither should flicker because a request went out. So this
+    /// leaves `found` alone — the empty list stays empty, and the code stays on
+    /// screen — and only the answer changes anything.
+    ///
+    /// It runs only while that screen is open, and only while the answer is
+    /// still an empty list. Bind a chat, walk back to the credentials, close the
+    /// panel: all three stop it, because all three change what `step` is.
+    fn maybe_watch_for_a_chat(&mut self) {
+        let Some(Modal::Channels(form)) = self.modal.as_ref() else {
+            return;
+        };
+        let Some(ChannelStep::Chats(chats)) = form.step.as_ref() else {
+            return;
+        };
+        // `Some([])` and nothing else. `None` is the first ask still in flight,
+        // and a list with anything in it is a chooser somebody is reading.
+        if chats.asking || !chats.found.as_deref().is_some_and(<[_]>::is_empty) {
+            return;
+        }
+        if chats
+            .checked
+            .is_some_and(|at| at.elapsed() < CHAT_WATCH_INTERVAL)
+        {
+            return;
+        }
+        let keys = chats.keys.clone();
+        let environment = self
+            .config
+            .environment_for(LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        self.channel_attempt = self.channel_attempt.saturating_add(1);
+        let attempt = self.channel_attempt;
+        let sent = self
+            .worker
+            .requests
+            .send(Request::ChannelChats {
+                attempt,
+                app_id: keys.app_id.trim().to_string(),
+                secret: keys.secret.trim().to_string(),
+                environment,
+            })
+            .is_ok();
+        let Some(Modal::Channels(form)) = self.modal.as_mut() else {
+            return;
+        };
+        let Some(ChannelStep::Chats(chats)) = form.step.as_mut() else {
+            return;
+        };
+        if sent {
+            chats.attempt = attempt;
+            chats.asking = true;
+        } else {
+            // The worker is gone, so nothing is ever coming back. Say so once
+            // and stop, rather than spin asking a channel nobody is reading.
+            form.error = Some("The worker is gone; press r once it is back".into());
+            chats.checked = Some(Instant::now());
+        }
+    }
+
+    /// Turn a chosen chat into a binding. The one place a Lark binding is made,
+    /// whether a person picked the chat or the watch found it for them.
+    fn bind_lark_chat(
+        &mut self,
+        mut form: ChannelsForm,
+        keys: &ChannelKeys,
+        chat: &crate::channel::Chat,
+    ) {
+        let binding = crate::channel::ChannelBinding {
+            id: form.set.mint_id(ChannelKind::Lark),
+            kind: ChannelKind::Lark,
+            label: "Lark".into(),
+            app_id: keys.app_id.trim().to_string(),
+            secret: keys.secret.trim().to_string(),
+            route: chat.id.clone(),
+            route_label: chat.name.clone(),
+            preferred: form.set.bindings.is_empty(),
+            ..Default::default()
+        };
+        self.adopt_binding(&mut form, binding);
         self.modal = Some(Modal::Channels(form));
     }
 
@@ -8051,23 +8151,12 @@ impl App {
                 .and_then(|found| found.get(chats.selected))
             {
                 Some(chat) => {
-                    let binding = crate::channel::ChannelBinding {
-                        id: form.set.mint_id(ChannelKind::Lark),
-                        kind: ChannelKind::Lark,
-                        label: "Lark".into(),
-                        app_id: chats.keys.app_id.trim().to_string(),
-                        secret: chats.keys.secret.trim().to_string(),
-                        route: chat.id.clone(),
-                        route_label: chat.name.clone(),
-                        preferred: form.set.bindings.is_empty(),
-                        ..Default::default()
-                    };
-                    self.adopt_binding(&mut form, binding);
-                    self.modal = Some(Modal::Channels(form));
+                    let (keys, chat) = (chats.keys.clone(), chat.clone());
+                    self.bind_lark_chat(form, &keys, &chat);
                 }
                 None => {
                     form.error = Some(match chats.found.is_some() {
-                        true => "No chat to pick — add the bot to one, then press r".into(),
+                        true => "No chat to pick — add the bot to one and it binds itself".into(),
                         false => "Still asking Lark…".to_string(),
                     });
                     form.step = Some(ChannelStep::Chats(Box::new(chats)));
@@ -8097,6 +8186,9 @@ impl App {
         if chats.attempt != attempt {
             return;
         }
+        chats.asking = false;
+        chats.checked = Some(Instant::now());
+        let mut arrived = None;
         match result {
             Ok(found) => {
                 // An old cc-connect configuration named a chat; if it is one of
@@ -8106,14 +8198,27 @@ impl App {
                     .iter()
                     .position(|chat| chat.id == chats.keys.route.trim())
                     .unwrap_or_default();
+                let was_empty = chats.found.as_deref().is_some_and(<[_]>::is_empty);
                 if found.is_empty() {
                     // Short enough to survive a narrow panel, because on one
                     // too small to draw the code this line is the whole of the
                     // instructions.
                     form.note = Some(
-                        "Not in any chat yet — scan to open its bot, add it to a group, press r."
+                        "Not in any chat yet — scan to open its bot, then add it to a group."
                             .into(),
                     );
+                } else if was_empty && let [only] = found.as_slice() {
+                    // The watch was running, and what it was watching for has
+                    // happened: a bot that was in nothing is now in one chat.
+                    // There is nothing left to ask — the chat somebody just put
+                    // it in is the chat they meant, and making them come back
+                    // to the keyboard to say so twice is the flow this was
+                    // supposed to replace.
+                    //
+                    // Only for one. Two at once is somebody with a plan, and a
+                    // guess between them would be a coin toss with a binding
+                    // riding on it, so that still opens the chooser.
+                    arrived = Some((chats.keys.clone(), only.clone()));
                 }
                 chats.found = Some(found);
             }
@@ -8124,6 +8229,11 @@ impl App {
                 // always one of them, and the cursor should be where the fix is.
                 form.step = Some(ChannelStep::Keys(keys));
             }
+        }
+        if let Some((keys, chat)) = arrived
+            && let Some(Modal::Channels(form)) = self.modal.take()
+        {
+            self.bind_lark_chat(form, &keys, &chat);
         }
     }
 
@@ -15135,7 +15245,8 @@ mod tests {
             }
             other => panic!("still on the chooser: {other:?}"),
         }
-        // Enter on nothing binds nothing, and says what to do instead.
+        // Enter on nothing binds nothing, and says what to do instead — which
+        // is not a keystroke.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(channels_form(&app).set.bindings.is_empty());
         assert!(
@@ -15143,7 +15254,7 @@ mod tests {
                 .error
                 .clone()
                 .unwrap_or_default()
-                .contains("press r")
+                .contains("binds itself")
         );
         // And r asks again without making anybody retype the credentials.
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -15173,6 +15284,164 @@ mod tests {
             ChannelStep::Chats(chats) => assert!(chats.found.is_none(), "still waiting"),
             other => panic!("still choosing: {other:?}"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every ask about an app's chats the panel has queued, and nothing else:
+    /// a tick sends housekeeping of its own, and the watch is the only part of
+    /// it this is about.
+    fn asks_about_chats(requests: &std::sync::mpsc::Receiver<Request>) -> Vec<u64> {
+        let mut seen = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            if let Request::ChannelChats { attempt, .. } = request {
+                seen.push(attempt);
+            }
+        }
+        seen
+    }
+
+    /// Age the last answer so the next tick is due, without sleeping for it.
+    fn age_the_last_check(app: &mut App) {
+        match app.modal.as_mut() {
+            Some(Modal::Channels(form)) => match form.step.as_mut() {
+                Some(ChannelStep::Chats(chats)) => {
+                    chats.checked = Some(Instant::now() - CHAT_WATCH_INTERVAL);
+                }
+                other => panic!("not on the chooser: {other:?}"),
+            },
+            other => panic!("the panel closed: {other:?}"),
+        }
+    }
+
+    /// Walk the Lark flow as far as "that app is in no chats", which is where
+    /// the watch takes over.
+    fn app_with_no_chats_yet() -> (App, std::sync::mpsc::Receiver<Request>, PathBuf, u64) {
+        let (mut app, requests, path) = channels_app("watch", Vec::new());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into(&mut app, "cli_9");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_into(&mut app, "shhh");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let attempt = match asks_about_chats(&requests).as_slice() {
+            [only] => *only,
+            other => panic!("Lark should have been asked once: {other:?}"),
+        };
+        app.handle_worker_event(Event::ChannelChats {
+            attempt,
+            result: Ok(Vec::new()),
+        });
+        (app, requests, path, attempt)
+    }
+
+    #[test]
+    fn a_bot_added_to_a_group_binds_itself_without_anybody_pressing_anything() {
+        let (mut app, requests, path, first) = app_with_no_chats_yet();
+
+        // The interval has not passed, so nothing goes out yet: a screen with a
+        // code on it must not ask Lark again every time it is drawn.
+        app.on_tick();
+        assert!(
+            asks_about_chats(&requests).is_empty(),
+            "the watch is paced, not run off the redraw"
+        );
+
+        // Pretend it has. Somebody has been in Lark for a few seconds.
+        age_the_last_check(&mut app);
+        app.on_tick();
+        let second = match asks_about_chats(&requests).as_slice() {
+            [only] => *only,
+            other => panic!("the watch should have asked again, once: {other:?}"),
+        };
+        assert!(second > first, "and it is a new ask, not the old one");
+        // The code stays on screen while it does — the ask is quiet, and the
+        // phone that is being pointed at it has not moved.
+        match channel_step(&app) {
+            ChannelStep::Chats(chats) => {
+                assert_eq!(chats.found.as_deref(), Some(&[][..]), "still empty");
+                assert!(chats.code.is_some(), "and the code did not flicker away");
+                assert_eq!(
+                    chats.keys.app_id, "cli_9",
+                    "the credentials are not retyped"
+                );
+                assert!(chats.asking, "with one ask out");
+            }
+            other => panic!("moved off the chooser: {other:?}"),
+        }
+        // One at a time: a tick while that answer is still coming sends
+        // nothing, so a slow Lark cannot pile requests up behind it.
+        age_the_last_check(&mut app);
+        app.on_tick();
+        assert!(
+            asks_about_chats(&requests).is_empty(),
+            "no pile-up behind a slow Lark"
+        );
+
+        // The bot is in a group now. That is the whole answer — there is
+        // nothing left to choose, so nobody is asked to choose it.
+        app.handle_worker_event(Event::ChannelChats {
+            attempt: second,
+            result: Ok(vec![crate::channel::Chat {
+                id: "oc_7".into(),
+                name: "研发日常".into(),
+            }]),
+        });
+        let form = channels_form(&app);
+        assert!(form.step.is_none(), "straight back to the list");
+        match form.set.bindings.as_slice() {
+            [binding] => {
+                assert_eq!(binding.route, "oc_7");
+                assert_eq!(binding.route_label, "研发日常");
+                assert_eq!(binding.app_id, "cli_9");
+                assert!(binding.preferred, "the first one bound is the default");
+            }
+            other => panic!("exactly one binding: {other:?}"),
+        }
+        // And with the chooser gone the watch is gone with it.
+        app.on_tick();
+        assert!(asks_about_chats(&requests).is_empty(), "the watch stopped");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_chats_at_once_is_still_a_choice_somebody_has_to_make() {
+        let (mut app, requests, path, _) = app_with_no_chats_yet();
+        age_the_last_check(&mut app);
+        app.on_tick();
+        let second = match asks_about_chats(&requests).as_slice() {
+            [only] => *only,
+            other => panic!("the watch should have asked again, once: {other:?}"),
+        };
+        app.handle_worker_event(Event::ChannelChats {
+            attempt: second,
+            result: Ok(vec![
+                crate::channel::Chat {
+                    id: "oc_7".into(),
+                    name: "研发日常".into(),
+                },
+                crate::channel::Chat {
+                    id: "oc_8".into(),
+                    name: "值班".into(),
+                },
+            ]),
+        });
+        // Guessing between two would be a coin toss with a binding riding on
+        // it, so this is the one case that still wants a person.
+        assert!(
+            channels_form(&app).set.bindings.is_empty(),
+            "nothing bound itself"
+        );
+        match channel_step(&app) {
+            ChannelStep::Chats(chats) => {
+                assert_eq!(chats.found.as_deref().map(<[_]>::len), Some(2));
+            }
+            other => panic!("should be on the chooser: {other:?}"),
+        }
+        // And the watch is done: there is a list on screen now, so asking again
+        // would move what somebody is in the middle of reading.
+        app.on_tick();
+        assert!(asks_about_chats(&requests).is_empty(), "the watch stopped");
         let _ = std::fs::remove_file(&path);
     }
 

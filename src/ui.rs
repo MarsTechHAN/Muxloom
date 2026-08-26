@@ -4725,9 +4725,10 @@ fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) 
         Some(ChannelStep::Scan(_)) => "r new code   Esc back",
         Some(ChannelStep::Keys(_)) => "Tab field   Enter find my chats   Esc back",
         Some(ChannelStep::Chats(chats)) => match chats.found.as_deref() {
-            // Nothing to move through and nothing to bind: the only key that
-            // does anything here is the one that asks Lark again.
-            Some([]) => "r I have added it   Esc back",
+            // Nothing to move through and nothing to bind, and nothing anybody
+            // has to press either: the panel is asking Lark by itself. r is
+            // only here for whoever would rather not wait out the interval.
+            Some([]) => "Nothing to press — r check now   Esc back",
             _ => "Up/Down choose   Enter bind   r ask again   Esc back",
         },
         Some(ChannelStep::Rename { .. }) => "Enter rename   Esc back",
@@ -5172,19 +5173,24 @@ fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) 
 ///
 /// This is the one screen in the Lark flow with nothing on it to choose and
 /// nothing to type — a chat id exists nowhere a person can copy it from, so the
-/// only route to a bindable chat is to put the bot in a group and ask again.
-/// Scanning opens the bot in Lark, where adding it to a group is a tap; the link
-/// under it is the same thing for a window with no room to draw a code, or for
-/// somebody who would rather paste than scan.
+/// only route to a bindable chat is to put the bot in a group. Scanning opens
+/// the bot in Lark, where adding it to a group is a tap; the link under it is
+/// the same thing for a window with no room to draw a code, or for somebody who
+/// would rather paste than scan.
+///
+/// Nothing here asks for a keystroke. The panel keeps asking Lark on its own
+/// while this is up, so the hands that are holding the phone never have to come
+/// back to the keyboard to say they are done.
 fn draw_channel_bot_code(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) {
     for (offset, (line, colour)) in [
-        ("That app is in no chats yet.", Color::Yellow),
-        ("", MUTED),
+        ("That app is in no chats yet.".to_string(), Color::Yellow),
+        (String::new(), MUTED),
         (
-            "Scan to open its bot in Lark, then add the bot to a group —",
+            "Scan to open its bot in Lark, then add the bot to a group —".to_string(),
             MUTED,
         ),
-        ("群设置 › 群机器人 › 添加机器人. Then press r.", MUTED),
+        ("群设置 › 群机器人 › 添加机器人.".to_string(), MUTED),
+        (watch_line(chats), ACCENT),
     ]
     .iter()
     .enumerate()
@@ -5199,8 +5205,8 @@ fn draw_channel_bot_code(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rec
         );
     }
     let grid = Rect {
-        y: inner.y.saturating_add(5),
-        height: inner.height.saturating_sub(6),
+        y: inner.y.saturating_add(6),
+        height: inner.height.saturating_sub(7),
         ..inner
     };
     let drawn = chats
@@ -5222,6 +5228,25 @@ fn draw_channel_bot_code(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rec
             .style(Style::default().fg(MUTED)),
             row,
         );
+    }
+}
+
+/// The line that says the screen is doing something, so an empty list does not
+/// read as a screen that has given up.
+///
+/// It counts from the last answer rather than showing a spinner, because what
+/// somebody standing there with a phone wants to know is not "is it busy" but
+/// "would it have noticed yet".
+fn watch_line(chats: &ChannelChats) -> String {
+    if chats.asking {
+        return "Watching for it — asking Lark…".into();
+    }
+    match chats.checked {
+        Some(at) => format!(
+            "Watching for it — last checked {}s ago",
+            at.elapsed().as_secs()
+        ),
+        None => "Watching for it…".into(),
     }
 }
 
