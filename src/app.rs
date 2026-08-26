@@ -25,7 +25,6 @@ use crate::{
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
     port_forward::{PortForwardManager, PortForwardState, PortForwardSummary},
-    recap::extract_recap,
     runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
     ssh_config,
     talk::{TalkAuthor, TalkDraft, TalkKind, TalkMessage, TalkPage, TalkScope, TalkVoice},
@@ -3803,33 +3802,6 @@ impl App {
     pub fn selected_session(&self) -> Option<&AgentSession> {
         let id = self.selected_session_id.as_deref()?;
         self.sessions.iter().find(|session| session.id == id)
-    }
-
-    pub fn recap_for(&self, session: &AgentSession) -> String {
-        // A daemon reads the runtime's own transcript and falls back to the
-        // same screen scrape this would do, so its answer is never the worse
-        // of the two. Only a session reached some other way — a tmux pane,
-        // where the recap was scraped once at scan time — is better served by
-        // looking at the screen again here.
-        if crate::runtime::is_daemon_session_id(&session.id)
-            && let Some(recap) = session.recap.as_ref().filter(|recap| !recap.is_empty())
-        {
-            return recap.clone();
-        }
-        let source = if self.terminal_session_id.as_deref() == Some(&session.id) {
-            self.terminal.as_ref().map(|_| self.terminal_screen.clone())
-        } else if self.selected_session_id.as_deref() == Some(&session.id)
-            && !self.history.text.is_empty()
-        {
-            Some(self.history.text.clone())
-        } else {
-            None
-        };
-        source
-            .as_deref()
-            .and_then(|output| extract_recap(session.kind, output))
-            .or_else(|| session.recap.clone())
-            .unwrap_or_else(|| "No recap yet".into())
     }
 
     /// Whether a session's prompt still deserves a reminder. The session list
@@ -12616,29 +12588,6 @@ mod tests {
 
         app.handle_worker_event(scan(vec![tree_session("later", None, 40)]));
         assert!(app.state.folded_tasks.is_empty());
-    }
-
-    /// The daemon reads the turn as the runtime recorded it. What the terminal
-    /// happens to be painting is the same thing at best, and half a repaint at
-    /// worst.
-    #[test]
-    fn the_recap_of_a_daemon_session_beats_what_is_on_its_screen() {
-        let mut app = ux_test_app(vec![Target::local()]);
-        let session = AgentSession {
-            recap: Some("wrote the fix".into()),
-            ..waiting_agent("")
-        };
-        app.selected_session_id = Some(session.id.clone());
-        app.history.text = "※ recap: scraped off the screen\n".into();
-        assert_eq!(app.recap_for(&session), "wrote the fix");
-        // A session muxloom only reaches through tmux was scraped once, when
-        // the machine was last scanned; the screen in front of us is newer.
-        let pane = AgentSession {
-            id: "pane-1".into(),
-            ..session
-        };
-        app.selected_session_id = Some(pane.id.clone());
-        assert_eq!(app.recap_for(&pane), "scraped off the screen");
     }
 
     #[test]

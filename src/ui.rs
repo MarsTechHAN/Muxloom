@@ -913,17 +913,6 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     agent_style(Style::default().fg(Color::Gray)),
                 ),
             ]));
-            // A shell has no recap to give, and an empty row under it only
-            // takes a line away from the folder and the status.
-            if session.kind != AgentKind::Terminal {
-                lines.push(Line::from(vec![
-                    Span::styled("    recap   ", agent_style(Style::default().fg(MUTED))),
-                    Span::styled(
-                        truncate(&app.recap_for(&session), value_width),
-                        agent_style(Style::default().fg(Color::White)),
-                    ),
-                ]));
-            }
             lines.push(Line::from(vec![
                 Span::styled("    status  ", agent_style(Style::default().fg(MUTED))),
                 Span::styled(
@@ -6113,8 +6102,8 @@ mod tests {
         assert!(rendered.contains("Temporal Chat"));
         assert!(!rendered.contains("hidden-for-temporal"));
 
-        // Row 1 is the folder heading; the selected agent occupies rows 2-5.
-        for y in 2..=5 {
+        // Row 1 is the folder heading; the selected agent occupies rows 2-4.
+        for y in 2..=4 {
             for x in 1..69 {
                 let cell = buffer.cell((x, y)).unwrap();
                 assert_eq!(cell.fg, Color::Yellow, "cell {x},{y} was not yellow");
