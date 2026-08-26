@@ -4022,6 +4022,18 @@ fn parse_claude_resume(session: &str, path: &str, source_path: &str) -> Option<R
     let mut title = None;
     let mut legacy_title = None;
     for value in session.lines().filter_map(parse_json_line) {
+        // A subagent's transcript is filed beside its parent's, under the same
+        // folder and stamped with the *parent's* session id. Read as a
+        // conversation of its own it becomes a candidate that answers to the
+        // parent's id while carrying a subagent's words and pointing at a file
+        // nothing can be resumed from — and, being newer, it wins the dedup
+        // against the real conversation. So a sidechain line contributes
+        // nothing: a file that is all sidechain never gets an id and drops out
+        // here, while a parent that recorded its subagents inline keeps its
+        // own account of itself.
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
         if id.is_none() {
             id = value
                 .get("sessionId")
@@ -5601,6 +5613,30 @@ mod tests {
             parse_resume_candidates(AgentKind::Claude, "/other", claude).is_empty(),
             "resume candidates must match the exact working directory"
         );
+    }
+
+    /// A Claude subagent writes its own file, under the same folder and under
+    /// its parent's session id. Read as a conversation it answers to the
+    /// parent's id with a subagent's words, and being written later it wins the
+    /// dedup — so the parent's own history disappears behind it and the file
+    /// the id points at is one nothing can be resumed from.
+    #[test]
+    fn a_claude_subagents_transcript_is_not_a_conversation_to_resume() {
+        let sessions = concat!(
+            "\u{1e}SESSION\n",
+            "/home/test/.claude/projects/claude-id.jsonl\n",
+            "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/project\",\"timestamp\":\"2026-07-20T11:00:00Z\",\"message\":{\"content\":\"configure the sglang proxy\"}}\n",
+            "\u{1e}SESSION\n",
+            "/home/test/.claude/projects/claude-id/subagents/agent-1.jsonl\n",
+            "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/project\",\"isSidechain\":true,\"timestamp\":\"2026-07-20T12:00:00Z\",\"message\":{\"content\":\"grep the tree for retry markers\"}}\n",
+        );
+        let candidates = parse_resume_candidates(AgentKind::Claude, "/work/project", sessions);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].source_path,
+            "/home/test/.claude/projects/claude-id.jsonl"
+        );
+        assert_eq!(candidates[0].summary(), "configure the sglang proxy");
     }
 
     /// Claude Code renames a session as it goes, and the name it settled on is
