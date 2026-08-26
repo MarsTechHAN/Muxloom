@@ -231,7 +231,10 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          - send_channel_message reaches the human themselves, on their phone, through the chat \
          app they bound to muxloom. It is for the end of something they are waiting on and for a \
          decision only they can make — one summary they can act on, never a progress log. Their \
-         answer comes back to you as a direct message.\n\n\
+         answer comes back to you as a direct message. This and the talk board are independent \
+         surfaces: a channel message posts nothing to the board, and a talk_post tells the \
+         person on their phone nothing. Reply to a person on the surface they wrote to — over \
+         the channel, not the board.\n\n\
          Boundaries that are not negotiable:\n\
          - Machines the user has not enabled are unreachable. Naming one is an error, not a \
          workaround to route around.\n\
@@ -530,7 +533,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       front of everyone else on the machine. kind \"note\" is the same thing meant \
                       to be kept and found later: decisions, gotchas, where a thing lives. \
                       Posting does not interrupt anyone; to put a message in front of one agent, \
-                      use message_agent."
+                      use message_agent. This writes only to the talk board: it never reaches a \
+                      person's chat app, and nobody on their phone is told. To reach a person \
+                      where they are, use send_channel_message instead — the board and the chat \
+                      app are independent surfaces and nothing routes between them."
             .into(),
         input_schema: schema(
             multi,
@@ -563,7 +569,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       session you are in, so do not write that yourself, and never put a token, a \
                       key, or an absolute home path in it. Their reply comes back to you as a \
                       direct message: watch for it with talk_read { scope: \"direct\", \
-                      wait_seconds }."
+                      wait_seconds }. This is a second surface, independent of the talk board: it \
+                      posts nothing there and reads nothing from it, so do not use talk_post to \
+                      reply to a person — answer them here, on the surface they wrote to."
             .into(),
         input_schema: schema(
             false,
@@ -3872,7 +3880,26 @@ mod tests {
                 "{}",
                 tool.description
             );
+            // The chat app and the talk board are separate surfaces: a channel
+            // message posts nothing to the board, and posting on the board is
+            // not how you answer a person on their phone.
+            assert!(
+                tool.description.contains("independent of the talk board"),
+                "{}",
+                tool.description
+            );
         }
+        // The board's post tool says the reverse side of the same line: writing
+        // to the board never reaches a person's chat app.
+        let board = specs(Flavor::Controller)
+            .into_iter()
+            .find(|tool| tool.name == "talk_post")
+            .expect("the board is always offered");
+        assert!(
+            board.description.contains("never reaches a person's chat app"),
+            "{}",
+            board.description
+        );
         // It says something on a machine's behalf without changing anything
         // there, which is exactly the shape of an errand a controller runs.
         assert!(crate::relay::relayed("send_channel_message"));
