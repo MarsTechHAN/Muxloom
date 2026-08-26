@@ -3493,13 +3493,31 @@ const CODEX_PLACEHOLDERS: [&str; 3] = [
     "Type a message",
 ];
 
+/// The glyph each CLI paints at the head of its live prompt line. A transcript
+/// row can carry the same glyph too, but it scrolls above the composer region,
+/// so a bottom-row match amid a screen's frame is taken as the live input line.
+/// The set is shared across the two CLIs because both cycle the same cursor
+/// glyphs; a wrong guess only costs a delivery being held instead of rushed.
+const PROMPT_GLYPHS: [char; 4] = ['❯', '›', '>', '»'];
+
+/// The empty-state strings pi greys into its composer, text that is not text
+/// anybody typed.
+#[cfg_attr(not(unix), allow(dead_code))]
+const PI_PLACEHOLDERS: [&str; 3] = ["Ask anything", "Type a message", "Send a message"];
+
+/// The empty-state strings OpenCode shows while its (multi-line) composer is
+/// empty.
+#[cfg_attr(not(unix), allow(dead_code))]
+const OPENCODE_PLACEHOLDERS: [&str; 3] = ["Send a message", "Ask anything", "Type a message"];
+
 /// Read a session's prompt box off its screen.
 ///
 /// [`Composer::Absent`] means the box was looked for and is not there — a
 /// dialog is up, the CLI is still starting, something else has the pty. `None`
-/// means it was never looked for, because this is a runtime whose box muxloom
-/// has not learned; callers read that as "no reason to hold anything back",
-/// which is what muxloom did for every runtime before it could read one.
+/// means there is no box to read at all, which is only ever a plain terminal;
+/// every managed agent — Codex, Claude, and now pi and OpenCode — has one, and
+/// callers treat `None` as "no reason to hold anything back" the way they did
+/// before pi and OpenCode were learned.
 ///
 /// Only the daemon reads a prompt box, and there is no daemon off Unix, so
 /// this and everything under it are unreachable there. Allowed rather than
@@ -3515,8 +3533,141 @@ pub(crate) fn composer(kind: AgentKind, screen: &str) -> Option<Composer> {
     match kind {
         AgentKind::Claude => Some(claude_composer(tail)),
         AgentKind::Codex => Some(codex_composer(tail)),
-        _ => None,
+        AgentKind::Pi => Some(pi_composer(tail)),
+        AgentKind::OpenCode => Some(opencode_composer(tail)),
+        AgentKind::Terminal => None,
     }
+}
+
+/// Read pi's prompt box off its screen.
+///
+/// pi draws a single-line composer right above its footer, prefixed with the
+/// input glyph. While a select dialog — the model or effort picker, a theme
+/// chooser — is up it replaces the composer with a choice list, and while a
+/// turn runs it draws `Working… (esc to interrupt)` with no input line. Both
+/// read as [`Composer::Absent`]: whatever is typed next would answer the
+/// dialog or go to a shell rather than into pi's box.
+fn pi_composer(tail: &[&str]) -> Composer {
+    let Some(row) = live_composer_signal(tail) else {
+        return Composer::Absent;
+    };
+    let typed = tail[row]
+        .trim_start()
+        .trim_start_matches(|character| PROMPT_GLYPHS.contains(&character))
+        .trim();
+    if typed.is_empty()
+        || PI_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| typed.starts_with(placeholder))
+    {
+        Composer::Ready
+    } else {
+        Composer::Occupied
+    }
+}
+
+/// Read OpenCode's prompt box off its screen.
+///
+/// OpenCode's composer is a bottom textarea that holds a whole draft across
+/// several rows; the first carries the input glyph and the rest continue it
+/// un-prefixed. A select dialog or a running turn with no input line reads as
+/// [`Composer::Absent`] for the same reason pi's does.
+fn opencode_composer(tail: &[&str]) -> Composer {
+    let Some(row) = live_composer_signal(tail) else {
+        return Composer::Absent;
+    };
+    let mut typed = String::new();
+    for (offset, line) in tail.iter().enumerate().skip(row) {
+        let prefix = line.trim_start();
+        // The footer hint below the draft, and a fresh glyph above the next
+        // prompt, both end it.
+        if offset > row
+            && (is_user_facing_hint(prefix)
+                || prefix.starts_with(|c: char| PROMPT_GLYPHS.contains(&c)))
+        {
+            break;
+        }
+        let text = if offset == row {
+            prefix
+                .trim_start_matches(|character: char| PROMPT_GLYPHS.contains(&character))
+                .trim()
+        } else {
+            prefix
+        };
+        if text.is_empty() {
+            // A wrapped draft is one run of text; a blank row ends it.
+            break;
+        }
+        if !typed.is_empty() {
+            typed.push(' ');
+        }
+        typed.push_str(text);
+    }
+    if typed.is_empty()
+        || OPENCODE_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| typed.starts_with(placeholder))
+    {
+        Composer::Ready
+    } else {
+        Composer::Occupied
+    }
+}
+
+/// A line that reads as a footer/user-facing hint rather than as typed text:
+/// it names a key chord and an action. A wrap of prose may contain "esc" but
+/// not the chord-plus-`to` shape of a hint bar.
+fn is_user_facing_hint(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    ["· enter to", "enter to send", "enter to submit"]
+        .iter()
+        .any(|hint| lower.contains(hint))
+        || lower.starts_with("ctrl+")
+        || (lower.contains("esc to") && line.split_whitespace().count() <= 12)
+}
+
+/// The index in `tail` of the CLI's live prompt-glyph line, if one can be
+/// told apart from a transcript row or a select list.
+///
+/// A transcript row carries the same glyph, but it scrolls above the composer
+/// and is long; a select list's choice rows are prefixed `N. Option` with one
+/// cursor row, which `attention_reason` already flags as a question. So only a
+/// glyph line that is within a couple of rows of the bottom of the screen —
+/// where a live composer always sits — and that carries no numbered-option
+/// shape counts.
+fn live_composer_signal(tail: &[&str]) -> Option<usize> {
+    let cursor = tail.len().saturating_sub(1);
+    for (offset, line) in tail.iter().enumerate().rev() {
+        // Do not reach past the last few rows a composer would live in.
+        if cursor.saturating_sub(offset) > 4 {
+            break;
+        }
+        if let Some(rest) = line
+            .trim_start()
+            .strip_prefix(|character: char| PROMPT_GLYPHS.contains(&character))
+        {
+            // A cursor on a numbered option is a select list, not a composer.
+            if !looks_like_choice_row(rest) {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+/// Whether the text after a prompt glyph is a `N. Option` choice row — the
+/// shape a select list paints under its cursor.
+fn looks_like_choice_row(rest: &str) -> bool {
+    let digits = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count();
+    digits > 0
+        && matches!(
+            rest.trim_start().chars().nth(digits),
+            Some('.') | Some(')') | Some(':')
+        )
 }
 
 /// Claude Code fences its prompt between two full-width rules, with its hint
@@ -5407,9 +5558,14 @@ mod tests {
             composer(AgentKind::Claude, updating),
             Some(Composer::Absent)
         );
-        // A runtime with no box muxloom has learned is not read at all, and
-        // says so rather than claiming the box is missing.
-        assert_eq!(composer(AgentKind::OpenCode, updating), None);
+        // pi and OpenCode also have a composer muxloom now reads; a screen with
+        // no input line at all still reads as a box that is not there.
+        assert_eq!(composer(AgentKind::Pi, updating), Some(Composer::Absent));
+        assert_eq!(
+            composer(AgentKind::OpenCode, updating),
+            Some(Composer::Absent)
+        );
+        // A terminal has no box to read.
         assert_eq!(composer(AgentKind::Terminal, "tiger $ "), None);
     }
 
@@ -5429,6 +5585,98 @@ mod tests {
         let trust = "  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. \
                      No, quit\n\n  Press enter to continue\n";
         assert_eq!(composer(AgentKind::Codex, trust), Some(Composer::Absent));
+    }
+
+    #[test]
+    fn pi_reads_its_prompt_line_and_holds_back_for_dialogs() {
+        // Idle with a drawn, empty prompt: a message may go in.
+        let idle = concat!(
+            "> what does the renderer do?\n", // a transcript row, scrolled above
+            "\n",
+            "❯ \n",
+            "Ctrl+N new session · Enter to interrupt· ? for shortcuts\n",
+        );
+        assert_eq!(composer(AgentKind::Pi, idle), Some(Composer::Ready));
+
+        // Somebody is mid-sentence in the box: a paste joins it and goes in as
+        // one message nobody wrote.
+        let typed = concat!(
+            "❯ tell me about the parser and nothing else\n",
+            "Ctrl+N new session · Enter to send\n",
+        );
+        assert_eq!(composer(AgentKind::Pi, typed), Some(Composer::Occupied));
+
+        // A select dialog replaces the box, so nothing may be delivered.
+        let choosing = concat!(
+            "Choose a model\n",
+            "  › 1. DeepSeek-V4-Flash (sglang-soil)\n",
+            "    2. Butternut-V4-Pro (sglang-soil)\n",
+            "\n",
+            "Esc to cancel · Tab to amend\n",
+        );
+        assert_eq!(composer(AgentKind::Pi, choosing), Some(Composer::Absent));
+    }
+
+    #[test]
+    fn opencode_reads_its_prompt_line_and_holds_back_for_dialogs() {
+        // Idle with an empty composer.
+        let idle = concat!(
+            "▌ Recognize and fix the width bug\n",
+            "\n",
+            "❯ \n",
+            "Ctrl+E cycle model · Enter to send · esc to interrupt\n",
+        );
+        assert_eq!(composer(AgentKind::OpenCode, idle), Some(Composer::Ready));
+
+        // A wrapped draft across several rows is still one unsent message.
+        let wrapped = concat!(
+            "❯ Debug the session recovery by reading the keeper handshake, tracing\n",
+            "  how a superseded daemon releases the socket, and confirming the\n",
+            "  next generation adopts the same process.\n",
+            "Ctrl+E cycle model · Enter to send\n",
+        );
+        assert_eq!(
+            composer(AgentKind::OpenCode, wrapped),
+            Some(Composer::Occupied)
+        );
+
+        // A running turn with no input box on screen cannot take a message.
+        let working = concat!(
+            "⚡ Reading sessions… (esc to interrupt)\n",
+            "\n",
+            "ctrl+r session · ctrl+o files\n",
+        );
+        assert_eq!(
+            composer(AgentKind::OpenCode, working),
+            Some(Composer::Absent)
+        );
+    }
+
+    #[test]
+    fn pi_and_opencode_working_status_are_read_consistently() {
+        // pi draws its whole-turn working hint; it is the same marker Codex and
+        // Claude use, so the generic path already catches it.
+        assert!(agent_is_working(
+            AgentKind::Pi,
+            "Working... (esc to interrupt)\n",
+        ));
+        // A tool run inside the turn keeps the hint.
+        assert!(agent_is_working(
+            AgentKind::Pi,
+            "Running bash: cargo test (esc to interrupt)\n",
+        ));
+        // An idle pi with a prompt drawn is not working.
+        assert!(!agent_is_working(AgentKind::Pi, "❯ \nCtrl+N new session\n"));
+
+        // OpenCode's interrupt marker is read the same way.
+        assert!(agent_is_working(
+            AgentKind::OpenCode,
+            "⚡ Reading sessions… (esc to interrupt)\n",
+        ));
+        assert!(!agent_is_working(
+            AgentKind::OpenCode,
+            "❯ \nctrl+r session\n",
+        ));
     }
 
     #[test]

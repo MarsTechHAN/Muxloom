@@ -193,7 +193,8 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
         }
     };
     let mut text = format!(
-        "muxloom manages long-lived terminal sessions — Codex, Claude Code, and plain shells — \
+        "muxloom manages long-lived terminal sessions — Codex, Claude Code, pi, OpenCode, and \
+         plain shells — \
          {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
          be watching any of them right now.\n\n\
          Work through the sessions rather than around them:\n\
@@ -201,6 +202,11 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          message_agent to say something to another agent, send_input for raw keystrokes and for \
          plain shells, then wait_for or read_screen to see what came of it. Treat a session as a \
          colleague you are messaging, not as a subprocess you drive.\n\
+         - A message lands in the session's prompt box and is read when its turn ends. For pi and \
+         OpenCode the box is read off their screen like the others: if it already holds an \
+         unsent sentence your message is held until it clears, and if a model or effort picker is \
+         up it waits rather than answering the dialog. When unsure whether a message went in, \
+         read_screen or check list_sessions' working/needs_attention before sending another.\n\
          - run_shell is a last resort. Reach for it only for a short, non-interactive, ideally \
          read-only query that no other tool covers. Never start long-running or interactive work \
          with it — that is what launch_session is for — and never use it to do something a \
@@ -330,11 +336,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     }
     tools.push(ToolSpec {
         name: "list_sessions",
-        description: "List managed agent sessions with fresh status: kind (codex/claude/\
-                      terminal), working directory, whether the agent is working, whether it \
-                      waits for input (needs_attention plus the matched reason), and a recap \
-                      line. A terminal has no recap - read_screen is how a shell is read. \
-                      Archived sessions are included only with include_archived."
+        description: "List managed agent sessions with fresh status: kind (codex/claude/pi/\
+                      opencode/terminal), working directory, whether the agent is working, \
+                      whether it waits for input (needs_attention plus the matched reason), and \
+                      a recap line. A terminal has no recap - read_screen is how a shell is \
+                      read. Archived sessions are included only with include_archived."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -391,7 +397,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       is hearing from an agent and how to answer. Use this to ask for work, hand \
                       something over, answer a question you were asked, or warn someone off a file \
                       you are changing — and use send_input instead only when you need raw \
-                      keystrokes rather than a message. The target must be a codex or claude \
+                      keystrokes rather than a message. The target must be a codex, claude, \
                       session; a terminal has nobody in it to read. Every message is also filed on \
                       the talk board, so read your own with talk_read { scope: \"direct\" } — that \
                       is where replies arrive if the other agent is not sure how to reach you. \
@@ -572,7 +578,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "launch_session",
         description: format!(
-            "Start a persistent codex, claude, or terminal session in a working directory. Use \
+            "Start a persistent codex, claude, pi, opencode, or terminal session in a working \
+             directory. Use \
              this for anything long-running or interactive instead of run_shell. `resume_id` \
              resumes that agent-native conversation; `initial_prompt` seeds a fresh agent \
              instead. The session survives this process: pair every launch with a later archive \
@@ -593,7 +600,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         input_schema: schema(
             multi,
             json!({
-                "kind": { "type": "string", "enum": ["codex", "claude", "terminal"] },
+                "kind": { "type": "string", "enum": ["codex", "claude", "pi", "opencode", "terminal"] },
                 "path": {
                     "type": "string",
                     "description": match flavor {
@@ -689,7 +696,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "query": { "type": "string", "description": "Text to look for, matched case-insensitively." },
                 "machines": { "type": "array", "items": { "type": "string" }, "description": "Machine ids from list_machines. Default: every enabled machine." },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Only conversations held in these directories or below them." },
-                "kinds": { "type": "array", "items": { "type": "string", "enum": ["codex", "claude", "terminal"] } },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["codex", "claude", "pi", "opencode", "terminal"] } },
                 "since": { "type": "integer", "description": "Epoch ms: only conversations started at or after this." },
                 "until": { "type": "integer", "description": "Epoch ms: only conversations started at or before this." },
                 "limit": { "type": "integer", "description": "Most hits to return, 1-100. Default 20." },
