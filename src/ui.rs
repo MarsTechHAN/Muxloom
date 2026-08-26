@@ -4698,11 +4698,12 @@ fn moderator_item_line(item: &crate::app::ScopeItem) -> String {
 /// that an agent finishing something at three in the morning on a machine
 /// nobody is watching can still say so.
 fn draw_channels_modal(frame: &mut Frame<'_>, form: &ChannelsForm, outer: Rect) {
-    // The scan step takes the window it needs. A code has to come out square
-    // and big enough for a phone to read across a desk, and there is nothing
-    // else on that screen to make room for.
+    // Every step with a code on it takes the window it needs. A code has to
+    // come out square and big enough for a phone to read across a desk, and on
+    // the credentials step the two fields above it are three rows of nothing
+    // much — there is no reason to make the code pay for them.
     let area = match &form.step {
-        Some(ChannelStep::Scan(_)) => centered_rect(76, 40, outer),
+        Some(ChannelStep::Scan(_) | ChannelStep::Keys(_)) => centered_rect(76, 40, outer),
         // A chooser with nothing to choose from turns into a code as well, and
         // a code has to come out square and big enough to read across a desk.
         Some(ChannelStep::Chats(chats))
@@ -5008,26 +5009,31 @@ fn draw_qr(frame: &mut Frame<'_>, area: Rect, code: &crate::qr::Code) -> bool {
 /// Lark's two strings, and the one honest sentence about why they have to be
 /// typed at all.
 fn draw_channel_keys(frame: &mut Frame<'_>, form: &ChannelsForm, keys: &ChannelKeys, inner: Rect) {
-    if let Some(row) = modal_row(inner, 0) {
-        frame.render_widget(
-            Paragraph::new(truncate(
-                // Not "Lark has no code to scan": there is one, a step further
-                // on, once these two strings have said which bot it should be
-                // a code for.
-                &format!(
-                    "Only Lark can make an app. Make one at {}, then:",
-                    crate::channel::LARK_CONSOLE
-                ),
-                inner.width as usize,
-            ))
-            .style(Style::default().fg(MUTED)),
-            row,
-        );
+    // The address on its own line rather than folded into the sentence: it is
+    // the one thing on this screen somebody might have to type by hand, and a
+    // line with nothing else on it is a line that survives a narrow panel.
+    for (offset, (line, colour)) in [
+        (
+            "Only Lark can make an app. Scan below, or open it yourself:",
+            MUTED,
+        ),
+        (crate::channel::LARK_CONSOLE, ACCENT),
+    ]
+    .iter()
+    .enumerate()
+    {
+        if let Some(row) = modal_row(inner, offset as u16) {
+            frame.render_widget(
+                Paragraph::new(truncate(line, inner.width as usize))
+                    .style(Style::default().fg(*colour)),
+                row,
+            );
+        }
     }
     let label_width = 14;
     let mut cursor = None;
     for (index, field) in KeysField::ALL.iter().enumerate() {
-        let Some(row) = modal_row(inner, 2 + index as u16) else {
+        let Some(row) = modal_row(inner, 3 + index as u16) else {
             break;
         };
         let active = index == keys.selected.min(KeysField::ALL.len() - 1);
@@ -5085,16 +5091,39 @@ fn draw_channel_keys(frame: &mut Frame<'_>, form: &ChannelsForm, keys: &ChannelK
         ),
         None => (String::new(), MUTED),
     };
-    if let Some(row) = modal_row(inner, 2 + KeysField::ALL.len() as u16 + 1) {
+    let below = 3 + KeysField::ALL.len() as u16 + 1;
+    if let Some(row) = modal_row(inner, below) {
         frame.render_widget(
             Paragraph::new(truncate(&footnote.0, inner.width as usize))
                 .style(Style::default().fg(footnote.1)),
             row,
         );
     }
+    // Under everything, and only if the window left room. A code that will not
+    // fit is simply absent: the address two rows from the top is the part that
+    // cannot go missing, and it is text, so it survives any panel at all.
+    let grid = Rect {
+        y: inner.y.saturating_add(below).saturating_add(2),
+        height: inner.height.saturating_sub(below.saturating_add(2)),
+        ..inner
+    };
+    if let Some(code) = console_code() {
+        draw_qr(frame, grid, code);
+    }
     if let Some((x, y)) = cursor {
         frame.set_cursor_position((x, y));
     }
+}
+
+/// The console as a code, encoded once for the whole run.
+///
+/// Unlike every other code in this panel it says the same thing every time —
+/// there is one open platform and it is at one address — so encoding it per
+/// frame would be work done sixty times a second to draw the same squares.
+fn console_code() -> Option<&'static crate::qr::Code> {
+    static CODE: LazyLock<Option<crate::qr::Code>> =
+        LazyLock::new(|| crate::qr::encode(crate::channel::LARK_CONSOLE).ok());
+    CODE.as_ref()
 }
 
 /// The chats that app turned out to be in.

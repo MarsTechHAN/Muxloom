@@ -237,6 +237,31 @@ fn channels_modal_never_panics() {
 }
 
 #[test]
+fn the_lark_step_nobody_can_skip_has_a_code_on_it() {
+    // The credentials step is the one screen every Lark binding goes through.
+    // A code further in — behind an app that turns out to be in no chats — is
+    // a code most people never lay eyes on, which is the same as not having
+    // one.
+    let form = ChannelsForm {
+        step: Some(ChannelStep::Keys(ChannelKeys::default())),
+        ..ChannelsForm::default()
+    };
+    let drawn = render_rows(Some(Modal::Channels(form.clone())), 120, 44).1;
+    let code_rows = drawn.iter().filter(|row| row.contains('▀')).count();
+    assert!(code_rows >= 17, "no code was drawn, only {code_rows} rows");
+    assert!(
+        drawn.join("").contains("open.feishu.cn/app"),
+        "and the address is written out as well, for whoever would rather type"
+    );
+
+    // On a window with no room for one, there is simply no code — and the
+    // address, which is the part that cannot be missing, is still there.
+    let cramped = render_text(Some(Modal::Channels(form)), 120, 20);
+    assert!(cramped.contains("open.feishu.cn/app"));
+    assert!(!cramped.contains('▀'));
+}
+
+#[test]
 fn help_modal_never_panics() {
     for (w, h) in SIZES {
         draw_with(Some(Modal::Help(HelpForm::default())), *w, *h);
