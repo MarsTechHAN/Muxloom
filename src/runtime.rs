@@ -473,6 +473,17 @@ impl Runtime {
         command: &CommandConfig,
         environment: &[(String, String)],
     ) -> Result<String> {
+        // A unit test runs against a bridge pool that may not be able to reach
+        // a real daemon; the path then falls through to the legacy tmux backend
+        // and spawns a genuine `tmux new-session` holding a live agent that
+        // nothing in the test binary ever reaps. Letting a test leak real
+        // sessions (and the processes inside them) is far worse than the test
+        // not launching one, and no unit test asserts a successful launch — the
+        // daemon round-trip tests exercise the daemon's own Launch request
+        // handling, not this controller path.
+        if cfg!(test) {
+            bail!("a unit test does not start real sessions");
+        }
         if request.path.trim().is_empty() {
             bail!("working directory cannot be empty");
         }
