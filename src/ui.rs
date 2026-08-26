@@ -4900,9 +4900,19 @@ fn draw_channel_pick(frame: &mut Frame<'_>, selected: usize, inner: Rect) {
 
 /// The code, and one line saying what to do with it.
 fn draw_channel_scan(frame: &mut Frame<'_>, scan: &ChannelScan, inner: Rect) {
+    let asking = if scan.lark {
+        "Asking Feishu to create a bot…"
+    } else {
+        "Asking WeChat for a code…"
+    };
+    let showing = if scan.lark {
+        "Open Lark › 扫一扫 and point it here to create your bot"
+    } else {
+        "Open WeChat › 扫一扫 and point it here"
+    };
     let (headline, colour) = match &scan.state {
-        ScanState::Asking => ("Asking WeChat for a code…", MUTED),
-        ScanState::Showing => ("Open WeChat › 扫一扫 and point it here", Color::White),
+        ScanState::Asking => (asking, MUTED),
+        ScanState::Showing => (showing, Color::White),
         ScanState::Scanned => ("Scanned — now tap confirm on your phone", Color::Green),
         ScanState::Expired => ("That code timed out. Press r for another.", Color::Yellow),
         ScanState::Failed(error) => (error.as_str(), Color::Red),

@@ -212,6 +212,15 @@ pub enum Request {
         alive: Arc<AtomicBool>,
         environment: Vec<(String, String)>,
     },
+    /// Begin Feishu/Lark onboarding: the worker asks Feishu for a code, shows
+    /// it, and polls until the phone approves and Feishu hands over a freshly
+    /// created bot's credentials. The same alive flag as [`Self::ChannelLogin`]
+    /// ends the watch when the scanner walks away.
+    ChannelLarkLogin {
+        attempt: u64,
+        alive: Arc<AtomicBool>,
+        environment: Vec<(String, String)>,
+    },
     /// Ask Lark which chats an app's bot is in, so one can be chosen instead of
     /// having its id copied out of a browser's address bar.
     ChannelChats {
@@ -236,6 +245,8 @@ pub enum LoginStep {
     Expired,
     /// Done, and this is the bot that came of it.
     Connected(Box<crate::ilink::Account>),
+    /// Done, and this is the Feishu/Lark bot onboarding created.
+    LarkConnected(Box<crate::lark_onboard::Onboarded>),
     Failed(String),
 }
 
@@ -1223,6 +1234,64 @@ impl Worker {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                    Request::ChannelLarkLogin {
+                        attempt,
+                        alive,
+                        environment,
+                    } => {
+                        let reached = |step| {
+                            let _ = events.send(Event::ChannelLogin { attempt, step });
+                        };
+                        match crate::lark_onboard::begin(&environment) {
+                            Err(error) => reached(LoginStep::Failed(format!("{error:#}"))),
+                            Ok((link, device_code, interval)) => {
+                                reached(LoginStep::Code(link));
+                                // Said once. Feishu repeats the pending answer
+                                // on every poll, and a line that rewrites
+                                // itself with the same words reads as
+                                // something going wrong.
+                                let mut announced = false;
+                                let mut host = crate::lark_onboard::FEISHU.to_string();
+                                while alive.load(Ordering::Relaxed) {
+                                    match crate::lark_onboard::poll(
+                                        &host,
+                                        &device_code,
+                                        &environment,
+                                    ) {
+                                        Ok((
+                                            next_host,
+                                            crate::lark_onboard::Scan::Waiting { interval: wait },
+                                        )) => {
+                                            host = next_host;
+                                            if !announced {
+                                                announced = true;
+                                                // The scan is up and waiting;
+                                                // there is nothing more to
+                                                // tell the phone screen until
+                                                // something moves.
+                                                reached(LoginStep::Scanned);
+                                            }
+                                            std::thread::sleep(std::time::Duration::from_secs(
+                                                wait,
+                                            ));
+                                        }
+                                        Ok((
+                                            _,
+                                            crate::lark_onboard::Scan::Connected(onboarded),
+                                        )) => {
+                                            reached(LoginStep::LarkConnected(Box::new(onboarded)));
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            reached(LoginStep::Failed(format!("{error:#}")));
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = interval;
                             }
                         }
                     }

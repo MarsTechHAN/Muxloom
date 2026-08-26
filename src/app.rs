@@ -276,6 +276,10 @@ pub struct ChannelScan {
     pub attempt: u64,
     /// Held by the watching thread too. Cleared on the way out of this step.
     pub alive: Arc<AtomicBool>,
+    /// Whether this code is Feishu/Lark onboarding rather than WeChat. The two
+    /// scan the same way but re-scan to different ends, and a Lark scan may be
+    /// abandoned for typing credentials by hand ("`m`") instead.
+    pub lark: bool,
     pub state: ScanState,
     /// The link WeChat handed over, and the grid it becomes. The link is kept
     /// as well as the grid: a terminal too small to draw the code can still
@@ -289,6 +293,7 @@ impl Default for ChannelScan {
         Self {
             attempt: 0,
             alive: Arc::new(AtomicBool::new(true)),
+            lark: false,
             state: ScanState::default(),
             link: String::new(),
             code: None,
@@ -7851,9 +7856,12 @@ impl App {
                 self.ask_for_code(form);
             }
             ChannelKind::Lark => {
-                // A Lark binding starts from cc-connect's credentials when that
-                // is what this machine already had: the same two strings out of
-                // the same console, already copied once.
+                // A Lark binding offers two roads; both get to the same chat
+                // picker. When this machine already talks to src-connect, reuse
+                // its credentials so nobody has to type them twice. Otherwise
+                // scan: Feishu's registration QR creates a bot for you, with
+                // the messaging permissions already attached — the part
+                // hand-building an app so often gets wrong.
                 let mut keys = ChannelKeys::default();
                 if let Some(borrowed) =
                     crate::channel::borrow_cc_connect(&crate::channel::cc_connect_path())
@@ -7862,9 +7870,12 @@ impl App {
                     keys.secret = borrowed.secret;
                     keys.route = borrowed.route;
                     keys.borrowed = Some(borrowed.from.display().to_string());
+                    form.step = Some(ChannelStep::Keys(keys));
+                    self.modal = Some(Modal::Channels(form));
+                } else {
+                    form.step = Some(ChannelStep::Scan(Box::default()));
+                    self.ask_for_lark_code(form);
                 }
-                form.step = Some(ChannelStep::Keys(keys));
-                self.modal = Some(Modal::Channels(form));
             }
         }
     }
@@ -7903,6 +7914,39 @@ impl App {
         self.modal = Some(Modal::Channels(form));
     }
 
+    /// Ask the worker to begin Feishu/Lark onboarding — the same scan screen
+    /// as WeChat, but the code is Feishu's own registration QR, and what comes
+    /// of it is a freshly created bot rather than a bound one.
+    fn ask_for_lark_code(&mut self, mut form: ChannelsForm) {
+        form.abandon_scan();
+        self.channel_attempt = self.channel_attempt.saturating_add(1);
+        let scan = ChannelScan {
+            attempt: self.channel_attempt,
+            lark: true,
+            ..ChannelScan::default()
+        };
+        let environment = self
+            .config
+            .environment_for(LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        if self
+            .worker
+            .requests
+            .send(Request::ChannelLarkLogin {
+                attempt: scan.attempt,
+                alive: scan.alive.clone(),
+                environment,
+            })
+            .is_err()
+        {
+            form.error = Some("The worker is gone; no code was asked for".into());
+            form.step = None;
+        } else {
+            form.step = Some(ChannelStep::Scan(Box::new(scan)));
+        }
+        self.modal = Some(Modal::Channels(form));
+    }
+
     fn handle_channel_scan_key(
         &mut self,
         mut form: ChannelsForm,
@@ -7913,6 +7957,19 @@ impl App {
             KeyCode::Esc => {
                 scan.alive.store(false, Ordering::Relaxed);
                 self.modal = Some(Modal::Channels(form));
+            }
+            // A Feishu onboarding scan can be put aside for the credentials a
+            // human already has: `m` drops out of the scan into the two-string
+            // form, so an existing bot is bound without forcing the scene of
+            // its birth.
+            KeyCode::Char('m') if scan.lark => {
+                scan.alive.store(false, Ordering::Relaxed);
+                form.step = Some(ChannelStep::Keys(ChannelKeys::default()));
+                self.modal = Some(Modal::Channels(form));
+            }
+            KeyCode::Char('r') | KeyCode::Enter if scan.lark => {
+                form.step = Some(ChannelStep::Scan(Box::new(scan)));
+                self.ask_for_lark_code(form);
             }
             KeyCode::Char('r') | KeyCode::Enter => {
                 form.step = Some(ChannelStep::Scan(Box::new(scan)));
@@ -8343,6 +8400,24 @@ impl App {
             }
             LoginStep::Scanned => scan.state = ScanState::Scanned,
             LoginStep::Expired => scan.state = ScanState::Expired,
+            LoginStep::LarkConnected(onboarded) => {
+                let keys = ChannelKeys {
+                    app_id: onboarded.app_id.clone(),
+                    secret: onboarded.app_secret.clone(),
+                    ..ChannelKeys::default()
+                };
+                let form = match self.modal.take() {
+                    Some(Modal::Channels(form)) => form,
+                    other => {
+                        self.modal = other;
+                        return;
+                    }
+                };
+                // A freshly created bot can list its chats (it was provisioned
+                // with the messaging permissions), so move straight to picking
+                // one; if the tenant is Lark the same two strings work there.
+                self.ask_for_chats(form, keys);
+            }
             LoginStep::Failed(error) => scan.state = ScanState::Failed(error),
             LoginStep::Connected(account) => {
                 let binding = crate::channel::ChannelBinding {
@@ -15016,6 +15091,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = requests.try_recv();
         assert!(matches!(channel_step(&app), ChannelStep::Keys(_)));
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -15104,6 +15182,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = _requests.try_recv();
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let error = channels_form(&app).error.clone().unwrap_or_default();
@@ -15128,6 +15209,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = requests.try_recv();
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_into(&mut app, "wrong");
@@ -15166,6 +15250,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = _requests.try_recv();
 
         // Committed text, which is what a terminal that handles the paste
         // itself sends.
@@ -15215,6 +15302,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = requests.try_recv();
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_into(&mut app, "shhh");
@@ -15320,6 +15410,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Abandon the onboarding scan for typing credentials that already exist.
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // The scan we abandoned had already asked the worker for a code.
+        let _ = requests.try_recv();
         type_into(&mut app, "cli_9");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         type_into(&mut app, "shhh");

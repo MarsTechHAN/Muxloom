@@ -12,6 +12,7 @@ pub mod http;
 pub mod ilink;
 #[cfg(unix)]
 pub mod keeper;
+pub mod lark_onboard;
 pub mod mcp;
 pub mod mcp_register;
 pub mod media;

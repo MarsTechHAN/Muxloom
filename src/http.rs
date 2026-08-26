@@ -285,6 +285,74 @@ pub fn post_json(
     json(send(request, url, |_| true)?, url)
 }
 
+/// POST `application/x-www-form-urlencoded`, used by the flows that take a
+/// plain form rather than JSON — Feishu's bot-registration endpoint among
+/// them.
+pub fn post_form(
+    url: &str,
+    headers: &[(&str, &str)],
+    fields: &[(String, String)],
+    environment: &[(String, String)],
+) -> Result<serde_json::Value> {
+    json(post_form_response(url, headers, fields, environment)?, url)
+}
+
+/// The same POST as [`post_form`], but the body is parsed as JSON without
+/// asking that the status be 2xx. Feishu's onboarding answers "still waiting
+/// for the scan" with HTTP 400 and a JSON body; a caller that wants that
+/// answer instead of an error uses this and reads the body itself.
+///
+/// The overall request is still bounded: a connection timeout and the usual
+/// retry on a transport that never answered.
+pub fn post_form_free(
+    url: &str,
+    headers: &[(&str, &str)],
+    fields: &[(String, String)],
+    environment: &[(String, String)],
+) -> Result<serde_json::Value> {
+    let response = post_form_response(url, headers, fields, environment)?;
+    let body = response.as_str().unwrap_or_default();
+    serde_json::from_str(body).with_context(|| format!("{url} did not answer with JSON: {body}"))
+}
+
+fn post_form_response(
+    url: &str,
+    headers: &[(&str, &str)],
+    fields: &[(String, String)],
+    environment: &[(String, String)],
+) -> Result<minreq::Response> {
+    let mut encoded = String::new();
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            encoded.push('&');
+        }
+        encoded.push_str(&form_encode(name));
+        encoded.push('=');
+        encoded.push_str(&form_encode(value));
+    }
+    let request = headed(prepare(minreq::post(url), url, environment), headers)
+        .with_header("Content-Type", "application/x-www-form-urlencoded")
+        .with_body(encoded);
+    send(request, url, |_| true)
+}
+
+/// Percent-encode one form field, the way `application/x-www-form-urlencoded`
+/// wants it: everything outside the unreserved set becomes percent-triplets.
+/// Iterating bytes keeps each UTF-8 code point intact as its own `%XX` runs.
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// Fetch a small text body (follows redirects).
 #[cfg(feature = "controller")]
 pub fn fetch_text(url: &str, environment: &[(String, String)]) -> Result<String> {
