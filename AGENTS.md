@@ -134,9 +134,14 @@ preserve.
   surface reaches other machines only by relaying through an attached
   controller, and only for the relay whitelist — never a shell, a machine
   enablement, or an SSH edit. With no controller attached those calls fail
-  immediately rather than waiting. The line is look and speak, not change: a
-  tool that only reports, plus the ones that say something, may be relayed;
-  everything that alters the far machine belongs to the agents living there.
+  immediately rather than waiting. The line is look, speak, and — only after a
+  person approves it — a narrow set of writes. Tools that only report, plus
+  the ones that say something, may be relayed; starting a session on a far
+  machine and typing into one may be relayed too, but the controller holds
+  each such call behind the person's approval (one-shot, or remembered for
+  the asking session) and asks over the bound chat; deny ends it, and the most
+  destructive writes are never remembered across a cart approval. Everything
+  else that alters the far machine belongs to the agents living there.
   Nothing that waits is relayed either — a relayed job runs on the controller's
   own round, and a tool that sits there holds up every other machine's errands.
 - A daemon learns the fleet only from a controller coming round to ask for

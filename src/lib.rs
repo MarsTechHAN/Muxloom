@@ -1,4 +1,5 @@
 pub mod app;
+pub mod approvals;
 #[cfg(feature = "controller")]
 pub mod backup;
 pub mod bridge;

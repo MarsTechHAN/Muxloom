@@ -356,6 +356,11 @@ pub enum DaemonRequest {
     RelaySubmit {
         tool: String,
         arguments: String,
+        /// The session that asked, when the daemon surface had one in
+        /// context. Reaches the controller so a "always for this
+        /// conversation" is scoped to the asking agent.
+        #[serde(default)]
+        session: String,
     },
     /// A controller asking what it can carry, and saying where it can reach
     /// while it is here. Answering it is also how a daemon learns a controller

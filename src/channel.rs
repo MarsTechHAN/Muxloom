@@ -1238,6 +1238,13 @@ pub enum Route {
     Current,
     /// Stop the agent this chat is aimed at.
     Stop,
+    /// A person answering a cross-machine approval ask. `id` is the approval
+    /// id (`approve-N`), and `verdict` whether they said one-shot yes, always,
+    /// or no.
+    Approval {
+        id: String,
+        verdict: crate::approvals::Verdict,
+    },
     /// Say what there is to talk to.
     Who,
     /// Explain the commands this chat understands.
@@ -1274,6 +1281,12 @@ pub fn route(
     inbox: &Inbox,
 ) -> (Route, String) {
     let text = text.trim();
+    // A bare approval reply (`approve-12`, `always-12`, `reject-12`) answers
+    // a cross-machine write the controller parked and asked about. It is not a
+    // slash command; intercept it whole so it never reaches a session as prose.
+    if let Some(route) = approval_route(text) {
+        return (route, String::new());
+    }
     let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     let rest = rest.trim().to_string();
     // A command is a command wherever it was typed, including in a reply: the
@@ -1327,6 +1340,26 @@ pub fn parse_kind(word: &str) -> Option<AgentKind> {
         "opencode" => Some(AgentKind::OpenCode),
         _ => None,
     }
+}
+
+/// Recognise a bare approval reply — `approve-12`, `always-12`, `reject-12` —
+/// and turn it into an Approval route. Anything that is not one of those three
+/// words followed by a numeric id is left alone.
+pub fn approval_route(text: &str) -> Option<Route> {
+    let (word, id) = text.trim().split_once('-')?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let verdict = match word.trim().to_ascii_lowercase().as_str() {
+        "approve" => crate::approvals::Verdict::Yes,
+        "always" => crate::approvals::Verdict::Always,
+        "reject" => crate::approvals::Verdict::No,
+        _ => return None,
+    };
+    Some(Route::Approval {
+        id: format!("approve-{id}"),
+        verdict,
+    })
 }
 
 fn meant_as_a_command(word: &str) -> bool {
@@ -2244,6 +2277,43 @@ fn handle(
                 None => "· nothing is aimed — `/select <num>-<n>` first, or reply to a card".into(),
             }
         }
+        Route::Approval { id, verdict } => {
+            let path = crate::approvals::Approvals::default_path();
+            let mut ledger = crate::approvals::Approvals::load(&path);
+            let Some(pending) = ledger.take(&id) else {
+                return "· that approval is already settled or was never asked".into();
+            };
+            let out = match verdict {
+                crate::approvals::Verdict::No => "· denied".to_string(),
+                crate::approvals::Verdict::Yes => {
+                    ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
+                    format!(
+                        "· allowed {} once — tell the agent to run it again",
+                        pending.tool
+                    )
+                }
+                crate::approvals::Verdict::Always => {
+                    if crate::relay::reminder_allowed(&pending.tool) {
+                        ledger.remember(&pending.session, &pending.machine, &pending.tool);
+                        format!(
+                            "· allowed {} for the rest of this conversation",
+                            pending.tool
+                        )
+                    } else {
+                        // Too sensitive to remember; the one-shot is the ceiling.
+                        ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
+                        format!(
+                            "· {} is sensitive, so allowed it once only — tell the agent to run it again",
+                            pending.tool
+                        )
+                    }
+                }
+            };
+            if let Err(error) = ledger.save(&path) {
+                return format!("· could not record that: {error:#}");
+            }
+            out
+        }
         Route::Clear => match inbox.aimed.remove(&binding.id) {
             Some(who) => format!("· no longer aimed at {}", who.name()),
             None => "· nothing was aimed".into(),
@@ -3102,5 +3172,40 @@ mod tests {
         // Numbering stays stable across folders, so /select's machine-agent
         // numbers stay stable even as folders move around.
         assert!(rendered.contains("  1  lexer"), "numbering starts at one");
+    }
+
+    #[test]
+    fn approval_replies_are_recognised_and_reach_a_verdict() {
+        let inbox = Inbox::default();
+        match route("approve-12", None, "lark-1", false, &inbox).0 {
+            Route::Approval { id, verdict } => {
+                assert_eq!(id, "approve-12");
+                assert_eq!(verdict, crate::approvals::Verdict::Yes);
+            }
+            other => panic!("approve-12 should route to an approval: {other:?}"),
+        }
+        match route("always-7", None, "lark-1", false, &inbox).0 {
+            Route::Approval { id, verdict } => {
+                assert_eq!(id, "approve-7");
+                assert_eq!(verdict, crate::approvals::Verdict::Always);
+            }
+            other => panic!("always-7 should route to an approval: {other:?}"),
+        }
+        match route("reject-3", None, "lark-1", false, &inbox).0 {
+            Route::Approval { id, verdict } => {
+                assert_eq!(id, "approve-3");
+                assert_eq!(verdict, crate::approvals::Verdict::No);
+            }
+            other => panic!("reject-3 should route to an approval: {other:?}"),
+        }
+        // A number with no verb, or a plain sentence, is not an approval.
+        assert!(matches!(
+            route("123", None, "lark-1", false, &inbox).0,
+            Route::Board { .. }
+        ));
+        assert!(matches!(
+            route("approve", None, "lark-1", false, &inbox).0,
+            Route::Board { .. }
+        ));
     }
 }

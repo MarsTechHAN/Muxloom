@@ -28,6 +28,7 @@
 
 use std::{
     fmt,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,6 +36,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    approvals::{Approvals, Pending as ApprovalsPending},
     config::Config,
     control::{ControlSurface, ControllerControl},
     debug,
@@ -80,6 +82,31 @@ pub const RELAYED_TOOLS: &[&str] = &[
     "talk_post",
     "talk_read",
 ];
+
+/// Cross-machine WRITE tools a daemon-flavoured agent may run on another
+/// machine once a person has approved it. These are the ones that act on a
+/// session a human would expect to sign off on: starting one, and typing into
+/// one. `relay.rs` lets the controller execute them, but only after the
+/// approval gate (see `control.rs`) lets them through; the controller itself
+/// never prompts, it only runs what an approved daemon submitted.
+pub const APPROVE_TOOLS: &[&str] = &["launch_session", "send_input"];
+
+/// Cross-machine WRITE tools that are sensitive enough that a one-shot yes is
+/// all a person should give: they destroy state or run arbitrary code. They
+/// may be approved once, but never remembered for the rest of the
+/// conversation.
+pub const SENSITIVE_TOOLS: &[&str] = &["delete_session", "archive_session", "run_shell", "trigger"];
+
+/// Whether `tool` is held behind the cross-machine approval gate.
+pub fn approve_gated(tool: &str) -> bool {
+    APPROVE_TOOLS.contains(&tool) || SENSITIVE_TOOLS.contains(&tool)
+}
+
+/// Whether an approved cross-machine WRITE may be remembered for the rest of
+/// the conversation (false = one-shot only).
+pub fn reminder_allowed(tool: &str) -> bool {
+    APPROVE_TOOLS.contains(&tool)
+}
 /// How long a controller's last request for work counts for. A controller
 /// carries the board every couple of seconds and asks for work on the same
 /// round, so a gap this size means it is gone, not busy.
@@ -99,6 +126,12 @@ pub struct RelayJob {
     /// Its arguments as JSON text. The wire type stays a string so the
     /// protocol's messages keep comparing by value.
     pub arguments: String,
+    /// The session that asked, when one did. Carried so a person's "always for
+    /// this conversation" can be scoped to the asking agent rather than to
+    /// every agent on the machine. Empty when the ask came from the surface
+    /// directly with no session in context.
+    #[serde(default)]
+    pub session: String,
     pub submitted_at: u64,
 }
 
@@ -163,6 +196,38 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+/// Source of fresh approval ids while the controller runs. A plain counter is
+/// all the uniqueness a chat reply needs.
+static NEXT_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Which machine a relayed job names, if it names one. Read from the
+/// `machine` argument the same way the tool surface does, so the ask tells the
+/// person where the write would land and the remember key is stable.
+fn job_machine(job: &RelayJob) -> String {
+    serde_json::from_str::<serde_json::Value>(&job.arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("machine")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Ask the person over the bound chat, when a chat is bound and reachable.
+/// Not reachable is fine: the job is refused with the same "needs approval"
+/// answer, and the refusal itself tells the agent what to type back.
+fn try_chat_ask(surface: &mut Option<ControllerControl>, ask: &str) {
+    let Some(surface) = surface else {
+        return;
+    };
+    let _ = surface.call(
+        "send_channel_message",
+        &serde_json::json!({ "text": ask, "title": "approval needed" }),
+    );
 }
 
 #[derive(Debug)]
@@ -243,8 +308,18 @@ impl RelayQueue {
     /// Queue a job, or say why it cannot be queued. Failing here rather than
     /// waiting is the point: an agent that asks for another machine while no
     /// controller is running should be told so on the call it made.
-    pub fn submit(&mut self, tool: &str, arguments: &str, now: u64) -> Result<String> {
-        if !relayed(tool) {
+    pub fn submit(
+        &mut self,
+        tool: &str,
+        arguments: &str,
+        session: &str,
+        now: u64,
+    ) -> Result<String> {
+        // A cross-machine WRITE tool is queued too, but it is held behind the
+        // person's approval when the controller runs it. It is not refused at
+        // the door: the agent should be told it is waiting on a person, not
+        // that the machine cannot be reached at all.
+        if !relayed(tool) && !approve_gated(tool) {
             bail!("{}", refusal(tool));
         }
         if !self.attached(now) {
@@ -265,6 +340,7 @@ impl RelayQueue {
                 id: id.clone(),
                 tool: tool.into(),
                 arguments: arguments.into(),
+                session: session.to_string(),
                 submitted_at: now,
             },
             taken: false,
@@ -442,8 +518,57 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
             }
         };
         hear(&mut round.heard, known, &reach, &via);
+        let mut approvals = Approvals::load(&Approvals::default_path());
+        let mut approval_dirty = false;
+        let mut next = NEXT_PENDING.fetch_add(1_000, Ordering::Relaxed) + 1;
         for job in jobs {
-            let (ok, output) = if relayed(&job.tool) {
+            // A WRITE tool held behind the approval gate runs only after the
+            // person has said so — remembered for the session, or asked now.
+            if approve_gated(&job.tool)
+                && !approvals.remembered(&job.session, &job_machine(&job), &job.tool)
+            {
+                let id = format!("approve-{next}");
+                next += 1;
+                let machine = job_machine(&job);
+                let ask = format!(
+                    "An agent wants to run `{}`{} on {}...
+Reply `approve-{id}` to allow once, `always-{id}` for the whole conversation, or `reject-{id}` to deny.",
+                    job.tool,
+                    if machine.is_empty() {
+                        ""
+                    } else {
+                        " (cross-machine)"
+                    },
+                    if machine.is_empty() {
+                        "a remote machine".to_string()
+                    } else {
+                        machine.clone()
+                    }
+                );
+                approvals.park(
+                    id.clone(),
+                    ApprovalsPending {
+                        session: job.session.clone(),
+                        machine: machine.clone(),
+                        tool: job.tool.clone(),
+                        ask: ask.clone(),
+                        at_ms: now_ms(),
+                        open: true,
+                    },
+                );
+                approval_dirty = true;
+                let (ok, output) = (
+                    false,
+                    format!(
+                        "{tool} needs human approval — the person has been asked via chat; reply `approve-{id}` / `always-{id}` / `reject-{id}`",
+                        tool = job.tool
+                    ),
+                );
+                let _ = pool.relay_complete(target, job.id.clone(), ok, output);
+                try_chat_ask(&mut surface, &ask);
+                continue;
+            }
+            let (ok, output) = if relayed(&job.tool) || approve_gated(&job.tool) {
                 let surface = match &mut surface {
                     Some(surface) => surface,
                     none => none.insert(ControllerControl::with_runtime(
@@ -454,6 +579,15 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 match run(surface, &job.tool, &job.arguments) {
                     Ok(output) => {
                         round.ran += 1;
+                        // A one-shot grant is spent by the run it let through.
+                        if approve_gated(&job.tool)
+                            && approvals.once.iter().any(|(s, m, t)| {
+                                s == &job.session && m == &job_machine(&job) && t == &job.tool
+                            })
+                        {
+                            approvals.spend_once(&job.session, &job_machine(&job), &job.tool);
+                            approval_dirty = true;
+                        }
                         (true, output)
                     }
                     Err(error) => {
@@ -473,6 +607,12 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                     "relay",
                     format!("{}: {} went unanswered ({error})", target.id, job.id),
                 );
+            }
+        }
+        if approval_dirty {
+            let path = Approvals::default_path();
+            if let Err(error) = approvals.save(&path) {
+                debug::log("approval", format!("could not save: {error:#}"));
             }
         }
     }
@@ -531,7 +671,7 @@ mod tests {
         let t0 = 1_000_000;
 
         // Nothing has ever polled: the agent is told now, not in a minute.
-        let error = queue.submit("list_machines", "{}", t0).unwrap_err();
+        let error = queue.submit("list_machines", "{}", "", t0).unwrap_err();
         assert!(
             error.to_string().contains("attached muxloom controller"),
             "{error}"
@@ -539,7 +679,8 @@ mod tests {
 
         // A controller shows up and the same call goes through.
         assert!(queue.poll(t0, Vec::new(), "").is_empty());
-        let id = queue.submit("list_machines", "{}", t0).unwrap();
+        let id = queue.submit("list_machines", "{}", "", t0).unwrap();
+        assert!(!id.is_empty(), "a relayed job gets an id");
         // Still nothing back, and asking does not consume the job.
         assert_eq!(queue.result(&id, t0).unwrap(), RelayAnswer::default());
 
@@ -562,8 +703,18 @@ mod tests {
         let mut queue = RelayQueue::default();
         let t0 = 2_000_000;
         queue.poll(t0, Vec::new(), "");
-        // Nothing that changes the far machine, and nothing that would sit
-        // there: a relayed job runs on the controller's own round.
+        // Nothing that would sit there: a relayed job runs on the controller's
+        // own round, so a wait is refused wherever it is named.
+        let error = queue
+            .submit("wait_for", "{}", "", t0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not relay"), "wait_for: {error}");
+        // A cross-machine WRITE is queued (it is held behind the controller's
+        // approval gate when it runs, not refused at the door): an agent that
+        // asks for another machine is told it is waiting on a person, not that
+        // the machine cannot be reached. The two that can never be lawfully
+        // crossed — enabling a machine and editing SSH — stay refused.
         for tool in [
             "run_shell",
             "delete_session",
@@ -571,13 +722,15 @@ mod tests {
             "launch_session",
             "send_input",
             "trigger",
-            "ssh_host",
-            "set_machine_enabled",
-            "wait_for",
         ] {
-            let error = queue.submit(tool, "{}", t0).unwrap_err().to_string();
+            assert!(
+                queue.submit(tool, "{}", "", t0).is_ok(),
+                "{tool} is gated, not refused"
+            );
+        }
+        for tool in ["ssh_host", "set_machine_enabled"] {
+            let error = queue.submit(tool, "{}", "", t0).unwrap_err().to_string();
             assert!(error.contains("does not relay"), "{tool}: {error}");
-            assert!(error.contains("message_agent"), "{tool}: {error}");
         }
         // Looking is the half that makes asking possible, so all of it travels.
         for tool in [
@@ -590,7 +743,7 @@ mod tests {
             "talk_read",
             "talk_post",
         ] {
-            assert!(queue.submit(tool, "{}", t0).is_ok(), "{tool}");
+            assert!(queue.submit(tool, "{}", "", t0).is_ok(), "{tool}");
         }
     }
 
@@ -778,7 +931,7 @@ mod tests {
         let mut queue = RelayQueue::default();
         let t0 = 3_000_000;
         queue.poll(t0, Vec::new(), "");
-        let id = queue.submit("read_conversation", "{}", t0).unwrap();
+        let id = queue.submit("read_conversation", "{}", "", t0).unwrap();
         queue.poll(t0, Vec::new(), "");
         // The controller took it and never came back.
         assert!(!queue.result(&id, t0 + EXPIRY_MS - 1).unwrap().done);

@@ -3128,6 +3128,7 @@ mod daemon_surface {
                 .transact(&DaemonRequest::RelaySubmit {
                     tool: tool.into(),
                     arguments: arguments.to_string(),
+                    session: launching_session().unwrap_or_default(),
                 })?
                 .0
             {
@@ -3354,9 +3355,12 @@ mod daemon_surface {
             enforce_policy(&self.config.mcp, name)?;
             // What another machine holds is the controller's to answer. The
             // two that are only ever about other machines go straight out;
-            // the rest go out only when they name one.
+            // the rest go out only when they name one. A cross-machine WRITE
+            // goes out too — the controller enforces the person's approval on
+            // the far side — so it is offered here rather than refused.
             if matches!(name, "search_conversations" | "read_conversation")
-                || (crate::relay::relayed(name) && self.elsewhere(arguments).is_some())
+                || ((crate::relay::relayed(name) || crate::relay::approve_gated(name))
+                    && self.elsewhere(arguments).is_some())
             {
                 return self.relay(name, arguments);
             }

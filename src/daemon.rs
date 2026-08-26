@@ -2206,12 +2206,16 @@ mod platform {
                     },
                 )
             }
-            DaemonRequest::RelaySubmit { tool, arguments } => {
+            DaemonRequest::RelaySubmit {
+                tool,
+                arguments,
+                session,
+            } => {
                 let id = state
                     .relay
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .submit(&tool, &arguments, crate::relay::now_ms())?;
+                    .submit(&tool, &arguments, &session, crate::relay::now_ms())?;
                 write_response(writer, request_id, &DaemonResponse::RelayTicket { id })
             }
             DaemonRequest::RelayPoll { peers, via } => {
