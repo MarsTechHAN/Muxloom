@@ -4,19 +4,22 @@
 //! sessions — its own machine's and, through them, the work it handed off — but
 //! only if it has been told the surface exists. Wiring that up by hand on every
 //! machine is exactly the chore muxloom exists to remove, so the daemon does it
-//! for the user it runs as: on start it writes a `muxloom` entry into Claude
-//! Code's and Codex's user-level MCP configuration, pointing at itself.
+//! for the user it runs as: on start it writes a `muxloom` entry into the
+//! user-level MCP configuration of every agent that speaks MCP — Claude Code,
+//! Codex, and OpenCode — pointing at itself, plus a Pi extension that bridges
+//! the same surface to the one agent that does not speak MCP at all.
 //!
-//! The same start also leaves Claude Code a skill describing how to work with
+//! The same start also leaves the agents a skill describing how to work with
 //! the rest of the fleet, since a tool list says what can be called but not
-//! what is worth calling. Codex has no skill mechanism; it gets the shorter
-//! version through the MCP `instructions` field instead.
+//! what is worth calling. Claude Code, Codex, and Pi all load the Agent Skills
+//! standard; OpenCode has no skill directory and gets the shorter version
+//! through the MCP `instructions` field instead, as everything does.
 //!
 //! These files belong to the user, not to muxloom. Nothing else in them is
 //! touched, the entry is rewritten only when it is missing or points somewhere
 //! else, a file that does not parse is left exactly as it is, and
 //! `MUXLOOM_MCP_REGISTER=0` turns the whole thing off (`MUXLOOM_SKILL=0` turns
-//! off just the skill).
+//! off just the skill, `MUXLOOM_PI=0` turns off just the Pi extension).
 
 use std::{
     collections::BTreeMap,
@@ -27,8 +30,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-/// The name the entry carries in both agents' configuration.
+/// The name the entry carries in every agent's configuration.
 const SERVER_NAME: &str = "muxloom";
+
+/// The agents the daemon registers a skill with. Each is the relative path from
+/// `home` to that agent's `SKILL.md` under its own `skills` directory.
+const CLAUDE: &str = ".claude/skills/muxloom/SKILL.md";
+const CODEX: &str = ".codex/skills/muxloom/SKILL.md";
+const PI: &str = ".pi/agent/skills/muxloom/SKILL.md";
 
 /// What the daemon wants both agents to know about it.
 #[derive(Debug, Clone)]
@@ -122,6 +131,10 @@ pub fn register(home: &Path, entry: &ServerEntry) -> Result<Vec<PathBuf>> {
     if register_with_codex(&codex, entry)? {
         written.push(codex);
     }
+    let opencode = home.join(".config").join("opencode").join("opencode.json");
+    if register_with_opencode(&opencode, entry)? {
+        written.push(opencode);
+    }
     Ok(written)
 }
 
@@ -144,7 +157,10 @@ pub fn register_for_this_daemon(serves_the_machines_state: bool) -> Result<Vec<P
     };
     let mut written = register(&home, &ServerEntry::for_this_machine()?)?;
     if !switched_off("MUXLOOM_SKILL") {
-        written.extend(install_skill(&home)?);
+        written.extend(install_skills(&home)?);
+    }
+    if !switched_off("MUXLOOM_PI") {
+        written.extend(install_pi(&home)?);
     }
     Ok(written)
 }
@@ -349,14 +365,27 @@ fn skill_document() -> String {
     )
 }
 
-/// Leave the skill under `home`, unless the file there is not ours to write.
-/// Returns the path when it was written.
-pub fn install_skill(home: &Path) -> Result<Option<PathBuf>> {
-    let path = home
-        .join(".claude")
-        .join("skills")
-        .join(SERVER_NAME)
-        .join("SKILL.md");
+/// Every agent that loads the Agent Skills standard gets the same skill file,
+/// so a fleet behaviour learned in one works in all of them. Claude Code and
+/// Codex read `SKILL.md` from their own `skills` directories under `home`; Pi
+/// does the same from `~/.pi/agent/skills`. OpenCode has no skill directory and
+/// is deliberately left out: it gets the higher-priority `instructions` sent by
+/// the MCP handshake instead.
+///
+/// Returns the paths written.
+pub fn install_skills(home: &Path) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    for relative in [CLAUDE, CODEX, PI] {
+        if let Some(path) = install_skill_at(home.join(relative))? {
+            written.push(path);
+        }
+    }
+    Ok(written)
+}
+
+/// Leave the skill under one agent's `skills` directory, unless the file there
+/// is not ours to write. Returns the path when it was written.
+fn install_skill_at(path: PathBuf) -> Result<Option<PathBuf>> {
     match fs::read_to_string(&path) {
         Ok(existing) => match skill_revision(&existing) {
             // No stamp: someone else wrote this, and it is not ours to replace.
@@ -485,6 +514,232 @@ fn register_with_codex(path: &Path, entry: &ServerEntry) -> Result<bool> {
     }
     write_atomically(path, text.as_bytes())?;
     Ok(true)
+}
+
+/// OpenCode keeps its user-scope servers under the `mcp` object in
+/// `~/.config/opencode/opencode.json`. That file is hand-written and may hold
+/// anything, so the `muxloom` server is inserted into the `mcp` object and
+/// everything else is preserved byte-for-byte; a file that does not parse is
+/// left untouched.
+fn register_with_opencode(path: &Path, entry: &ServerEntry) -> Result<bool> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => json!({}),
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let Some(object) = root.as_object_mut() else {
+        bail!("{} does not hold a JSON object", path.display());
+    };
+    let mut command = vec![entry.command.clone()];
+    command.extend(entry.args.clone());
+    let mut desired = json!({
+        "type": "local",
+        "command": command,
+        "enabled": true,
+    });
+    if !entry.environment.is_empty() {
+        desired["environment"] = json!(entry.environment);
+    }
+    let servers = object
+        .entry("mcp")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .with_context(|| format!("mcp in {} is not an object", path.display()))?;
+    if servers.get(SERVER_NAME) == Some(&desired) {
+        return Ok(false);
+    }
+    servers.insert(SERVER_NAME.into(), desired);
+    let mut text = serde_json::to_string_pretty(&root).context("failed to encode the config")?;
+    text.push('\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    write_atomically(path, text.as_bytes())?;
+    Ok(true)
+}
+
+/// Pi has no MCP integration, so the surface is bridged through an extension
+/// that speaks the same JSON-RPC-over-stdio protocol muxloomd itself speaks,
+/// registering every control tool as a native Pi tool. The extension needs to
+/// know where `muxloomd` lives; muxloomd's own binary is the answer, embedded
+/// at install time, so a daemon that moves rewrites the extension with it.
+///
+/// `register_for_this_daemon` passes the daemon path on the entry it already
+/// built; here we read it back from the environment the daemon runs with, so
+/// the installed extension is only ever pointed at whatever we actually are.
+fn install_pi(home: &Path) -> Result<Vec<PathBuf>> {
+    install_pi_into(home, &ServerEntry::for_this_machine()?)
+}
+
+/// The portion of [`install_pi`] that takes an explicit entry, so tests can
+/// point the generated extension at a fake daemon.
+fn install_pi_into(home: &Path, entry: &ServerEntry) -> Result<Vec<PathBuf>> {
+    let mut args = vec![entry.command.clone()];
+    args.extend(entry.args.clone());
+    let body = pi_extension_body(&args, &entry.environment);
+    let dir = home.join(".pi/agent/extensions/muxloom");
+    let index = dir.join("index.ts");
+    match fs::read_to_string(&index) {
+        Ok(existing) if existing == body => return Ok(Vec::new()),
+        _ => {}
+    }
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    write_atomically(&index, body.as_bytes())?;
+    Ok(vec![index])
+}
+
+/// The TypeScript source that bridges muxloom's control surface onto Pi's
+/// native tool list. Pi deliberately ships no MCP integration, so this speaks
+/// the same JSON-RPC-over-stdio protocol muxloomd itself implements: it spawns
+/// `muxloomd mcp`, lists the tools, and registers each one as a first-class Pi
+/// tool via `pi.registerTool`. The daemon — not this shim — owns the tool list
+/// and validates arguments, so the shim forwards parameters verbatim.
+///
+/// It is self-contained: only Node built-ins plus `typebox`, which Pi bundles
+/// and makes importable from extensions. No npm install for the user.
+///
+/// `args` is the [`spawn`] argv for the muxloomd mcp process; `env` is the
+/// extra environment the daemon entry carries for a non-default state dir.
+fn pi_extension_body(args: &[String], env: &BTreeMap<String, String>) -> String {
+    let args_json = serde_json::Value::Array(args.iter().map(|a| json!(a)).collect()).to_string();
+    let mut env_entries = env
+        .iter()
+        .map(|(k, v)| format!("    {k:?}: {v:?},"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !env_entries.is_empty() {
+        env_entries.insert_str(0, "{\n");
+        env_entries.push_str("\n  }");
+    } else {
+        env_entries = "undefined".into();
+    }
+    // A single \"…\" inside the raw string is fine; we only avoid the sequence
+    // \"# that would end the r#…# literal. No tool value here contains it.
+    format!(
+        r#"// muxloom — managed by muxloomd. Delete this line to keep your own edits.
+import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
+import {{ Type }} from "typebox";
+import {{ spawn }} from "node:child_process";
+import type {{ ChildProcess }} from "node:child_process";
+import {{ createInterface }} from "node:readline";
+import {{ Readable, Writable }} from "node:stream";
+
+const MUXLOOM_ARGS: string[] = {args_json};
+const MUXLOOM_ENV: Record<string, string> | undefined = {env_entries};
+
+// One child process per Pi run, started lazily on first call and torn down on
+// shutdown. muxloomd is the authority on the tool list and argument schema;
+// this shim only relays JSON-RPC over stdio.
+let proc: {{ child: ChildProcess; pending: Map<number, {{resolve: (v: any) => void; reject: (e: Error) => void}}>; nextId: number; lines: import("node:readline").Interface }} | null = null;
+
+function spawnDaemon(): {{ child: ChildProcess; pending: Map<number, {{resolve: (v: any) => void; reject: (e: Error) => void}}>; nextId: number; lines: import("node:readline").Interface }} {{
+  const child = spawn(MUXLOOM_ARGS[0]!, MUXLOOM_ARGS.slice(1), {{
+    stdio: ["pipe", "pipe", "inherit"],
+    env: MUXLOOM_ENV ? {{ ...process.env, ...MUXLOOM_ENV }} : process.env,
+  }});
+  const state = {{ child, pending: new Map(), nextId: 1, lines: null as any }};
+  const reader = createInterface({{ input: child.stdout as unknown as Readable }});
+  reader.on("line", (line) => {{
+    if (!line.trim()) return;
+    let message: any;
+    try {{ message = JSON.parse(line); }} catch {{ return; }}
+    const id = message?.id;
+    if (id == null) return;
+    const entry = state.pending.get(id);
+    if (!entry) return;
+    state.pending.delete(id);
+    if (message.error) entry.reject(new Error(String(message.error.message ?? message.error)));
+    else entry.resolve(message.result);
+  }});
+  state.lines = reader;
+  reader.on("close", () => {{
+    for (const entry of state.pending.values()) entry.reject(new Error("muxloomd mcp closed"));
+    state.pending.clear();
+  }});
+  return state;
+}}
+
+async function rpc(state: any, method: string, params: any = {{}}): Promise<any> {{
+  const id = state.nextId++;
+  const reply = new Promise<any>((resolve, reject) => {{
+    state.pending.set(id, {{ resolve, reject }});
+  }});
+  const line = JSON.stringify({{ jsonrpc: "2.0", id, method, params }});
+  (state.child.stdin as Writable).write(line + "\n");
+  return reply;
+}}
+
+async function getInstance(): Promise<any> {{
+  if (proc) return proc;
+  proc = spawnDaemon();
+  return proc;
+}}
+
+export default function (pi: ExtensionAPI) {{
+  let registered = false;
+
+  async function registerTools() {{
+    if (registered) return;
+    registered = true;
+    try {{
+      const inst = await getInstance();
+      await rpc(inst, "initialize", {{
+        protocolVersion: "2025-06-18",
+        capabilities: {{}},
+        clientInfo: {{ name: "muxloom-pi", version: "1" }},
+      }});
+      const {{ tools }} = await rpc(inst, "tools/list", {{}});
+      for (const tool of tools ?? []) {{
+        const name: string = tool.name ?? String(tool.name);
+        if (!name) continue;
+        const description: string = typeof tool.description === "string" ? tool.description : "";
+        pi.registerTool({{
+          name,
+          label: name,
+          description,
+          parameters: Type.Object({{}}),
+          prepareArguments(args) {{ return args ?? {{}}; }},
+          async execute(toolCallId, params, _signal, _onUpdate, _ctx) {{
+            const inst = await getInstance();
+            const result = await rpc(inst, "tools/call", {{
+              name,
+              arguments: params ?? {{}},
+            }});
+            const text = Array.isArray(result?.content)
+              ? result.content.map((c: any) => c?.text ?? "").join("\n")
+              : JSON.stringify(result);
+            return {{ content: [{{ type: "text", text }}], details: {{}} }};
+          }},
+        }});
+      }}
+    }} catch (error) {{
+      // Surfacing the failure keeps the rest of the surface useful even when
+      // the local daemon is absent; the tools simply fail with a clear text.
+      console.error("[muxloom] could not reach muxloomd mcp:", error);
+    }}
+  }}
+
+  pi.on("session_start", async () => {{
+    await registerTools();
+  }});
+  pi.on("resources_discover", async () => {{
+    await registerTools();
+  }});
+  pi.on("session_shutdown", () => {{
+    if (proc) {{
+      proc.child.kill();
+      proc = null;
+      registered = false;
+    }}
+  }});
+}}
+"#
+    )
 }
 
 fn is_our_table(header: &str) -> bool {
@@ -619,10 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn both_agents_learn_about_the_daemon_and_stop_being_rewritten_after_that() {
+    fn every_agent_learns_about_the_daemon_and_stops_being_rewritten_after_that() {
         let home = scratch("fresh");
         let written = register(&home, &entry()).unwrap();
-        assert_eq!(written.len(), 2);
+        assert_eq!(written.len(), 3);
 
         let claude: Value =
             serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
@@ -634,6 +889,13 @@ mod tests {
             codex["mcp_servers"]["muxloom"]["command"].as_str(),
             Some("/opt/muxloomd")
         );
+        let opencode: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(opencode["mcp"]["muxloom"]["type"], "local");
+        assert_eq!(opencode["mcp"]["muxloom"]["command"][0], "/opt/muxloomd");
+        assert_eq!(opencode["mcp"]["muxloom"]["command"][1], "mcp");
 
         // Nothing to say the second time.
         assert!(register(&home, &entry()).unwrap().is_empty());
@@ -643,10 +905,18 @@ mod tests {
             command: "/usr/local/bin/muxloomd".into(),
             ..entry()
         };
-        assert_eq!(register(&home, &moved).unwrap().len(), 2);
+        assert_eq!(register(&home, &moved).unwrap().len(), 3);
         let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
         assert_eq!(text.matches("[mcp_servers.muxloom]").count(), 1);
         assert!(text.contains("/usr/local/bin/muxloomd"));
+        let opencode: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            opencode["mcp"]["muxloom"]["command"][0],
+            "/usr/local/bin/muxloomd"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -714,24 +984,98 @@ mod tests {
     }
 
     #[test]
-    fn the_skill_is_written_once_and_refreshed_when_it_goes_stale() {
+    fn opencode_keeps_the_users_other_servers_with_only_ours_added() {
+        let home = scratch("opencode-populated");
+        let config = home.join(".config/opencode/opencode.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            r#"{
+  "model": "anthropic/claude-sonnet-4-5",
+  "mcp": { "other": { "type": "local", "command": ["other-mcp"] } }
+}
+"#,
+        )
+        .unwrap();
+
+        register(&home, &entry()).unwrap();
+
+        let root: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(root["model"], "anthropic/claude-sonnet-4-5");
+        assert_eq!(root["mcp"]["other"]["command"][0], "other-mcp");
+        assert_eq!(root["mcp"]["muxloom"]["command"][0], "/opt/muxloomd");
+        assert_eq!(root["mcp"]["muxloom"]["command"][1], "mcp");
+        assert_eq!(root["mcp"]["muxloom"]["type"], "local");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_that_does_not_parse_is_left_exactly_as_it_was() {
+        let home = scratch("opencode-broken");
+        let config = home.join(".config/opencode/opencode.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{ not json").unwrap();
+        assert!(register(&home, &entry()).is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "{ not json");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_pi_extension_is_generated_self_contained_and_points_at_the_daemon() {
+        let home = scratch("pi");
+        let written = install_pi_into(&home, &entry()).unwrap();
+        assert_eq!(written.len(), 1);
+        let path = home.join(".pi/agent/extensions/muxloom/index.ts");
+        assert_eq!(written[0], path);
+        let body = fs::read_to_string(&path).unwrap();
+        // It registers tools on Pi and spawns the daemon's own binary.
+        assert!(body.contains("pi.registerTool"), "{body}");
+        assert!(body.contains("\"/opt/muxloomd\""), "{body}");
+        assert!(body.contains("\"mcp\""), "{body}");
+        assert!(body.contains("tools/list"), "{body}");
+        assert!(body.contains("tools/call"), "{body}");
+        // A fresh install is idempotent.
+        assert!(install_pi_into(&home, &entry()).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_pi_extension_carries_the_state_directory_when_the_daemon_was_given_one() {
+        let home = scratch("pi-state");
+        let mut entry = entry();
+        entry
+            .environment
+            .insert("MUXLOOMD_STATE_DIR".into(), "/tmp/state".into());
+        install_pi_into(&home, &entry).unwrap();
+        let body = fs::read_to_string(home.join(".pi/agent/extensions/muxloom/index.ts")).unwrap();
+        assert!(body.contains("MUXLOOMD_STATE_DIR"), "{body}");
+        assert!(body.contains("/tmp/state"), "{body}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_skill_is_written_to_every_agent_and_refreshed_when_it_goes_stale() {
         let home = scratch("skill");
-        let path = install_skill(&home)
-            .unwrap()
-            .expect("a fresh install writes");
-        assert_eq!(path, home.join(".claude/skills/muxloom/SKILL.md"));
+        let written = install_skills(&home).unwrap();
+        assert_eq!(written.len(), 3);
+        for relative in [CLAUDE, CODEX, PI] {
+            let path = home.join(relative);
+            assert!(written.iter().any(|w| w == &path), "missing {relative}");
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.starts_with("---\nname: muxloom\n"), "{text}");
+            assert!(text.contains("talk_read"), "{text}");
+            assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
+        }
+
+        // Current: nothing to do, and no file is touched.
+        assert!(install_skills(&home).unwrap().is_empty());
+        let path = home.join(CLAUDE);
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("---\nname: muxloom\n"), "{text}");
-        assert!(text.contains("talk_read"), "{text}");
-        assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
 
-        // Current: nothing to do, and the file is not touched.
-        assert!(install_skill(&home).unwrap().is_none());
-        assert_eq!(fs::read_to_string(&path).unwrap(), text);
-
-        // Stale: ours to replace.
+        // Stale: ours to replace, in every agent.
         fs::write(&path, text.replace(&format!("r{SKILL_REVISION}"), "r0")).unwrap();
-        assert!(install_skill(&home).unwrap().is_some());
+        let written = install_skills(&home).unwrap();
+        assert!(written.iter().any(|w| w == &path));
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         let _ = fs::remove_dir_all(&home);
     }
@@ -739,13 +1083,19 @@ mod tests {
     #[test]
     fn a_skill_the_user_wrote_themselves_is_never_overwritten() {
         let home = scratch("skill-mine");
-        let path = home.join(".claude/skills/muxloom/SKILL.md");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "---\nname: muxloom\n---\n\nMy own notes.\n").unwrap();
+        let mine = home.join(CLAUDE);
+        fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        fs::write(&mine, "---\nname: muxloom\n---\n\nMy own notes.\n").unwrap();
 
-        assert!(install_skill(&home).unwrap().is_none());
+        // The stamped file is skipped, but the other two agents still get ours.
+        let written = install_skills(&home).unwrap();
+        assert!(
+            written.iter().all(|w| w != &mine),
+            "touched the user's file"
+        );
+        assert_eq!(written.len(), 2);
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
+            fs::read_to_string(&mine).unwrap(),
             "---\nname: muxloom\n---\n\nMy own notes.\n"
         );
         let _ = fs::remove_dir_all(&home);
