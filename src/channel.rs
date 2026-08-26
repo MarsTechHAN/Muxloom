@@ -590,30 +590,6 @@ pub fn send(
     }
 }
 
-/// Send, then leave the human a sign that it arrived. Lark can hang a small
-/// reaction on the message itself; WeChat, which has nothing to hang anything
-/// on, gets one short message. The receipt never fails the send — a message
-/// that reached the chat is worth more than a receipt that did not — but the
-/// failure is not silent.
-pub fn send_with_receipt(
-    binding: &ChannelBinding,
-    message: &Outgoing,
-    environment: &[(String, String)],
-) -> Result<Sent> {
-    let sent = send(binding, message, environment)?;
-    let receipt = match binding.kind {
-        ChannelKind::Lark => ack_lark(binding, &sent.message_id, environment),
-        ChannelKind::WeChat => ack_wechat(binding, environment),
-    };
-    if let Err(error) = receipt {
-        crate::debug::log(
-            "channel",
-            format!("receipt through {} failed: {error:#}", binding.id),
-        );
-    }
-    Ok(sent)
-}
-
 /// Lark answers HTTP 200 with a non-zero `code` for everything it refuses, so
 /// the status alone never says whether a message arrived. Checking this is what
 /// keeps "sent" from meaning "the request was well formed".
@@ -740,14 +716,15 @@ fn send_lark(
     })
 }
 
-/// A reaction a human reads as "the bot has this". Deliberately friendly: the
-/// point is to say the work landed, not to fill the chat with a formal sticker.
+/// A reaction a human reads as "the agent has seen this". Deliberately
+/// friendly: the point is to say someone is looking, not to fill the chat
+/// with a formal sticker.
 const LARK_RECEIPT_EMOJI: &str = "FINGERHEART";
 
-/// Put a small reaction on a message already delivered, so whoever is watching
-/// the chat sees that it was received. Lark can mark a message without saying
-/// a word; this is that mark. Failing here is never worth the original message
-/// being read as undelivered, so a refusal is reported and the message stands.
+/// Put a small reaction on a message the human just sent, so they know the
+/// agent has seen it without the bot having to say a word. Lark can mark a
+/// message in place; this is that mark, and it is exactly what `☕️ 收到` a
+/// WeChat receipt would do, without adding a second message to the chat.
 fn ack_lark(
     binding: &ChannelBinding,
     message_id: &str,
@@ -769,27 +746,6 @@ fn ack_lark(
         environment,
     )?;
     lark_ok(&answer, "a receipt reaction").context("Lark would not mark the message as received")
-}
-
-/// The text a WeChat bot sends to mean "this arrived", because WeChat has no
-/// reaction to hang on a message and no quoted reply to attach. Kept to one
-/// word so a batch of receipts does not bury the messages they acknowledge.
-const WECHAT_RECEIPT: &str = "☕️ 收到";
-
-/// Tell the person a WeChat message arrived. It is a separate short message —
-/// the smallest thing WeChat has — and it is sent directly on the wire rather
-/// than through the whole send path, so it cannot retrigger its own receipt.
-fn ack_wechat(binding: &ChannelBinding, environment: &[(String, String)]) -> Result<()> {
-    let account = wechat_account(binding);
-    let message_id = ilink::send_text(
-        &account,
-        binding.context_token.trim(),
-        WECHAT_RECEIPT,
-        environment,
-    )
-    .context("the message went out but the WeChat receipt did not")?;
-    let _ = message_id;
-    Ok(())
 }
 
 /// Where a Lark app is made, and the one page both of its strings are copied
@@ -1648,6 +1604,19 @@ pub fn run_inbox(
                 continue;
             };
             round.read += 1;
+            // A human reading the chat wants to know the agent saw what they
+            // said before the agent has had time to answer. Lark can mark that
+            // on the message itself, with a reaction, so the person gets "seen"
+            // without the bot having to say a word. WeChat has no such mark;
+            // its receipt is the eventual answer, which needs no extra message.
+            if binding.kind == ChannelKind::Lark {
+                if let Err(error) = ack_lark(binding, &message.message_id, environment) {
+                    crate::debug::log(
+                        "channel",
+                        format!("seen mark through {} failed: {error:#}", binding.id),
+                    );
+                }
+            }
             let answer = handle(&mut desk, binding, &message, inbox);
             round.routed.push(format!("{}: {answer}", binding.id));
             // The answer is itself something a human can reply to, so it is

@@ -1365,7 +1365,7 @@ fn send_channel(
         text: required_str(arguments, "text")?.into(),
         signature: speaker(),
     };
-    let sent = crate::channel::send_with_receipt(binding, &message, environment)?;
+    let sent = crate::channel::send(binding, &message, environment)?;
     // A receipt is what turns the human's reply into an answer: without one it
     // lands on the board, which is not wrong but is not this conversation. It
     // needs a session to name, so a call from outside a session leaves none.
