@@ -7016,6 +7016,12 @@ impl App {
         self.history_cache
             .get(&history_cache_key(target_id, session_id))?
             .iter()
+            // A rendered page is not text, it is the rows a terminal of one
+            // particular width drew. Put those rows in a pane of another width
+            // and every wrapped line lands in the wrong place — which is what
+            // reading an archived session's history looked like, because the
+            // pane it is read in is not the width the page was captured at.
+            .filter(|page| !page.rendered || page.pane_width == self.agent_viewport_width as usize)
             .filter(|page| {
                 if self.history.total_lines() == 0 {
                     return true;
@@ -7047,10 +7053,16 @@ impl App {
             .history_cache
             .entry(history_cache_key(target_id, session_id))
             .or_default();
-        if let Some(existing) = pages
-            .iter_mut()
-            .find(|existing| existing.offset_from_bottom == page.offset_from_bottom)
-        {
+        // Two captures only describe the same slice of the session when they
+        // were taken the same way and at the same width; anything else is a
+        // different page that happens to start at the same offset, and
+        // overwriting one with the other is what left the pane drawing rows
+        // wrapped for a width it no longer has.
+        if let Some(existing) = pages.iter_mut().find(|existing| {
+            existing.offset_from_bottom == page.offset_from_bottom
+                && existing.rendered == page.rendered
+                && existing.pane_width == page.pane_width
+        }) {
             *existing = page.clone();
         } else {
             pages.push(page.clone());
@@ -7059,7 +7071,7 @@ impl App {
             target_id,
             session_id,
             page.offset_from_bottom,
-            page.rendered,
+            page.rendered.then_some(page.pane_width),
         );
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent)
@@ -7082,13 +7094,22 @@ impl App {
 
     fn load_history_page(&mut self, target_id: &str, session_id: &str, offset: usize) -> bool {
         // Rendered and raw pages at the same offset are different reads of the
-        // session, so they are cached apart. Rendered ones are what the daemon
-        // is asked for now; the raw file is what an earlier release left.
-        let rendered = self.history_cache_path(target_id, session_id, offset, true);
+        // session, so they are cached apart, and a rendered one is only worth
+        // reading back at the width it was drawn for — hence the width in its
+        // name. Files an earlier release left under the width-less name are
+        // never read again: they are rows of some width nobody recorded, which
+        // is precisely what made them unusable. The raw file is the older
+        // fallback, and is plain text at any width.
+        let rendered = self.history_cache_path(
+            target_id,
+            session_id,
+            offset,
+            Some(self.agent_viewport_width as usize),
+        );
         let path = if rendered.exists() {
             rendered
         } else {
-            self.history_cache_path(target_id, session_id, offset, false)
+            self.history_cache_path(target_id, session_id, offset, None)
         };
         let Ok(data) = fs::read(&path) else {
             return false;
@@ -7114,14 +7135,21 @@ impl App {
         }
     }
 
+    /// Where one cached page lives. `rendered_width` is the pane width a
+    /// rendered page was drawn for, and `None` for a raw one: the rows of a
+    /// rendered page only mean anything at that width, so it is part of what
+    /// names the file rather than something to discover after reading it.
     fn history_cache_path(
         &self,
         target_id: &str,
         session_id: &str,
         offset: usize,
-        rendered: bool,
+        rendered_width: Option<usize>,
     ) -> PathBuf {
-        let suffix = if rendered { "r" } else { "" };
+        let suffix = match rendered_width {
+            Some(width) => format!("r{width}"),
+            None => String::new(),
+        };
         self.history_cache_dir
             .join(cache_path_component(target_id))
             .join(session_id)
@@ -13063,6 +13091,54 @@ mod tests {
         assert_eq!(reloaded.portrait_terminal_percent, 70);
         assert_eq!(reloaded.machine_width, 24);
         let _ = std::fs::remove_file(state_path);
+    }
+
+    /// A rendered page is not text, it is the rows a terminal of one width
+    /// drew. Reusing those rows in a pane of another width is what made an
+    /// archived session's history come out scrambled: the panes are not all the
+    /// same width, so moving around the dashboard changes what the page has to
+    /// fit before anything asks the daemon for it again.
+    #[test]
+    fn a_rendered_history_page_is_only_reused_at_the_width_it_was_drawn_for() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.history_cache_dir = std::env::temp_dir().join(format!(
+            "muxloom-history-width-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let page = |width: usize| HistoryPage {
+            text: "one\ntwo\nthree".into(),
+            history_size: 3,
+            pane_height: 3,
+            pane_width: width,
+            offset_from_bottom: 0,
+            rendered: true,
+            more_history: false,
+        };
+        app.history_cache
+            .insert(history_cache_key("local", "s-1"), vec![page(132)]);
+        app.agent_viewport_width = 132;
+        assert!(app.cached_history_page("local", "s-1", 0, 3).is_some());
+        app.agent_viewport_width = 80;
+        assert!(
+            app.cached_history_page("local", "s-1", 0, 3).is_none(),
+            "rows wrapped for 132 columns say nothing about what fits in 80"
+        );
+
+        // And a capture at the new width does not evict the old one: both are
+        // real pages, they just answer different panes.
+        app.store_history_page("local", "s-1", page(80));
+        assert_eq!(
+            app.history_cache
+                .get(&history_cache_key("local", "s-1"))
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(app.cached_history_page("local", "s-1", 0, 3).is_some());
+        let _ = std::fs::remove_dir_all(&app.history_cache_dir);
     }
 
     #[test]
