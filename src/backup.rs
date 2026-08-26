@@ -1025,9 +1025,30 @@ fn pick_native_candidate<'a>(
     {
         return Some(existing);
     }
+    // Last resort, and the one that has to be kept honest. A folder holds
+    // every conversation ever held in it, so "whichever file was written to
+    // most recently" is not an answer for a session nobody could name a thread
+    // for: a freshly started agent that has yet to write a word takes whatever
+    // the last person to work in that directory left behind. The wrong id then
+    // outlives the guess — it is what gets mirrored, what the archive records,
+    // and what a later resume reopens.
+    //
+    // A conversation whose last word predates the session's launch cannot be
+    // one this session is writing, so rule that much out. Same slack the
+    // daemon's own matching allows, for a transcript stamped a moment before
+    // muxloom recorded the launch. A transcript that never said when it was
+    // touched stays out of the guess entirely: no id at all is recoverable,
+    // and somebody else's is not.
+    let started = crate::native_history::iso_timestamp(
+        session
+            .created_at
+            .saturating_mul(1_000)
+            .saturating_sub(crate::native_history::START_GRACE_MS),
+    );
     candidates
         .iter()
         .filter(|candidate| mine(&candidate.id))
+        .filter(|candidate| !candidate.updated_at.is_empty() && candidate.updated_at >= started)
         .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
 }
 
@@ -2575,6 +2596,27 @@ mod tests {
         assert!(
             pick_native_candidate(&files, &session, &BackupRecord::default(), &all_taken).is_none()
         );
+    }
+
+    /// How a resume came to reopen a stranger's conversation. A fresh agent in
+    /// a folder somebody else had been working in got handed the file they
+    /// left behind, mirrored it, and the archive kept the pairing.
+    #[test]
+    fn a_guess_never_reaches_back_before_the_session_started() {
+        let files = vec![
+            transcript("last-week", "2026-08-18T09:00:00.000Z"),
+            transcript("ours", "2026-08-25T12:00:00.000Z"),
+        ];
+        let session = crate::daemon_protocol::DaemonSession {
+            created_at: 1_787_652_000, // 2026-08-25T10:00:00Z
+            ..live_session("s-one", None)
+        };
+        let record = BackupRecord::default();
+        let pick = pick_native_candidate(&files, &session, &record, &HashMap::new()).unwrap();
+        assert_eq!(pick.id, "ours");
+        // And with only the stale one to choose from it mirrors nothing:
+        // somebody else's id is worse than no id at all.
+        assert!(pick_native_candidate(&files[..1], &session, &record, &HashMap::new()).is_none());
     }
 
     #[test]
