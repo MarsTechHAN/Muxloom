@@ -133,10 +133,19 @@ fn run() -> Result<()> {
 /// registers its agents for itself. This stand-alone path gives the target the
 /// same fleet wiring its own daemon would have, pointing at the muxloomd that
 /// is actually on that machine.
+#[cfg(unix)]
 fn register_this_machine(paths: &DaemonPaths) -> Result<()> {
     let written = muxloom::mcp_register::register_for_this_daemon(paths.is_the_machines_own())?;
     for path in written {
         println!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// Off Unix there is no daemon to write a surface for, and `DaemonPaths` there
+/// is a stub with no ownership question to ask: the same answer as every other
+/// subcommand here.
+#[cfg(not(unix))]
+fn register_this_machine(_: &DaemonPaths) -> Result<()> {
+    bail!("muxloomd is currently supported on Unix targets")
 }

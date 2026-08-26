@@ -1925,10 +1925,7 @@ fn handle(
                                     })
                                     .collect();
                                 lines.push(String::new());
-                                lines.push(format!(
-                                    "`/select {}-<agent>` aims this chat",
-                                    number
-                                ));
+                                lines.push(format!("`/select {}-<agent>` aims this chat", number));
                                 lines.join("\n")
                             }
                         }
