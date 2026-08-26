@@ -984,6 +984,28 @@ pub struct Correspondent {
     /// What to call it in a chat message, where a session id means nothing.
     #[serde(default)]
     pub label: String,
+    /// The working directory the session runs in, when the account knows it.
+    /// Kept so `/list` can group agents by folder.
+    #[serde(default)]
+    pub path: String,
+    /// Whether the session is alive and answering. A session with no pid is
+    /// finished, whatever the account says; absent from an old record is
+    /// treated as active so a hand-written aim still reaches it.
+    #[serde(default = "default_true")]
+    pub alive: bool,
+    /// Whether the session is engaged right now, not just alive. Shown as the
+    /// working marker in `/list`; absent from an old record is treated as
+    /// idle rather than guessing.
+    #[serde(default)]
+    pub working: bool,
+    /// A glance at what the session has been doing, for `/list`. This is the
+    /// daemon's `recap` — the last thing the model said.
+    #[serde(default)]
+    pub recap: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Correspondent {
@@ -1152,6 +1174,10 @@ impl Inbox {
             machine: String::new(),
             session_id: receipt.session_id.clone(),
             label: receipt.label.clone(),
+            // A recipient recovered from a receipt is assumed live for the
+            // purpose of answering it: the receipt is what a live agent just
+            // sent, so the most recent word is that it was here.
+            ..Default::default()
         }
     }
 }
@@ -1175,6 +1201,8 @@ pub enum Route {
     List(String),
     /// Say what there is to talk to.
     Who,
+    /// Explain the commands this chat understands.
+    Help,
     /// Stop pointing anywhere; plain messages go back to the board.
     Clear,
     /// Put it on the machine board, where any agent can find it. `asked` is
@@ -1215,7 +1243,8 @@ pub fn route(
     match word.to_lowercase().as_str() {
         "/select" | "/s" => return (Route::Aim(rest.clone()), rest),
         "/list" | "/l" => return (Route::List(rest.clone()), rest),
-        "/who" | "/help" => return (Route::Who, rest),
+        "/who" => return (Route::Who, rest),
+        "/help" | "/h" | "/?" => return (Route::Help, rest),
         "/clear" => return (Route::Clear, rest),
         "/all" => return (Route::Board { asked: true }, rest),
         other if meant_as_a_command(other) => {
@@ -1753,6 +1782,10 @@ impl<'a> Desk<'a> {
                             machine: machine.id.clone(),
                             session_id: session.id,
                             label: session.label,
+                            path: session.path.clone(),
+                            alive: !session.dead && session.pid.is_some(),
+                            working: session.working,
+                            recap: session.recap.clone(),
                         }),
                 );
             }
@@ -1843,6 +1876,46 @@ impl<'a> Desk<'a> {
     }
 }
 
+/// Render active agents grouped by the folder they run in, each numbered so
+/// `/select <machine>-<n>` can reach it, and each carrying its `recap` (the
+/// last thing the model said) on the line under it. A folder with no path — a
+/// session that did not say where it runs — is grouped under `~`.
+fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut by_folder: BTreeMap<&str, Vec<&Correspondent>> = BTreeMap::new();
+    for who in agents {
+        let folder = if who.path.trim().is_empty() {
+            "~"
+        } else {
+            who.path.trim()
+        };
+        by_folder.entry(folder).or_default().push(who);
+    }
+    let mut lines = Vec::new();
+    let mut number = 1;
+    for (folder, members) in &by_folder {
+        lines.push(folder.to_string());
+        for who in members {
+            lines.push(format!("  {number}  {}", who.name_without_machine()));
+            if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
+                let one = recap.split('\n').next().unwrap_or("").trim();
+                if !one.is_empty() {
+                    let recap_line = if one.chars().count() > 140 {
+                        let cut: String = one.chars().take(137).collect();
+                        format!("{cut}…")
+                    } else {
+                        one.to_string()
+                    };
+                    lines.push(format!("      {recap_line}"));
+                }
+            }
+            number += 1;
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Act on one thing a human said, and answer in the words they should see.
 fn handle(
     desk: &mut Desk<'_>,
@@ -1907,25 +1980,22 @@ fn handle(
             }
         }
         Route::List(arg) => {
-            // A machine number lists the agents on it, in a stable order.
+            // A machine number lists the *active* agents on it, grouped by the
+            // folder they run in, each carrying a glance at what it is doing.
             match arg.trim().parse::<usize>() {
                 Ok(number) => {
                     let machines = desk.machines_ordered();
                     match machines.get(number.checked_sub(1).unwrap_or(usize::MAX)) {
                         Some(m) => {
                             let agents = desk.agents_on(&m.id);
-                            if agents.is_empty() {
-                                format!("· {} has nobody running", m.label_or_id())
+                            let active: Vec<&Correspondent> =
+                                agents.iter().filter(|who| who.alive).collect();
+                            if active.is_empty() {
+                                format!("· {} has no active agents", m.label_or_id())
                             } else {
-                                let mut lines: Vec<String> = agents
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, who)| {
-                                        format!("{}  {}", index + 1, who.name_without_machine())
-                                    })
-                                    .collect();
+                                let mut lines = folder_grouped(&active);
                                 lines.push(String::new());
-                                lines.push(format!("`/select {}-<agent>` aims this chat", number));
+                                lines.push("`/select <machine>-<agent>` aims this chat · `/new` to start one here · only active agents shown".into());
                                 lines.join("\n")
                             }
                         }
@@ -1937,6 +2007,23 @@ fn handle(
                     arg.trim()
                 ),
             }
+        }
+        Route::Help => {
+            let mut lines: Vec<String> = vec![
+                "Commands this chat understands:".into(),
+                "  /list              active agents, grouped by folder, with a glance at what each is doing".into(),
+                "  /list <num>        the active agents on one machine (number from /list)".into(),
+                "  /select <num>-<n>  aim this chat at one agent until /clear".into(),
+                "  /select <name>     aim at an agent by name / session id".into(),
+                "  /who               every agent everywhere (not only active, not grouped)".into(),
+                "  /clear             stop aiming; plain messages go to the board".into(),
+                "  /all <text>        put something on the board every agent reads".into(),
+                "  /new               start a new agent".into(),
+                "  /help              this list".into(),
+            ];
+            lines.push(String::new());
+            lines.push("Just type a plain sentence and it goes where this chat is aimed (or to whoever replied last, in a one-to-one chat).".into());
+            lines.join("\n")
         }
         Route::Clear => match inbox.aimed.remove(&binding.id) {
             Some(who) => format!("· no longer aimed at {}", who.name()),
@@ -2454,6 +2541,7 @@ mod tests {
             machine: "seed".into(),
             session_id: session_id.into(),
             label: label.into(),
+            ..Default::default()
         }
     }
 
@@ -2561,6 +2649,7 @@ mod tests {
                 machine: String::new(),
                 session_id: "s-lexer".into(),
                 label: "lexer".into(),
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -2657,6 +2746,7 @@ mod tests {
             machine: "seed-debug".into(),
             session_id: "a7f3c1".into(),
             label: "lexer rewrite".into(),
+            ..Default::default()
         };
         for needle in ["lexer", "LEXER", "a7f3", "seed/lexer", "seed-debug/a7f3"] {
             assert!(session.answers_to(needle), "{needle} names it");
@@ -2692,5 +2782,71 @@ mod tests {
         // person getting the bot's attention, not a message for an agent.
         assert_eq!(lark_text(&text("image", r#"{"image_key":"k"}"#)), None);
         assert_eq!(lark_text(&text("text", r#"{"text":"@_user_1"}"#)), None);
+    }
+
+    #[test]
+    fn help_is_its_own_command_and_lists_the_surface() {
+        let inbox = Inbox::default();
+        assert_eq!(route("/help", None, "lark-1", false, &inbox).0, Route::Help);
+        assert_eq!(route("/h", None, "lark-1", false, &inbox).0, Route::Help);
+        assert_eq!(
+            route("/help", Some("om_1"), "lark-1", false, &inbox).0,
+            Route::Help,
+            "a command is a command even when typed as a reply"
+        );
+    }
+
+    #[test]
+    fn list_groups_active_agents_by_folder_and_carries_their_recap() {
+        // Two folders, a working agent and an idle one, and a dead one that
+        // must not show up at all.
+        let agents = [
+            Correspondent {
+                machine: "m".into(),
+                session_id: "s-1".into(),
+                label: "lexer".into(),
+                path: "/works/x/".into(),
+                alive: true,
+                working: true,
+                recap: Some("splitting the lexer".into()),
+            },
+            Correspondent {
+                machine: "m".into(),
+                session_id: "s-2".into(),
+                label: "parser".into(),
+                path: "/works/x/".into(),
+                alive: true,
+                working: false,
+                recap: None,
+            },
+            Correspondent {
+                machine: "m".into(),
+                session_id: "s-dead".into(),
+                label: "dead".into(),
+                path: "/works/x/".into(),
+                alive: false,
+                working: false,
+                recap: None,
+            },
+        ];
+        // Route's job is only to say "a /list" — the active filter and the
+        // grouping are the handler's. So we exercise the pure renderer here
+        // over exactly the active subset the handler would pass it.
+        let active: Vec<&Correspondent> = agents.iter().filter(|a| a.alive).collect();
+        let lines = folder_grouped(&active);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("/works/x/"), "folder is the heading");
+        assert!(rendered.contains("lexer"), "the labelled agent is there");
+        assert!(
+            rendered.contains("splitting the lexer"),
+            "its recap follows"
+        );
+        assert!(
+            !rendered.contains("dead"),
+            "an inactive agent is not grouped in"
+        );
+        // Numbering stays stable across folders, so /select's machine-agent
+        // numbers stay stable even as folders move around.
+        assert!(rendered.contains("  1  lexer"), "numbering starts at one");
     }
 }
