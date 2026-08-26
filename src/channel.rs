@@ -1199,6 +1199,9 @@ pub enum Route {
     /// List the machines, or (with a machine number) the agents on one of
     /// them. `arg` carries the part after `/list`.
     List(String),
+    /// Start a new agent. `arg` carries what came after `/new` — a folder, if
+    /// one was given.
+    New(String),
     /// Say what there is to talk to.
     Who,
     /// Explain the commands this chat understands.
@@ -1243,6 +1246,7 @@ pub fn route(
     match word.to_lowercase().as_str() {
         "/select" | "/s" => return (Route::Aim(rest.clone()), rest),
         "/list" | "/l" => return (Route::List(rest.clone()), rest),
+        "/new" => return (Route::New(rest.clone()), rest),
         "/who" => return (Route::Who, rest),
         "/help" | "/h" | "/?" => return (Route::Help, rest),
         "/clear" => return (Route::Clear, rest),
@@ -1607,6 +1611,7 @@ pub fn run_inbox(
     set: &ChannelSet,
     inbox: &mut Inbox,
     environment: &[(String, String)],
+    config: &crate::config::Config,
 ) -> InboxRound {
     let mut round = InboxRound::default();
     // Listening asks less than sending does. A WeChat bot that has never been
@@ -1621,7 +1626,7 @@ pub fn run_inbox(
         return round;
     }
     let now = now_ms();
-    let mut desk = Desk::new(runtime, targets);
+    let mut desk = Desk::new(runtime, targets, config);
     for binding in listening {
         if inbox
             .waking
@@ -1744,6 +1749,7 @@ fn absorb(
 /// messages ask about it, and not at all when none does.
 struct Desk<'a> {
     runtime: &'a Runtime,
+    config: &'a crate::config::Config,
     machines: Vec<Target>,
     sessions: Option<Vec<Correspondent>>,
     author: Option<crate::talk::TalkAuthor>,
@@ -1752,13 +1758,14 @@ struct Desk<'a> {
 }
 
 impl<'a> Desk<'a> {
-    fn new(runtime: &'a Runtime, targets: &[Target]) -> Self {
+    fn new(runtime: &'a Runtime, targets: &[Target], config: &'a crate::config::Config) -> Self {
         let local = Target::local();
         let machines = std::iter::once(local.clone())
             .chain(targets.iter().filter(|it| it.id != local.id).cloned())
             .collect();
         Self {
             runtime,
+            config,
             machines,
             sessions: None,
             author: None,
@@ -1845,6 +1852,29 @@ impl<'a> Desk<'a> {
         let machine: usize = machine.trim().parse().ok()?;
         let agent: usize = agent.trim().parse().ok()?;
         self.resolve_numbered(machine, agent)
+    }
+
+    /// Start a fresh agent session of `kind` in `folder` on the local machine.
+    /// The parent is left empty: this is a person asking from a chat, and the
+    /// session is theirs to aim at, not a subagent of anything.
+    fn launch(&self, kind: crate::model::AgentKind, folder: &str) -> Result<String> {
+        use crate::model::LaunchRequest;
+        let request = LaunchRequest {
+            target: Target::local(),
+            kind,
+            path: folder.to_string(),
+            label: String::new(),
+            temporary: false,
+            resume_id: None,
+            initial_prompt: None,
+            parent: None,
+        };
+        let command = self.config.agents.get(kind).clone();
+        let environment = self
+            .config
+            .environment_for(crate::model::LOCAL_TARGET_ID)
+            .unwrap_or_default();
+        self.runtime.launch(&request, &command, &environment)
     }
 
     /// A human speaking, as the board records them. Asked of the local board
@@ -2024,6 +2054,35 @@ fn handle(
             lines.push(String::new());
             lines.push("Just type a plain sentence and it goes where this chat is aimed (or to whoever replied last, in a one-to-one chat).".into());
             lines.join("\n")
+        }
+        Route::New(arg) => {
+            // Start a fresh agent. The argument is a folder to start it in,
+            // or empty to use the machine's recent-launch directory via the
+            // controller state is too heavy here, so we default to the
+            // daemon-side working directory this session landed in.
+            let kind = crate::model::AgentKind::Pi;
+            let folder = {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    crate::config::expand_tilde(".")
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    crate::config::expand_tilde(arg)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            match desk.launch(kind, &folder) {
+                Ok(session_id) => {
+                    let short = session_id.rsplit('-').next().unwrap_or(&session_id);
+                    format!(
+                        "· started {} in {folder} — aim this chat with `/select <machine>-<n>` once `/list` shows it (session {short})",
+                        kind.as_str()
+                    )
+                }
+                Err(error) => format!("· could not start an agent: {error:#}"),
+            }
         }
         Route::Clear => match inbox.aimed.remove(&binding.id) {
             Some(who) => format!("· no longer aimed at {}", who.name()),

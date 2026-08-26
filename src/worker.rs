@@ -1352,6 +1352,7 @@ impl Worker {
                                     &channels,
                                     &mut inbox,
                                     &environment,
+                                    &config,
                                 ),
                                 Err(error) => {
                                     debug::log("channel", format!("no environment: {error:#}"));
