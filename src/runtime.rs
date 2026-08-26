@@ -4402,6 +4402,10 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
         attention_reason: session.attention_reason,
         recap: session.recap,
         title: session.title,
+        // The seed stands in until the daemon has matched a transcript: it is
+        // the id the launch was told to reopen, so it names the same
+        // conversation the match will land on.
+        thread: session.thread.or(session.seed),
         parent: session.parent,
     })
 }
@@ -4464,6 +4468,7 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     // A pane record carries what tmux was told at launch and
                     // nothing the runtime has said since.
                     title: None,
+                    thread: None,
                     parent: None,
                 });
             }

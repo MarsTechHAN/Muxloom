@@ -49,6 +49,7 @@ fn make_app() -> App {
         attention_reason: Some("approve".into()),
         recap: None,
         title: None,
+        thread: None,
         parent: None,
     });
     app.selected_session_id = Some("ad-codex-1-1-1".into());

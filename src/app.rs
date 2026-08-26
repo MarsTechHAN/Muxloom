@@ -438,6 +438,12 @@ impl ChannelsForm {
 struct ArchivedResume {
     source_session_id: String,
     launch: LaunchForm,
+    /// The conversation this archived session was having. Reopening it means
+    /// reopening *that* one; without it there is nothing to tell the folder's
+    /// conversations apart, and the choice belongs to the person.
+    thread: Option<String>,
+    /// What to call the session in a message about it.
+    label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +606,10 @@ struct RecoverableSession {
     created_at: u64,
     machine_key: String,
     restorable: bool,
+    /// The conversation the record mirrors, so a restore reopens the one this
+    /// session was having rather than the newest one in the folder. Empty when
+    /// only a terminal capture came back.
+    native_id: String,
 }
 
 /// What the local store knows about a listed session its machine has lost.
@@ -696,6 +706,10 @@ pub enum Modal {
         source_session_id: String,
         launch: LaunchForm,
         resume_id: String,
+        /// What the conversation about to be reopened is about. Shown so a
+        /// mismatch is caught before the agent starts rather than after the
+        /// person has typed into it.
+        summary: String,
         remove_archive: bool,
     },
     ConfirmHistoryReference {
@@ -3992,6 +4006,7 @@ impl App {
             return;
         };
         self.close_terminal();
+        let display_label = session.display_label().to_string();
         let launch = LaunchForm {
             target: target.clone(),
             kind: session.kind,
@@ -4012,13 +4027,19 @@ impl App {
         debug::log(
             "resume",
             format!(
-                "archived scan target={} session={} kind={} path={}",
-                session.target_id, session.id, session.kind, launch.path
+                "archived scan target={} session={} kind={} path={} thread={}",
+                session.target_id,
+                session.id,
+                session.kind,
+                launch.path,
+                session.thread.as_deref().unwrap_or("-")
             ),
         );
         self.pending_archived_resume = Some(ArchivedResume {
             source_session_id: session.id,
             launch,
+            thread: session.thread,
+            label: display_label,
         });
         self.status_message = format!("Finding {} history to resume...", session.kind);
     }
@@ -5124,24 +5145,50 @@ impl App {
                         .expect("matched pending archived resume");
                     match result {
                         Ok(candidates) => {
-                            if let Some(candidate) =
-                                candidates.iter().find(|candidate| candidate.kind == kind)
-                            {
-                                debug::log(
-                                    "resume",
-                                    format!(
-                                        "archived match source={} resume_id={} candidates={}",
-                                        pending.source_session_id,
-                                        candidate.id,
-                                        candidates.len()
-                                    ),
-                                );
+                            let of_kind: Vec<&ResumeCandidate> = candidates
+                                .iter()
+                                .filter(|candidate| candidate.kind == kind)
+                                .collect();
+                            let chosen =
+                                archived_resume_choice(pending.thread.as_deref(), &of_kind);
+                            debug::log(
+                                "resume",
+                                format!(
+                                    "archived match source={} thread={} resume_id={} candidates={}",
+                                    pending.source_session_id,
+                                    pending.thread.as_deref().unwrap_or("-"),
+                                    chosen.map_or("-", |candidate| candidate.id.as_str()),
+                                    of_kind.len()
+                                ),
+                            );
+                            if let Some(candidate) = chosen {
                                 self.modal = Some(Modal::ConfirmArchivedResume {
                                     source_session_id: pending.source_session_id,
                                     launch: pending.launch,
                                     resume_id: candidate.id.clone(),
+                                    summary: candidate.summary().to_string(),
                                     remove_archive: self.state.remove_archive_after_resume,
                                 });
+                            } else if !of_kind.is_empty() {
+                                // Several conversations in this folder and no way
+                                // to say which one this session was having.
+                                // Reopening the newest is a guess, and a wrong
+                                // guess reads as the right one until the person
+                                // has typed into somebody else's conversation, so
+                                // hand them the list instead.
+                                let note = archived_resume_note(&pending, of_kind.len());
+                                self.modal = Some(Modal::Resume(ResumeForm {
+                                    launch: pending.launch,
+                                    candidates,
+                                    selected: 1,
+                                    loading: false,
+                                    error: Some(note),
+                                    query: String::new(),
+                                    history_hits: Vec::new(),
+                                    history_selected: 0,
+                                    searched_query: String::new(),
+                                    search_edited_at: None,
+                                }));
                             } else if let Some(unread) = unread {
                                 self.request_history();
                                 self.set_error(unread);
@@ -5637,6 +5684,7 @@ impl App {
                 attention_reason: None,
                 recap,
                 title,
+                thread: Some(record.native_id).filter(|id| !id.is_empty()),
                 // The backup mirrors a transcript, not the machine's session
                 // list, so it cannot say who started this one.
                 parent: None,
@@ -9647,6 +9695,7 @@ impl App {
                 source_session_id,
                 launch,
                 resume_id,
+                summary,
                 mut remove_archive,
             } => match key.code {
                 KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
@@ -9655,6 +9704,7 @@ impl App {
                         source_session_id,
                         launch,
                         resume_id,
+                        summary,
                         remove_archive,
                     });
                 }
@@ -9675,6 +9725,7 @@ impl App {
                         source_session_id,
                         launch,
                         resume_id,
+                        summary,
                         remove_archive,
                     });
                 }
@@ -10994,6 +11045,41 @@ fn history_capture_offset(
     desired_offset / stride * stride
 }
 
+/// Which of a folder's conversations reopening an archived session means.
+///
+/// The session's own thread names it outright, and that is the only thing that
+/// does: several conversations can share a folder and a runtime, and the one an
+/// archived session was having is not in general the one touched most recently.
+/// Where no thread was recorded — an older daemon, or a session whose transcript
+/// was never matched — a single candidate is still unambiguous, and anything
+/// more than that is a question for the person rather than a guess.
+fn archived_resume_choice<'a>(
+    thread: Option<&str>,
+    of_kind: &[&'a ResumeCandidate],
+) -> Option<&'a ResumeCandidate> {
+    match thread {
+        Some(thread) => of_kind
+            .iter()
+            .copied()
+            .find(|candidate| candidate.id == thread),
+        None => (of_kind.len() == 1).then(|| of_kind[0]),
+    }
+}
+
+/// Why the picker opened instead of the conversation.
+fn archived_resume_note(pending: &ArchivedResume, found: usize) -> String {
+    match pending.thread.as_deref() {
+        Some(_) => format!(
+            "The conversation {} was having is no longer on this machine. Pick one of the {found} still here, or start fresh.",
+            pending.label
+        ),
+        None => format!(
+            "Nothing records which of these {found} conversations {} was having. Pick one, or start fresh.",
+            pending.label
+        ),
+    }
+}
+
 fn materialize_history_page(
     source: &HistoryPage,
     desired_offset: usize,
@@ -11183,6 +11269,7 @@ fn recoverable_backup_records(
             title: record.title,
             recap: record.recap,
             created_at: record.created_at,
+            native_id: record.native_id,
         })
         .collect()
 }
@@ -11860,6 +11947,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
 
@@ -11956,6 +12044,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             },
             AgentSession {
@@ -11972,6 +12061,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             },
         ];
@@ -12218,6 +12308,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             },
             AgentSession {
@@ -12234,6 +12325,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             },
         ];
@@ -12286,6 +12378,7 @@ mod tests {
             attention_reason: Some(reason.into()),
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         }
     }
@@ -12335,6 +12428,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: parent.map(Into::into),
         }
     }
@@ -12615,6 +12709,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
 
@@ -12655,6 +12750,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("ad-codex-old".into());
@@ -13705,6 +13801,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloomd-claude-long-history".into());
@@ -13847,6 +13944,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.sessions.push(AgentSession {
@@ -13863,6 +13961,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         assert!(app.visible_sessions().is_empty());
@@ -13884,7 +13983,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_archived_agent_resumes_its_latest_history() {
+    fn opening_an_archived_agent_resumes_the_one_conversation_in_its_folder() {
         let config = Config::default();
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
@@ -13924,6 +14023,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-dead".into());
@@ -13992,6 +14092,94 @@ mod tests {
         let _ = std::fs::remove_file(state_path);
     }
 
+    /// The defect behind "I asked to resume one conversation and got another":
+    /// the folder was scanned and the newest transcript in it was taken, which
+    /// is whatever anybody last worked on there.
+    #[test]
+    fn an_archived_agent_reopens_the_conversation_it_was_having() {
+        let candidate = |id: &str| ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/test/.claude/projects/{id}.jsonl"),
+            recap: None,
+            first_message: None,
+            last_message: None,
+            updated_at: "2026-08-25T12:00:00Z".into(),
+        };
+        let newest = candidate("newest");
+        let ours = candidate("ours");
+        let both = vec![&newest, &ours];
+
+        assert_eq!(
+            archived_resume_choice(Some("ours"), &both).map(|pick| pick.id.as_str()),
+            Some("ours"),
+            "the recorded conversation, not the one touched last"
+        );
+        // Recorded, but no longer on this machine. Falling back to the newest
+        // is how a wrong answer got to look like a right one.
+        assert!(archived_resume_choice(Some("gone"), &both).is_none());
+        // Nothing recorded and more than one to choose from is a question for
+        // the person; on its own there is still nothing to get wrong.
+        assert!(archived_resume_choice(None, &both).is_none());
+        assert_eq!(
+            archived_resume_choice(None, &both[1..]).map(|pick| pick.id.as_str()),
+            Some("ours")
+        );
+    }
+
+    /// And what the person sees when it cannot be answered: the list, with the
+    /// reason, rather than a confirmation of somebody else's conversation.
+    #[test]
+    fn an_unanswerable_archived_resume_opens_the_picker() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.targets[0].probe.set(AgentKind::Claude, true);
+        app.sessions.push(AgentSession {
+            id: "muxloomd-claude-dead".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            label: "sglang proxy".into(),
+            created_at: 1,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+        });
+        app.selected_session_id = Some("muxloomd-claude-dead".into());
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let candidate = |id: &str| ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/test/.claude/projects/{id}.jsonl"),
+            recap: Some(format!("about {id}")),
+            first_message: None,
+            last_message: None,
+            updated_at: "2026-08-25T12:00:00Z".into(),
+        };
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            warning: None,
+            result: Ok(vec![candidate("newest"), candidate("older")]),
+        });
+        match app.modal {
+            Some(Modal::Resume(ref form)) => {
+                assert_eq!(form.candidates.len(), 2);
+                let note = form.error.as_deref().unwrap_or_default();
+                assert!(note.contains("sglang proxy"), "{note}");
+            }
+            ref other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
     #[test]
     fn archived_resume_can_keep_the_old_entry_and_remembers_the_choice() {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
@@ -14029,6 +14217,7 @@ mod tests {
                 field: LaunchField::Kind,
             },
             resume_id: "thread-id".into(),
+            summary: "the conversation".into(),
             remove_archive: true,
         });
 
@@ -14097,6 +14286,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
 
@@ -14144,6 +14334,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.handle_worker_event(Event::Launched {
@@ -14193,6 +14384,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-live".into());
@@ -14286,6 +14478,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-files".into());
@@ -14965,6 +15158,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-modal".into());
@@ -15035,6 +15229,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloom-codex-nav".into());
@@ -15685,6 +15880,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         for failure in 1..=2 {
@@ -15942,6 +16138,7 @@ mod tests {
             attention_reason: Some(reason.into()),
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         }
     }
@@ -16129,6 +16326,7 @@ mod tests {
                     attention_reason: None,
                     recap: None,
                     title: None,
+                    thread: None,
                     parent: None,
                 }],
             )),
@@ -16194,6 +16392,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloomd-codex-current".into());
@@ -16272,6 +16471,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-test".into());
@@ -16339,6 +16539,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloomd-claude-forward".into());
@@ -16472,6 +16673,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         };
         app.sessions = vec![
@@ -16540,6 +16742,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         };
         app.sessions = vec![session("far", "gpu"), session("near", "local")];
@@ -16849,6 +17052,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         app.submit_rename_agent("s1".into(), "  My Bot  ".into());
@@ -16955,6 +17159,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         };
         app.sessions = vec![

@@ -1557,15 +1557,24 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
         }
         Modal::ConfirmArchivedResume {
             launch,
+            summary,
             remove_archive,
             ..
         } => {
-            let area = centered_rect(72, 12, outer);
+            let area = centered_rect(72, 14, outer);
             frame.render_widget(Clear, area);
             let checkbox = if *remove_archive { "[x]" } else { "[ ]" };
             let text = vec![
                 Line::raw(""),
-                Line::raw(format!("Resume '{}' as a new running agent?", launch.label)),
+                Line::raw("Reopen this conversation as a new running agent?"),
+                Line::raw(""),
+                // The name of what is about to be reopened, so a wrong match is
+                // caught here rather than after the agent has started.
+                Line::styled(
+                    truncate(summary, area.width.saturating_sub(6) as usize),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(format!("in {}", launch.path), Style::default().fg(MUTED)),
                 Line::raw(""),
                 Line::from(vec![
                     Span::styled(
@@ -5616,6 +5625,7 @@ mod tests {
                 attention_reason: Some("approve".into()),
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             });
             app.selected_session_id = Some("ad-codex-1-1-1".into());
@@ -5749,6 +5759,7 @@ mod tests {
                 attention_reason: None,
                 recap: None,
                 title: None,
+                thread: None,
                 parent: None,
             });
         }
@@ -5851,6 +5862,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: parent.map(Into::into),
         };
         app.sessions = vec![
@@ -5947,6 +5959,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: parent.map(Into::into),
         };
         app.sessions = vec![
@@ -6052,6 +6065,7 @@ mod tests {
             attention_reason: Some("command approval".into()),
             recap: Some("approve the command".into()),
             title: None,
+            thread: None,
             parent: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-waiting".into());
@@ -6383,6 +6397,7 @@ mod tests {
             attention_reason: None,
             recap: None,
             title: None,
+            thread: None,
             parent: None,
         });
         let backend = TestBackend::new(150, 30);
