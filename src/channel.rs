@@ -24,11 +24,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{debug, http, ilink, model::Target, runtime::Runtime};
+use crate::{
+    debug, http, ilink,
+    model::{AgentKind, Target},
+    runtime::Runtime,
+};
 
 /// Advertised by a daemon that can be given a channel set. A daemon without it
 /// is simply left out of the round; nothing else about it changes.
@@ -1026,12 +1030,26 @@ impl Correspondent {
     /// The same session without the machine qualifier — for a list that is
     /// already grouped under a machine, where repeating the machine on every
     /// row is noise.
-    fn name_without_machine(&self) -> String {
-        if self.label.trim().is_empty() {
-            self.session_id.as_str().to_string()
-        } else {
-            self.label.trim().to_string()
+    fn list_name(&self) -> String {
+        if !self.label.trim().is_empty() {
+            return self.label.trim().to_string();
         }
+        if let Some(recap) = self.recap.as_ref() {
+            let first = recap.split('\n').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return if first.chars().count() > 60 {
+                    let cut: String = first.chars().take(57).collect();
+                    format!("{cut}…")
+                } else {
+                    first.to_string()
+                };
+            }
+        }
+        self.session_id
+            .rsplit('-')
+            .next()
+            .unwrap_or(&self.session_id)
+            .to_string()
     }
 
     /// Whether a `/select` word picks this session out.
@@ -1097,6 +1115,15 @@ pub struct Inbox {
     /// Per binding: who a plain message goes to, until `/select` says otherwise.
     #[serde(default)]
     pub aimed: HashMap<String, Correspondent>,
+    /// Per binding: the agent kind `/call` and `/new` should start. Set with
+    /// `/agent <kind>`; absent means the default (claude). Kept so a person
+    /// does not re-type their preference on every call.
+    #[serde(default)]
+    pub default_kind: HashMap<String, AgentKind>,
+    /// Per binding: which agent kind the last `/call` used, so a bare `/call`
+    /// keeps the kind it last ran without the person re-selecting.
+    #[serde(default)]
+    pub last_call_kind: HashMap<String, AgentKind>,
     /// Which agent sent each message a human might reply to, newest last.
     #[serde(default)]
     pub receipts: Vec<ChannelReceipt>,
@@ -1202,6 +1229,15 @@ pub enum Route {
     /// Start a new agent. `arg` carries what came after `/new` — a folder, if
     /// one was given.
     New(String),
+    /// Run what comes after `/call` with a fresh one-shot agent of the kind
+    /// the last `/call` used (default claude), in a temporary scratch folder.
+    Call(String),
+    /// Set the default agent kind `/call` and `/new` start, for this chat.
+    AgentKind(String),
+    /// Say what this chat is aimed at and what kind it will start.
+    Current,
+    /// Stop the agent this chat is aimed at.
+    Stop,
     /// Say what there is to talk to.
     Who,
     /// Explain the commands this chat understands.
@@ -1246,6 +1282,10 @@ pub fn route(
     match word.to_lowercase().as_str() {
         "/select" | "/s" => return (Route::Aim(rest.clone()), rest),
         "/list" | "/l" => return (Route::List(rest.clone()), rest),
+        "/call" => return (Route::Call(rest.clone()), rest),
+        "/agent" | "/model" => return (Route::AgentKind(rest.clone()), rest),
+        "/current" => return (Route::Current, rest),
+        "/stop" => return (Route::Stop, rest),
         "/new" => return (Route::New(rest.clone()), rest),
         "/who" => return (Route::Who, rest),
         "/help" | "/h" | "/?" => return (Route::Help, rest),
@@ -1278,6 +1318,17 @@ pub fn route(
 /// about. A bare `/tmp` at the very start of a message is the one case this
 /// reads wrongly, and the answer it gets says how to send it anyway — which is
 /// a far smaller price than a silently misdelivered `/slect`.
+/// Resolve a `/agent` switch word to an agent kind, case-insensitively.
+pub fn parse_kind(word: &str) -> Option<AgentKind> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(AgentKind::Claude),
+        "pi" => Some(AgentKind::Pi),
+        "codex" => Some(AgentKind::Codex),
+        "opencode" => Some(AgentKind::OpenCode),
+        _ => None,
+    }
+}
+
 fn meant_as_a_command(word: &str) -> bool {
     let Some(name) = word.strip_prefix('/') else {
         return false;
@@ -1855,18 +1906,27 @@ impl<'a> Desk<'a> {
     }
 
     /// Start a fresh agent session of `kind` in `folder` on the local machine.
-    /// The parent is left empty: this is a person asking from a chat, and the
-    /// session is theirs to aim at, not a subagent of anything.
-    fn launch(&self, kind: crate::model::AgentKind, folder: &str) -> Result<String> {
+    /// When `temporary`, the daemon gives it a private scratch folder that is
+    /// removed with the session. `initial_prompt` seeds a fresh session, and
+    /// `label` names it. A launch a person asks for from a chat has no parent:
+    /// it is their own piece of work, not a subagent of anything.
+    fn launch(
+        &self,
+        kind: crate::model::AgentKind,
+        folder: &str,
+        temporary: bool,
+        initial_prompt: Option<String>,
+        label: &str,
+    ) -> Result<String> {
         use crate::model::LaunchRequest;
         let request = LaunchRequest {
             target: Target::local(),
             kind,
             path: folder.to_string(),
-            label: String::new(),
-            temporary: false,
+            label: label.to_string(),
+            temporary,
             resume_id: None,
-            initial_prompt: None,
+            initial_prompt,
             parent: None,
         };
         let command = self.config.agents.get(kind).clone();
@@ -1875,6 +1935,17 @@ impl<'a> Desk<'a> {
             .environment_for(crate::model::LOCAL_TARGET_ID)
             .unwrap_or_default();
         self.runtime.launch(&request, &command, &environment)
+    }
+
+    /// Send the interrupt byte to an agent's session, the way an attached
+    /// terminal's Ctrl-C would, to stop whatever turn it is running.
+    fn stop(&self, who: &Correspondent) -> Result<()> {
+        let target = self
+            .target(&who.machine)
+            .ok_or_else(|| anyhow!("{} is on a machine we cannot reach", who.machine))?;
+        self.runtime
+            .bridge_pool()
+            .send_input(target, who.session_id.clone(), vec![3]) // ^C
     }
 
     /// A human speaking, as the board records them. Asked of the local board
@@ -1926,7 +1997,7 @@ fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
     for (folder, members) in &by_folder {
         lines.push(folder.to_string());
         for who in members {
-            lines.push(format!("  {number}  {}", who.name_without_machine()));
+            lines.push(format!("  {number}  {}", who.list_name()));
             if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
                 let one = recap.split('\n').next().unwrap_or("").trim();
                 if !one.is_empty() {
@@ -2041,26 +2112,33 @@ fn handle(
         Route::Help => {
             let mut lines: Vec<String> = vec![
                 "Commands this chat understands:".into(),
+                "  /call <text>        run <text> with a fresh one-shot agent (the one /call last used), once".into(),
                 "  /list              active agents, grouped by folder, with a glance at what each is doing".into(),
                 "  /list <num>        the active agents on one machine (number from /list)".into(),
                 "  /select <num>-<n>  aim this chat at one agent until /clear".into(),
-                "  /select <name>     aim at an agent by name / session id".into(),
+                "  /select <name>     aim at an agent by name".into(),
                 "  /who               every agent everywhere (not only active, not grouped)".into(),
                 "  /clear             stop aiming; plain messages go to the board".into(),
                 "  /all <text>        put something on the board every agent reads".into(),
-                "  /new               start a new agent".into(),
+                "  /new               start a fresh agent".into(),
                 "  /help              this list".into(),
             ];
             lines.push(String::new());
-            lines.push("Just type a plain sentence and it goes where this chat is aimed (or to whoever replied last, in a one-to-one chat).".into());
+            lines.push(match binding.kind.solo() {
+                true => "Just type a plain sentence and it goes to whoever you last talked to; use /select to aim it somewhere fixed.".into(),
+                false => "Just type a plain sentence and it goes where this chat is aimed, or to the board if nothing is. A reply to a card always reaches the agent who sent it.".into(),
+            });
             lines.join("\n")
         }
         Route::New(arg) => {
-            // Start a fresh agent. The argument is a folder to start it in,
-            // or empty to use the machine's recent-launch directory via the
-            // controller state is too heavy here, so we default to the
-            // daemon-side working directory this session landed in.
-            let kind = crate::model::AgentKind::Pi;
+            // Start a fresh agent in this machine's folder. `/new <path>` uses
+            // that folder; otherwise the current directory. The kind is this
+            // chat's default (set by /agent), defaulting to claude.
+            let kind = inbox
+                .default_kind
+                .get(&binding.id)
+                .copied()
+                .unwrap_or(AgentKind::Claude);
             let folder = {
                 let arg = arg.trim();
                 if arg.is_empty() {
@@ -2073,7 +2151,7 @@ fn handle(
                         .into_owned()
                 }
             };
-            match desk.launch(kind, &folder) {
+            match desk.launch(kind, &folder, false, None, &called) {
                 Ok(session_id) => {
                     let short = session_id.rsplit('-').next().unwrap_or(&session_id);
                     format!(
@@ -2082,6 +2160,88 @@ fn handle(
                     )
                 }
                 Err(error) => format!("· could not start an agent: {error:#}"),
+            }
+        }
+        Route::Call(text) => {
+            let kind = inbox
+                .last_call_kind
+                .get(&binding.id)
+                .copied()
+                .or_else(|| inbox.default_kind.get(&binding.id).copied())
+                .unwrap_or(AgentKind::Claude);
+            inbox.last_call_kind.insert(binding.id.clone(), kind);
+            let text = text.trim().to_string();
+            let prompt = if text.is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            };
+            match desk.launch(kind, ".", true, prompt, &called) {
+                Ok(session_id) => {
+                    let short = session_id.rsplit('-').next().unwrap_or(&session_id);
+                    let what = if text.is_empty() {
+                        "(no instruction given)".to_string()
+                    } else {
+                        text
+                    };
+                    format!(
+                        "· {} running `{what}` in a scratch folder — one-shot (session {short})",
+                        kind.as_str()
+                    )
+                }
+                Err(error) => format!("· could not start an agent: {error:#}"),
+            }
+        }
+        Route::AgentKind(word) => {
+            let word = word.trim();
+            if word.is_empty() {
+                let current = inbox
+                    .default_kind
+                    .get(&binding.id)
+                    .copied()
+                    .unwrap_or(AgentKind::Claude);
+                format!(
+                    "· this chat starts {} — `/agent claude|pi|codex|opencode` to change",
+                    current.as_str()
+                )
+            } else {
+                match parse_kind(word) {
+                    Some(kind) => {
+                        inbox.default_kind.insert(binding.id.clone(), kind);
+                        format!("· this chat will start {} from now on", kind.as_str())
+                    }
+                    None => format!(
+                        "· `{word}` is not one of codex / pi / claude / opencode — `/agent <kind>` to set the default"
+                    ),
+                }
+            }
+        }
+        Route::Current => {
+            let mut parts = Vec::new();
+            let kind = inbox
+                .default_kind
+                .get(&binding.id)
+                .copied()
+                .unwrap_or(AgentKind::Claude);
+            parts.push(format!("default kind: {}", kind.as_str()));
+            match inbox.aimed.get(&binding.id) {
+                Some(who) => parts.push(format!("aimed at: {}", who.name())),
+                None => parts.push("aimed at: nothing".into()),
+            }
+            if let Some(k) = inbox.last_call_kind.get(&binding.id) {
+                parts.push(format!("last /call: {}", k.as_str()));
+            }
+            parts.join(" · ")
+        }
+        Route::Stop => {
+            // Interrupt the agent this chat is aimed at: send the interrupt
+            // byte as typing, which is what an attached terminal's Ctrl-C does.
+            match inbox.aimed.get(&binding.id) {
+                Some(who) => match desk.stop(who) {
+                    Ok(()) => format!("· interrupted {}", who.name()),
+                    Err(error) => format!("· could not interrupt {}: {error:#}", who.name()),
+                },
+                None => "· nothing is aimed — `/select <num>-<n>` first, or reply to a card".into(),
             }
         }
         Route::Clear => match inbox.aimed.remove(&binding.id) {
@@ -2853,6 +3013,41 @@ mod tests {
             Route::Help,
             "a command is a command even when typed as a reply"
         );
+    }
+
+    #[test]
+    fn the_new_wire_commands_map_where_they_should() {
+        let inbox = Inbox::default();
+        // The run-a-fresh-agent and switch-default-kind commands, plus the two
+        // small inspection/stop ones, each read as their own route. The words
+        // carried after /call and /agent are preserved.
+        assert_eq!(
+            route("/call go check the logs", None, "lark-1", false, &inbox),
+            (
+                Route::Call("go check the logs".into()),
+                "go check the logs".into()
+            )
+        );
+        assert_eq!(
+            route("/agent pi", None, "lark-1", false, &inbox).0,
+            Route::AgentKind("pi".into())
+        );
+        // cc-connect spells the same thing /model; we accept it too.
+        assert_eq!(
+            route("/model codex", None, "lark-1", false, &inbox).0,
+            Route::AgentKind("codex".into())
+        );
+        assert_eq!(
+            route("/current", None, "lark-1", false, &inbox).0,
+            Route::Current
+        );
+        assert_eq!(route("/stop", None, "lark-1", false, &inbox).0, Route::Stop);
+        // parse_kind is case-insensitive and rejects what is not a runtime.
+        assert_eq!(parse_kind("CLAUDE"), Some(AgentKind::Claude));
+        assert_eq!(parse_kind("pi"), Some(AgentKind::Pi));
+        assert_eq!(parse_kind("opencode"), Some(AgentKind::OpenCode));
+        assert_eq!(parse_kind("grok"), None);
+        assert_eq!(parse_kind(""), None);
     }
 
     #[test]
