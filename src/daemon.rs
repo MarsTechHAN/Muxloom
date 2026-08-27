@@ -327,6 +327,12 @@ mod platform {
         /// pass to age an unsent draft: a box that keeps changing has someone
         /// typing, and a box that has stopped is a draft we may deliver over.
         draft_watch: Mutex<Option<(String, u64)>>,
+        /// Set on adoption only: this daemon rebuilt the screen by replaying a
+        /// bounded tail of history into a fresh parser, so what it holds is a
+        /// partial frame for an app that differential-renders. The first
+        /// attach must force the app to repaint instead of shipping the
+        /// snapshot; the attach consumes the flag.
+        screen_rebuilt: AtomicBool,
         /// The last thing the agent was seen to say, for a runtime that keeps
         /// no transcript of its own. Its answer scrolls off the screen long
         /// before it stops being the last word on the session, so the reading
@@ -1659,6 +1665,13 @@ mod platform {
                             // now is an intermediate frame, not the live one.
                             let pre_cols = session.columns.load(Ordering::Relaxed);
                             let pre_rows = session.rows.load(Ordering::Relaxed);
+                            // Adoption rebuilt this screen from a bounded tail of
+                            // history: a partial frame for an app that
+                            // differential-renders. The first attach must force a
+                            // full repaint instead of shipping the snapshot.
+                            // Consume the flag here so a second attach behaves
+                            // as usual.
+                            let rebuilt = session.screen_rebuilt.swap(false, Ordering::Relaxed);
                             session.resize(columns, rows)?;
                             let size_changed = pre_cols != session.columns.load(Ordering::Relaxed)
                                 || pre_rows != session.rows.load(Ordering::Relaxed);
@@ -1690,22 +1703,24 @@ mod platform {
                             );
                             write_stream_opened(&writer, &frame, None)?;
                             // One payload, sent first: the daemon's absolute view of the
-                            // live screen. When the size did not change, it is the full
-                            // snapshot (modes + row dump) — the parser's state is
-                            // untouched, so that is exactly the live screen.
+                            // live screen. When the parser mirrors the child's real
+                            // screen, it is the full snapshot (modes + row dump) and
+                            // that is exactly the live screen.
                             //
-                            // When the attach CHANGED the size of an alt-screen TUI, the
-                            // parser just reflowed the old-size content into the new
-                            // size: the row dump is a stale intermediate frame, and
-                            // committing it is what left the pane clipped until a later
-                            // repaint. A full-screen TUI agent redraws itself on
-                            // SIGWINCH, so send only the mode preamble (alt buffer,
-                            // scroll region, clear) and let the app's own post-resize
-                            // repaint — already streaming as live frames — paint the
-                            // screen. That optimization only applies to agent kinds
-                            // that are full-screen TUIs: a plain terminal (or any
-                            // unknown kind) has no such repaint, so it keeps the
-                            // snapshot.
+                            // Two cases break that mirror, and both leave a frame the
+                            // app has not painted: an attach that CHANGED the size
+                            // (the parser just reflowed the old-size content into the
+                            // new size — a stale intermediate frame), and a fresh
+                            // adoption (the screen was rebuilt by replaying a bounded
+                            // history tail that starts mid-stream, so most cells were
+                            // never painted at all). In both, a full-screen TUI agent
+                            // repaints itself on SIGWINCH: send only the mode preamble
+                            // (alt buffer, scroll region, clear), nudge the child with
+                            // a two-frame resize, and let the app's own repaint —
+                            // already streaming as live frames — paint the screen. That
+                            // optimization only applies to agent kinds that are
+                            // full-screen TUIs: a plain terminal (or any unknown kind)
+                            // has no such repaint, so it keeps the snapshot.
                             //
                             // No scrollback seed goes out here any more: rendering a
                             // redraw-heavy session's history costs seconds, and while it
@@ -1734,7 +1749,18 @@ mod platform {
                                     | Some(AgentKind::OpenCode)
                                     | Some(AgentKind::Pi)
                             );
-                            let payload = if size_changed && on_alt && repaints_on_resize {
+                            let force_repaint =
+                                (size_changed || rebuilt) && on_alt && repaints_on_resize;
+                            if force_repaint {
+                                // Out and back is two real keeper RESIZE frames
+                                // (old-keeper compatible): the app gets SIGWINCH, and
+                                // the final size is exactly the attach size. Sent
+                                // before the payload, so the app's repaint frames
+                                // follow the preamble on this stream.
+                                session.resize(columns.saturating_add(1), rows)?;
+                                session.resize(columns, rows)?;
+                            }
+                            let payload = if force_repaint {
                                 session.screen_preamble()
                             } else {
                                 session.screen_snapshot()
@@ -3279,6 +3305,7 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
+            screen_rebuilt: AtomicBool::new(false),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             native: Mutex::new(NativeLink {
@@ -3780,6 +3807,10 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
+            // The screen below is replayed from a bounded history tail (or is
+            // empty for a temporary session): a partial frame for an app that
+            // differential-renders, so its first attach forces a repaint.
+            screen_rebuilt: AtomicBool::new(true),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             // The command line that started this one belongs to a keeper this
@@ -8394,6 +8425,261 @@ mod platform {
             loop {
                 let frame = Frame::read_from(&mut client).unwrap().unwrap();
                 if frame.kind == FrameKind::Response && frame.request_id == 4 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        /// Launch an alt-screen child that draws a marker row, prints
+        /// WINCHMARKER on every SIGWINCH, then idles.
+        fn launch_alt_screen_winch_session(
+            client: &mut UnixStream,
+            label: &str,
+            session_id: &str,
+            kind: &str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Frame::json(
+                FrameKind::Request,
+                0,
+                1,
+                &DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: kind.into(),
+                    path: "/tmp".into(),
+                    label: label.into(),
+                    temporary: false,
+                    executable: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf '\\033[?1049h'; printf 'TASKCMARKER\\n'; \
+                         trap 'printf WINCHMARKER' WINCH; while :; do sleep 0.1; done"
+                            .into(),
+                    ],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )?
+            .write_to(client)?;
+            loop {
+                let frame = Frame::read_from(client)?.unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
+        #[test]
+        fn an_adopted_alt_screen_session_forces_a_repaint_on_a_same_size_attach() {
+            // Adoption rebuilds the screen from a bounded tail of history: for
+            // a differential-rendering TUI that is a partial frame. The first
+            // attach must not ship it — it sends the preamble and forces the
+            // child to repaint — even though the size did not change.
+            let state = test_state("adoptwinch");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-opencode-adoptwinch";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "opencode".into(),
+                "/tmp".into(),
+                "adoptwinch".into(),
+                false,
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\033[?1049h'; printf 'WINCHSCREEN\\n'; \
+                     trap 'printf WINCHMARKER' WINCH; while :; do sleep 0.1; done"
+                        .into(),
+                ],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            // Let the child paint, so the tail the next generation replays
+            // holds its screen.
+            thread::sleep(Duration::from_millis(750));
+            // A session this daemon spawned itself is never marked rebuilt.
+            assert!(!launched.screen_rebuilt.load(Ordering::Relaxed));
+            // The old generation drains and dies; the child's keeper survives.
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            // Adoption rebuilt its screen from the history tail, so its first
+            // attach is told to force a repaint.
+            assert!(adopted.screen_rebuilt.load(Ordering::Relaxed));
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let serve = Arc::clone(&restarted);
+            let handle = thread::spawn(move || serve_client(server, serve));
+            // Attach at the size the session already has: no reflow happened,
+            // so only the rebuilt flag can justify the repaint path.
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                1,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 0,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            // Judge a window, not the first frame: the live frame from the
+            // nudge may land either side of the payload. The preamble must be
+            // in it, the partial snapshot must not be, and the child must have
+            // felt the nudge.
+            let mut window = String::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline
+                && !(window.contains("\x1b[?1049h") && window.contains("WINCHMARKER"))
+            {
+                match Frame::read_from(&mut client) {
+                    Ok(Some(frame))
+                        if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
+                    {
+                        window
+                            .push_str(&String::from_utf8_lossy(&frame.decoded_payload().unwrap()));
+                    }
+                    // The stream-open ack (and other housekeeping) comes first.
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            assert!(
+                window.contains("\x1b[?1049h"),
+                "a rebuilt same-size attach must send the preamble: {window:?}"
+            );
+            assert!(
+                window.contains("\x1b[2J"),
+                "the preamble must clear the screen: {window:?}"
+            );
+            assert!(
+                !window.contains("WINCHSCREEN"),
+                "the partial rebuilt frame must not be committed: {window:?}"
+            );
+            assert!(
+                window.contains("WINCHMARKER"),
+                "the repaint nudge must SIGWINCH the child: {window:?}"
+            );
+            // ...and the PTY ends at exactly the attach size.
+            assert_eq!(adopted.columns.load(Ordering::Relaxed), 80);
+            assert_eq!(adopted.rows.load(Ordering::Relaxed), 24);
+            // The flag is consumed: the next attach is an ordinary one.
+            assert!(!adopted.screen_rebuilt.load(Ordering::Relaxed));
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                2,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 2 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_same_size_attach_to_a_fresh_alt_screen_tui_keeps_the_snapshot_and_no_winch() {
+            // A session this daemon spawned itself has a live, complete screen:
+            // a same-size attach ships the full snapshot (the marker row is in
+            // it) and must not re-signal the child — no SIGWINCH.
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("freshwinch");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-opencode-freshwinch";
+            launch_alt_screen_winch_session(&mut client, "freshwinch", session_id, "opencode")
+                .unwrap();
+            thread::sleep(Duration::from_millis(750));
+            let payload = first_attach_payload(&mut client, session_id, 80, 24).unwrap();
+            assert!(
+                payload.starts_with("\x1b[?1049h"),
+                "snapshot must enter the alt screen the child is on: {payload:?}"
+            );
+            assert!(
+                payload.contains("TASKCMARKER"),
+                "a fresh same-size attach must keep the full snapshot: {payload:?}"
+            );
+            // No repaint nudge went out: the child never saw a resize.
+            let mut window = String::new();
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            while Instant::now() < deadline {
+                match Frame::read_from(&mut client) {
+                    Ok(Some(frame))
+                        if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
+                    {
+                        window
+                            .push_str(&String::from_utf8_lossy(&frame.decoded_payload().unwrap()));
+                    }
+                    // The stream-open ack (and other housekeeping) comes first.
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            assert!(
+                !window.contains("WINCHMARKER"),
+                "a fresh same-size attach must not re-SIGWINCH the child: {window:?}"
+            );
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
                     assert_eq!(
                         frame.decode_json::<DaemonResponse>().unwrap(),
                         DaemonResponse::Ack
