@@ -48,7 +48,8 @@ mod platform {
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
-            CodexActivity, render_history_rows, render_scrollback_seed, resize_parser,
+            CodexActivity, InlineScrollback, render_history_rows, render_scrollback_seed,
+            resize_parser,
         },
     };
 
@@ -313,6 +314,9 @@ mod platform {
         attention_patterns: Arc<Mutex<Vec<String>>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
+        /// Tracks the scroll region the session has, so an attach snapshot can
+        /// hand the client the same `DECSTBM` the app left behind.
+        inline: Mutex<InlineScrollback>,
         codex_activity: Mutex<CodexActivity>,
         recent_output: Mutex<Vec<u8>>,
         /// The last thing the agent was seen to say, for a runtime that keeps
@@ -1568,6 +1572,12 @@ mod platform {
                             session.resize(columns, rows)?;
                             let subscriber_id =
                                 state.next_subscriber.fetch_add(1, Ordering::Relaxed);
+                            // Register for live broadcast immediately, so no
+                            // output is ever lost in a registration gap. Live
+                            // frames may interleave with the seed/snapshot on
+                            // the stream, but that is harmless: the snapshot is
+                            // an absolute screen state written last, so it
+                            // corrects whatever the interleaved frames did.
                             session
                                 .subscribers
                                 .lock()
@@ -1587,36 +1597,31 @@ mod platform {
                                 },
                             );
                             write_stream_opened(&writer, &frame, None)?;
-                            // The retained output only repaints the screen. The
-                            // history above it is rendered here so the client
-                            // starts with scrollback the raw ring never held.
-                            // Rendering takes long enough that the session can
-                            // write during it, so the retained output is taken
-                            // afterwards: it then covers everything the render
-                            // was too early to see.
+                            // Two parts, in order:
+                            // 1) Rendered history (everything scrolled off), ending at the
+                            //    tail of the log, so the client's scrollback is complete.
+                            // 2) An absolute snapshot of the live screen from the daemon's
+                            //    own emulator: current visible rows, cursor, input modes,
+                            //    scroll region and screen buffer. Replaying raw recent
+                            //    output cannot reconstruct an alt-screen TUI (it only holds
+                            //    diffs against earlier state), but the daemon's parser has
+                            //    seen every byte and serializes the exact state.
                             let seed = session
-                                .scrollback_seed(
-                                    columns,
-                                    rows,
-                                    RECENT_OUTPUT_LIMIT,
-                                    scrollback_rows,
-                                )
+                                .scrollback_seed(columns, rows, 0, scrollback_rows)
                                 .unwrap_or_else(|error| {
                                     eprintln!("muxloomd scrollback seed failed: {error}");
                                     Vec::new()
                                 });
-                            let recent = session
-                                .recent_output
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .clone();
                             for chunk in seed.chunks(DATA_CHUNK_SIZE) {
                                 write_frame(
                                     &writer,
                                     &Frame::data(frame.stream_id, 0, chunk, true),
                                 )?;
                             }
-                            for chunk in recent.chunks(DATA_CHUNK_SIZE) {
+                            // Taken after the (slow) seed render so it reflects the
+                            // newest state, and written last so it always wins.
+                            let snapshot = session.screen_snapshot();
+                            for chunk in snapshot.chunks(DATA_CHUNK_SIZE) {
                                 write_frame(
                                     &writer,
                                     &Frame::data(frame.stream_id, 0, chunk, true),
@@ -3122,6 +3127,7 @@ mod platform {
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
+            inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             screen_recap: Mutex::new(None),
@@ -3621,6 +3627,7 @@ mod platform {
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
+            inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             screen_recap: Mutex::new(None),
@@ -4293,15 +4300,69 @@ mod platform {
             render_scrollback_seed(BufReader::new(file).take(end - start), columns, rows, keep)
         }
 
+        /// Serialises the current screen state as escape-sequence bytes that,
+        /// fed to a fresh vt100 parser of the same dimensions, reproduce the
+        /// exact visible state (contents, cursor, input modes, scroll region,
+        /// alt-screen flag).  Replaces the old "replay last 2 MiB of raw bytes"
+        /// approach which was lossy for alt-screen TUIs.
+        fn screen_snapshot(&self) -> Vec<u8> {
+            let screen = self
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let inline = self
+                .inline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut out = Vec::new();
+
+            // Match the client's active screen buffer.  A fresh client parser
+            // starts in the primary buffer, so explicitly enter/leave alt to
+            // match the daemon's state.
+            if screen.screen().alternate_screen() {
+                out.extend_from_slice(b"\x1b[?1049h");
+            } else {
+                out.extend_from_slice(b"\x1b[?1049l");
+            }
+
+            // Reinstall the scroll region the app has set, so the client's
+            // InlineScrollback tracks the same region and subsequent scrolls
+            // behave identically.
+            if let Some(region) = inline.region_sequence() {
+                out.extend_from_slice(region.as_bytes());
+            }
+
+            // Full absolute redraw: ClearScreen + all rows (with SGR) + cursor
+            // position + input modes + title. The erase is not implied by the
+            // row writes — `state_formatted` only emits the rows that carry
+            // content — so without it, a live frame that interleaves between
+            // the seed and this snapshot (the writer is only locked per frame)
+            // could leave bytes on a row the daemon's screen has blank.
+            out.extend_from_slice(b"\x1b[2J");
+            out.extend_from_slice(&screen.screen().state_formatted());
+
+            out
+        }
+
         fn record_output(&self, bytes: &[u8]) {
             self.line_count.fetch_add(
                 bytes.iter().filter(|&&byte| byte == b'\n').count(),
                 Ordering::Relaxed,
             );
-            self.screen
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .process(bytes);
+            {
+                let mut screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut inline = self
+                    .inline
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Route through the same InlineScrollback the client uses so the
+                // daemon's screen state stays consistent with what a client
+                // would render (scroll-region rewriting included).
+                inline.process(&mut screen, bytes);
+            }
             self.codex_activity
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

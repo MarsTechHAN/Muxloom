@@ -507,7 +507,7 @@ fn osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
 /// the last column also scroll a region, but no agent muxloom drives prints its
 /// transcript that way, and both stay on vt100's own path.
 #[derive(Debug, Default)]
-struct InlineScrollback {
+pub(crate) struct InlineScrollback {
     scan: Scan,
     params: Vec<u8>,
     /// Set while the agent holds a region that starts at the first row and ends
@@ -545,7 +545,7 @@ impl InlineScrollback {
         self.region = None;
     }
 
-    fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
+    pub(crate) fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
         let mut flushed = 0;
         for index in 0..bytes.len() {
             if !self.step(parser, bytes[index]) {
@@ -649,7 +649,7 @@ impl InlineScrollback {
     /// The `DECSTBM` that reinstalls the tracked region, for handing an
     /// emulator the region without replaying the stream that set it.
     #[cfg(any(unix, test))]
-    fn region_sequence(&self) -> Option<String> {
+    pub(crate) fn region_sequence(&self) -> Option<String> {
         let (top, bottom) = self.region?;
         Some(format!("\x1b[{};{}r", top + 1, bottom + 1))
     }
@@ -894,6 +894,20 @@ pub(crate) fn render_history_rows(
 
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
     let (previous_height, previous_width) = parser.screen().size();
+    if height < previous_height && !parser.screen().alternate_screen() {
+        // `set_size` truncates the tail when the height shrinks, which would
+        // drop the newest lines. A real terminal keeps the bottom of the
+        // viewport, so delete the top rows that are about to be discarded,
+        // sliding the surviving rows up; `set_size` then drops the blanks left
+        // at the bottom. The scroll region is reset so the deletion spans the
+        // whole grid, which is also the region a resized screen should have.
+        // In alt-screen mode the TUI draws from the top, so the default
+        // top-anchored truncation is already correct.
+        use std::fmt::Write as _;
+        let mut sequence = String::new();
+        let _ = write!(sequence, "\x1b[r\x1b[H\x1b[{}M", previous_height - height);
+        parser.process(sequence.as_bytes());
+    }
     if width < previous_width {
         // vt100 0.15 can leave the first half of a wide glyph in the new last
         // column when shrinking a row. A later erase then indexes one cell
