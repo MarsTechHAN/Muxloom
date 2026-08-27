@@ -3650,6 +3650,7 @@ pub(crate) fn composer(kind: AgentKind, screen: &str) -> Option<Composer> {
 /// placeholder, so there is nothing to wait on or age. `Some("")` — the box is
 /// drawn and ready. `Some(draft)` — the unsent draft, which is what changes as
 /// somebody types.
+#[cfg(unix)]
 pub(crate) fn composer_text(kind: AgentKind, screen: &str) -> Option<String> {
     let mut lines: Vec<&str> = screen.lines().collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
@@ -3665,6 +3666,7 @@ pub(crate) fn composer_text(kind: AgentKind, screen: &str) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
 fn pi_composer_text(tail: &[&str]) -> Option<String> {
     let row = live_composer_signal(tail)?;
     let typed = tail[row]
@@ -3682,6 +3684,7 @@ fn pi_composer_text(tail: &[&str]) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
 fn opencode_composer_text(tail: &[&str]) -> Option<String> {
     let bottom = tail
         .iter()
@@ -3719,6 +3722,7 @@ fn opencode_composer_text(tail: &[&str]) -> Option<String> {
     if draft.is_empty() { None } else { Some(draft) }
 }
 
+#[cfg(unix)]
 fn claude_composer_text(tail: &[&str]) -> Option<String> {
     let bottom = tail.iter().rposition(|line| is_rule(line))?;
     if tail.len() - bottom - 1 > CLAUDE_FOOTER_LINES {
@@ -3752,6 +3756,7 @@ fn claude_composer_text(tail: &[&str]) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
 fn codex_composer_text(tail: &[&str]) -> Option<String> {
     let row = tail
         .iter()
