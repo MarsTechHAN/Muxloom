@@ -859,22 +859,29 @@ mod platform {
         Ok(())
     }
 
-    /// Type a rendered message into a session as one submission.
+    /// The exact bytes a delivered message is typed with, per runtime.
     ///
     /// Codex and Claude Code both understand bracketed paste, which is what
     /// gets a multi-line envelope into the prompt whole; typed as bytes, every
     /// newline in it would submit what came before. The other runtimes are not
-    /// known to, so they are told the same thing folded onto one line: uglier,
-    /// and still one message rather than eight.
-    fn type_message(session: &ManagedSession, kind: AgentKind, body: &str) -> Result<()> {
-        let bytes = if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
+    /// known to, so they are told the same thing folded onto one line — and it
+    /// ends in a plain `\r`: the Enter keystroke is what OpenCode and pi bind
+    /// their submit to. Anything else (a `\n`, an escape sequence) would type
+    /// the draft in and leave it sitting in the box, which is what the
+    /// "message never got through" reports were.
+    fn message_bytes(kind: AgentKind, body: &str) -> Vec<u8> {
+        if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
             paste_bytes(body, true)
         } else {
             let mut folded = folded(body).into_bytes();
             folded.push(b'\r');
             folded
-        };
-        session.write_input(&bytes)
+        }
+    }
+
+    /// Type a rendered message into a session as one submission.
+    fn type_message(session: &ManagedSession, kind: AgentKind, body: &str) -> Result<()> {
+        session.write_input(&message_bytes(kind, body))
     }
 
     /// Deliver what the outbox holds to the sessions that have become free
@@ -7472,6 +7479,34 @@ mod platform {
         }
 
         #[test]
+        fn opencode_and_pi_messages_end_in_plain_enter_not_bracketed_paste() {
+            // The delivered bytes must end with the Enter keystroke the TUI
+            // binds its submit to, not a newline or an escape sequence that
+            // leaves the draft sitting in the box.
+            let body = "line one\n\nline two";
+            let oc = message_bytes(AgentKind::OpenCode, body);
+            assert_eq!(oc, "line one \u{23ce} line two\r".as_bytes().to_vec());
+            assert!(
+                !oc.starts_with(b"\x1b[200~"),
+                "opencode must not use bracketed paste"
+            );
+            let pi = message_bytes(AgentKind::Pi, body);
+            assert_eq!(pi, oc);
+            let codex = message_bytes(AgentKind::Codex, body);
+            assert!(
+                codex.starts_with(b"\x1b[200~"),
+                "codex uses bracketed paste"
+            );
+            assert_eq!(*codex.last().unwrap(), b'\r');
+            let claude = message_bytes(AgentKind::Claude, body);
+            assert!(
+                claude.starts_with(b"\x1b[200~"),
+                "claude uses bracketed paste"
+            );
+            assert_eq!(*claude.last().unwrap(), b'\r');
+        }
+
+        #[test]
         fn an_attach_delivers_the_snapshot_without_replaying_history() {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
@@ -7703,9 +7738,8 @@ mod platform {
             while !after_resize.contains("WINCHMARKER") && Instant::now() < deadline {
                 if let Ok(Some(frame)) = Frame::read_from(&mut client) {
                     if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE {
-                        after_resize.push_str(
-                            &String::from_utf8_lossy(&frame.decoded_payload().unwrap())
-                        );
+                        after_resize
+                            .push_str(&String::from_utf8_lossy(&frame.decoded_payload().unwrap()));
                     }
                 }
             }

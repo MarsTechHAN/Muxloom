@@ -3636,63 +3636,56 @@ fn pi_composer(tail: &[&str]) -> Composer {
 
 /// Read OpenCode's prompt box off its screen.
 ///
-/// OpenCode's composer is a bottom textarea that holds a whole draft across
-/// several rows; the first carries the input glyph and the rest continue it
-/// un-prefixed. A select dialog or a running turn with no input line reads as
-/// [`Composer::Absent`] for the same reason pi's does.
+/// OpenCode draws the composer as a bordered box at the bottom of the screen:
+/// `┃` rows over a `╹▀▀▀` bottom border, holding the placeholder or the typed
+/// draft above a `Build · <model>` status line pinned to the box bottom. No
+/// prompt glyph is drawn anywhere (unlike pi or Claude), so a glyph search
+/// always read a live session as Absent — which left delivered messages
+/// waiting in the outbox or stranded in the box. Read the box border instead.
+///
+/// Placeholder in the box (idle) → Ready. A running turn leaves the input row
+/// empty with only the status line → Absent (the outbox drainer retries when
+/// the turn ends and the placeholder returns). A real draft in the box →
+/// Occupied, so nobody's typed sentence gets merged with a pasted message.
 fn opencode_composer(tail: &[&str]) -> Composer {
-    let Some(row) = live_composer_signal(tail) else {
+    let Some(bottom) = tail
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("╹▀▀▀▀▀▀▀"))
+    else {
         return Composer::Absent;
     };
-    let mut typed = String::new();
-    for (offset, line) in tail.iter().enumerate().skip(row) {
-        let prefix = line.trim_start();
-        // The footer hint below the draft, and a fresh glyph above the next
-        // prompt, both end it.
-        if offset > row
-            && (is_user_facing_hint(prefix)
-                || prefix.starts_with(|c: char| PROMPT_GLYPHS.contains(&c)))
-        {
-            break;
-        }
-        let text = if offset == row {
-            prefix
-                .trim_start_matches(|character: char| PROMPT_GLYPHS.contains(&character))
-                .trim()
-        } else {
-            prefix
-        };
-        if text.is_empty() {
-            // A wrapped draft is one run of text; a blank row ends it.
-            break;
-        }
-        if !typed.is_empty() {
-            typed.push(' ');
-        }
-        typed.push_str(text);
+    // Walk up through the box's left-border rows; the first non-`┃` row above
+    // (blank or transcript) marks the box top.
+    let mut top = bottom;
+    while top > 0 && tail[top - 1].trim_start().starts_with('┃') {
+        top -= 1;
     }
-    if typed.is_empty()
-        || OPENCODE_PLACEHOLDERS
-            .iter()
-            .any(|placeholder| typed.starts_with(placeholder))
-    {
-        Composer::Ready
-    } else {
-        Composer::Occupied
-    }
-}
-
-/// A line that reads as a footer/user-facing hint rather than as typed text:
-/// it names a key chord and an action. A wrap of prose may contain "esc" but
-/// not the chord-plus-`to` shape of a hint bar.
-fn is_user_facing_hint(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    ["· enter to", "enter to send", "enter to submit"]
+    let mut rows: Vec<&str> = tail[top..bottom]
         .iter()
-        .any(|hint| lower.contains(hint))
-        || lower.starts_with("ctrl+")
-        || ((lower.contains("esc to") || lower.contains("esc interrupt"))
-            && line.split_whitespace().count() <= 12)
+        .map(|line| line.trim_start().trim_start_matches('┃').trim())
+        .collect();
+    // The model status row (which may wrap) sits against the box bottom; peel
+    // it off before reading the input area above it. Never peel a placeholder.
+    while rows.last().is_some_and(|row| {
+        !row.is_empty() && !OPENCODE_PLACEHOLDERS.iter().any(|p| row.starts_with(p))
+    }) {
+        rows.pop();
+    }
+    let mut occupied = false;
+    for row in &rows {
+        if row.is_empty() {
+            continue;
+        }
+        if OPENCODE_PLACEHOLDERS.iter().any(|p| row.starts_with(p)) {
+            return Composer::Ready;
+        }
+        occupied = true;
+    }
+    if occupied {
+        Composer::Occupied
+    } else {
+        Composer::Absent
+    }
 }
 
 /// The index in `tail` of the CLI's live prompt-glyph line, if one can be
@@ -5687,36 +5680,63 @@ mod tests {
     }
 
     #[test]
-    fn opencode_reads_its_prompt_line_and_holds_back_for_dialogs() {
-        // Idle with an empty composer.
+    fn opencode_reads_its_bordered_composer_box() {
+        // Real idle screen (OpenCode 1.18.23): the composer is a ┃-bordered
+        // box holding the greyed placeholder and a model status line above the
+        // ╹▀▀▀ border. No prompt glyph is drawn — the old glyph-based reader
+        // classified this as Absent and left messages queued for 60s.
         let idle = concat!(
-            "▌ Recognize and fix the width bug\n",
-            "\n",
-            "❯ \n",
-            "Ctrl+E cycle model · Enter to send · esc to interrupt\n",
+            "                             ┃\n",
+            "                             ┃  Ask anything... \"Fix a TODO in the codebase\"\n",
+            "                             ┃\n",
+            "                             ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
+            "                             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "                             tab agents  ctrl+p commands\n",
+            "  ~/Works/Terminal:main  ⊙ 1 MCP /status  1.18.23\n",
         );
         assert_eq!(composer(AgentKind::OpenCode, idle), Some(Composer::Ready));
 
-        // A wrapped draft across several rows is still one unsent message.
-        let wrapped = concat!(
-            "❯ Debug the session recovery by reading the keeper handshake, tracing\n",
-            "  how a superseded daemon releases the socket, and confirming the\n",
-            "  next generation adopts the same process.\n",
-            "Ctrl+E cycle model · Enter to send\n",
+        // A running turn: the input row is empty and only the model status
+        // line (with the working path) remains in the box. The ▣ activity
+        // line above the box must not be mistaken for box content.
+        let working = concat!(
+            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n",
+            "\n",
+            "  ┃\n",
+            "  ┃\n",
+            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)                    ~/Works/xperf_infer:zhen/layer_cut\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "   /Users/bytedance/Works/xperf_infer  22.4K (9%)  ctrl+p commands  • OpenCode 1.18.23\n",
         );
         assert_eq!(
-            composer(AgentKind::OpenCode, wrapped),
+            composer(AgentKind::OpenCode, working),
+            Some(Composer::Absent)
+        );
+
+        // A draft typed into the box (wrapped across rows) keeps it Occupied;
+        // the status line below must not be read as typed text.
+        let draft = concat!(
+            "  ┃\n",
+            "  ┃  Debug the session recovery by reading the keeper handshake, tracing\n",
+            "  ┃  how a superseded daemon releases the socket, and confirming the\n",
+            "  ┃\n",
+            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+        );
+        assert_eq!(
+            composer(AgentKind::OpenCode, draft),
             Some(Composer::Occupied)
         );
 
-        // A running turn with no input box on screen cannot take a message.
-        let working = concat!(
+        // A screen without the box (dialog, installer, startup) has nowhere
+        // to deliver into.
+        let no_box = concat!(
             "⚡ Reading sessions… (esc to interrupt)\n",
             "\n",
             "ctrl+r session · ctrl+o files\n",
         );
         assert_eq!(
-            composer(AgentKind::OpenCode, working),
+            composer(AgentKind::OpenCode, no_box),
             Some(Composer::Absent)
         );
     }
