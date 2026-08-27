@@ -252,7 +252,7 @@ instead of deriving it again.
 To wait for someone rather than poll them:
 
 ```
-talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 300 }
+talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 45 }
 ```
 
 ## Name what you are doing
@@ -285,7 +285,7 @@ in the prompt and is read when that turn ends. The reply comes back as a direct
 message:
 
 ```
-talk_read { scope: \"direct\", wait_seconds: 900 }
+talk_read { scope: \"direct\", wait_seconds: 45 }
 ```
 
 Waiting is the whole skill here. An agent you asked is usually in the middle of
@@ -328,7 +328,7 @@ plain lists to anything that needs a grid.
 Their reply comes back to you as a direct message, so end your turn and wait:
 
 ```
-talk_read { scope: \"direct\", wait_seconds: 900 }
+talk_read { scope: \"direct\", wait_seconds: 45 }
 ```
 
 ## Watch instead of poll

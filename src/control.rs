@@ -79,25 +79,27 @@ const SHELL_OUTPUT_LIMIT: usize = 128 * 1024;
 const WAIT_SCREEN_LINES: usize = 80;
 /// How many of those rows the answer carries back.
 const WAIT_TAIL_LINES: usize = 30;
-/// How long a wait runs when the caller does not say, and the most it may ask
-/// for. The ceiling is under every MCP client's own call timeout: a wait that
-/// ends saying "not yet" is answerable, one the transport gives up on is not.
-const WAIT_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
-const WAIT_MAX_TIMEOUT_SECONDS: u64 = 900;
+/// How long a wait runs when the caller does not say, and the most a single
+/// call may block. A wait-class call is one long-lived JSON-RPC request, and
+/// an MCP client (opencode's, and the SDK default) drops any request it has
+/// not heard back from in ~60 seconds, answering `-32001: Request timed out`.
+/// A call that returns at 45 seconds saying "not yet, call again" is always
+/// answerable; one the client gives up on is not. Both wait tools already tell
+/// the caller to re-poll, so the cap only changes how the wait is sliced.
+const WAIT_DEFAULT_TIMEOUT_SECONDS: u64 = 45;
+const WAIT_MAX_TIMEOUT_SECONDS: u64 = 45;
 /// Consecutive failed looks a wait rides out before reporting them. A daemon
 /// handing over to a new generation is unreachable for a moment, and a wait
 /// that outlives conversations must outlive that too.
 const WAIT_ERROR_TOLERANCE: usize = 3;
-/// The longest a `talk_read` may sit waiting for someone to say something, and
-/// how often it looks while it waits. Same reasoning as the wait ceiling: an
-/// answer of "nothing yet, here is your cursor" beats a dropped call.
-///
-/// Two minutes was too short by a wide margin. An agent asked a question is
-/// usually in the middle of something else, and the answer comes when that
-/// finishes: on this board most replies take minutes and a fair number take
-/// far longer. A cap under the common case turns one wait into a poll loop the
-/// asker has to drive, and an asker that stops driving it never hears back at
-/// all. Same ceiling as `wait_for`, for the same reason.
+/// The longest a `talk_read` may sit in a single call, and how often it looks
+/// while it waits. Shares `wait_for`'s ceiling because it is the same kind of
+/// long-lived request: a `talk_read` that blocks past the MCP client's
+/// ~60-second request timeout is dropped with `-32001` before it can answer
+/// "nothing yet, here is your cursor". Each call therefore returns within the
+/// 45-second cap and the caller re-polls — the tool text and the skill both
+/// say to call again while an answer is outstanding — rather than hold one
+/// call open until the transport gives up on it.
 const TALK_MAX_WAIT_SECONDS: u64 = WAIT_MAX_TIMEOUT_SECONDS;
 const TALK_POLL: Duration = Duration::from_secs(2);
 /// How far back a timed-out wait looks for messages of its own still waiting
