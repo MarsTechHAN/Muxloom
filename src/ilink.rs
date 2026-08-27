@@ -213,18 +213,39 @@ pub fn watch(handle: &str, environment: &[(String, String)]) -> Result<Scan> {
     }
 }
 
+/// WeChat's verdict on one send, read straight off the reply body.
+///
+/// WeChat answers HTTP 200 for a refused, a dropped, and a delivered send alike,
+/// so the status line never says whether the message arrived. The code and
+/// reason are the protocol's own complaint; `delivery_confirmed` is the one
+/// thing this side cannot mint for itself — an id of WeChat's own in the body,
+/// distinct from the `client_id` the request carried. An accepted-but-dropped
+/// reply (a stale context token waved through as a success) comes back code 0
+/// with no such field, which is exactly what "a success id that never arrives"
+/// looks like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub code: i64,
+    pub reason: String,
+    pub delivery_confirmed: bool,
+}
+
 /// Say one thing to the person this bot belongs to.
 ///
 /// `context_token` is the one off the last thing they said. Without it WeChat
 /// has no conversation to put the message in, so a bot nobody has greeted has
 /// nothing to answer into — which the caller is expected to explain rather than
 /// pass on as a protocol error.
+///
+/// Returns the id this side minted for the send together with WeChat's own
+/// verdict on it. The id alone says nothing about delivery; the body does, and
+/// the caller is the only one in a position to read it before it is forgotten.
 pub fn send_text(
     account: &Account,
     context_token: &str,
     text: &str,
     environment: &[(String, String)],
-) -> Result<String> {
+) -> Result<(String, Verdict)> {
     if context_token.trim().is_empty() {
         bail!("say anything to this bot in WeChat first — it can only answer a conversation");
     }
@@ -247,22 +268,24 @@ pub fn send_text(
         }),
         environment,
     )?;
+    let verdict = verdict_of(&answer, &id);
     // A reply that is accepted but never delivered is indistinguishable from a
     // real delivery unless the body is read: WeChat answers HTTP 200 for both
-    // and puts the whole verdict in the code and the reason. What is logged is
-    // the platform's own reply — the code, its human reason, and the shape of
-    // the body (its keys, never the values) — so a stale context token that is
-    // waved through as a success leaves a trace a person can read.
+    // and puts the whole verdict in the code, the reason, and a delivery id it
+    // only includes when the message actually goes out. Logging the platform's
+    // own reply (code, reason, body keys — never values) keeps a stale context
+    // token from leaving no trace at all.
     crate::debug::log(
         "ilink",
         format!(
-            "sendmessage accepted but unverified: code={} reason={} body_keys={:?}",
-            code_of(&answer),
-            answer
-                .get("errmsg")
-                .and_then(Value::as_str)
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("none"),
+            "sendmessage verdict: code={} reason={} delivery_confirmed={} body_keys={:?}",
+            verdict.code,
+            if verdict.reason.is_empty() {
+                "none"
+            } else {
+                verdict.reason.as_str()
+            },
+            verdict.delivery_confirmed,
             answer
                 .as_object()
                 .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
@@ -270,7 +293,38 @@ pub fn send_text(
         ),
     );
     complain(&answer)?;
-    Ok(id)
+    Ok((id, verdict))
+}
+
+/// Read the verdict off one reply body: the code, the human reason, and whether
+/// the body carries a delivery id of WeChat's own — a server-side id distinct
+/// from the `client_id` this side sent. That is the only evidence the message
+/// went out rather than merely being accepted; an accepted-but-dropped reply
+/// (a stale context token) comes back with none.
+fn verdict_of(answer: &Value, client_id: &str) -> Verdict {
+    let code = code_of(answer);
+    let reason = answer
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let delivery_confirmed = answer.as_object().is_some_and(|fields| {
+        fields
+            .iter()
+            .filter(|(key, _)| key.to_ascii_lowercase().contains("id"))
+            .filter_map(|(_, value)| match value {
+                Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            })
+            .any(|value| value != client_id)
+    });
+    Verdict {
+        code,
+        reason,
+        delivery_confirmed,
+    }
 }
 
 /// Ask for whatever has been said since `cursor`.
@@ -548,6 +602,48 @@ mod tests {
             format!("{error:#}").contains("say anything to this bot"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn the_verdict_tells_an_acceptance_apart_from_a_delivery() {
+        let client_id = "muxloom-minted";
+        // A delivery id of WeChat's own is the only evidence of delivery.
+        assert_eq!(
+            verdict_of(
+                &json!({ "errcode": 0, "errmsg": "success", "msg_id": "wx-42" }),
+                client_id
+            ),
+            Verdict {
+                code: 0,
+                reason: "success".into(),
+                delivery_confirmed: true,
+            }
+        );
+        // Code 0 with only the complaint keys: accepted, delivery unconfirmed.
+        assert_eq!(
+            verdict_of(&json!({ "errcode": 0, "errmsg": "success" }), client_id),
+            Verdict {
+                code: 0,
+                reason: "success".into(),
+                delivery_confirmed: false,
+            }
+        );
+        // An echo of the id this side minted is not a delivery.
+        assert_eq!(
+            verdict_of(&json!({ "errcode": 0, "client_id": client_id }), client_id),
+            Verdict {
+                code: 0,
+                reason: String::new(),
+                delivery_confirmed: false,
+            }
+        );
+        // A numeric delivery id counts, and a refusal carries its code.
+        assert!(
+            verdict_of(&json!({ "errcode": 0, "item_id": 8123 }), client_id).delivery_confirmed
+        );
+        let asleep = verdict_of(&json!({ "errcode": ASLEEP }), client_id);
+        assert_eq!(asleep.code, ASLEEP);
+        assert!(!asleep.delivery_confirmed);
     }
 
     #[test]

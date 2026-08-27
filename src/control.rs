@@ -1431,11 +1431,19 @@ fn send_channel(
             label: session_env("MUXLOOM_SESSION_LABEL").unwrap_or_default(),
         });
     }
+    let wechat_json = sent.wechat.as_ref().map(|v| {
+        json!({
+            "code": v.code,
+            "reason": v.reason,
+            "delivery_confirmed": v.delivery_confirmed,
+        })
+    });
     Ok(pretty(&json!({
         "channel": sent.channel,
         "through": sent.through,
         "message_id": sent.message_id,
         "signed": message.signature,
+        "wechat": wechat_json,
         "note": "Sent to a person, not to an agent. Their answer comes back as a direct message: \
                  talk_read { scope: \"direct\", wait_seconds }.",
     })))

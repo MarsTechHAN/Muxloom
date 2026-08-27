@@ -572,6 +572,9 @@ pub struct Sent {
     /// entirely — so a WeChat chat is answered by aim and by who spoke last,
     /// not by which message was replied to.
     pub message_id: String,
+    /// WeChat only: the platform's verdict on this send. None for Lark, since
+    /// its HTTP status alone is sufficient to know whether delivery succeeded.
+    pub wechat: Option<ilink::Verdict>,
 }
 
 /// Post one message to a human through one binding.
@@ -717,6 +720,7 @@ fn send_lark(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        wechat: None,
     })
 }
 
@@ -987,7 +991,7 @@ fn send_wechat(
         true => plain(&body),
         false => format!("{title}\n\n{}", plain(&body)),
     };
-    let message_id = ilink::send_text(
+    let (message_id, verdict) = ilink::send_text(
         &wechat_account(binding),
         binding.context_token.trim(),
         &text,
@@ -998,6 +1002,7 @@ fn send_wechat(
         channel: binding.id.clone(),
         through: binding.describes(),
         message_id,
+        wechat: Some(verdict),
     })
 }
 
