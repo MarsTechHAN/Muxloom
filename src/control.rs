@@ -18,6 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -49,9 +50,14 @@ pub struct ToolSpec {
 
 /// A capability surface a transport adapter serves. Calls return the text the
 /// consumer reads; failures carry the reason and leave the surface usable.
-pub trait ControlSurface {
+///
+/// `call` borrows immutably: a serve loop may answer several requests at once
+/// on separate threads (a long `wait_for` must not hold up a `read_screen`),
+/// so one surface must be callable concurrently. Implementations that keep
+/// mutable state hold it behind their own locks.
+pub trait ControlSurface: Send + Sync {
     fn tools(&self) -> Vec<ToolSpec>;
-    fn call(&mut self, name: &str, arguments: &Value) -> Result<String>;
+    fn call(&self, name: &str, arguments: &Value) -> Result<String>;
 
     /// How a consumer is meant to use this surface: what muxloom is for, which
     /// tool to reach for first, and what it must not do. Adapters that have a
@@ -2029,7 +2035,7 @@ fn conversation_page(
 pub struct ControllerControl {
     runtime: Runtime,
     config: Config,
-    state: State,
+    state: Mutex<State>,
     state_path: PathBuf,
 }
 
@@ -2048,9 +2054,15 @@ impl ControllerControl {
         Ok(Self {
             runtime,
             config,
-            state,
+            state: Mutex::new(state),
             state_path,
         })
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The name a machine argument goes by here. This machine is `local` to
@@ -2060,7 +2072,7 @@ impl ControllerControl {
     /// missing. An ssh alias of the same spelling wins: it is the more
     /// deliberate answer, and it points at this host anyway.
     fn spelled_here<'a>(&self, machine: &'a str) -> &'a str {
-        if !self.state.enabled_hosts.contains(machine)
+        if !self.state().enabled_hosts.contains(machine)
             && machine.eq_ignore_ascii_case(&crate::talk::hostname())
         {
             return crate::model::LOCAL_TARGET_ID;
@@ -2074,7 +2086,7 @@ impl ControllerControl {
     fn target(&self, arguments: &Value) -> Result<Target> {
         let machine = optional_str(arguments, "machine").unwrap_or(crate::model::LOCAL_TARGET_ID);
         let machine = self.spelled_here(machine);
-        if !self.state.enabled_hosts.contains(machine) {
+        if !self.state().enabled_hosts.contains(machine) {
             bail!("machine {machine} is not enabled in muxloom");
         }
         if machine == crate::model::LOCAL_TARGET_ID {
@@ -2091,7 +2103,7 @@ impl ControllerControl {
             return Ok(vec![self.target(arguments)?]);
         }
         Ok(self
-            .state
+            .state()
             .enabled_hosts
             .iter()
             .map(|host| {
@@ -2108,7 +2120,7 @@ impl ControllerControl {
         let mut machines = vec![json!({
             "id": crate::model::LOCAL_TARGET_ID,
             "label": "This machine",
-            "enabled": self.state.enabled_hosts.contains(crate::model::LOCAL_TARGET_ID),
+            "enabled": self.state().enabled_hosts.contains(crate::model::LOCAL_TARGET_ID),
             "connected": self.runtime.bridge_pool().is_connected(crate::model::LOCAL_TARGET_ID),
         })];
         let aliases = ssh_config::load_hosts(&self.config.ssh_config_path()).unwrap_or_default();
@@ -2116,7 +2128,7 @@ impl ControllerControl {
             machines.push(json!({
                 "id": alias,
                 "label": alias,
-                "enabled": self.state.enabled_hosts.contains(&alias),
+                "enabled": self.state().enabled_hosts.contains(&alias),
                 "connected": self.runtime.bridge_pool().is_connected(&alias),
             }));
         }
@@ -2126,7 +2138,7 @@ impl ControllerControl {
     /// Add a machine to the reachable set or take it out of it. The state file
     /// is read again first: the dashboard owns the same file, and an MCP
     /// process that started an hour ago must not write back a stale view.
-    fn set_machine_enabled(&mut self, arguments: &Value) -> Result<String> {
+    fn set_machine_enabled(&self, arguments: &Value) -> Result<String> {
         let machine = required_str(arguments, "machine")?.to_string();
         let enabled = arguments
             .get("enabled")
@@ -2150,18 +2162,18 @@ impl ControllerControl {
         if changed {
             state.save(&self.state_path)?;
         }
-        self.state = state;
+        *self.state() = state;
         Ok(pretty(&json!({
             "machine": machine,
             "enabled": enabled,
             "changed": changed,
-            "enabled_machines": self.state.enabled_hosts.iter().collect::<Vec<_>>(),
+            "enabled_machines": self.state().enabled_hosts.iter().collect::<Vec<_>>(),
         })))
     }
 
     /// Read the SSH aliases this machine knows, or write one into the file
     /// muxloom owns. Hosts the user maintains are read but never rewritten.
-    fn ssh_host(&mut self, arguments: &Value) -> Result<String> {
+    fn ssh_host(&self, arguments: &Value) -> Result<String> {
         let ssh_path = self.config.ssh_config_path();
         let managed_path = ssh_config::managed_path(&ssh_path);
         match required_str(arguments, "action")? {
@@ -2173,7 +2185,7 @@ impl ControllerControl {
                     .map(|(alias, sources)| {
                         json!({
                             "host": alias,
-                            "enabled": self.state.enabled_hosts.contains(&alias),
+                            "enabled": self.state().enabled_hosts.contains(&alias),
                             "managed": sources.iter().any(|source| source == &managed_file),
                             "defined_in": sources
                                 .iter()
@@ -2258,7 +2270,7 @@ impl ControllerControl {
                     "previous": previous,
                     "managed_file": managed_path.display().to_string(),
                     "include_added": included,
-                    "enabled": self.state.enabled_hosts.contains(&alias),
+                    "enabled": self.state().enabled_hosts.contains(&alias),
                     "note": "muxloom cannot address this machine until set_machine_enabled \
                              turns it on, and connecting still needs working SSH credentials.",
                 })))
@@ -2288,7 +2300,7 @@ impl ControllerControl {
                 if disabled {
                     state.save(&self.state_path)?;
                 }
-                self.state = state;
+                *self.state() = state;
                 Ok(pretty(&json!({
                     "host": alias,
                     "removed": true,
@@ -2564,7 +2576,7 @@ impl ControllerControl {
     ) -> Result<Vec<String>> {
         if asked.is_empty() {
             return Ok(self
-                .state
+                .state()
                 .enabled_hosts
                 .iter()
                 .map(|host| index.machine_key_for_alias(host))
@@ -2574,7 +2586,7 @@ impl ControllerControl {
             .iter()
             .map(|machine| {
                 let machine = self.spelled_here(machine);
-                if !self.state.enabled_hosts.contains(machine) {
+                if !self.state().enabled_hosts.contains(machine) {
                     bail!(
                         "machine {machine} is not enabled in muxloom; ask the user to enable it \
                          rather than working around it"
@@ -2714,7 +2726,7 @@ impl ControlSurface for ControllerControl {
         Some(instructions(Flavor::Controller, &self.config.mcp))
     }
 
-    fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
+    fn call(&self, name: &str, arguments: &Value) -> Result<String> {
         enforce_policy(&self.config.mcp, name)?;
         match name {
             "list_machines" => self.list_machines(),
@@ -3351,7 +3363,7 @@ mod daemon_surface {
             Some(instructions(Flavor::Daemon, &self.config.mcp))
         }
 
-        fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
+        fn call(&self, name: &str, arguments: &Value) -> Result<String> {
             enforce_policy(&self.config.mcp, name)?;
             // What another machine holds is the controller's to answer. The
             // two that are only ever about other machines go straight out;
@@ -3473,7 +3485,7 @@ impl ControlSurface for DaemonControl {
         Vec::new()
     }
 
-    fn call(&mut self, _name: &str, _arguments: &Value) -> Result<String> {
+    fn call(&self, _name: &str, _arguments: &Value) -> Result<String> {
         bail!("muxloomd is currently supported on Unix targets")
     }
 }
@@ -4014,7 +4026,7 @@ mod tests {
         let control = ControllerControl {
             runtime: Runtime::new(&config),
             config,
-            state,
+            state: Mutex::new(state),
             state_path: root.join("state.json"),
         };
         (control, root)
@@ -4022,7 +4034,7 @@ mod tests {
 
     #[test]
     fn controller_surface_gates_machines_on_the_enabled_set() {
-        let (mut control, root) = controller_over_temp("gate");
+        let (control, root) = controller_over_temp("gate");
         let ssh_config = control.config.ssh_config_path();
         std::fs::write(&ssh_config, "Host gpu\n  HostName 10.0.0.1\n").unwrap();
 
@@ -4047,7 +4059,12 @@ mod tests {
         assert_eq!(machine("local")["enabled"], true);
         assert_eq!(machine("gpu")["enabled"], false);
 
-        control.state.enabled_hosts.insert("gpu".into());
+        control
+            .state
+            .lock()
+            .unwrap()
+            .enabled_hosts
+            .insert("gpu".into());
         assert_eq!(
             control.target(&json!({ "machine": "gpu" })).unwrap().id,
             "gpu"
@@ -4086,7 +4103,7 @@ mod tests {
 
     #[test]
     fn ssh_writes_stay_inside_the_file_muxloom_owns() {
-        let (mut control, root) = controller_over_temp("ssh");
+        let (control, root) = controller_over_temp("ssh");
         let ssh_path = control.config.ssh_config_path();
         std::fs::write(&ssh_path, "Host mine\n  HostName mine.example\n").unwrap();
 
@@ -4918,7 +4935,7 @@ mod tests {
 
         #[test]
         fn with_no_channel_bound_the_agent_is_told_who_can_bind_one() {
-            let mut surface = surface("channel");
+            let surface = surface("channel");
             // Nothing is bound here and no controller is watching, so the
             // errand cannot be handed off either. What comes back has to be
             // the useful half of that — where a human sets a channel up —

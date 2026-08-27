@@ -54,12 +54,12 @@ fn mcp_entry(paths: &DaemonPaths) -> Result<()> {
     {
         return hand_over(&controller);
     }
-    let mut surface = muxloom::control::DaemonControl::new()?;
+    let surface = muxloom::control::DaemonControl::new()?;
     muxloom::mcp::serve(
-        &mut surface,
+        &surface,
         "muxloomd",
-        std::io::stdin().lock(),
-        std::io::stdout().lock(),
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
     )
 }
 

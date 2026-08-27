@@ -103,12 +103,12 @@ fn real_main() -> Result<()> {
                 debug::init(log_path)?;
             }
             let config = Config::load(&options.config_path)?;
-            let mut surface = muxloom::control::ControllerControl::new(config)?;
+            let surface = muxloom::control::ControllerControl::new(config)?;
             muxloom::mcp::serve(
-                &mut surface,
+                &surface,
                 "muxloom",
-                io::stdin().lock(),
-                io::stdout().lock(),
+                io::BufReader::new(io::stdin()),
+                io::stdout(),
             )
         }
         Command::Run => {

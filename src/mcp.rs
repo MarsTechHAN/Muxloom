@@ -13,6 +13,8 @@
 //! would cost more than it saves.
 
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -32,32 +34,50 @@ const INVALID_PARAMS: i64 = -32602;
 
 /// Serve MCP over the given transport until the client disconnects. `name` is
 /// the serverInfo name a client shows the user, e.g. `muxloom` or `muxloomd`.
+///
+/// Each request is answered on its own thread so that a long-running call
+/// (a `wait_for` or `talk_read` that blocks for minutes) cannot stall the
+/// reader loop and starve every other in-flight request into a client-side
+/// timeout. JSON-RPC responses carry their own `id`, so replies may arrive
+/// out of order.
 pub fn serve(
-    surface: &mut dyn ControlSurface,
+    surface: &dyn ControlSurface,
     name: &str,
     reader: impl BufRead,
-    mut writer: impl Write,
+    writer: impl Write + Send,
 ) -> Result<()> {
-    for line in reader.lines() {
-        let line = line.context("failed to read MCP transport")?;
-        if line.trim().is_empty() {
-            continue;
+    let name = name.to_string();
+    let writer = Arc::new(Mutex::new(writer));
+
+    thread::scope(|scope| -> Result<()> {
+        for result in reader.lines() {
+            let line = result.context("failed to read MCP transport")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let name = name.clone();
+            let writer = Arc::clone(&writer);
+            scope.spawn(move || {
+                let Some(reply) = handle_line(surface, &name, &line) else {
+                    return;
+                };
+                let Ok(mut bytes) = serde_json::to_vec(&reply) else {
+                    return;
+                };
+                bytes.push(b'\n');
+                if let Ok(mut guard) = writer.lock() {
+                    let _ = guard.write_all(&bytes).and_then(|()| guard.flush());
+                }
+            });
         }
-        let Some(reply) = handle_line(surface, name, &line) else {
-            continue;
-        };
-        let mut bytes = serde_json::to_vec(&reply).context("failed to encode MCP reply")?;
-        bytes.push(b'\n');
-        writer
-            .write_all(&bytes)
-            .and_then(|()| writer.flush())
-            .context("failed to write MCP reply")?;
-    }
+        Ok(())
+    })
+    .context("failed to serve MCP")?;
     Ok(())
 }
 
 /// Handle one inbound line; `None` when it warrants no reply (a notification).
-fn handle_line(surface: &mut dyn ControlSurface, name: &str, line: &str) -> Option<Value> {
+fn handle_line(surface: &dyn ControlSurface, name: &str, line: &str) -> Option<Value> {
     let message: Value = match serde_json::from_str(line) {
         Ok(message) => message,
         Err(error) => {
@@ -135,7 +155,7 @@ fn initialize_reply(surface: &dyn ControlSurface, id: Value, name: &str, params:
     reply(id, result)
 }
 
-fn tool_call_reply(surface: &mut dyn ControlSurface, id: Value, params: &Value) -> Value {
+fn tool_call_reply(surface: &dyn ControlSurface, id: Value, params: &Value) -> Value {
     let Some(tool) = params.get("name").and_then(Value::as_str) else {
         return error_reply(id, INVALID_PARAMS, "tools/call requires a tool name");
     };
@@ -193,7 +213,7 @@ mod tests {
             Some("echo back what you are told".into())
         }
 
-        fn call(&mut self, name: &str, arguments: &Value) -> Result<String> {
+        fn call(&self, name: &str, arguments: &Value) -> Result<String> {
             assert_eq!(name, "echo");
             let message = arguments
                 .get("message")
@@ -206,12 +226,27 @@ mod tests {
     fn transcript(lines: &[&str]) -> Vec<Value> {
         let input = lines.join("\n");
         let mut output = Vec::new();
-        serve(&mut EchoSurface, "test", input.as_bytes(), &mut output).unwrap();
+        serve(
+            &EchoSurface,
+            "test",
+            std::io::BufReader::new(input.as_bytes()),
+            &mut output,
+        )
+        .unwrap();
         String::from_utf8(output)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// Replies arrive in completion order (each request runs on its own thread),
+    /// so look one up by its JSON-RPC `id` rather than by position.
+    fn by_id(replies: &[Value], id: i64) -> &Value {
+        replies
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_i64) == Some(id))
+            .unwrap_or_else(|| panic!("no reply for id {id} in {replies:?}"))
     }
 
     #[test]
@@ -222,17 +257,19 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         ]);
         assert_eq!(replies.len(), 2, "the notification must not be answered");
-        assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(replies[0]["result"]["serverInfo"]["name"], "test");
-        assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
+        let init = by_id(&replies, 1);
+        let list = by_id(&replies, 2);
+        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(init["result"]["serverInfo"]["name"], "test");
+        assert!(init["result"]["capabilities"]["tools"].is_object());
         // Scope guidance rides the handshake, where a client can put it in
         // front of the model before it picks its first tool.
         assert_eq!(
-            replies[0]["result"]["instructions"],
+            init["result"]["instructions"],
             "echo back what you are told"
         );
-        assert_eq!(replies[1]["result"]["tools"][0]["name"], "echo");
-        assert!(replies[1]["result"]["tools"][0]["inputSchema"].is_object());
+        assert_eq!(list["result"]["tools"][0]["name"], "echo");
+        assert!(list["result"]["tools"][0]["inputSchema"].is_object());
     }
 
     #[test]
@@ -250,16 +287,19 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"missing"}}"#,
         ]);
-        assert_eq!(replies[0]["result"]["content"][0]["text"], "echo: hi");
-        assert!(replies[0]["result"]["isError"].is_null());
-        assert_eq!(replies[1]["result"]["isError"], true);
+        let ok = by_id(&replies, 1);
+        let bad = by_id(&replies, 2);
+        let unknown = by_id(&replies, 3);
+        assert_eq!(ok["result"]["content"][0]["text"], "echo: hi");
+        assert!(ok["result"]["isError"].is_null());
+        assert_eq!(bad["result"]["isError"], true);
         assert!(
-            replies[1]["result"]["content"][0]["text"]
+            bad["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .contains("message")
         );
-        assert_eq!(replies[2]["error"]["code"], INVALID_PARAMS);
+        assert_eq!(unknown["error"]["code"], INVALID_PARAMS);
     }
 
     #[test]
@@ -269,9 +309,15 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#,
         ]);
-        assert_eq!(replies[0]["error"]["code"], PARSE_ERROR);
-        assert_eq!(replies[0]["id"], Value::Null);
-        assert_eq!(replies[1]["error"]["code"], METHOD_NOT_FOUND);
-        assert!(replies[2]["result"].is_object());
+        let parse = replies
+            .iter()
+            .find(|r| r.get("id").is_some_and(Value::is_null))
+            .expect("parse-error reply carries a null id");
+        let unknown = by_id(&replies, 4);
+        let ping = by_id(&replies, 5);
+        assert_eq!(parse["error"]["code"], PARSE_ERROR);
+        assert_eq!(parse["id"], Value::Null);
+        assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+        assert!(ping["result"].is_object());
     }
 }
