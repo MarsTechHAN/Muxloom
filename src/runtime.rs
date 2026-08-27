@@ -3498,6 +3498,14 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     if lower.contains("esc to interrupt") || lower.contains("esc interrupt") {
         return true;
     }
+    // OpenCode's status bar does not always carry the interrupt hint — a live
+    // capture shows it displaying the working path instead — so the other sign
+    // of a running turn is its ▣ activity line ticking an elapsed counter:
+    // `▣  Build · <model> · 6.0s`. A ▣ line with no counter (a turn paused at
+    // a permission dialog, for instance) is not a running turn.
+    if kind == AgentKind::OpenCode && tail.lines().any(opencode_turn_counter) {
+        return true;
+    }
     // Not every phase offers an interrupt, though. Claude Code drops the hint
     // while it compacts a conversation — which can run for minutes — and while
     // it waits out a rate limit, and it drops it whenever the footer is too
@@ -3539,6 +3547,27 @@ fn spinner_status_line(line: &str) -> bool {
         && elapsed
             .chars()
             .all(|character| character.is_ascii_digit() || " hms".contains(character))
+}
+
+/// OpenCode's per-turn activity line, captured off live sessions:
+/// `▣  Build · <model> · 6.0s`. The `▣` row stays on screen for the whole of a
+/// running turn and its last ` · ` segment is the elapsed counter it ticks; a
+/// turn paused at a permission dialog drops the counter, which is what tells a
+/// running turn from a waiting one.
+fn opencode_turn_counter(line: &str) -> bool {
+    let line = line.trim_start();
+    if !line.starts_with('▣') {
+        return false;
+    }
+    let Some(counter) = line.rsplit(" · ").next() else {
+        return false;
+    };
+    let counter = counter.trim();
+    counter.ends_with(['h', 'm', 's'])
+        && counter
+            .chars()
+            .all(|character| character.is_ascii_digit() || " .hms".contains(character))
+        && counter.chars().any(|character| character.is_ascii_digit())
 }
 
 /// How far up from the bottom of a screen a prompt box is looked for. Both
@@ -5780,16 +5809,78 @@ mod tests {
 
     #[test]
     fn opencode_permission_prompt_triggers_attention() {
-        // Real OpenCode permission dialog — options are on one line.
-        let screen = "\
-△ Permission required\n  \n  ← Access external directory ~/.cargo/registry/src/\n  \n  Patterns\n  \n  - /Users/x/.cargo/registry/src/index.crates.io/vt100-0.15.2/src/*\n  \n  \n  Allow once   Allow always   Reject   ctrl+f fullscreen  ⇆ select  enter confirm\n";
+        // A real OpenCode 1.18.23 permission dialog, captured off a live
+        // session: the whole dialog is drawn inside the ┃-bordered composer
+        // box, the options sit on one row, and the status bar is gone while
+        // it is up.
+        let screen = concat!(
+            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL)\n",
+            "\n",
+            "  ┃\n",
+            "  ┃  △ Permission required\n",
+            "  ┃    ← Access external directory /tmp\n",
+            "  ┃\n",
+            "  ┃  Patterns\n",
+            "  ┃\n",
+            "  ┃  - /tmp/*\n",
+            "  ┃\n",
+            "  ┃\n",
+            "  ┃   Allow once   Allow always   Reject   ctrl+f fullscreen  ⇆ select  enter confirm\n",
+            "  ┃\n",
+        );
         assert_eq!(
             attention_reason(AgentKind::OpenCode, screen, &[]),
             Some("permission request".to_string()),
         );
-        // And working must be false when attention is set (daemon gates on !needs_attention).
-        // The permission screen does contain "esc interrupt" in the status bar in practice,
-        // but the daemon applies !needs_attention before working, so this is correct.
+        // And working must be false when attention is set (daemon gates on
+        // !needs_attention). The dialog itself carries no spinner and no
+        // "esc interrupt", so both halves of the gate agree.
+        assert!(!agent_is_working(AgentKind::OpenCode, screen));
+    }
+
+    #[test]
+    fn opencode_real_idle_and_working_screens_classify_correctly() {
+        // A real idle OpenCode 1.18.23 screen: ASCII banner, the ┃-bordered
+        // composer with its greyed placeholder, the model status line, and the
+        // bottom bar. No spinner, no "esc interrupt", nothing to attend to.
+        let idle = concat!(
+            "                                         █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n",
+            "                                         █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n",
+            "                                         ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n",
+            "\n",
+            "\n",
+            "                       ┃\n",
+            "                       ┃  Ask anything... \"Fix a TODO in the codebase\"\n",
+            "                       ┃\n",
+            "                       ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
+            "                       ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "                       tab agents  ctrl+p commands\n",
+            "\n",
+            "                                   ● Tip Use opencode run for non-interactive scripting\n",
+            "\n",
+            "\n",
+            "\n",
+            "\n",
+            "\n",
+            "\n",
+            "  ~/Works/Terminal:main  ⊙ 1 MCP /status                                                                       1.18.23\n",
+        );
+        assert_eq!(attention_reason(AgentKind::OpenCode, idle, &[]), None);
+        assert!(!agent_is_working(AgentKind::OpenCode, idle));
+
+        // A real mid-turn screen: the ▣ activity line and the status bar's
+        // "esc interrupt" (no "to") are what mark a running turn.
+        let working = concat!(
+            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n",
+            "\n",
+            "  ┃\n",
+            "  ┃\n",
+            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)                    ~/Works/xperf_infer:zhen/layer_cut\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "   /Users/bytedance/Works/xperf_infer  22.4K (9%)  ctrl+p commands  • OpenCode 1.18.23\n",
+        );
+        assert_eq!(attention_reason(AgentKind::OpenCode, working, &[]), None);
+        assert!(agent_is_working(AgentKind::OpenCode, working));
     }
 
     #[test]
