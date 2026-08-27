@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 6;
+const SKILL_REVISION: u32 = 8;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -344,6 +344,14 @@ on a pattern while nothing is watching at all.
 `read_conversation { machine, session_id, around_index }` pages through one
 without dragging the whole thing into your context. Both read backup snapshots,
 so a conversation still in progress may be a few minutes behind.
+
+## Read a screen
+
+`read_screen { session_id, lines?, offset_from_bottom?, raw? }` returns the
+screen's read result by default: borders and the bottom status/footer bar
+stripped, whitespace collapsed, content in reading order — the text a person
+would read off the screen. Pass `raw: true` for the raw vt100 grid (ANSI
+stripped, columns intact) when you need the exact layout.
 
 ## Shells are the last resort
 

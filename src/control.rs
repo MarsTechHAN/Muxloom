@@ -235,8 +235,10 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          read-only query that no other tool covers. Never start long-running or interactive work \
          with it — that is what launch_session is for — and never use it to do something a \
          session you could talk to would do better.\n\
-         - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
-         search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\n\
+          - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
+          search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\
+          - read_screen returns the read result by default (chrome stripped, content in \
+          reading order); pass raw: true for the raw vt100 grid.\n\n\
           Work with the others out in the open:\n\
           {headname}\
           - talk_read before you start and after you have been away: the board carries what every \
@@ -381,10 +383,14 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "read_screen",
         description: format!(
-            "Read a session's terminal as rendered rows: the visible screen plus scrollback. \
-             Returns up to `lines` rows (default {DEFAULT_SCREEN_LINES}) ending \
-             `offset_from_bottom` rows above the live bottom edge; page older output by \
-             raising the offset."
+            "Read a session's terminal. Returns the screen's read result by default: \
+             the text a person would read off the screen — borders and the bottom \
+             status/footer bar stripped, internal whitespace collapsed, content in \
+             reading order. The visible screen plus scrollback, up to `lines` rows \
+             (default {DEFAULT_SCREEN_LINES}) ending `offset_from_bottom` rows above \
+             the live bottom edge; page older output by raising the offset. Pass \
+             `raw: true` for the raw vt100 grid (ANSI stripped, column positions \
+             intact) when you need the exact layout."
         ),
         input_schema: schema(
             multi,
@@ -392,6 +398,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
                 "lines": { "type": "integer", "description": "Rows to return." },
                 "offset_from_bottom": { "type": "integer", "description": "Rows above the bottom to end at." },
+                "raw": { "type": "boolean", "description": "Return the raw vt100 grid instead of the read result." },
             }),
             &["session_id"],
         ),
@@ -1911,10 +1918,17 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
     })
 }
 
-fn screen_page(text: &str, offset_from_bottom: usize, rows: usize, older: bool) -> String {
-    let text = plain_screen(text);
+fn screen_page(
+    text: &str,
+    raw: bool,
+    offset_from_bottom: usize,
+    rows: usize,
+    older: bool,
+) -> String {
+    let plain = plain_screen(text);
+    let body = if raw { plain } else { read_result(&plain) };
     format!(
-        "{text}\n\n[rows={rows} offset_from_bottom={offset_from_bottom} older_history_above={older}]"
+        "{body}\n\n[rows={rows} offset_from_bottom={offset_from_bottom} older_history_above={older}]"
     )
 }
 
@@ -1980,6 +1994,115 @@ fn plain_screen(text: &str) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+/// What `read_screen` returns by default: the screen as a person reads it.
+/// Border glyphs and the indent they carry are off each row, a row that is
+/// only border or blank is gone, the status bar pinned to the bottom is
+/// screened out, and each surviving row is one run of words in order.
+fn read_result(plain: &str) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    for line in plain.lines() {
+        let row = line
+            .trim_start_matches(chrome_char)
+            .trim_end_matches(chrome_char);
+        let row = row.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    // The status bar is pinned to the bottom, and a tip or a line of content
+    // may sit between two of its rows, so the last few rows are screened
+    // rather than popped from the end: a bar row goes wherever it is, the
+    // rest stays put.
+    let scan = rows.len().min(4);
+    for row in rows.iter_mut().rev().take(scan) {
+        if is_status_bar(row) {
+            *row = String::new();
+        }
+    }
+    rows.retain(|row| !row.is_empty());
+    rows.join("\n")
+}
+
+/// A character a frame, rather than the content, is made of: a box-drawing
+/// or block-element glyph, or the whitespace a border indents its row with.
+/// Both ends of a row are stripped of them, so a `│ text │` row reads `text`.
+fn chrome_char(c: char) -> bool {
+    c.is_ascii_whitespace()
+        || ('\u{2500}'..='\u{257F}').contains(&c)
+        || ('\u{2580}'..='\u{259F}').contains(&c)
+}
+
+/// The persistent status/footer bar a TUI pins to the bottom. It is screened
+/// only from the last few rows, where that bar lives, so a line of real
+/// content is safe. A row is a bar when it carries a strong signal — a
+/// braille spinner or a usage figure — or when it is a build footer (ends on
+/// a version stamp next to a path or an mcp marker) or a short key-hint bar.
+/// The version signal alone is too common in prose ("shipped in release
+/// 1.2.3"), so it only counts beside a path or an mcp marker; the same
+/// restraint keeps a sentence that merely mentions a key alive — a key hint
+/// is short.
+fn is_status_bar(row: &str) -> bool {
+    let lower = row.to_ascii_lowercase();
+    if row.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)) || usage_figure(&lower) {
+        return true;
+    }
+    if ends_with_version(&lower) && (lower.contains('/') || lower.contains("mcp")) {
+        return true;
+    }
+    row.len() <= 40
+        && (lower.contains("ctrl+p commands")
+            || lower.contains("esc interrupt")
+            || lower.contains("esc to interrupt"))
+}
+
+/// A usage figure: a number, an optional unit letter, and a percentage in
+/// parentheses right after it — the "146.5K (56%)" of a context bar. The rest
+/// of the row may continue, so the percentage is matched in place, not at the
+/// end. A bare percent in prose does not match, because it has no figure
+/// before it.
+fn usage_figure(row: &str) -> bool {
+    let bytes = row.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        if j + 1 < bytes.len() && bytes[j] == b' ' && bytes[j + 1] == b'(' {
+            let mut p = j + 2;
+            while p < bytes.len() && bytes[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p + 2 <= bytes.len() && bytes[p] == b'%' && bytes[p + 1] == b')' {
+                return true;
+            }
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
+/// A row that ends on a bare version stamp — "1.18.23", "v2.0.1" — the way a
+/// footer names the build that drew it.
+fn ends_with_version(row: &str) -> bool {
+    let Some(last) = row.split_whitespace().next_back() else {
+        return false;
+    };
+    let last = last.strip_prefix('v').unwrap_or(last);
+    let parts: Vec<&str> = last.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn preview_text(preview: &FilePreview) -> String {
@@ -2375,11 +2498,13 @@ impl ControllerControl {
         let session_id = required_str(arguments, "session_id")?;
         let lines = optional_usize(arguments, "lines", DEFAULT_SCREEN_LINES);
         let offset = optional_usize(arguments, "offset_from_bottom", 0);
+        let raw = optional_bool(arguments, "raw");
         let page = self
             .runtime
             .capture_page(&target, session_id, offset, lines, 0, 0)?;
         Ok(screen_page(
             &page.text,
+            raw,
             page.offset_from_bottom,
             page.pane_height,
             page.has_older(),
@@ -3020,9 +3145,10 @@ mod daemon_surface {
             let session_id = required_str(arguments, "session_id")?;
             let lines = optional_usize(arguments, "lines", DEFAULT_SCREEN_LINES);
             let offset = optional_usize(arguments, "offset_from_bottom", 0);
+            let raw = optional_bool(arguments, "raw");
             let (text, offset_from_bottom, rows, older) =
                 self.screen_rows(session_id, offset, lines)?;
-            Ok(screen_page(&text, offset_from_bottom, rows, older))
+            Ok(screen_page(&text, raw, offset_from_bottom, rows, older))
         }
 
         fn wait_for(&self, arguments: &Value) -> Result<String> {
@@ -3833,12 +3959,89 @@ mod tests {
         // stands in for indentation, and a title nobody reading wants.
         let page = screen_page(
             "\x1b[1;32m❯ 1. Yes\x1b[m\n\x1b[m\x1b]0;claude\x07 2.\x1b[3CNo   \n\n",
+            true,
             0,
             40,
             false,
         );
         let (text, _) = page.split_once("\n\n[rows=").unwrap();
         assert_eq!(text, "❯ 1. Yes\n 2.   No");
+    }
+
+    #[test]
+    fn read_result_strips_chrome_and_reads_content_in_order() {
+        // Modeled on a real opencode start screen: block-art logo, a framed
+        // composer, key hints, a transient tip, and a footer with the version.
+        let plain = "\u{2584}\n\
+                     \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\n\
+                     \n\
+                       \u{2503}\n\
+                       \u{2503}  Ask anything... \"Fix broken tests\"\n\
+                       \u{2503}\n\
+                       \u{2503}  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n\
+                       \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+                       tab agents  ctrl+p commands\n\
+                     \n\
+                             ● Tip Press ctrl+x h to toggle code block visibility in messages\n\
+                     \n\
+                      ~/Works/Terminal:main  ⊙ 1 MCP /status  1.18.23";
+        assert_eq!(
+            read_result(plain),
+            "Ask anything... \"Fix broken tests\"\n\
+             Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n\
+             ● Tip Press ctrl+x h to toggle code block visibility in messages"
+        );
+    }
+
+    #[test]
+    fn read_result_drops_a_working_footer_with_usage_and_spinner() {
+        // Bottom of a live session: answer text, a turn marker, the composer
+        // frame's model line, and a footer with a usage figure.
+        let plain = "Core fix: separated hull and turret rotation.\n\
+                     hullYaw (A/D) controls where the tank faces and moves\n\
+                     ▣ Build · Qwen3.8-27B (SGLang via SOIL) · 1m 23s\n\
+                     Build · Qwen3.8-27B (SGLang via SOIL) ~/Works/Minimax-H3\n\
+                     /Users/bytedance/Works/Minimax-H3  146.5K (56%)  ctrl+p commands  • OpenCode 1.18.23";
+        assert_eq!(
+            read_result(plain),
+            "Core fix: separated hull and turret rotation.\n\
+             hullYaw (A/D) controls where the tank faces and moves\n\
+             ▣ Build · Qwen3.8-27B (SGLang via SOIL) · 1m 23s\n\
+             Build · Qwen3.8-27B (SGLang via SOIL) ~/Works/Minimax-H3"
+        );
+    }
+
+    #[test]
+    fn read_result_keeps_content_that_mentions_keys_or_versions() {
+        // A real answer line that merely talks about keys or versions must
+        // survive: the status-bar screen only runs on the last few rows.
+        let plain = "To open the palette, press ctrl+p commands\n\
+                     Shipped in release 1.18.23\n\
+                     The tank now faces where it drives.";
+        assert_eq!(
+            read_result(plain),
+            "To open the palette, press ctrl+p commands\n\
+             Shipped in release 1.18.23\n\
+             The tank now faces where it drives."
+        );
+    }
+
+    #[test]
+    fn read_screen_defaults_to_read_result_with_raw_opt_out() {
+        let ansi = "  \u{2502}  Fix the flaky test in src/main.rs  \u{2502}\n\
+                    \u{2579}\u{2580}\u{2580}\u{2580}\n\
+                    ~/work:main  1.18.23\n";
+        let raw = screen_page(ansi, true, 0, 40, false);
+        let (raw_text, _) = raw.split_once("\n\n[rows=").unwrap();
+        assert_eq!(
+            raw_text,
+            "  \u{2502}  Fix the flaky test in src/main.rs  \u{2502}\n\
+             \u{2579}\u{2580}\u{2580}\u{2580}\n\
+             ~/work:main  1.18.23"
+        );
+        let read = screen_page(ansi, false, 0, 40, false);
+        let (read_text, _) = read.split_once("\n\n[rows=").unwrap();
+        assert_eq!(read_text, "Fix the flaky test in src/main.rs");
     }
 
     #[test]
