@@ -1573,7 +1573,16 @@ mod platform {
                             ..
                         } => {
                             let session = daemon_session(&state, &session_id)?;
+                            // Capture the size before the resize so we can tell
+                            // whether this attach actually changed the viewport.
+                            // A changed size means the daemon's parser just
+                            // reflowed the old-size screen, so a snapshot taken
+                            // now is an intermediate frame, not the live one.
+                            let pre_cols = session.columns.load(Ordering::Relaxed);
+                            let pre_rows = session.rows.load(Ordering::Relaxed);
                             session.resize(columns, rows)?;
+                            let size_changed = pre_cols != session.columns.load(Ordering::Relaxed)
+                                || pre_rows != session.rows.load(Ordering::Relaxed);
                             let subscriber_id =
                                 state.next_subscriber.fetch_add(1, Ordering::Relaxed);
                             // Register for live broadcast immediately, so no
@@ -1601,13 +1610,23 @@ mod platform {
                                 },
                             );
                             write_stream_opened(&writer, &frame, None)?;
-                            // One payload, sent first: an absolute snapshot of the live
-                            // screen from the daemon's own emulator: current visible
-                            // rows, cursor, input modes, scroll region and screen buffer.
-                            // Replaying raw recent output cannot reconstruct an
-                            // alt-screen TUI (it only holds diffs against earlier
-                            // state), but the daemon's parser has seen every byte and
-                            // serializes the exact state.
+                            // One payload, sent first: the daemon's absolute view of the
+                            // live screen. When the size did not change, it is the full
+                            // snapshot (modes + row dump) — the parser's state is
+                            // untouched, so that is exactly the live screen.
+                            //
+                            // When the attach CHANGED the size of an alt-screen TUI, the
+                            // parser just reflowed the old-size content into the new
+                            // size: the row dump is a stale intermediate frame, and
+                            // committing it is what left the pane clipped until a later
+                            // repaint. A full-screen TUI agent redraws itself on
+                            // SIGWINCH, so send only the mode preamble (alt buffer,
+                            // scroll region, clear) and let the app's own post-resize
+                            // repaint — already streaming as live frames — paint the
+                            // screen. That optimization only applies to agent kinds
+                            // that are full-screen TUIs: a plain terminal (or any
+                            // unknown kind) has no such repaint, so it keeps the
+                            // snapshot.
                             //
                             // No scrollback seed goes out here any more: rendering a
                             // redraw-heavy session's history costs seconds, and while it
@@ -1615,8 +1634,33 @@ mod platform {
                             // a partial live frame and sat on it. Older history is paged
                             // on demand through read_history when the client scrolls past
                             // its own emulator buffer.
-                            let snapshot = session.screen_snapshot();
-                            for chunk in snapshot.chunks(DATA_CHUNK_SIZE) {
+                            let on_alt = {
+                                let screen = session
+                                    .screen
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                screen.screen().alternate_screen()
+                            };
+                            let kind = session
+                                .metadata
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .kind
+                                .parse::<AgentKind>()
+                                .ok();
+                            let repaints_on_resize = matches!(
+                                kind,
+                                Some(AgentKind::Codex)
+                                    | Some(AgentKind::Claude)
+                                    | Some(AgentKind::OpenCode)
+                                    | Some(AgentKind::Pi)
+                            );
+                            let payload = if size_changed && on_alt && repaints_on_resize {
+                                session.screen_preamble()
+                            } else {
+                                session.screen_snapshot()
+                            };
+                            for chunk in payload.chunks(DATA_CHUNK_SIZE) {
                                 write_frame(
                                     &writer,
                                     &Frame::data(frame.stream_id, 0, chunk, true),
@@ -4286,12 +4330,13 @@ mod platform {
             let _ = self.keeper_frame(keeper::frame::QUIT, &[]);
         }
 
-        /// Serialises the current screen state as escape-sequence bytes that,
-        /// fed to a fresh vt100 parser of the same dimensions, reproduce the
-        /// exact visible state (contents, cursor, input modes, scroll region,
-        /// alt-screen flag).  Replaces the old "replay last 2 MiB of raw bytes"
-        /// approach which was lossy for alt-screen TUIs.
-        fn screen_snapshot(&self) -> Vec<u8> {
+        /// The mode preamble every attaching client needs before row content:
+        /// the screen buffer the daemon is on, the app's scroll region, and a
+        /// full clear. Sent on its own when an attach just resized an
+        /// alt-screen TUI, whose row dump at that moment is a reflowed copy of
+        /// the old-size screen — the app's post-SIGWINCH repaint (streamed as
+        /// live frames) is what paints the real one.
+        fn screen_preamble(&self) -> Vec<u8> {
             let screen = self
                 .screen
                 .lock()
@@ -4318,15 +4363,28 @@ mod platform {
                 out.extend_from_slice(region.as_bytes());
             }
 
-            // Full absolute redraw: ClearScreen + all rows (with SGR) + cursor
-            // position + input modes + title. The erase is not implied by the
-            // row writes — `state_formatted` only emits the rows that carry
-            // content — so without it, a live frame that interleaves between
-            // the seed and this snapshot (the writer is only locked per frame)
-            // could leave bytes on a row the daemon's screen has blank.
             out.extend_from_slice(b"\x1b[2J");
-            out.extend_from_slice(&screen.screen().state_formatted());
+            out
+        }
 
+        /// Serialises the current screen state as escape-sequence bytes that,
+        /// fed to a fresh vt100 parser of the same dimensions, reproduce the
+        /// exact visible state (contents, cursor, input modes, scroll region,
+        /// alt-screen flag).  Replaces the old "replay last 2 MiB of raw bytes"
+        /// approach which was lossy for alt-screen TUIs.
+        fn screen_snapshot(&self) -> Vec<u8> {
+            let mut out = self.screen_preamble();
+            let screen = self
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Full absolute redraw: all rows (with SGR) + cursor position +
+            // input modes + title. The clear already went out in the preamble
+            // — `state_formatted` only emits the rows that carry content, so
+            // without it a live frame interleaved before the rows (the writer
+            // is locked per frame) could leave bytes on a row the daemon's
+            // screen has blank.
+            out.extend_from_slice(&screen.screen().state_formatted());
             out
         }
 
@@ -7504,6 +7562,241 @@ mod platform {
                 "claude uses bracketed paste"
             );
             assert_eq!(*claude.last().unwrap(), b'\r');
+        }
+
+        /// Launch an alt-screen child that draws a marker row, then idles.
+        /// `kind` is what the session is recorded as (the attach path gates
+        /// its payload choice on it), independent of the actual command.
+        fn launch_alt_screen_marker_session(
+            client: &mut UnixStream,
+            label: &str,
+            session_id: &str,
+            kind: &str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Frame::json(
+                FrameKind::Request,
+                0,
+                1,
+                &DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: kind.into(),
+                    path: "/tmp".into(),
+                    label: label.into(),
+                    temporary: false,
+                    executable: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf '\\033[?1049h'; printf 'TASKCMARKER\\n'; \
+                         while :; do sleep 0.1; done"
+                            .into(),
+                    ],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )?
+            .write_to(client)?;
+            loop {
+                let frame = Frame::read_from(client)?.unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
+        /// The first data frame an attach sends on the pty stream.
+        fn first_attach_payload(
+            client: &mut UnixStream,
+            session_id: &str,
+            columns: u16,
+            rows: u16,
+        ) -> Result<String, Box<dyn std::error::Error>> {
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                2,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns,
+                    rows,
+                    scrollback_rows: 0,
+                },
+            )?
+            .write_to(client)?;
+            loop {
+                let frame =
+                    Frame::read_from(client)?.ok_or("stream closed before the attach payload")?;
+                if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE {
+                    return Ok(
+                        String::from_utf8_lossy(&frame.decoded_payload().unwrap()).into_owned()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn an_alt_screen_attach_at_a_new_size_sends_only_the_preamble() {
+            // The pane changed size and the child sits in the alt screen: the
+            // parser just reflowed the old-size screen, so attach must not
+            // commit that intermediate frame. It sends the mode preamble
+            // (alt enter + clear) and leaves the repaint to the app.
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("altsize");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-terminal-altsize";
+            launch_alt_screen_marker_session(&mut client, "altsize", session_id, "opencode")
+                .unwrap();
+            // Let the child enter the alt screen and draw its marker row.
+            thread::sleep(Duration::from_millis(750));
+            let payload = first_attach_payload(&mut client, session_id, 100, 40).unwrap();
+            assert!(
+                payload.starts_with("\x1b[?1049h"),
+                "preamble must enter the alt screen the child is on: {payload:?}"
+            );
+            assert!(
+                payload.contains("\x1b[2J"),
+                "preamble must clear the screen: {payload:?}"
+            );
+            assert!(
+                !payload.contains("TASKCMARKER"),
+                "a size-changed alt-screen attach must not dump the reflowed rows: {payload:?}"
+            );
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn an_alt_screen_attach_at_the_same_size_still_sends_the_full_snapshot() {
+            // No size change, no reflow: the snapshot is the live screen, so
+            // the full row dump still goes out (and carries the marker row).
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("altresame");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-terminal-altresame";
+            launch_alt_screen_marker_session(&mut client, "altresame", session_id, "opencode")
+                .unwrap();
+            thread::sleep(Duration::from_millis(750));
+            let payload = first_attach_payload(&mut client, session_id, 80, 24).unwrap();
+            assert!(
+                payload.starts_with("\x1b[?1049h"),
+                "snapshot must enter the alt screen the child is on: {payload:?}"
+            );
+            assert!(
+                payload.contains("TASKCMARKER"),
+                "a same-size attach must send the full snapshot: {payload:?}"
+            );
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_terminal_kind_attach_at_a_new_size_keeps_the_full_snapshot() {
+            // A plain terminal has no post-SIGWINCH repaint to lean on, so even
+            // when the pane changed size its attach must still deliver the full
+            // snapshot (reflowed or not) — never the bare preamble, which would
+            // leave its screen blank (the embedded-pty smoke scenario).
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("altterm");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-terminal-altterm";
+            launch_alt_screen_marker_session(&mut client, "altterm", session_id, "terminal")
+                .unwrap();
+            thread::sleep(Duration::from_millis(750));
+            let payload = first_attach_payload(&mut client, session_id, 100, 40).unwrap();
+            assert!(
+                payload.starts_with("\x1b[?1049h"),
+                "snapshot must enter the alt screen the child is on: {payload:?}"
+            );
+            assert!(
+                payload.contains("TASKCMARKER"),
+                "a terminal-kind size-changed attach must keep the full snapshot: {payload:?}"
+            );
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
         }
 
         #[test]

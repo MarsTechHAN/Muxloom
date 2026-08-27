@@ -316,9 +316,13 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
     let config = daemon.config();
     let runtime = Runtime::new(&config);
     let target = Target::local();
+    // The child is a plain shell, so the session must be recorded as a terminal:
+    // the attach path only skips the row dump (in favor of the app's own
+    // post-resize repaint) for full-screen TUI agent kinds, and a shell never
+    // repaints on SIGWINCH.
     let request = LaunchRequest {
         target: target.clone(),
-        kind: AgentKind::Claude,
+        kind: AgentKind::Terminal,
         path: std::env::temp_dir().display().to_string(),
         label: "pty smoke".into(),
         temporary: false,
