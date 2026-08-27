@@ -3636,6 +3636,138 @@ pub(crate) fn composer(kind: AgentKind, screen: &str) -> Option<Composer> {
     }
 }
 
+/// The unsent text currently sitting in a session's composer box, read the
+/// same way [`composer`] reads its state.
+///
+/// The outbox drainer compares successive reads to tell a draft that is still
+/// being typed from one that has been abandoned, and ages a queued message
+/// off that. Only the box is read, never the whole screen: a working turn
+/// repaints the spinner and status line every second, so a whole-screen
+/// comparison would read "still typing" forever.
+///
+/// `None` — no box is drawn (an [`Composer::Absent`] case: a dialog, a launch,
+/// a process that is no longer the agent) or the box is empty with no
+/// placeholder, so there is nothing to wait on or age. `Some("")` — the box is
+/// drawn and ready. `Some(draft)` — the unsent draft, which is what changes as
+/// somebody types.
+pub(crate) fn composer_text(kind: AgentKind, screen: &str) -> Option<String> {
+    let mut lines: Vec<&str> = screen.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let tail = &lines[lines.len().saturating_sub(COMPOSER_TAIL_LINES)..];
+    match kind {
+        AgentKind::Claude => claude_composer_text(tail),
+        AgentKind::Codex => codex_composer_text(tail),
+        AgentKind::Pi => pi_composer_text(tail),
+        AgentKind::OpenCode => opencode_composer_text(tail),
+        AgentKind::Terminal => None,
+    }
+}
+
+fn pi_composer_text(tail: &[&str]) -> Option<String> {
+    let row = live_composer_signal(tail)?;
+    let typed = tail[row]
+        .trim_start()
+        .trim_start_matches(|character| PROMPT_GLYPHS.contains(&character))
+        .trim();
+    if typed.is_empty()
+        || PI_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| typed.starts_with(placeholder))
+    {
+        Some(String::new())
+    } else {
+        Some(typed.to_string())
+    }
+}
+
+fn opencode_composer_text(tail: &[&str]) -> Option<String> {
+    let bottom = tail
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("╹▀▀▀▀▀▀▀"))?;
+    // Walk up through the box's left-border rows to the box top, exactly like
+    // `opencode_composer`.
+    let mut top = bottom;
+    while top > 0 && tail[top - 1].trim_start().starts_with('┃') {
+        top -= 1;
+    }
+    let mut rows: Vec<&str> = tail[top..bottom]
+        .iter()
+        .map(|line| line.trim_start().trim_start_matches('┃').trim())
+        .collect();
+    // The model status row (which may wrap) sits against the box bottom; peel
+    // it off the way `opencode_composer` does, keeping only the input area.
+    while rows.last().is_some_and(|row| {
+        !row.is_empty() && !OPENCODE_PLACEHOLDERS.iter().any(|p| row.starts_with(p))
+    }) {
+        rows.pop();
+    }
+    let mut draft = String::new();
+    for row in rows {
+        if row.is_empty() {
+            continue;
+        }
+        if OPENCODE_PLACEHOLDERS.iter().any(|p| row.starts_with(p)) {
+            return Some(String::new());
+        }
+        if !draft.is_empty() {
+            draft.push('\n');
+        }
+        draft.push_str(row);
+    }
+    if draft.is_empty() { None } else { Some(draft) }
+}
+
+fn claude_composer_text(tail: &[&str]) -> Option<String> {
+    let bottom = tail.iter().rposition(|line| is_rule(line))?;
+    if tail.len() - bottom - 1 > CLAUDE_FOOTER_LINES {
+        return None;
+    }
+    let top = tail[..bottom].iter().rposition(|line| is_rule(line))?;
+    let rows = &tail[top + 1..bottom];
+    if rows.is_empty() || rows.len() > CLAUDE_BOX_LINES {
+        return None;
+    }
+    let mut draft = String::new();
+    for (index, line) in rows.iter().enumerate() {
+        let line = line.trim();
+        let line = if index == 0 {
+            line.strip_prefix(['❯', '›', '>']).unwrap_or(line).trim()
+        } else {
+            line
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if !draft.is_empty() {
+            draft.push('\n');
+        }
+        draft.push_str(line);
+    }
+    if draft.is_empty() {
+        Some(String::new())
+    } else {
+        Some(draft)
+    }
+}
+
+fn codex_composer_text(tail: &[&str]) -> Option<String> {
+    let row = tail
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('»'))?;
+    let typed = tail[row].trim_start().trim_start_matches('»').trim();
+    if typed.is_empty()
+        || CODEX_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| typed.starts_with(placeholder))
+    {
+        Some(String::new())
+    } else {
+        Some(typed.to_string())
+    }
+}
+
 /// Read pi's prompt box off its screen.
 ///
 /// pi draws a single-line composer right above its footer, prefixed with the

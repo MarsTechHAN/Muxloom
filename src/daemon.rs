@@ -39,7 +39,7 @@ mod platform {
         recap::extract_recap,
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
-            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer,
+            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer, composer_text,
             is_temporary_session_id,
         },
         talk::{
@@ -87,6 +87,12 @@ mod platform {
     const OUTBOX_LIMIT: usize = 128;
     /// How often a queued message looks at whether its session has finished.
     const OUTBOX_POLL: Duration = Duration::from_secs(1);
+    /// How long an unsent draft may sit unchanged before a queued message
+    /// stops waiting for it: a box still changing has somebody typing into it,
+    /// and typing behind them would fold our message into theirs; a box that
+    /// has stopped changing is a draft nobody is coming back to, and holding a
+    /// waiting message for it any longer is stranger than delivering.
+    const DELIVER_STALE_DRAFT_MS: u64 = 15_000;
     /// How often a session's runtime is asked what it has been writing about
     /// itself. Soon enough that a finished turn shows up under the session
     /// while whoever asked for it is still looking, rarely enough that the
@@ -316,6 +322,11 @@ mod platform {
         inline: Mutex<InlineScrollback>,
         codex_activity: Mutex<CodexActivity>,
         recent_output: Mutex<Vec<u8>>,
+        /// The text last read out of this session's composer box, and the
+        /// epoch-ms when it last changed. The outbox path reads it on every
+        /// pass to age an unsent draft: a box that keeps changing has someone
+        /// typing, and a box that has stopped is a draft we may deliver over.
+        draft_watch: Mutex<Option<(String, u64)>>,
         /// The last thing the agent was seen to say, for a runtime that keeps
         /// no transcript of its own. Its answer scrolls off the screen long
         /// before it stops being the last word on the session, so the reading
@@ -778,12 +789,22 @@ mod platform {
                 }),
             text: message.text.clone(),
         };
+        let draft_age = (composer == Composer::Occupied)
+            .then(|| draft_age_ms(&session, &kind, queued.queued_at))
+            .flatten();
         if deliver == TalkDeliver::Now
             || queued.due(
                 composer,
                 snapshot.working,
                 snapshot.needs_attention,
                 queued.queued_at,
+            )
+            || stale_draft_due(
+                &queued,
+                composer,
+                snapshot.working,
+                snapshot.needs_attention,
+                draft_age,
             )
         {
             return Ok(match type_message(&session, kind, &queued.body) {
@@ -884,6 +905,52 @@ mod platform {
         session.write_input(&message_bytes(kind, body))
     }
 
+    /// How long this session's composer-box text has gone without changing,
+    /// read on this pass: the first sighting of a draft is age zero, and an
+    /// unchanged draft ages up one poll per pass. `None` when there is no box
+    /// text to read (an absent or empty composer is the patience constants' to
+    /// wait on, not the draft's).
+    fn draft_age_ms(session: &ManagedSession, kind: &AgentKind, now: u64) -> Option<u64> {
+        let visible_screen = session
+            .screen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .screen()
+            .contents();
+        let draft = composer_text(*kind, &visible_screen)?;
+        let mut watch = session
+            .draft_watch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match watch.as_ref() {
+            Some((last, changed_at)) if *last == draft => Some(now.saturating_sub(*changed_at)),
+            _ => {
+                *watch = Some((draft, now));
+                Some(0)
+            }
+        }
+    }
+
+    /// Whether a queued message should go in now although [`TalkQueued::due`]
+    /// still holds it: the unsent draft it would land behind has gone quiet
+    /// (nobody has changed it in `DELIVER_STALE_DRAFT_MS`), or the session has
+    /// gone idle and can read it. A `now` delivery never waits on a draft.
+    fn stale_draft_due(
+        queued: &TalkQueued,
+        composer: Composer,
+        working: bool,
+        attention: bool,
+        draft_age: Option<u64>,
+    ) -> bool {
+        if queued.deliver == TalkDeliver::Now {
+            return true;
+        }
+        if composer != Composer::Occupied || attention || queued.deliver == TalkDeliver::WhenIdle {
+            return false;
+        }
+        !working || draft_age.is_some_and(|age| age >= DELIVER_STALE_DRAFT_MS)
+    }
+
     /// Deliver what the outbox holds to the sessions that have become free
     /// enough to read it, and drop what has waited too long to be worth
     /// delivering at all.
@@ -919,11 +986,23 @@ mod platform {
                     lost.push((queued.clone(), TalkUndelivered::Ended));
                     return false;
                 };
-                if queued.due(
-                    snapshot.composer.unwrap_or(Composer::Ready),
+                let composer = snapshot.composer.unwrap_or(Composer::Ready);
+                if queued.due(composer, snapshot.working, snapshot.needs_attention, now) {
+                    due.push((Arc::clone(session), kind, queued.clone()));
+                    return false;
+                }
+                // A draft that has gone quiet is no reason to keep holding:
+                // nobody is finishing it, and a message waiting behind it is
+                // stranger than one delivered.
+                let draft_age = (composer == Composer::Occupied)
+                    .then(|| draft_age_ms(session, &kind, now))
+                    .flatten();
+                if stale_draft_due(
+                    queued,
+                    composer,
                     snapshot.working,
                     snapshot.needs_attention,
-                    now,
+                    draft_age,
                 ) {
                     due.push((Arc::clone(session), kind, queued.clone()));
                     return false;
@@ -3199,6 +3278,7 @@ mod platform {
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            draft_watch: Mutex::new(None),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             native: Mutex::new(NativeLink {
@@ -3699,6 +3779,7 @@ mod platform {
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
+            draft_watch: Mutex::new(None),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             // The command line that started this one belongs to a keeper this
@@ -7772,6 +7853,264 @@ mod platform {
             assert!(
                 payload.contains("TASKCMARKER"),
                 "a terminal-kind size-changed attach must keep the full snapshot: {payload:?}"
+            );
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        fn queued_message(deliver: TalkDeliver) -> TalkQueued {
+            TalkQueued {
+                message_id: "msg-taskd".into(),
+                session_id: "muxloomd-terminal-taskd".into(),
+                body: "an envelope".into(),
+                queued_at: 1_000,
+                deliver,
+                from: None,
+                text: "hello".into(),
+            }
+        }
+
+        #[test]
+        fn a_freshly_typed_draft_holds_the_message_back() {
+            // A box that changed moments ago is being typed into: appending our
+            // message would fold it into somebody's live sentence.
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS - 1)
+            ));
+            // The very first sighting of a draft is never stale.
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                false,
+                Some(0)
+            ));
+        }
+
+        #[test]
+        fn a_stale_draft_releases_the_message() {
+            // A draft that has not changed for the grace period is one nobody
+            // is coming back to: deliver over it rather than holding to the
+            // five-minute backstop.
+            assert!(stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS)
+            ));
+            assert!(stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS + 5_000)
+            ));
+            // No box text could be read: treat it as not-yet-stale and let the
+            // old patience rules keep owning it rather than guess.
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                false,
+                None
+            ));
+        }
+
+        #[test]
+        fn an_idle_session_releases_the_message_over_a_fresh_draft() {
+            // The turn is over, so a waiting message no longer risks being read
+            // mid-sentence: the draft's freshness stops mattering.
+            assert!(stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                false,
+                false,
+                Some(0)
+            ));
+        }
+
+        #[test]
+        fn a_forced_message_skips_the_draft_wait_entirely() {
+            // A `now` sender asked for it in regardless of state.
+            assert!(stale_draft_due(
+                &queued_message(TalkDeliver::Now),
+                Composer::Occupied,
+                true,
+                false,
+                Some(0)
+            ));
+            assert!(stale_draft_due(
+                &queued_message(TalkDeliver::Now),
+                Composer::Ready,
+                true,
+                false,
+                Some(0)
+            ));
+        }
+
+        #[test]
+        fn the_when_idle_and_attention_gates_still_hold_over_a_stale_draft() {
+            // A `when_idle` sender asked to wait out the turn, and a question
+            // on screen is answered by whoever is there, not by a queued
+            // message: neither is rescued by a stale draft.
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::WhenIdle),
+                Composer::Occupied,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS)
+            ));
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Occupied,
+                true,
+                true,
+                Some(DELIVER_STALE_DRAFT_MS)
+            ));
+            // A ready or absent box has no draft to age: the old patience rules
+            // own it.
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Ready,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS)
+            ));
+            assert!(!stale_draft_due(
+                &queued_message(TalkDeliver::Auto),
+                Composer::Absent,
+                true,
+                false,
+                Some(DELIVER_STALE_DRAFT_MS)
+            ));
+        }
+
+        #[test]
+        fn composer_text_reads_only_the_opencode_draft() {
+            // The draft rows only: the model status line against the box bottom
+            // belongs to the app, not to the sender, and must not be read as
+            // draft text. The shapes below are the real 1.18.23 box: an input
+            // row, an empty row, then the wrapping status line under the border.
+            let screen = "┃ a stale draft\n┃\n┃ Build · m\n╹▀▀▀▀▀▀▀\n";
+            assert_eq!(
+                composer_text(AgentKind::OpenCode, screen).as_deref(),
+                Some("a stale draft")
+            );
+            let idle = "┃ Ask anything...\n┃\n┃ Build · m\n╹▀▀▀▀▀▀▀\n";
+            assert_eq!(
+                composer_text(AgentKind::OpenCode, idle).as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                composer_text(AgentKind::OpenCode, "just some transcript\n"),
+                None
+            );
+        }
+
+        /// Launch a child that draws an opencode-shaped composer box holding a
+        /// draft, then idles — a user who typed and walked away.
+        fn launch_stale_draft_session(
+            client: &mut UnixStream,
+            label: &str,
+            session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Frame::json(
+                FrameKind::Request,
+                0,
+                1,
+                &DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: "opencode".into(),
+                    path: "/tmp".into(),
+                    label: label.into(),
+                    temporary: false,
+                    executable: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        // The real 1.18.23 box: an input row, an empty row,
+                        // then the wrapping status line under the border.
+                        "printf '\\033[2J\\033[H┃ a stale draft\\n┃\\n┃ Build · m\\n╹▀▀▀▀▀▀▀\\n'; \
+                         while :; do sleep 0.1; done"
+                            .into(),
+                    ],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )?
+            .write_to(client)?;
+            loop {
+                let frame = Frame::read_from(client)?.unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
+        #[test]
+        fn the_draft_age_clock_ages_an_unchanged_draft_from_its_first_sighting() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("draftage");
+            let paths = state.paths.clone();
+            let client_state = Arc::clone(&state);
+            let handle = thread::spawn(move || serve_client(server, client_state));
+            let session_id = "muxloomd-terminal-draftage";
+            launch_stale_draft_session(&mut client, "draftage", session_id).unwrap();
+            // Let the child draw the box.
+            thread::sleep(Duration::from_millis(750));
+            let session = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(session_id)
+                .cloned()
+                .expect("the launched session");
+            let t0 = 1_000_000u64;
+            assert_eq!(
+                draft_age_ms(&session, &AgentKind::OpenCode, t0),
+                Some(0),
+                "the first sighting of the draft is age zero"
+            );
+            assert_eq!(
+                draft_age_ms(&session, &AgentKind::OpenCode, t0 + 16_000),
+                Some(16_000),
+                "an unchanged draft ages up without resetting"
             );
             Frame::json(
                 FrameKind::Request,
