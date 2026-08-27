@@ -3353,6 +3353,14 @@ pub(crate) fn attention_reason(
         return Some(pattern.clone());
     }
 
+    // OpenCode draws its permission dialog header before the options. The
+    // options ("Allow once  Allow always  Reject") sit on a single row, which
+    // the per-line choice detection below cannot split into a pair, so a plain
+    // `has_choice` gate would miss it. The header text is unambiguous.
+    if kind == AgentKind::OpenCode && screen.contains("permission required") {
+        return Some("permission request".into());
+    }
+
     let has_yes = screen.lines().any(|line| choice_line(line, "yes"));
     let has_no = screen.lines().any(|line| choice_line(line, "no"));
     let has_allow = screen.lines().any(|line| choice_line(line, "allow"));
@@ -3430,7 +3438,10 @@ pub(crate) fn attention_reason(
     // count, and a real menu shows several numbered options, exactly one
     // cursor, and a key hint. The interrupt marker rules out the working
     // phase, whose panels can also draw pointed lists.
-    if !screen.contains("esc to interrupt") && bottom_menu_is_open(&screen) {
+    if !screen.contains("esc to interrupt")
+        && !screen.contains("esc interrupt")
+        && bottom_menu_is_open(&screen)
+    {
         return Some("interactive choice".into());
     }
     None
@@ -3480,11 +3491,11 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
         return false;
     }
     let tail = attention_tail(screen);
-    // "esc to interrupt" is the marker both CLIs keep on screen for the whole
-    // of an interruptible turn: the early phase before a token count appears,
-    // tool runs, and parallel subagent displays included. Anything stricter
-    // reads those phases as idle.
-    if tail.to_lowercase().contains("esc to interrupt") {
+    let lower = tail.to_lowercase();
+    // "esc to interrupt" is the marker Claude Code and Codex keep on screen
+    // for the whole of an interruptible turn; OpenCode's status bar says
+    // "esc interrupt" (no "to"). Either one means a turn is running.
+    if lower.contains("esc to interrupt") || lower.contains("esc interrupt") {
         return true;
     }
     // Not every phase offers an interrupt, though. Claude Code drops the hint
@@ -3495,8 +3506,11 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     tail.lines().any(spinner_status_line)
 }
 
-/// The frames Claude Code cycles at the head of its status line.
-const SPINNER_FRAMES: [char; 6] = ['✻', '✽', '✶', '✳', '✢', '·'];
+/// The frames Claude Code and Pi cycle at the head of their status line.
+/// Claude Code uses ✻ ✽ ✶ ✳ ✢ ·; Pi uses braille dots ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.
+const SPINNER_FRAMES: [char; 16] = [
+    '✻', '✽', '✶', '✳', '✢', '·', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
+];
 
 /// A turn's live status line: a spinner frame, the phase, and the counter it
 /// ticks — `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`. The phase
@@ -3677,7 +3691,8 @@ fn is_user_facing_hint(line: &str) -> bool {
         .iter()
         .any(|hint| lower.contains(hint))
         || lower.starts_with("ctrl+")
-        || (lower.contains("esc to") && line.split_whitespace().count() <= 12)
+        || ((lower.contains("esc to") || lower.contains("esc interrupt"))
+            && line.split_whitespace().count() <= 12)
 }
 
 /// The index in `tail` of the CLI's live prompt-glyph line, if one can be
@@ -5719,10 +5734,20 @@ mod tests {
             AgentKind::Pi,
             "Running bash: cargo test (esc to interrupt)\n",
         ));
+        // Pi also uses braille spinner frames for its status line.
+        assert!(agent_is_working(
+            AgentKind::Pi,
+            "⠧ Working… (5s · ↓ 3 tokens · thinking with high effort)\n",
+        ));
         // An idle pi with a prompt drawn is not working.
         assert!(!agent_is_working(AgentKind::Pi, "❯ \nCtrl+N new session\n"));
 
-        // OpenCode's interrupt marker is read the same way.
+        // OpenCode's status bar says "esc interrupt" (not "esc to interrupt").
+        assert!(agent_is_working(
+            AgentKind::OpenCode,
+            "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                  60.0K (23%)  ctrl+p commands    • OpenCode 1.18.23\n",
+        ));
+        // OpenCode also shows "esc to interrupt" in some older builds.
         assert!(agent_is_working(
             AgentKind::OpenCode,
             "⚡ Reading sessions… (esc to interrupt)\n",
@@ -5731,6 +5756,35 @@ mod tests {
             AgentKind::OpenCode,
             "❯ \nctrl+r session\n",
         ));
+    }
+
+    #[test]
+    fn opencode_permission_prompt_triggers_attention() {
+        // Real OpenCode permission dialog — options are on one line.
+        let screen = "\
+△ Permission required\n  \n  ← Access external directory ~/.cargo/registry/src/\n  \n  Patterns\n  \n  - /Users/x/.cargo/registry/src/index.crates.io/vt100-0.15.2/src/*\n  \n  \n  Allow once   Allow always   Reject   ctrl+f fullscreen  ⇆ select  enter confirm\n";
+        assert_eq!(
+            attention_reason(AgentKind::OpenCode, screen, &[]),
+            Some("permission request".to_string()),
+        );
+        // And working must be false when attention is set (daemon gates on !needs_attention).
+        // The permission screen does contain "esc interrupt" in the status bar in practice,
+        // but the daemon applies !needs_attention before working, so this is correct.
+    }
+
+    #[test]
+    fn opencode_working_does_not_trigger_bottom_menu() {
+        // OpenCode working state has numbered output and a hint line; make sure
+        // the "esc interrupt" guard prevents a false interactive-choice match.
+        let screen = concat!(
+            "▣  Build · Qwen3.8-27B (SGLang via SOIL)\n",
+            "  1. reading file\n",
+            "  2. writing edit\n",
+            "  3. running test\n",
+            "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                  60.0K (23%)  ctrl+p commands\n",
+        );
+        assert!(agent_is_working(AgentKind::OpenCode, screen));
+        assert!(attention_reason(AgentKind::OpenCode, screen, &[]).is_none());
     }
 
     #[test]
