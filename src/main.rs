@@ -14,9 +14,9 @@ use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Attribute, ResetColor, SetAttribute},
@@ -255,9 +255,28 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
             continue;
         }
         let action = match event::read()? {
+            Event::FocusGained => {
+                // Terminal regained OS focus – the visible screen may have been
+                // cleared or corrupted while we were in the background.  Force
+                // a full repaint on the next frame so the whole UI reappears.
+                terminal.clear()?;
+                Action::Continue
+            }
+            Event::Resize(_, _) => {
+                // Ratatui re-queries the backend size on the next draw, but
+                // explicitly clearing avoids a one-frame flash of stale content.
+                terminal.clear()?;
+                Action::Continue
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                log_navigation_key(key);
-                app.handle_key(key)
+                // Manual full-redraw (fallback for terminals without focus events)
+                if key.code == KeyCode::F(5) {
+                    let _ = terminal.clear();
+                    Action::Continue
+                } else {
+                    log_navigation_key(key);
+                    app.handle_key(key)
+                }
             }
             Event::Mouse(mouse) => app.handle_mouse(mouse),
             Event::Paste(text) => {
@@ -539,6 +558,7 @@ fn enter_terminal() -> Result<Tui> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
@@ -556,6 +576,7 @@ fn leave_terminal(terminal: &mut Tui) -> Result<()> {
     }
     execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
@@ -576,6 +597,7 @@ fn restore_terminal_best_effort() {
     }
     let _ = execute!(
         stdout,
+        DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
