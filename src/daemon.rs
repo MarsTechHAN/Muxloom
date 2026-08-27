@@ -2446,6 +2446,36 @@ mod platform {
                 remove_scratch_dir(&state.paths, &session_id);
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
+            DaemonRequest::SetLabel { session_id, label } => {
+                let label = label
+                    .trim()
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>();
+                match daemon_session(state, &session_id) {
+                    Ok(session) => {
+                        session
+                            .metadata
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .label = label.clone();
+                        session.persist_metadata()?;
+                    }
+                    Err(_) => {
+                        let session = persisted_session(state, &session_id)?;
+                        let metadata = {
+                            let mut metadata = session
+                                .metadata
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            metadata.label = label.clone();
+                            metadata.clone()
+                        };
+                        persist_session_metadata(&session.metadata_path, &metadata)?;
+                    }
+                }
+                write_response(writer, request_id, &DaemonResponse::Ack)
+            }
             DaemonRequest::RunShell {
                 script,
                 environment,
@@ -7965,6 +7995,133 @@ mod platform {
             );
             drop(client);
             handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn set_label_renames_a_live_session_in_memory_and_on_disk() {
+            let (client, server) = UnixStream::pair().unwrap();
+            let state = test_state("setlabel-live");
+            let paths = state.paths.clone();
+            let writer = Arc::new(Mutex::new(server));
+            let session_id = "muxloomd-terminal-setlabel";
+
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: "terminal".into(),
+                    path: "/tmp".into(),
+                    label: "before rename".into(),
+                    temporary: false,
+                    executable: "/bin/cat".into(),
+                    args: vec![],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )
+            .unwrap();
+
+            // Padding and a control character ride in and are stripped out.
+            handle_request(
+                &writer,
+                &state,
+                2,
+                DaemonRequest::SetLabel {
+                    session_id: session_id.into(),
+                    label: "  now the head name\u{7}  ".into(),
+                },
+            )
+            .unwrap();
+
+            // The snapshot the dashboard reads carries the new name.
+            assert_eq!(
+                daemon_session(&state, session_id).unwrap().snapshot().label,
+                "now the head name"
+            );
+            // And it reached the disk, so a restarted daemon keeps it.
+            let on_disk: DaemonSession = serde_json::from_slice(
+                &fs::read(paths.sessions.join(format!("{session_id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(on_disk.label, "now the head name");
+
+            // An id nobody knows is an error, not a silent ack.
+            assert!(
+                handle_request(
+                    &writer,
+                    &state,
+                    3,
+                    DaemonRequest::SetLabel {
+                        session_id: "muxloomd-terminal-nobody".into(),
+                        label: "x".into(),
+                    },
+                )
+                .is_err()
+            );
+
+            daemon_session(&state, session_id).unwrap().stop().unwrap();
+            drop(client);
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn set_label_renames_a_persisted_session_on_disk() {
+            let initial = test_state("setlabel-persisted");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let session_id = "muxloomd-claude-setlabel";
+            let metadata_path = paths.sessions.join(format!("{session_id}.json"));
+            persist_session_metadata(
+                &metadata_path,
+                &DaemonSession {
+                    id: session_id.into(),
+                    kind: "claude".into(),
+                    path: "/tmp/project".into(),
+                    label: "original".into(),
+                    temporary: false,
+                    created_at: 42,
+                    pid: None,
+                    dead: true,
+                    archived: true,
+                    recap: None,
+                    title: None,
+                    thread: None,
+                    seed: None,
+                    working: false,
+                    needs_attention: false,
+                    attention_reason: None,
+                    composer: None,
+                    parent: None,
+                },
+            )
+            .unwrap();
+
+            // A fresh daemon that reloaded the persisted session can rename it.
+            let state = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            let (client, server) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(server));
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::SetLabel {
+                    session_id: session_id.into(),
+                    label: "  renamed afterwards  ".into(),
+                },
+            )
+            .unwrap();
+
+            let reloaded: DaemonSession =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            assert_eq!(reloaded.label, "renamed afterwards");
+
+            drop(client);
+            fs::remove_dir_all(paths.root).unwrap();
         }
     }
 }
