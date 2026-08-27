@@ -2936,13 +2936,23 @@ impl App {
             // An application that asked for mouse reporting owns the wheel, the
             // way it does in any terminal emulator; otherwise the wheel moves
             // Muxloom's scrollback. PageUp reaches the history either way.
+            // Alt is the way through the app's claim, the same way it is the
+            // way through the right-click clipboard button: with Alt held the
+            // wheel scrolls Muxloom's scrollback and nothing is written toward
+            // the app. On macOS the key is Option (Fn never reaches the TUI).
             MouseEventKind::ScrollUp => {
-                if !self.forward_terminal_mouse(mouse) {
+                // Alt short-circuits the forward: with it held nothing is
+                // written toward the app, the wheel scrolls Muxloom instead.
+                if mouse.modifiers.contains(KeyModifiers::ALT)
+                    || !self.forward_terminal_mouse(mouse)
+                {
                     self.scroll_at(mouse.column, mouse.row, true);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if !self.forward_terminal_mouse(mouse) {
+                if mouse.modifiers.contains(KeyModifiers::ALT)
+                    || !self.forward_terminal_mouse(mouse)
+                {
                     self.scroll_at(mouse.column, mouse.row, false);
                 }
             }
@@ -13648,6 +13658,98 @@ mod tests {
             app.modal,
             Some(Modal::Help(HelpForm { offset: 1 }))
         ));
+    }
+
+    #[test]
+    fn alt_wheel_over_an_app_with_mouse_mode_reaches_muxloom_history() {
+        // opencode (and similar TUIs) ask for mouse reporting, so the app
+        // claims the wheel — and ignores it, since it has no use for it. The
+        // plain wheel then never reaches Muxloom's scrollback: the first notch
+        // is forwarded, and only a forwarded scroll could have entered the
+        // scrollback first, which is a dead end. Alt+wheel is the way through
+        // (Option on macOS), the same way Alt is the way through the
+        // right-click clipboard button.
+        let prepped = |name: &str| -> (App, std::sync::mpsc::Receiver<Request>, PathBuf, usize) {
+            let (mut app, request_rx, root, boundary) = attached_claude_app(name);
+            app.interactive = true;
+            app.pane_layout.recap = Some(Rect::new(0, 0, 80, 24));
+            let terminal = app.terminal.as_mut().expect("terminal attached");
+            // The app has claimed the mouse (opencode sends 1000/1006),
+            // and the view sits at the live bottom.
+            terminal.process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
+            terminal.set_scrollback(0);
+            app.history_offset = 0;
+            app.terminal_scrollback_pin = 0;
+            (app, request_rx, root, boundary)
+        };
+        let wheel = |modifiers: KeyModifiers| MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers,
+        };
+
+        // A plain wheel keeps the current behavior: it is forwarded to the app
+        // first. This fixture's terminal has no PTY behind it, so the write
+        // fails — that status message is the evidence the forward path ran.
+        let (mut app, _rx, root, _boundary) = prepped("alt-wheel-plain");
+        app.handle_mouse(wheel(KeyModifiers::NONE));
+        assert!(
+            app.status_message.contains("Mouse input failed"),
+            "a plain wheel must be forwarded to the app that owns the mouse: {}",
+            app.status_message
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        // Alt+wheel: Muxloom's own scrollback moves and nothing is written
+        // toward the app (no write attempt, so no failure status).
+        let (mut app, rx, root, _boundary) = prepped("alt-wheel-alt");
+        app.handle_mouse(wheel(KeyModifiers::ALT));
+        assert_eq!(
+            app.history_offset, 1,
+            "alt+wheel up enters Muxloom's scrollback"
+        );
+        assert!(
+            !app.status_message.contains("Mouse input failed"),
+            "alt+wheel must not touch the app's PTY: {}",
+            app.status_message
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the rows are still in the local buffer, no daemon paging yet"
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::ALT,
+        });
+        assert_eq!(
+            app.history_offset, 0,
+            "alt+wheel down returns to the live bottom"
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        // An alt-screen TUI keeps an empty local buffer: alt+wheel must page
+        // the daemon's history, exactly the way PageUp does.
+        let (mut app, rx, root, _boundary) = prepped("alt-wheel-empty");
+        app.terminal = Some(TerminalSession::detached(20, 5));
+        app.terminal
+            .as_mut()
+            .unwrap()
+            .process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
+        app.handle_mouse(wheel(KeyModifiers::ALT));
+        assert_eq!(
+            app.history_offset, 1,
+            "alt+wheel enters history beyond an empty local buffer"
+        );
+        match receive_request(&rx) {
+            Request::Capture { .. } => {}
+            other => {
+                panic!("alt+wheel beyond an empty local buffer must page the daemon, got {other:?}")
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
