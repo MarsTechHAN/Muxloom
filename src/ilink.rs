@@ -21,6 +21,8 @@
 //!   something, not the machine trying harder. So `-14` is reported as the
 //!   plain fact it is instead of being retried.
 
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -268,6 +270,7 @@ pub fn send_text(
         }),
         environment,
     )?;
+    capture_raw("send", &answer);
     let verdict = verdict_of(&answer, &id);
     // A reply that is accepted but never delivered is indistinguishable from a
     // real delivery unless the body is read: WeChat answers HTTP 200 for both
@@ -327,6 +330,55 @@ fn verdict_of(answer: &Value, client_id: &str) -> Verdict {
     }
 }
 
+/// Diagnostic escape hatch for pinning down what the platform actually sends:
+/// when `MUXLOOM_ILINK_CAPTURE` names a directory, every raw `getupdates` and
+/// `sendmessage` reply body is written there as one pretty-printed JSON file
+/// per call. Off unless the variable is set; the bodies carry context tokens,
+/// so the directory must stay private (files land 0600).
+fn capture_raw(kind: &str, answer: &Value) {
+    let Ok(dir) = std::env::var("MUXLOOM_ILINK_CAPTURE") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    write_raw_capture(Path::new(&dir), kind, stamp, answer);
+}
+
+/// One captured body, one file: `ilink-<kind>-<unix-ms>.json`.
+fn write_raw_capture(dir: &Path, kind: &str, stamp: u128, answer: &Value) {
+    let Ok(bytes) = serde_json::to_vec_pretty(answer) else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("ilink-{kind}-{stamp}.json"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        else {
+            return;
+        };
+        use std::io::Write;
+        let _ = file.write_all(&bytes);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&path, &bytes);
+    }
+}
+
 /// Ask for whatever has been said since `cursor`.
 pub fn updates(
     account: &Account,
@@ -352,6 +404,7 @@ pub fn updates(
             ..Updates::default()
         });
     };
+    capture_raw("updates", &answer);
     if code_of(&answer) == ASLEEP {
         return Ok(Updates {
             cursor: cursor.to_string(),
@@ -644,6 +697,44 @@ mod tests {
         let asleep = verdict_of(&json!({ "errcode": ASLEEP }), client_id);
         assert_eq!(asleep.code, ASLEEP);
         assert!(!asleep.delivery_confirmed);
+    }
+
+    #[test]
+    fn a_capture_writes_the_raw_body_to_a_private_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "muxloom-ilink-capture-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let body = json!({
+            "errcode": 0,
+            "errmsg": "success",
+            "msgs": [{ "item_list": [], "context_token": "token" }],
+        });
+        write_raw_capture(&dir, "updates", 1234, &body);
+        let raw = std::fs::read_to_string(dir.join("ilink-updates-1234.json"))
+            .expect("the capture file is written");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("the capture is valid JSON"),
+            body
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("ilink-updates-1234.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the capture holds a context token and stays private"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
