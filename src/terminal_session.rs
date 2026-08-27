@@ -40,7 +40,7 @@ pub(crate) const SCROLLBACK_SEED_ROWS: usize = 2_000;
 
 /// Rows a seed may carry at most, whatever a client asks for. Bounds both the
 /// daemon's transient emulator and the bytes an attach puts on the wire.
-#[cfg(any(unix, test))]
+#[cfg(test)]
 pub(crate) const SCROLLBACK_SEED_ROWS_LIMIT: usize = 5_000;
 
 pub struct TerminalSession {
@@ -700,7 +700,11 @@ impl InlineScrollback {
 /// the rendered rows returned here. Feeding those rows to a fresh emulator ahead
 /// of the replay leaves it with the same history a terminal that had watched the
 /// whole session would hold.
-#[cfg(any(unix, test))]
+///
+/// Kept under `#[cfg(test)]`: an attach no longer seeds scrollback (it sends
+/// the live snapshot and pages history on demand), so nothing in the product
+/// calls this any more — its tests are the only reason it stays.
+#[cfg(test)]
 pub(crate) fn render_scrollback_seed(
     stream: impl Read,
     columns: u16,

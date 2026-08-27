@@ -47,10 +47,7 @@ mod platform {
             TalkKind, TalkMessage, TalkPage, TalkQueued, TalkScope, TalkStore, TalkUndelivered,
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
-        terminal_session::{
-            CodexActivity, InlineScrollback, render_history_rows, render_scrollback_seed,
-            resize_parser,
-        },
+        terminal_session::{CodexActivity, InlineScrollback, render_history_rows, resize_parser},
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -1566,7 +1563,7 @@ mod platform {
                             session_id,
                             columns,
                             rows,
-                            scrollback_rows,
+                            ..
                         } => {
                             let session = daemon_session(&state, &session_id)?;
                             session.resize(columns, rows)?;
@@ -1597,29 +1594,20 @@ mod platform {
                                 },
                             );
                             write_stream_opened(&writer, &frame, None)?;
-                            // Two parts, in order:
-                            // 1) Rendered history (everything scrolled off), ending at the
-                            //    tail of the log, so the client's scrollback is complete.
-                            // 2) An absolute snapshot of the live screen from the daemon's
-                            //    own emulator: current visible rows, cursor, input modes,
-                            //    scroll region and screen buffer. Replaying raw recent
-                            //    output cannot reconstruct an alt-screen TUI (it only holds
-                            //    diffs against earlier state), but the daemon's parser has
-                            //    seen every byte and serializes the exact state.
-                            let seed = session
-                                .scrollback_seed(columns, rows, 0, scrollback_rows)
-                                .unwrap_or_else(|error| {
-                                    eprintln!("muxloomd scrollback seed failed: {error}");
-                                    Vec::new()
-                                });
-                            for chunk in seed.chunks(DATA_CHUNK_SIZE) {
-                                write_frame(
-                                    &writer,
-                                    &Frame::data(frame.stream_id, 0, chunk, true),
-                                )?;
-                            }
-                            // Taken after the (slow) seed render so it reflects the
-                            // newest state, and written last so it always wins.
+                            // One payload, sent first: an absolute snapshot of the live
+                            // screen from the daemon's own emulator: current visible
+                            // rows, cursor, input modes, scroll region and screen buffer.
+                            // Replaying raw recent output cannot reconstruct an
+                            // alt-screen TUI (it only holds diffs against earlier
+                            // state), but the daemon's parser has seen every byte and
+                            // serializes the exact state.
+                            //
+                            // No scrollback seed goes out here any more: rendering a
+                            // redraw-heavy session's history costs seconds, and while it
+                            // ran the snapshot waited behind it, so the client committed
+                            // a partial live frame and sat on it. Older history is paged
+                            // on demand through read_history when the client scrolls past
+                            // its own emulator buffer.
                             let snapshot = session.screen_snapshot();
                             for chunk in snapshot.chunks(DATA_CHUNK_SIZE) {
                                 write_frame(
@@ -4212,19 +4200,29 @@ mod platform {
         }
 
         fn resize(&self, columns: u16, rows: u16) -> Result<()> {
-            self.columns.store(columns.max(20), Ordering::Relaxed);
-            self.rows.store(rows.max(5), Ordering::Relaxed);
+            let columns = columns.max(20);
+            let rows = rows.max(5);
+            if self.columns.load(Ordering::Relaxed) == columns
+                && self.rows.load(Ordering::Relaxed) == rows
+            {
+                // Re-attaching at an unchanged viewport must not re-SIGWINCH the
+                // child: a full-screen TUI (opencode) reflows its whole screen on
+                // a resize, so a redundant frame costs a redraw for no change.
+                return Ok(());
+            }
+            self.columns.store(columns, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
             resize_parser(
                 &mut self
                     .screen
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                rows.max(5),
-                columns.max(20),
+                rows,
+                columns,
             );
             let mut payload = [0u8; 4];
-            payload[..2].copy_from_slice(&columns.max(20).to_be_bytes());
-            payload[2..].copy_from_slice(&rows.max(5).to_be_bytes());
+            payload[..2].copy_from_slice(&columns.to_be_bytes());
+            payload[2..].copy_from_slice(&rows.to_be_bytes());
             self.keeper_frame(keeper::frame::RESIZE, &payload)
         }
 
@@ -4279,55 +4277,6 @@ mod platform {
         /// exits. Harmless if the keeper already left.
         fn send_quit(&self) {
             let _ = self.keeper_frame(keeper::frame::QUIT, &[]);
-        }
-
-        /// Render the history that sits above the retained output into rows an
-        /// attaching client can replay into its scrollback.
-        ///
-        /// `retained` is how many trailing bytes the client replays for itself;
-        /// rendering stops that far short of the log's end so the rows meet that
-        /// replay instead of repeating what it is about to redraw.
-        /// Only the tail of the log is read, and how much of it is measured out
-        /// in the rows asked for rather than in bytes: a redraw-heavy agent
-        /// spends tens of kilobytes on the frames around one finished line, so a
-        /// window that hands one agent its whole session leaves another with a
-        /// screenful.
-        fn scrollback_seed(
-            &self,
-            columns: u16,
-            rows: u16,
-            retained: usize,
-            keep: usize,
-        ) -> Result<Vec<u8>> {
-            if keep == 0 || self.temporary() {
-                return Ok(Vec::new());
-            }
-            let mut file = match File::open(&self.history_path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to open history {}", self.history_path.display())
-                    });
-                }
-            };
-            let end = file
-                .metadata()?
-                .len()
-                .saturating_sub(retained.try_into().unwrap_or(u64::MAX));
-            let start = seed_start(
-                &mut file,
-                end,
-                keep,
-                SCROLLBACK_SEED_BYTES_MIN,
-                SCROLLBACK_SEED_BYTES_MAX,
-            )
-            .with_context(|| format!("failed to scan history {}", self.history_path.display()))?;
-            if end == start {
-                return Ok(Vec::new());
-            }
-            file.seek(SeekFrom::Start(start))?;
-            render_scrollback_seed(BufReader::new(file).take(end - start), columns, rows, keep)
         }
 
         /// Serialises the current screen state as escape-sequence bytes that,
@@ -4524,43 +4473,6 @@ mod platform {
                 lines.saturating_add(buffer[..read].iter().filter(|&&byte| byte == b'\n').count());
         }
         Ok(lines)
-    }
-
-    /// Where in a session's log to start rendering to reach `keep` rows of
-    /// scrollback, given that the render stops at `end`.
-    ///
-    /// A row only leaves the screen when something scrolls it off, and almost
-    /// everything that does costs a newline byte, so counting them backwards
-    /// says where the rows cannot be any further back than. It is a floor and
-    /// not an answer: an agent redrawing a pane writes newlines that scroll
-    /// nothing, so the count is taken with room to spare and clamped to a window
-    /// that is neither pointlessly small (`least`) nor unbounded (`most`).
-    fn seed_start(file: &mut File, end: u64, keep: usize, least: u64, most: u64) -> Result<u64> {
-        let floor = end.saturating_sub(most);
-        let ceiling = end.saturating_sub(least);
-        if ceiling == 0 {
-            return Ok(0);
-        }
-        let wanted = keep.saturating_mul(3) / 2;
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        let mut cursor = end;
-        let mut newlines = 0usize;
-        while cursor > floor && newlines < wanted {
-            let step = (cursor - floor).min(buffer.len() as u64);
-            cursor -= step;
-            file.seek(SeekFrom::Start(cursor))?;
-            let window = &mut buffer[..step as usize];
-            file.read_exact(window)?;
-            newlines =
-                newlines.saturating_add(window.iter().filter(|&&byte| byte == b'\n').count());
-        }
-        if newlines < wanted && cursor > 0 {
-            eprintln!(
-                "muxloomd scrollback seed stopped {} MiB back with {newlines} lines of the {wanted} it looks for",
-                most / (1024 * 1024)
-            );
-        }
-        Ok(cursor.min(ceiling))
     }
 
     /// A page of a session's history as one read returns it.
@@ -5603,63 +5515,6 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        /// Writes a log whose every `spacing`-th byte is a newline.
-        fn log_with_lines(name: &str, len: usize, spacing: usize) -> File {
-            let path = test_state(name).paths.history.join("log.ansi");
-            let mut bytes = vec![b'x'; len];
-            for offset in (spacing..len).step_by(spacing) {
-                bytes[offset] = b'\n';
-            }
-            fs::write(&path, &bytes).unwrap();
-            File::open(&path).unwrap()
-        }
-
-        #[test]
-        fn a_seed_reads_back_as_far_as_the_rows_it_was_asked_for() {
-            const MIB: u64 = 1024 * 1024;
-            // A line every 4 KiB: 256 of them per mebibyte read.
-            let mut file = log_with_lines("seed-start", 6 * MIB as usize, 4096);
-            let end = 6 * MIB;
-
-            // 400 rows are looked for with room to spare, so the scan stops
-            // three mebibytes back, where the 600th line from the end is.
-            assert_eq!(
-                seed_start(&mut file, end, 400, MIB, 4 * MIB).unwrap(),
-                end - 3 * MIB
-            );
-            // Asking for more rows than the log can show reads back as far as
-            // it is allowed to and no further.
-            assert_eq!(
-                seed_start(&mut file, end, 100_000, MIB, 4 * MIB).unwrap(),
-                end - 4 * MIB
-            );
-            // A handful of rows still reads a whole window: the scan only says
-            // where the rows cannot be further back than, and starting a render
-            // that late would leave a client with almost nothing.
-            assert_eq!(
-                seed_start(&mut file, end, 1, MIB, 4 * MIB).unwrap(),
-                end - MIB
-            );
-            // A log shorter than one window is rendered from its beginning.
-            assert_eq!(
-                seed_start(&mut file, MIB / 2, 400, MIB, 4 * MIB).unwrap(),
-                0
-            );
-        }
-
-        #[test]
-        fn a_log_of_redraws_is_read_back_the_same_distance_as_one_of_lines() {
-            // Nothing in the window ever committed a line, which is what an
-            // agent that repaints a full-screen pane looks like. The scan must
-            // not answer with the whole log for want of newlines.
-            const MIB: u64 = 1024 * 1024;
-            let mut file = log_with_lines("seed-start-redraw", 6 * MIB as usize, usize::MAX);
-            assert_eq!(
-                seed_start(&mut file, 6 * MIB, 400, MIB, 4 * MIB).unwrap(),
-                6 * MIB - 4 * MIB
-            );
-        }
 
         #[test]
         fn a_history_page_widens_its_window_until_it_reaches_the_rows_asked_for() {
@@ -7614,6 +7469,275 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn an_attach_delivers_the_snapshot_without_replaying_history() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let state = test_state("noseed");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-terminal-noseed";
+            Frame::json(
+                FrameKind::Request,
+                0,
+                1,
+                &DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: "terminal".into(),
+                    path: "/tmp".into(),
+                    label: "noseed".into(),
+                    temporary: false,
+                    executable: "/bin/cat".into(),
+                    args: vec![],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    break;
+                }
+            }
+
+            // Give the session a log an old attach would have spent a long time
+            // rendering, with a marker in every line so a leak is unmistakable.
+            let history = paths.history.join(format!("{session_id}.ansi"));
+            let mut log = String::new();
+            for index in 0..4000 {
+                log.push_str(&format!("history line {index} SEEDMARKER\n"));
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&history)
+                .unwrap();
+            file.write_all(log.as_bytes()).unwrap();
+
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                2,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 2000,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+
+            // An idle session emits no live output, so the first data frame on
+            // the stream is exactly what attach chose to send: the live
+            // snapshot, with the seeded history nowhere in it.
+            let mut first: Option<Vec<u8>> = None;
+            for _ in 0..64 {
+                let Some(frame) = Frame::read_from(&mut client).unwrap_or(None) else {
+                    break;
+                };
+                if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE {
+                    first = Some(frame.decoded_payload().unwrap().to_vec());
+                    break;
+                }
+            }
+            let first = first.expect("attach sends no data at all");
+            let text = String::from_utf8_lossy(&first);
+            assert!(
+                text.starts_with("\x1b[?1049l") || text.starts_with("\x1b[?1049h"),
+                "attach must send the screen snapshot first, got: {text:?}"
+            );
+            assert!(
+                !text.contains("SEEDMARKER"),
+                "attach must not replay the session's history: {text:?}"
+            );
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 3 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn a_same_size_attach_does_not_resignal_the_child() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let state = test_state("noresize");
+            let paths = state.paths.clone();
+            let handle = thread::spawn(move || serve_client(server, state));
+            let session_id = "muxloomd-terminal-noresize";
+            Frame::json(
+                FrameKind::Request,
+                0,
+                1,
+                &DaemonRequest::Launch {
+                    session_id: session_id.into(),
+                    kind: "terminal".into(),
+                    path: "/tmp".into(),
+                    label: "noresize".into(),
+                    temporary: false,
+                    executable: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "trap 'printf WINCHMARKER' WINCH; while :; do sleep 0.1; done".into(),
+                    ],
+                    environment: vec![],
+                    created_at: 1,
+                    columns: 80,
+                    rows: 24,
+                    parent: None,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 1 {
+                    assert!(matches!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Launched { .. }
+                    ));
+                    break;
+                }
+            }
+
+            // Attach at the size the session already has: the daemon must not
+            // resend a RESIZE, which a full-screen TUI would read as a reason
+            // to reflow its whole screen.
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                2,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 0,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::OpenStream {
+                    break;
+                }
+            }
+
+            // An idle child is quiet: whatever the attach just sent, the child
+            // must not answer it. Read until the stream goes quiet (a timed-out
+            // read) and check the trap's marker never made it out.
+            let mut after_attach = Vec::new();
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            while Instant::now() < deadline {
+                match Frame::read_from(&mut client) {
+                    Ok(Some(frame))
+                        if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
+                    {
+                        after_attach.extend_from_slice(&frame.decoded_payload().unwrap());
+                    }
+                    _ => break,
+                }
+            }
+            let after_attach = String::from_utf8_lossy(&after_attach);
+            assert!(
+                !after_attach.contains("WINCHMARKER"),
+                "a same-size attach re-signalled the child: {after_attach:?}"
+            );
+
+            // A real size change must still reach the child.
+            Frame::json(
+                FrameKind::Request,
+                0,
+                3,
+                &DaemonRequest::Resize {
+                    session_id: session_id.into(),
+                    columns: 100,
+                    rows: 24,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            let mut after_resize = String::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !after_resize.contains("WINCHMARKER") && Instant::now() < deadline {
+                if let Ok(Some(frame)) = Frame::read_from(&mut client) {
+                    if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE {
+                        after_resize.push_str(
+                            &String::from_utf8_lossy(&frame.decoded_payload().unwrap())
+                        );
+                    }
+                }
+            }
+            assert!(
+                after_resize.contains("WINCHMARKER"),
+                "a genuine resize must still reach the child: {after_resize:?}"
+            );
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                4,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 4 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
         }
 
         #[test]
