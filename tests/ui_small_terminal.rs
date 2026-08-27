@@ -207,6 +207,7 @@ fn channels_modal_never_panics() {
                             .map(|index| Chat {
                                 id: format!("oc_{index}"),
                                 name: "a group with a rather long name on it".into(),
+                                chat_mode: "group".into(),
                             })
                             .collect(),
                     ),

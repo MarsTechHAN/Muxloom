@@ -752,6 +752,33 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut archive_header_added = false;
     app.archive_row = None;
 
+    // File watches are pseudo-sessions: pinned above every real agent so a
+    // watched log is always one step away, in its own steady colour.
+    for watch in &app.file_watches {
+        let row = items.len();
+        let selected = app.selected_session_id.as_deref() == Some(watch.id.as_str());
+        if selected {
+            selected_row = Some(row);
+        }
+        let status = if watch.loading { "..." } else { "live" };
+        items.push(
+            ListItem::new(Line::from(vec![
+                Span::styled("📄 ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    truncate(&watch.label, area.width.saturating_sub(12) as usize),
+                    Style::default().fg(Color::Cyan).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(format!("  {status}"), Style::default().fg(MUTED)),
+            ]))
+            .style(Style::default().fg(Color::Cyan)),
+        );
+        row_ids.push((Some(watch.id.clone()), 1));
+    }
+
     for (index, (session, shape)) in sessions.iter().enumerate() {
         let session = session.clone();
         let shape = *shape;
@@ -1009,13 +1036,20 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_file_preview_panel(frame, app, area);
         return;
     }
+    // A file watch is selected: the recap pane shows the watched file, live.
+    if app.selected_file_watch().is_some() {
+        app.terminal_back = None;
+        draw_file_watch_panel(frame, app, area);
+        return;
+    }
     // Take the emulator's own scrollback position before anything reads
     // `history_offset`, so the title and the rows agree on where the view sits.
     app.sync_terminal_scrollback();
     let selected = app.selected_session().cloned();
     let current_matches = app.terminal_session_id.as_deref() == app.selected_session_id.as_deref();
-    let pending_matches =
-        app.pending_terminal_session_id.as_deref() == app.selected_session_id.as_deref();
+    let pending_matches = app.pending_terminal_session_id.as_deref()
+        == app.selected_session_id.as_deref()
+        || app.attach_in_flight_for_selected();
     let loading = if app.history_loading {
         " [loading]"
     } else {
@@ -2521,6 +2555,80 @@ fn file_preview_metadata(preview: &crate::model::FilePreview) -> Line<'static> {
             Style::default().fg(MUTED),
         ),
     ])
+}
+
+/// The recap pane for a selected file watch: the watched file's current bytes,
+/// re-rendered only when the content changes, with the same paging and
+/// tail-follow behaviour as the file preview.
+fn draw_file_watch_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(index) = app
+        .selected_session_id
+        .as_deref()
+        .and_then(|id| app.file_watches.iter().position(|watch| watch.id == id))
+    else {
+        return;
+    };
+    let title = format!(
+        " Watching  {}  (x to stop) ",
+        truncate(
+            &app.file_watches[index].path,
+            area.width.saturating_sub(26) as usize
+        )
+    );
+    let block = panel(&title, app.focus == Focus::Recap);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let watch = &mut app.file_watches[index];
+    // Reuse the preview pipeline: a watch is a file preview that keeps
+    // refreshing. The styled body is cached per content, the way the browser's
+    // preview does, so paging never re-parses the file.
+    let mut transient = true;
+    let mut render = if watch.loading && watch.content.is_empty() {
+        PreviewRender::notice("Loading file...".to_string(), MUTED)
+    } else if let Some(render) = watch.rendered.take() {
+        transient = false;
+        render
+    } else {
+        transient = false;
+        file_preview_render(&crate::model::FilePreview {
+            path: watch.path.clone(),
+            mime: watch.mime.clone(),
+            kind: watch.kind,
+            size: watch.last_stamp.0,
+            content: watch.content.clone(),
+            truncated: watch.truncated,
+        })
+    };
+    render.measure(inner.width);
+    let pinned_rows = render
+        .pinned_height()
+        .min(inner.height.saturating_sub(1) as usize) as u16;
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + pinned_rows,
+        inner.width,
+        inner.height.saturating_sub(pinned_rows),
+    );
+    if pinned_rows > 0 {
+        let header = render.pinned_window(pinned_rows as usize);
+        frame.render_widget(
+            Paragraph::new(Text::from(header)),
+            Rect::new(inner.x, inner.y, inner.width, pinned_rows),
+        );
+    }
+    watch.max_scroll = render.height().saturating_sub(body_area.height as usize);
+    watch.page_rows = body_area.height.max(1);
+    // A reader parked at the end stays there as the file grows.
+    watch.scroll = if watch.follow_tail {
+        watch.max_scroll
+    } else {
+        watch.scroll.min(watch.max_scroll)
+    };
+    let window = render.window(watch.scroll, body_area.height as usize);
+    frame.render_widget(Paragraph::new(Text::from(window)), body_area);
+    if !transient {
+        watch.rendered = Some(render);
+    }
 }
 
 fn draw_media_frame(frame: &mut Frame<'_>, media: &crate::media::MediaFrame, area: Rect) {
@@ -5162,7 +5270,7 @@ fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) 
         let active = index == chats.selected;
         frame.render_widget(
             Paragraph::new(truncate(
-                &format!("{} {}", if active { "▸" } else { " " }, chat.name),
+                &format!("{} {}", if active { "▸" } else { " " }, chat.label()),
                 inner.width as usize,
             ))
             .style(
@@ -5183,23 +5291,30 @@ fn draw_channel_chats(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) 
 ///
 /// This is the one screen in the Lark flow with nothing on it to choose and
 /// nothing to type — a chat id exists nowhere a person can copy it from, so the
-/// only route to a bindable chat is to put the bot in a group. Scanning opens
-/// the bot in Lark, where adding it to a group is a tap; the link under it is
-/// the same thing for a window with no room to draw a code, or for somebody who
-/// would rather paste than scan.
+/// route to a bindable chat is to talk to the bot: a direct message opens the
+/// one-to-one chat, which the list picks up and can bind. Adding the bot to a
+/// group still works, but a private message is the shortest path. Scanning
+/// opens the bot in Lark; the link under it is the same thing for a window
+/// with no room to draw a code, or for somebody who would rather paste.
 ///
 /// Nothing here asks for a keystroke. The panel keeps asking Lark on its own
 /// while this is up, so the hands that are holding the phone never have to come
 /// back to the keyboard to say they are done.
 fn draw_channel_bot_code(frame: &mut Frame<'_>, chats: &ChannelChats, inner: Rect) {
     for (offset, (line, colour)) in [
-        ("That app is in no chats yet.".to_string(), Color::Yellow),
+        (
+            "No chat with this bot yet — that's normal for a fresh bot.".to_string(),
+            Color::Yellow,
+        ),
         (String::new(), MUTED),
         (
-            "Scan to open its bot in Lark, then add the bot to a group —".to_string(),
+            "Scan to open its bot in Lark, then just send it a message —".to_string(),
             MUTED,
         ),
-        ("群设置 › 群机器人 › 添加机器人.".to_string(), MUTED),
+        (
+            "直接私聊即可；群聊可选：群设置 › 群机器人 › 添加机器人.".to_string(),
+            MUTED,
+        ),
         (watch_line(chats), ACCENT),
     ]
     .iter()

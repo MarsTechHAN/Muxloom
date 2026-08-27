@@ -6,6 +6,12 @@
 //! already attached, which is exactly the part hand-building an app so often
 //! gets wrong.
 //!
+//! P2P (one-to-one) support rides on that same permission set: the
+//! `PersonalAgent` archetype is meant to cover direct messages as well as
+//! groups. Scopes cannot be widened from this code — if a tenant's private
+//! messages never arrive, the app's permission set is what to check in the
+//! open platform console (the `im` read scopes) and enable by hand there.
+//!
 //! The endpoint is Feishu's account service, not the open API: `init` asks
 //! what this device can do, `begin` starts a device-code session and returns a
 //! scan URL, and `poll` waits until whoever scanned it has approved and Feishu

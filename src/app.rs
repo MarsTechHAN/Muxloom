@@ -397,7 +397,8 @@ pub struct ChannelChats {
     /// Only ever shown when the app turns out to be in no chats at all. That is
     /// the one dead end this step has — there is nothing to choose and nothing
     /// to type, because a chat id is not a thing Lark lets anybody copy — and
-    /// the way out of it is on a phone: open the bot, add it to a group.
+    /// the way out of it is on a phone: open the bot and send it a message;
+    /// the one-to-one chat that opens is what the chooser then finds and binds.
     pub link: String,
     pub code: Option<crate::qr::Code>,
     /// Whether an ask is out and its answer still to come. Only ever one at a
@@ -694,6 +695,42 @@ struct FileClick {
     at: Instant,
 }
 
+/// A client-side pseudo-session: a file the user asked to watch, listed above
+/// the real agents. It re-reads the file through the normal preview pipeline
+/// and shows the result in the recap pane, so a log grows on screen the way
+/// `tail -f` would.
+#[derive(Debug)]
+pub struct FileWatch {
+    /// Stable id used as the agent-list row id; `filewatch:` marks it as a
+    /// pseudo-session so no real session can share it.
+    pub id: String,
+    pub path: String,
+    pub target: Target,
+    pub label: String,
+    /// `(size, mtime)` last observed; `mtime` is 0 unless a directory listing
+    /// supplied one. Size is what the preview pipeline can actually confirm.
+    pub last_stamp: (u64, u64),
+    pub content: String,
+    pub loading: bool,
+    pub kind: FilePreviewKind,
+    pub mime: String,
+    pub truncated: bool,
+    /// Scroll position in rendered rows, recomputed bounds, and whether the
+    /// view sits at the tail and should follow new content.
+    pub scroll: usize,
+    pub max_scroll: usize,
+    pub page_rows: u16,
+    pub follow_tail: bool,
+    /// Styled rows for the content on screen, kept out of the per-frame path.
+    pub rendered: Option<crate::ui::PreviewRender>,
+}
+
+pub const FILE_WATCH_ID_PREFIX: &str = "filewatch:";
+
+pub fn is_file_watch_id(id: &str) -> bool {
+    id.starts_with(FILE_WATCH_ID_PREFIX)
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     Launch(LaunchForm),
@@ -792,10 +829,18 @@ const FILE_MONITOR_TIMEOUT: Duration = Duration::from_secs(20);
 /// whole file, so following a bigger one would mean hauling it across the link
 /// every time it changes; those wait for an explicit refresh.
 const AUTO_REFRESH_LIMIT: u64 = 4 * 1024 * 1024;
+/// How often each file watch re-reads its file to keep the recap pane live.
+/// One round reads every outstanding watch, so a dozen watched files still
+/// cost a dozen preview reads a couple of seconds, not per tick.
+const FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How much of a backed-up capture is read to build one page of history. The
 /// blob holds every row the session ever printed, which for a long-running
 /// agent is tens of megabytes; a page is then cut from the tail of this.
 const RECOVERED_HISTORY_BYTES: usize = 512 * 1024;
+/// How many recently viewed sessions stay attached in the background. Switching
+/// back to one of them is instant (the emulator's screen state is preserved)
+/// instead of re-dialing and replaying the scrollback from scratch.
+const MAX_CACHED_TERMINALS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct SettingsForm {
@@ -1465,6 +1510,10 @@ pub struct App {
     /// only announces transitions instead of repeating itself every tick.
     port_forward_states: HashMap<u64, PortForwardState>,
     pub file_manager: Option<FileManagerForm>,
+    /// Client-side pseudo-sessions: files the user is watching, shown above the
+    /// real agents and kept live by re-reading them through the preview
+    /// pipeline.
+    pub file_watches: Vec<FileWatch>,
     /// File browsers stashed while another machine is selected, keyed by target
     /// id. The active machine's browser lives in `file_manager`; switching
     /// machines parks it here and restores the destination machine's browser.
@@ -1503,6 +1552,10 @@ pub struct App {
     pub agent_viewport_height: u16,
     pub terminal: Option<TerminalSession>,
     pub terminal_session_id: Option<String>,
+    /// Recently viewed sessions kept attached in the background so switching
+    /// back is instant instead of re-dialing and replaying scrollback.
+    /// Most-recent first; capped at [`MAX_CACHED_TERMINALS`].
+    terminal_cache: Vec<(String, TerminalSession)>,
     /// The text on the attached terminal's live screen, kept here so the reads
     /// that ask what the agent is doing right now stay honest while the user
     /// scrolls: the emulator answers with the rows on display, and those are
@@ -1579,6 +1632,9 @@ pub struct App {
     /// the monitor poll less often rather than queueing a listing per tick.
     file_monitor_sent_at: Option<Instant>,
     file_monitor_in_flight: bool,
+    /// When the last file-watch poll round was sent, so a slow link makes the
+    /// poller quiet instead of stacking a preview read per tick per watch.
+    file_watch_poll_at: Option<Instant>,
     next_file_search_id: u64,
     update_slot: UpdateSlot,
     pub(crate) task_progress: Vec<(String, TaskKind, TaskProgress)>,
@@ -1665,6 +1721,7 @@ impl App {
             port_forwards: PortForwardManager::default(),
             port_forward_states: HashMap::new(),
             file_manager: None,
+            file_watches: Vec::new(),
             stashed_file_managers: HashMap::new(),
             file_dirs: HashMap::new(),
             status_message: "Space enables a machine; n starts an agent".into(),
@@ -1687,6 +1744,7 @@ impl App {
             agent_viewport_height: 20,
             terminal: None,
             terminal_session_id: None,
+            terminal_cache: Vec::new(),
             terminal_screen: String::new(),
             pending_terminal: None,
             pending_terminal_session_id: None,
@@ -1732,6 +1790,7 @@ impl App {
             last_machine_click: None,
             file_monitor_sent_at: None,
             file_monitor_in_flight: false,
+            file_watch_poll_at: None,
             next_file_search_id: 0,
             update_slot: Arc::new(Mutex::new(None)),
             task_progress: Vec::new(),
@@ -2296,6 +2355,7 @@ impl App {
         self.maybe_auto_submit_search();
         self.maybe_submit_file_search();
         self.maybe_monitor_open_file();
+        self.maybe_poll_file_watches();
         self.maybe_search_resume_history();
         self.maybe_watch_for_a_chat();
         if self.last_activity_refresh.elapsed() >= ACTIVITY_REFRESH_INTERVAL {
@@ -2451,7 +2511,15 @@ impl App {
                 self.open_launch();
                 Action::Continue
             }
-            KeyCode::Char('x') if self.focus == Focus::Agents => {
+            // A file watch can be dropped from either the agents list or the
+            // recap pane (where it is being read), unlike a real session.
+            KeyCode::Char('x')
+                if self.focus == Focus::Agents
+                    || self
+                        .selected_session_id
+                        .as_deref()
+                        .is_some_and(is_file_watch_id) =>
+            {
                 self.open_kill_confirmation();
                 Action::Continue
             }
@@ -2482,6 +2550,37 @@ impl App {
                 } else {
                     self.toggle_target(self.selected_target);
                 }
+                Action::Continue
+            }
+            // A file watch focused in the recap pane scrolls like the file
+            // preview. List navigation still owns the arrows when the agents
+            // column is focused, so the watch only takes over the recap view.
+            KeyCode::Up | KeyCode::Left | KeyCode::PageUp | KeyCode::Char('k')
+                if self.focus == Focus::Recap && self.selected_file_watch().is_some() =>
+            {
+                self.page_file_watch(false);
+                Action::Continue
+            }
+            KeyCode::Down
+            | KeyCode::Right
+            | KeyCode::PageDown
+            | KeyCode::Char('j')
+            | KeyCode::Char(' ')
+                if self.focus == Focus::Recap && self.selected_file_watch().is_some() =>
+            {
+                self.page_file_watch(true);
+                Action::Continue
+            }
+            KeyCode::Home | KeyCode::Char('g')
+                if self.focus == Focus::Recap && self.selected_file_watch().is_some() =>
+            {
+                self.jump_file_watch(false);
+                Action::Continue
+            }
+            KeyCode::End | KeyCode::Char('G')
+                if self.focus == Focus::Recap && self.selected_file_watch().is_some() =>
+            {
+                self.jump_file_watch(true);
                 Action::Continue
             }
             KeyCode::Up => {
@@ -2632,6 +2731,17 @@ impl App {
                     if let Some(path) = form.preview_path.clone() {
                         self.request_preview_refresh(&mut form, path);
                         self.status_message = "Re-reading the open file".into();
+                    }
+                }
+                KeyCode::Char('n') => self.watch_file_from_preview(&mut form),
+                // A watch created from this preview is dropped with `x` right
+                // here; the preview modal would otherwise swallow the key and
+                // the watch could never be removed while the preview is open.
+                KeyCode::Char('x') => {
+                    if let Some(id) = self.selected_session_id.clone()
+                        && is_file_watch_id(&id)
+                    {
+                        self.remove_file_watch(&id);
                     }
                 }
                 _ => {}
@@ -4101,6 +4211,11 @@ impl App {
             }
             return;
         }
+        // Restore from LRU cache: instant switch-back with preserved screen.
+        if self.restore_cached_terminal(&session.id, take_input) {
+            self.clear_pending_terminal();
+            return;
+        }
         if self.pending_terminal_session_id.as_deref() == Some(&session.id)
             && self.pending_terminal.is_some()
         {
@@ -4244,6 +4359,76 @@ impl App {
         self.clear_pending_terminal();
     }
 
+    /// Store a terminal in the LRU cache, evicting the oldest entry if full.
+    fn cache_terminal(&mut self, session_id: String, terminal: TerminalSession) {
+        // Replace if an entry for this session already exists.
+        self.terminal_cache.retain(|(id, _)| id != &session_id);
+        self.terminal_cache.insert(0, (session_id, terminal));
+        while self.terminal_cache.len() > MAX_CACHED_TERMINALS {
+            let (evicted_id, _) = self.terminal_cache.pop().unwrap();
+            debug::log(
+                "app",
+                format!("evicted cached terminal session={evicted_id}"),
+            );
+        }
+    }
+
+    /// Drain and prune cached terminals: discard closed ones, keep the rest
+    /// receiving output so their emulator state stays current.
+    fn drain_terminal_cache(&mut self) {
+        let mut i = 0;
+        while i < self.terminal_cache.len() {
+            let terminal = &mut self.terminal_cache[i].1;
+            terminal.drain();
+            if terminal.is_closed() {
+                self.terminal_cache.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// If the target session is in the cache, restore it instantly instead of
+    /// re-dialing. Returns true if a cached terminal was restored.
+    fn restore_cached_terminal(&mut self, session_id: &str, take_input: bool) -> bool {
+        let pos = self
+            .terminal_cache
+            .iter()
+            .position(|(id, _)| id == session_id);
+        let Some((id, terminal)) = pos.map(|i| self.terminal_cache.remove(i)) else {
+            return false;
+        };
+        // Park the outgoing terminal back in the cache, the way the commit
+        // path does. Without this, restoring from cache discards the live
+        // terminal, so the very next switch back re-dials it from scratch and
+        // the pane keeps showing the previous agent's frame for the whole
+        // attach — the switch looks stuck on the other session.
+        if let Some(old_id) = self.terminal_session_id.clone()
+            && old_id != id
+        {
+            if let Some(old_terminal) = self.terminal.take() {
+                self.cache_terminal(old_id, old_terminal);
+            }
+        }
+        self.terminal = Some(terminal);
+        self.terminal_session_id = Some(id);
+        self.sync_terminal_size();
+        self.refresh_terminal_screen();
+        self.history_offset = 0;
+        self.terminal_retry_at = None;
+        self.terminal_failures = 0;
+        self.interactive = take_input;
+        if take_input {
+            self.focus = Focus::Recap;
+            self.status_message = "Agent terminal input active; Left returns to agent list".into();
+        }
+        debug::log(
+            "app",
+            format!("restored cached terminal session={session_id}"),
+        );
+        true
+    }
+
     /// Reads the attached terminal's live screen into [`Self::terminal_screen`].
     fn refresh_terminal_screen(&mut self) {
         self.terminal_screen = self
@@ -4274,6 +4459,17 @@ impl App {
                     .as_ref()
                     .map(|pending| pending.session_id.as_str())
                     == selected)
+    }
+
+    /// Whether a background attach for the selected session is still dialing:
+    /// the terminal has not landed in `pending_terminal` yet, so the pane is
+    /// holding the previous session's frame while the new one connects.
+    pub fn attach_in_flight_for_selected(&self) -> bool {
+        self.selected_session_id.as_deref().is_some_and(|selected| {
+            self.pending_attach
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == selected)
+        })
     }
 
     /// True when a live emulator is attached for the currently selected session,
@@ -4348,6 +4544,9 @@ impl App {
     }
 
     fn poll_terminal(&mut self) {
+        // Keep cached terminals receiving output and prune closed ones.
+        self.drain_terminal_cache();
+
         let (changed, closed, codex_working_hint) = self
             .terminal
             .as_mut()
@@ -4418,6 +4617,14 @@ impl App {
             self.pending_terminal_started_at = None;
             self.pending_terminal_has_output = false;
             self.pending_terminal_take_input = false;
+            // Cache the outgoing terminal so switching back later is instant.
+            if let Some(old_id) = self.terminal_session_id.clone()
+                && old_id.as_str() != session_id.as_deref().unwrap_or("")
+            {
+                if let Some(old_terminal) = self.terminal.take() {
+                    self.cache_terminal(old_id, old_terminal);
+                }
+            }
             self.terminal = terminal;
             self.terminal_session_id = session_id;
             self.refresh_terminal_screen();
@@ -5346,6 +5553,40 @@ impl App {
                 result,
             } => {
                 let mut media_request = None;
+                // A file watch is a pseudo-session on the same preview
+                // pipeline: fold the reply into whichever watch asked for it.
+                // The stamp the preview can confirm is the size; the mtime is
+                // only carried over from the listing that created the watch.
+                if let Some(watch) = self
+                    .file_watches
+                    .iter_mut()
+                    .find(|watch| watch.target.id == target_id && watch.path == path)
+                {
+                    match &result {
+                        Ok(preview) => {
+                            watch.loading = false;
+                            let changed = preview.size != watch.last_stamp.0
+                                || preview.content != watch.content;
+                            if changed {
+                                watch.last_stamp = (preview.size, watch.last_stamp.1);
+                                watch.kind = preview.kind;
+                                watch.mime = preview.mime.clone();
+                                watch.truncated = preview.truncated;
+                                watch.content = preview.content.clone();
+                                watch.rendered = None;
+                            }
+                        }
+                        // A failed refresh must not blank the watch: keep what
+                        // is on screen and try again on the next round.
+                        Err(error) => {
+                            watch.loading = false;
+                            debug::log(
+                                "files",
+                                format!("file watch refresh failed path={path}: {error}"),
+                            );
+                        }
+                    }
+                }
                 if let Some(form) = self.file_manager.as_mut()
                     && form.target.id == target_id
                     && form.preview_path.as_deref() == Some(path.as_str())
@@ -6801,11 +7042,12 @@ impl App {
                 self.ensure_session_selection();
             }
             Focus::Agents => {
-                let ids: Vec<_> = self
-                    .visible_sessions()
-                    .iter()
-                    .map(|session| session.id.clone())
-                    .collect();
+                let mut ids: Vec<String> = self.file_watches.iter().map(|w| w.id.clone()).collect();
+                ids.extend(
+                    self.visible_sessions()
+                        .iter()
+                        .map(|session| session.id.clone()),
+                );
                 if ids.is_empty() {
                     self.selected_session_id = None;
                     return;
@@ -6890,7 +7132,15 @@ impl App {
         self.clear_pending_terminal();
         self.terminal_retry_at = None;
         self.terminal_failures = 0;
-        self.selected_session_id = Some(id);
+        self.selected_session_id = Some(id.clone());
+        if is_file_watch_id(&id) {
+            // A pseudo-session has no terminal of its own; the recap pane
+            // renders the watched file instead.
+            self.history_offset = 0;
+            self.history = HistoryPage::default();
+            self.history_message.clear();
+            return;
+        }
         if let Some(session) = self.selected_session() {
             self.selected_sessions_by_target
                 .insert(session.target_id.clone(), session.id.clone());
@@ -6911,6 +7161,14 @@ impl App {
     }
 
     fn ensure_session_selection(&mut self) {
+        // A file watch is a pseudo-session that never appears in `sessions`,
+        // so it cannot be validated against the visible list: keep it selected
+        // for as long as the watch itself still exists.
+        if self.selected_session_id.as_deref().is_some_and(|id| {
+            is_file_watch_id(id) && self.file_watches.iter().any(|watch| watch.id == id)
+        }) {
+            return;
+        }
         let visible_ids: Vec<_> = self
             .visible_sessions()
             .iter()
@@ -8089,7 +8347,7 @@ impl App {
         self.modal = Some(Modal::Channels(form));
     }
 
-    /// Ask Lark again, quietly, while somebody is off adding the bot to a group.
+    /// Ask Lark again, quietly, while somebody is off messaging the bot or adding it to a group.
     ///
     /// Quietly is the whole point: the screen it runs behind is a QR code and a
     /// sentence, and neither should flicker because a request went out. So this
@@ -8213,7 +8471,7 @@ impl App {
                 }
                 None => {
                     form.error = Some(match chats.found.is_some() {
-                        true => "No chat to pick — add the bot to one and it binds itself".into(),
+                        true => "No chat to pick yet — message the bot in Lark (1:1) or add it to a group, and it binds itself".into(),
                         false => "Still asking Lark…".to_string(),
                     });
                     form.step = Some(ChannelStep::Chats(Box::new(chats)));
@@ -8261,7 +8519,7 @@ impl App {
                     // too small to draw the code this line is the whole of the
                     // instructions.
                     form.note = Some(
-                        "Not in any chat yet — scan to open its bot, then add it to a group."
+                        "No chat yet — scan to open the bot, then send it a message (1:1 works; groups are optional)."
                             .into(),
                     );
                 } else if was_empty && let [only] = found.as_slice() {
@@ -9023,6 +9281,145 @@ impl App {
         self.file_monitor_in_flight = self.worker.requests.send(request).is_ok();
     }
 
+    /// Re-read every file watch whose previous fetch has completed. Runs at most
+    /// once per `FILE_WATCH_POLL_INTERVAL`, so a dozen watches cost a dozen
+    /// preview reads a couple of seconds, not one per frame.
+    fn maybe_poll_file_watches(&mut self) {
+        if self.file_watches.is_empty() {
+            self.file_watch_poll_at = None;
+            return;
+        }
+        let due = self
+            .file_watch_poll_at
+            .map(|sent| sent.elapsed() >= FILE_WATCH_POLL_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        for watch in self.file_watches.iter_mut() {
+            if watch.loading {
+                continue;
+            }
+            let request = Request::PreviewFile {
+                target: watch.target.clone(),
+                path: watch.path.clone(),
+            };
+            watch.loading = self.worker.requests.send(request).is_ok();
+        }
+        self.file_watch_poll_at = Some(Instant::now());
+    }
+
+    /// Attach the open file-preview as a live "file watch" pseudo-session:
+    /// it appears at the top of the agents list and auto-refreshes the recap
+    /// pane, the way `tail -f` would.
+    fn watch_file_from_preview(&mut self, form: &mut FileManagerForm) {
+        let Some(path) = form.preview_path.clone() else {
+            return;
+        };
+        // Duplicate guard: one watch per (target, path).
+        if self
+            .file_watches
+            .iter()
+            .any(|w| w.target.id == form.target.id && w.path == path)
+        {
+            self.status_message = "Already watching this file".into();
+            return;
+        }
+        // Derive the label from the entry if we have one, else the path tail.
+        let label = form
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.name.clone())
+            .or_else(|| {
+                path.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| path.clone());
+        let id = format!("filewatch:{}:{}", form.target.id, path);
+        // Seed with whatever the preview already holds so the first frame is
+        // not blank; a fresh read follows to confirm the on-disk bytes.
+        let (content, kind, mime, truncated) = match form.preview.as_ref() {
+            Some(p) => (p.content.clone(), p.kind, p.mime.clone(), p.truncated),
+            None => (String::new(), FilePreviewKind::Text, String::new(), false),
+        };
+        let (size, mtime) = form.preview_stamp.unwrap_or((0, 0));
+        let mut watch = FileWatch {
+            id,
+            path: path.clone(),
+            target: form.target.clone(),
+            label: label.clone(),
+            last_stamp: (size, mtime),
+            content,
+            loading: false,
+            kind,
+            mime,
+            truncated,
+            scroll: 0,
+            max_scroll: 0,
+            page_rows: 0,
+            follow_tail: true,
+            rendered: None,
+        };
+        let request = Request::PreviewFile {
+            target: form.target.clone(),
+            path: path.clone(),
+        };
+        watch.loading = self.worker.requests.send(request).is_ok();
+        self.file_watches.push(watch);
+        self.file_watch_poll_at = Some(Instant::now());
+        self.select_session(format!("filewatch:{}:{}", form.target.id, path));
+        self.status_message = format!("Watching file: {} (press x to stop)", label);
+    }
+
+    /// Page through the selected file watch's content, mirroring the file
+    /// preview paging. Follows the tail while parked at the bottom.
+    fn page_file_watch(&mut self, forward: bool) {
+        let Some(id) = self
+            .selected_session_id
+            .clone()
+            .filter(|id| is_file_watch_id(id))
+        else {
+            return;
+        };
+        let Some(index) = self.file_watches.iter().position(|w| w.id == id) else {
+            return;
+        };
+        let watch = &mut self.file_watches[index];
+        let step = watch.page_rows.max(1) as usize;
+        if watch.max_scroll == 0 {
+            watch.scroll = 0;
+        } else if forward {
+            watch.scroll = watch.scroll.saturating_add(step).min(watch.max_scroll);
+        } else {
+            watch.scroll = watch.scroll.saturating_sub(step);
+        }
+        watch.follow_tail = watch.max_scroll > 0 && watch.scroll >= watch.max_scroll;
+    }
+
+    /// Jump the selected file watch to the top or bottom of its content.
+    /// Jumping to the bottom re-arms tail-follow, so a log that keeps growing
+    /// stays pinned to its newest lines.
+    fn jump_file_watch(&mut self, to_end: bool) {
+        let Some(id) = self
+            .selected_session_id
+            .clone()
+            .filter(|id| is_file_watch_id(id))
+        else {
+            return;
+        };
+        let Some(index) = self.file_watches.iter().position(|w| w.id == id) else {
+            return;
+        };
+        let watch = &mut self.file_watches[index];
+        watch.scroll = usize::from(to_end)
+            .saturating_mul(watch.max_scroll)
+            .min(watch.max_scroll);
+        watch.follow_tail = to_end;
+    }
+
     fn submit_file_search(&mut self, form: &mut FileManagerForm) {
         let Some(pattern) = form
             .query
@@ -9563,6 +9960,13 @@ impl App {
     }
 
     fn open_kill_confirmation(&mut self) {
+        // File watches are client-side: stop watching immediately, no confirm.
+        if let Some(id) = self.selected_session_id.clone()
+            && is_file_watch_id(&id)
+        {
+            self.remove_file_watch(&id);
+            return;
+        }
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -9573,6 +9977,24 @@ impl App {
                 && session.kind != AgentKind::Terminal
                 && !is_temporary_session_id(&session.id),
         });
+    }
+
+    /// Remove a file watch by its id and restore selection to a real session.
+    fn remove_file_watch(&mut self, id: &str) {
+        if let Some(index) = self.file_watches.iter().position(|w| w.id == id) {
+            let watch = self.file_watches.remove(index);
+            self.selected_session_id = None;
+            self.status_message = format!("Stopped watching {}", watch.label);
+            self.ensure_session_selection();
+        }
+    }
+
+    /// The currently selected file watch, if any.
+    pub fn selected_file_watch(&self) -> Option<&FileWatch> {
+        self.selected_session_id
+            .as_deref()
+            .filter(|id| is_file_watch_id(id))
+            .and_then(|id| self.file_watches.iter().find(|w| w.id == id))
     }
 
     fn open_rename_agent(&mut self) {
@@ -15131,10 +15553,12 @@ mod tests {
                 crate::channel::Chat {
                     id: "oc_0".into(),
                     name: "everyone".into(),
+                    chat_mode: "group".into(),
                 },
                 crate::channel::Chat {
                     id: "oc_1".into(),
                     name: "just me".into(),
+                    chat_mode: "p2p".into(),
                 },
             ]),
         });
@@ -15318,7 +15742,7 @@ mod tests {
             result: Ok(Vec::new()),
         });
         let note = channels_form(&app).note.clone().unwrap_or_default();
-        assert!(note.contains("add it to a group"), "{note}");
+        assert!(note.contains("send it a message"), "{note}");
         // Nothing to choose from and no chat id anybody could type — Lark shows
         // one nowhere. So what this screen has instead is the bot itself, as
         // something to point a phone at.
@@ -15368,6 +15792,7 @@ mod tests {
             result: Ok(vec![crate::channel::Chat {
                 id: "oc_0".into(),
                 name: "stale".into(),
+                chat_mode: "group".into(),
             }]),
         });
         match channel_step(&app) {
@@ -15479,6 +15904,7 @@ mod tests {
             result: Ok(vec![crate::channel::Chat {
                 id: "oc_7".into(),
                 name: "研发日常".into(),
+                chat_mode: "group".into(),
             }]),
         });
         let form = channels_form(&app);
@@ -15499,6 +15925,37 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_message_to_the_bot_binds_itself_without_anybody_pressing_anything() {
+        let (mut app, requests, path, _first) = app_with_no_chats_yet();
+        age_the_last_check(&mut app);
+        app.on_tick();
+        let second = match asks_about_chats(&requests).as_slice() {
+            [only] => *only,
+            other => panic!("the watch should have asked again, once: {other:?}"),
+        };
+        // The player DM'd the bot — a p2p chat shows up in the list.
+        app.handle_worker_event(Event::ChannelChats {
+            attempt: second,
+            result: Ok(vec![crate::channel::Chat {
+                id: "oc_p2p".into(),
+                name: "hanxiao".into(),
+                chat_mode: "p2p".into(),
+            }]),
+        });
+        let form = channels_form(&app);
+        assert!(form.step.is_none(), "straight back to the list");
+        match form.set.bindings.as_slice() {
+            [binding] => {
+                assert_eq!(binding.route, "oc_p2p");
+                assert_eq!(binding.route_label, "hanxiao");
+                assert!(binding.preferred, "the first one bound is the default");
+            }
+            other => panic!("exactly one binding: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn two_chats_at_once_is_still_a_choice_somebody_has_to_make() {
         let (mut app, requests, path, _) = app_with_no_chats_yet();
         age_the_last_check(&mut app);
@@ -15513,10 +15970,12 @@ mod tests {
                 crate::channel::Chat {
                     id: "oc_7".into(),
                     name: "研发日常".into(),
+                    chat_mode: "group".into(),
                 },
                 crate::channel::Chat {
                     id: "oc_8".into(),
                     name: "值班".into(),
+                    chat_mode: "p2p".into(),
                 },
             ]),
         });
@@ -16122,6 +16581,89 @@ mod tests {
                 .map(|form| form.preview_follow_tail),
             Some(false)
         );
+    }
+
+    #[test]
+    fn preview_n_key_attaches_a_file_watch_and_deduplicates_it() {
+        let (mut app, request_rx, _entry) = preview_monitor_app(6, 1_700_000_000);
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        // The watch is created from the open preview, seeded with its content,
+        // and selected so the recap pane shows it immediately.
+        assert_eq!(app.file_watches.len(), 1);
+        let watch = &app.file_watches[0];
+        assert_eq!(watch.id, "filewatch:local:/work/notes.log");
+        assert_eq!(watch.label, "notes.log");
+        assert_eq!(watch.content, "first\n");
+        assert_eq!(watch.last_stamp, (6, 1_700_000_000));
+        assert!(watch.loading, "a confirm read is issued on attach");
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some("filewatch:local:/work/notes.log")
+        );
+        assert!(request_rx.try_iter().any(
+            |request| matches!(request, Request::PreviewFile { path, .. } if path == "/work/notes.log")
+        ));
+
+        // Pressing n again on the same file is a no-op.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.file_watches.len(), 1);
+        assert_eq!(app.status_message, "Already watching this file");
+
+        // x drops the watch and restores selection to a real session.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.file_watches.is_empty());
+        assert_eq!(app.selected_session_id, None);
+    }
+
+    #[test]
+    fn file_watch_poll_picks_up_changed_content() {
+        let (mut app, request_rx, _entry) = preview_monitor_app(6, 1_700_000_000);
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        // The confirm read issued on attach comes back unchanged.
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: "/work/notes.log".into(),
+            result: Ok(FilePreview {
+                path: "/work/notes.log".into(),
+                mime: "text/plain".into(),
+                kind: crate::model::FilePreviewKind::Text,
+                size: 6,
+                content: "first\n".into(),
+                truncated: false,
+            }),
+        });
+        assert!(app.file_watches[0].content == "first\n" && !app.file_watches[0].loading);
+
+        // Once the poll interval elapses, another read goes out.
+        app.file_watch_poll_at =
+            Some(Instant::now() - FILE_WATCH_POLL_INTERVAL - Duration::from_secs(1));
+        app.maybe_poll_file_watches();
+        assert!(request_rx.try_iter().any(
+            |request| matches!(request, Request::PreviewFile { path, .. } if path == "/work/notes.log")
+        ));
+
+        // A reply with new bytes updates the watch and invalidates its render.
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: "/work/notes.log".into(),
+            result: Ok(FilePreview {
+                path: "/work/notes.log".into(),
+                mime: "text/plain".into(),
+                kind: crate::model::FilePreviewKind::Text,
+                size: 13,
+                content: "first\nsecond\n".into(),
+                truncated: false,
+            }),
+        });
+        let watch = &app.file_watches[0];
+        assert_eq!(watch.content, "first\nsecond\n");
+        assert_eq!(watch.last_stamp.0, 13);
+        assert!(!watch.loading);
+        assert!(watch.rendered.is_none());
     }
 
     #[test]

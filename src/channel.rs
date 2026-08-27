@@ -765,11 +765,11 @@ pub const LARK_CONSOLE: &str = "https://open.feishu.cn/app";
 /// 3.40 on; an older one, or an account the app was never released to, is shown
 /// Lark's own explanation rather than a blank screen.
 ///
-/// The chat it opens is the one-to-one one, which is not a chat this dashboard
-/// can bind: [`chats`] asks `im/v1/chats`, and that answers with groups and only
-/// groups, so a bot spoken to privately is a bot nothing here can find. What the
-/// link is for is getting to the bot at all — from there, adding it to a group
-/// is a tap, and that group is what the chooser then has to offer.
+/// The chat it opens is the one-to-one one. That is the point: once the person
+/// has said anything to the bot, the conversation is a chat `oc_…` the same
+/// [`chats`] list answers with, flagged `chat_mode` `p2p`, and it binds like
+/// any other. Groups still work — adding the bot to one is a tap — but a
+/// private message is the shortest way to a working channel.
 ///
 /// The id is trimmed and otherwise used as it stands. Nothing reaches here until
 /// Lark has issued a token for that very id, so an id that would need escaping
@@ -781,11 +781,25 @@ pub fn lark_bot_link(app_id: &str) -> String {
     )
 }
 
-/// One chat a Lark app's bot has been added to.
+/// One chat a Lark app's bot can talk in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
     pub id: String,
     pub name: String,
+    /// How the two halves of a chat differ in Lark: `p2p` is the one-to-one
+    /// conversation with the bot, `group` is a room it has been added to.
+    pub chat_mode: String,
+}
+
+impl Chat {
+    /// The row the chooser shows: a direct message and a room are named the
+    /// same way, so they need telling apart.
+    pub fn label(&self) -> String {
+        match self.chat_mode.as_str() {
+            "p2p" => format!("💬 {}", self.name),
+            _ => format!("👥 {}", self.name),
+        }
+    }
 }
 
 /// The chats a Lark app can already talk in, newest first.
@@ -795,6 +809,11 @@ pub struct Chat {
 /// to open a chat in a browser and read the address bar. Asking is better: the
 /// app knows which chats it is in, and the answer comes back with the names
 /// they are known by.
+///
+/// Groups and one-to-one conversations both come back here: each item carries a
+/// `chat_mode` (`group` or `p2p`). A one-to-one conversation appears as soon as
+/// the person has said anything to the bot, which is what makes a private
+/// message a first-class way to reach a channel — no group required.
 ///
 /// One page. A hundred chats is far more than a bot bound to a dashboard is in,
 /// and paging a chooser nobody will scroll is complexity bought for nobody.
@@ -830,14 +849,23 @@ pub fn chats(app_id: &str, secret: &str, environment: &[(String, String)]) -> Re
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .trim();
+            let chat_mode = item
+                .get("chat_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("group")
+                .to_string();
             Some(Chat {
                 id: id.to_string(),
                 // A group with no name set is not an error and should not read
                 // as an empty row; Lark itself shows these by their members.
-                name: match name.is_empty() {
-                    true => "(unnamed chat)".to_string(),
-                    false => name.to_string(),
+                // A direct message the API leaves unnamed is the person on the
+                // other end of it, so it is named for that instead.
+                name: match (name.is_empty(), chat_mode.as_str()) {
+                    (true, "p2p") => "(direct message)".to_string(),
+                    (true, _) => "(unnamed chat)".to_string(),
+                    (false, _) => name.to_string(),
                 },
+                chat_mode,
             })
         })
         .collect())
@@ -2722,6 +2750,30 @@ mod tests {
             lark_bot_link("  cli_9c21a4767c305107\n"),
             "https://applink.feishu.cn/client/bot/open?appId=cli_9c21a4767c305107"
         );
+    }
+
+    #[test]
+    fn a_direct_message_is_told_apart_from_a_group() {
+        // The chooser shows the bot's chats in one list, and a private message
+        // and a room are named the same way — so the row must say which it is.
+        let dm = Chat {
+            id: "oc_1".into(),
+            name: "hanxiao".into(),
+            chat_mode: "p2p".into(),
+        };
+        let room = Chat {
+            id: "oc_2".into(),
+            name: "研发日常".into(),
+            chat_mode: "group".into(),
+        };
+        assert!(
+            dm.label().starts_with("💬"),
+            "direct message: {}",
+            dm.label()
+        );
+        assert!(dm.label().ends_with("hanxiao"));
+        assert!(room.label().starts_with("👥"), "group: {}", room.label());
+        assert!(room.label().ends_with("研发日常"));
     }
 
     #[test]
