@@ -41,6 +41,68 @@ pub const CHANNELS_CAPABILITY: &str = "channels-v1";
 /// The file every machine keeps its copy in, relative to its state directory.
 pub const CHANNELS_FILE: &str = "channels.json";
 
+/// The board path the account lease lives on. Nothing ever works in that
+/// directory, so a lease note sits off every human's and agent's default board
+/// read, and an old muxloom that meets one just sees a note in an empty folder.
+pub const LEASE_PATH: &str = "/muxloom/channel-leases";
+
+/// The first line of a lease note. After it come `account=` (the WeChat
+/// account, the bot id), `until=` (epoch-millisecond expiry), and `cursor=`
+/// (the account cursor the holder has just advanced to, so a successor can
+/// resume past what was already read). The holder is not written; the note's
+/// origin is the machine that posted it, which is the only name both sides
+/// agree on.
+pub const LEASE_PREFIX: &str = "muxloom-channel-lease v1";
+
+/// How long a claim stays valid. It must ride out a few missed polls and a
+/// slow sync round, yet stay short enough that a machine whose controller died
+/// stops being counted on within a minute.
+pub const LEASE_TTL_MS: u64 = 45_000;
+
+/// How long a machine that just posted its lease stays silent. It must ride
+/// out the sync round to the other side (they run every couple of seconds),
+/// so two simultaneous first claims settle on the smaller origin before
+/// either one answers.
+pub const LEASE_SETTLE_MS: u64 = 10_000;
+
+/// How recently a target must have answered the channel round to count as a
+/// live peer. A round knocks on every enabled target about every two seconds,
+/// so thirty seconds is fifteen missed knocks.
+pub const PEER_LIVE_WINDOW: Duration = Duration::from_secs(30);
+
+/// When each target last answered the channel round. Process-local: the lease
+/// itself is what travels between machines, this only says how fresh the world
+/// is right now.
+fn last_reach() -> &'static Mutex<HashMap<String, Instant>> {
+    static LAST_REACH: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    LAST_REACH.get_or_init(Default::default)
+}
+
+fn heard_from(target: &Target) {
+    let map = last_reach();
+    let mut guard = map.lock().unwrap_or_else(|poison| poison.into_inner());
+    guard.insert(target.id.clone(), Instant::now());
+}
+
+fn no_longer_heard(target: &Target) {
+    let map = last_reach();
+    let mut guard = map.lock().unwrap_or_else(|poison| poison.into_inner());
+    guard.remove(&target.id);
+}
+
+/// Whether any of the fleet's targets answered the channel round recently:
+/// that is the 连着 signal. With no live peer the board cannot carry the other
+/// side's word, so no lease of anyone else can be trusted either.
+fn peers_are_live(targets: &[Target]) -> bool {
+    let map = last_reach();
+    let guard = map.lock().unwrap_or_else(|poison| poison.into_inner());
+    targets.iter().any(|target| {
+        guard
+            .get(&target.id)
+            .is_some_and(|at| at.elapsed() < PEER_LIVE_WINDOW)
+    })
+}
+
 /// Which chat app a binding speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelKind {
@@ -1164,6 +1226,16 @@ pub struct Inbox {
     /// must not deliver twice.
     #[serde(default)]
     pub handled: Vec<String>,
+    /// Per WeChat binding: when this machine last put its lease on the board,
+    /// epoch milliseconds. Zero means it never has, which is how a fresh
+    /// dashboard knows it still has to introduce itself to the fleet.
+    #[serde(default)]
+    pub lease_claims: HashMap<String, u64>,
+    /// Per binding: how many replies this machine has sent into it. Two
+    /// machines bound to one chat must look different to the person reading
+    /// their phone, and the number is the part only true on the sender.
+    #[serde(default)]
+    pub reply_counts: HashMap<String, u64>,
 }
 
 impl Inbox {
@@ -1239,6 +1311,21 @@ impl Inbox {
             // sent, so the most recent word is that it was here.
             ..Default::default()
         }
+    }
+
+    /// The line the next reply out this binding carries: which machine sent it,
+    /// and which of this machine's replies it is. With two machines bound to
+    /// the same chat the text alone cannot tell the voices apart, so the
+    /// counter makes identical replies from one machine still readable as a
+    /// sequence rather than as a stutter. Empty machine name means the identity
+    /// is unknown, and the reply goes out unsigned as before.
+    pub fn reply_signature(&mut self, binding: &str, machine: &str) -> String {
+        if machine.trim().is_empty() {
+            return String::new();
+        }
+        let count = self.reply_counts.entry(binding.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+        format!("*— {machine} #{count}*")
     }
 }
 
@@ -1444,8 +1531,13 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target], set: &ChannelSet) -> Chan
     let everywhere = std::iter::once(&local).chain(targets.iter().filter(|it| it.id != local.id));
     for target in everywhere {
         match pool.channels_get(target) {
-            Ok(None) => continue,
+            Ok(None) => {
+                // It answered — it is reachable, even without channels.
+                heard_from(target);
+                continue;
+            }
             Ok(Some((held, receipts))) => {
+                heard_from(target);
                 round.asked += 1;
                 round.receipts.extend(receipts);
                 if held.revision == set.revision {
@@ -1460,6 +1552,7 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target], set: &ChannelSet) -> Chan
                 }
             }
             Err(error) => {
+                no_longer_heard(target);
                 round.asked += 1;
                 round
                     .failures
@@ -1707,11 +1800,297 @@ pub struct InboxRound {
     /// something to retry harder: the person saying anything at all reopens it,
     /// and the panel's job is to say so.
     pub asleep: Vec<String>,
+    /// Bindings this machine stayed silent on because another live machine
+    /// holds the account lease: expected behavior when connected, worth
+    /// seeing in the log, not a failure.
+    pub held: Vec<String>,
 }
 
 impl InboxRound {
     pub fn busy(&self) -> bool {
         self.read > 0 || !self.failures.is_empty() || !self.refreshed.is_empty()
+    }
+}
+
+/// The account a WeChat binding actually polls, for lease purposes: the bot
+/// that owns the inbox, not the local name each machine gave the binding.
+/// Two machines handed the same bot (same `channels.json`) share this key,
+/// which is exactly the thing that must be consumed once.
+fn account_key(binding: &ChannelBinding) -> String {
+    for candidate in [&binding.app_id, &binding.route] {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    binding.id.clone()
+}
+
+/// One lease note read off the board, with its holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Leased {
+    holder: String,
+    until: u64,
+    /// The account cursor the holder had advanced to when it posted:
+    /// everything up to here was already read by this voice.
+    cursor: String,
+    /// When the note was posted; the newest note is the freshest word on how
+    /// far the account has been read.
+    ts: u64,
+}
+
+/// Read one note as a lease on `account`, or None when it is not one. The
+/// holder is the note's origin — the only name both machines agree on. An
+/// unreadable or foreign note is simply not a lease, never an error: old
+/// muxloom versions never post these, so a note that is not ours to parse is
+/// not ours to act on.
+fn lease_from(message: &crate::talk::TalkMessage, account: &str) -> Option<Leased> {
+    let (head, cursor) = message.text.split_once("\ncursor=")?;
+    let mut lines = head.lines();
+    if lines.next()? != LEASE_PREFIX {
+        return None;
+    }
+    let mut named = String::new();
+    let mut until = 0;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("account=") {
+            named = value.to_string();
+        } else if let Some(value) = line.strip_prefix("until=") {
+            until = value.parse().unwrap_or(0);
+        }
+    }
+    (named == account && until > 0).then(|| Leased {
+        holder: message.origin.clone(),
+        until,
+        cursor: cursor.to_string(),
+        ts: message.ts,
+    })
+}
+
+/// What one round of inbox reading does with one WeChat account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseDecision {
+    /// A live machine has the account; stay silent this round.
+    Yield,
+    /// Read the account, then publish a lease carrying the fresh cursor.
+    Consume,
+    /// The lease on the board is mine, but I only just posted it and the other
+    /// side may not have seen it: keep it alive and stay silent while the
+    /// order settles.
+    Quiet,
+    /// Put a lease on the board, but stay silent this round: the board held no
+    /// live lease while a peer was reachable, so a simultaneous claim may
+    /// exist on the other side; wait for the settle window before speaking.
+    Introduce,
+}
+
+/// The election, without the I/O.
+///
+/// With no live peer there is nobody to elect against, so the answer is always
+/// "speak" — that is the failover half of the contract: whatever leases the
+/// board still holds were posted by a machine that cannot be reached, and
+/// honoring them would silence this side of a split fleet. With live peers,
+/// the lease on the board decides: the smallest origin holding a live lease
+/// speaks, everyone else waits. The order is a total one, so two machines
+/// converge on one voice without talking about it, and a machine whose
+/// controller died stops being counted on after its lease lapses. A machine
+/// that just introduced stays quiet for the settle window, so two
+/// simultaneous introductions cannot both answer the same batch.
+fn lease_decision(
+    now: u64,
+    my_origin: &str,
+    leases: &[Leased],
+    my_intro: u64,
+    peers_live: bool,
+) -> LeaseDecision {
+    if !peers_live {
+        return LeaseDecision::Consume;
+    }
+    let live: Vec<&Leased> = leases.iter().filter(|l| l.until > now).collect();
+    let Some(smallest) = live.iter().min_by_key(|lease| &lease.holder) else {
+        return LeaseDecision::Introduce;
+    };
+    if smallest.holder == my_origin {
+        if my_intro != 0 && now.saturating_sub(my_intro) < LEASE_SETTLE_MS {
+            LeaseDecision::Quiet
+        } else {
+            LeaseDecision::Consume
+        }
+    } else {
+        LeaseDecision::Yield
+    }
+}
+
+/// Publish this machine's lease for the account to the board, carrying the
+/// cursor the account has been read to so a successor can resume past it. A
+/// post that fails is logged and shrugged off: the account stays usable, the
+/// election just runs without this voice for a round.
+fn publish_lease(runtime: &Runtime, account: &str, binding: &str, cursor: &str) {
+    let until = now_ms().saturating_add(LEASE_TTL_MS);
+    let draft = crate::talk::TalkDraft {
+        scope: crate::talk::TalkScope::Path {
+            machine: String::new(),
+            path: LEASE_PATH.into(),
+        },
+        author: Default::default(),
+        kind: crate::talk::TalkKind::Note,
+        to: None,
+        reply_to: None,
+        text: format!("{LEASE_PREFIX}\naccount={account}\nuntil={until}\ncursor={cursor}"),
+    };
+    if let Err(error) = runtime.bridge_pool().talk_post(&Target::local(), draft) {
+        debug::log(
+            "channel",
+            format!("{binding}: could not post its lease for {account}: {error:#}"),
+        );
+    }
+}
+
+/// Read the account's current leases off the board.
+fn read_leases(runtime: &Runtime, account: &str) -> Result<Vec<Leased>> {
+    let filter = crate::talk::TalkFilter {
+        scope: Some("path".into()),
+        machines: crate::talk::TalkSelector::All,
+        paths: crate::talk::TalkSelector::Only {
+            names: vec![LEASE_PATH.into()],
+        },
+        kinds: vec!["note".into()],
+        limit: 64,
+        ..Default::default()
+    };
+    let page = runtime
+        .bridge_pool()
+        .talk_read(&Target::local(), filter)
+        .with_context(|| format!("reading the lease board for {account}"))?;
+    Ok(page
+        .messages
+        .iter()
+        .filter_map(|message| lease_from(message, account))
+        .collect())
+}
+
+/// Resume where the previous voice left off.
+///
+/// The WeChat cursor is tracked per machine in this inbox: a machine that
+/// takes over the lease only now is behind the one that consumed last, and
+/// resuming from its own stale cursor would re-read — and re-answer — what the
+/// other side already handled. The newest lease note carries the cursor of
+/// whoever spoke most recently, so adopt it when it is someone else's and not
+/// empty. A note this machine wrote itself is never newer than its own live
+/// cursor; an empty cursor means the other side consumed nothing, and the
+/// first-round catch-up path then applies as usual.
+fn adopt_newer_cursor(
+    inbox: &mut Inbox,
+    binding: &ChannelBinding,
+    leases: &[Leased],
+    my_origin: &str,
+) {
+    let Some(newest) = leases.iter().max_by_key(|lease| lease.ts) else {
+        return;
+    };
+    if newest.holder == my_origin || newest.cursor.is_empty() {
+        return;
+    }
+    inbox
+        .cursors
+        .insert(binding.id.clone(), newest.cursor.clone());
+}
+
+/// Ask the board who speaks for this WeChat account this round, and make sure
+/// we are on the record. Returns true when this machine stays silent.
+///
+/// The check happens before the chat is read on purpose: a machine that is not
+/// the voice for the account does not even advance the cursor, so the batch
+/// stays whole for the machine that is. A consuming round publishes its fresh
+/// cursor back onto the board afterwards (see `run_inbox`), so the voice can
+/// pass the account on without its successor re-reading consumed messages.
+fn lease_round(
+    runtime: &Runtime,
+    local: Option<&crate::talk::TalkState>,
+    targets: &[Target],
+    inbox: &mut Inbox,
+    binding: &ChannelBinding,
+    round: &mut InboxRound,
+) -> bool {
+    let Some(local) = local else {
+        debug::log(
+            "channel",
+            format!(
+                "{}: no local board, taking account {} alone",
+                binding.id,
+                account_key(binding)
+            ),
+        );
+        return false;
+    };
+    let account = account_key(binding);
+    let leases = match read_leases(runtime, &account) {
+        Ok(leases) => leases,
+        Err(error) => {
+            debug::log(
+                "channel",
+                format!(
+                    "{}: lease board unreadable ({error:#}), taking account {account} alone",
+                    binding.id
+                ),
+            );
+            return false;
+        }
+    };
+    let now = now_ms();
+    let decision = lease_decision(
+        now,
+        &local.origin,
+        &leases,
+        inbox.lease_claims.get(&binding.id).copied().unwrap_or(0),
+        peers_are_live(targets),
+    );
+    match decision {
+        LeaseDecision::Yield => {
+            debug::log(
+                "channel",
+                format!(
+                    "{}: holding — another live machine has account {account}",
+                    binding.id
+                ),
+            );
+            round.held.push(binding.id.clone());
+            true
+        }
+        LeaseDecision::Consume => {
+            adopt_newer_cursor(inbox, binding, &leases, &local.origin);
+            false
+        }
+        LeaseDecision::Quiet => {
+            let cursor = inbox.cursors.get(&binding.id).cloned().unwrap_or_default();
+            publish_lease(runtime, &account, &binding.id, &cursor);
+            debug::log(
+                "channel",
+                format!(
+                    "{}: settle window for account {account} — keeping the lease, \
+                     staying silent one more round",
+                    binding.id
+                ),
+            );
+            round.held.push(binding.id.clone());
+            true
+        }
+        LeaseDecision::Introduce => {
+            adopt_newer_cursor(inbox, binding, &leases, &local.origin);
+            inbox.lease_claims.insert(binding.id.clone(), now);
+            let cursor = inbox.cursors.get(&binding.id).cloned().unwrap_or_default();
+            publish_lease(runtime, &account, &binding.id, &cursor);
+            debug::log(
+                "channel",
+                format!(
+                    "{}: introducing account {account} while a peer is live — \
+                     quiet for the settle window so the order settles",
+                    binding.id
+                ),
+            );
+            round.held.push(binding.id.clone());
+            true
+        }
     }
 }
 
@@ -1743,6 +2122,22 @@ pub fn run_inbox(
         return round;
     }
     let now = now_ms();
+    // How the board names this machine: the lease is keyed by origin, and the
+    // reply signature shows the label on the person's phone.
+    let local = runtime
+        .bridge_pool()
+        .talk_status(&Target::local(), None)
+        .ok();
+    let local_name = local
+        .as_ref()
+        .map(|state| {
+            if state.label.trim().is_empty() {
+                state.origin.clone()
+            } else {
+                state.label.clone()
+            }
+        })
+        .unwrap_or_default();
     let mut desk = Desk::new(runtime, targets, config);
     for binding in listening {
         if inbox
@@ -1751,6 +2146,14 @@ pub fn run_inbox(
             .is_some_and(|&until| now < until)
         {
             round.asleep.push(binding.id.clone());
+            continue;
+        }
+        // WeChat: one voice per account while the fleet is connected. The
+        // lease holder polls; the others stay silent, so the batch stays whole
+        // for whoever answers.
+        if binding.kind == ChannelKind::WeChat
+            && lease_round(runtime, local.as_ref(), targets, inbox, binding, &mut round)
+        {
             continue;
         }
         let said = match read_chat(binding, inbox, environment) {
@@ -1762,6 +2165,20 @@ pub fn run_inbox(
                 continue;
             }
         };
+        if binding.kind == ChannelKind::WeChat {
+            // Publish the lease with the cursor the read just advanced, so a
+            // successor resumes past what was already consumed.
+            publish_lease(
+                runtime,
+                &account_key(binding),
+                &binding.id,
+                inbox
+                    .cursors
+                    .get(&binding.id)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+        }
         if inbox.waking.contains_key(&binding.id) {
             round.asleep.push(binding.id.clone());
         }
@@ -1787,11 +2204,13 @@ pub fn run_inbox(
             round.routed.push(format!("{}: {answer}", binding.id));
             // The answer is itself something a human can reply to, so it is
             // remembered under whoever it is about — an agent's name in a
-            // receipt is a handle, not just a report.
+            // receipt is a handle, not just a report. The signature also names
+            // the sending machine and counts its replies, so two bound
+            // machines answering the same chat stay tellable apart.
             let receipt = Outgoing {
                 title: String::new(),
                 text: answer,
-                signature: String::new(),
+                signature: inbox.reply_signature(&binding.id, &local_name),
             };
             match send(&answering, &receipt, environment) {
                 Ok(sent) if !sent.message_id.is_empty() => {
@@ -3264,5 +3683,394 @@ mod tests {
             route("approve", None, "lark-1", false, &inbox).0,
             Route::Board { .. }
         ));
+    }
+
+    fn lease_note(holder: &str, _account: &str, until: u64, cursor: &str, ts: u64) -> Leased {
+        Leased {
+            holder: holder.into(),
+            until,
+            cursor: cursor.into(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn lease_election_yields_to_a_smaller_live_holder_and_takes_over_after_expiry() {
+        // Connected fleet, two machines: the smaller origin holds a live lease,
+        // so this machine stays silent for the account.
+        assert_eq!(
+            lease_decision(
+                1_000,
+                "machine-b",
+                &[lease_note(
+                    "machine-a",
+                    "bot@im",
+                    1_000 + LEASE_TTL_MS,
+                    "cur-a",
+                    1_000
+                )],
+                0,
+                true,
+            ),
+            LeaseDecision::Yield
+        );
+        // The holder's lease lapses (its controller died) and nobody else holds
+        // the account: this machine enters the election — whatever it has done
+        // before, the board is empty of live leases, so it introduces and stays
+        // quiet for the settle window.
+        assert_eq!(
+            lease_decision(
+                1_000 + LEASE_TTL_MS + 1,
+                "machine-b",
+                &[lease_note(
+                    "machine-a",
+                    "bot@im",
+                    1_000 + LEASE_TTL_MS,
+                    "cur-a",
+                    1_000
+                )],
+                0,
+                true,
+            ),
+            LeaseDecision::Introduce
+        );
+        // Inside its own settle window: the lease is on the board and is the
+        // smallest (only) live one, but the other side may not have seen it
+        // yet — keep it alive and hold one more round.
+        let takeover = 1_000 + LEASE_TTL_MS + 1;
+        assert_eq!(
+            lease_decision(
+                takeover + 5_000,
+                "machine-b",
+                &[lease_note(
+                    "machine-b",
+                    "bot@im",
+                    takeover + LEASE_TTL_MS,
+                    "cur-b",
+                    takeover
+                )],
+                takeover,
+                true,
+            ),
+            LeaseDecision::Quiet
+        );
+        // The settle window is over and the lease is still live: speak.
+        assert_eq!(
+            lease_decision(
+                takeover + LEASE_SETTLE_MS,
+                "machine-b",
+                &[lease_note(
+                    "machine-b",
+                    "bot@im",
+                    takeover + LEASE_TTL_MS,
+                    "cur-b",
+                    takeover
+                )],
+                takeover,
+                true,
+            ),
+            LeaseDecision::Consume
+        );
+    }
+
+    #[test]
+    fn lease_election_consumes_on_its_own_live_lease_and_yields_to_a_smaller() {
+        let now = 100_000u64;
+        let mine = lease_note(
+            "machine-a",
+            "bot@im",
+            now + LEASE_TTL_MS,
+            "cur",
+            now - 5_000,
+        );
+        // I hold the only live lease and my settle window is over: speak.
+        assert_eq!(
+            lease_decision(
+                now,
+                "machine-a",
+                std::slice::from_ref(&mine),
+                now - LEASE_SETTLE_MS,
+                true
+            ),
+            LeaseDecision::Consume
+        );
+        // I hold the only live lease but I just introduced: stay quiet.
+        assert_eq!(
+            lease_decision(
+                now,
+                "machine-a",
+                std::slice::from_ref(&mine),
+                now - 1_000,
+                true
+            ),
+            LeaseDecision::Quiet
+        );
+        // A smaller holder appearing with a live lease means I lose: yield.
+        assert_eq!(
+            lease_decision(
+                now,
+                "machine-a",
+                &[
+                    mine,
+                    lease_note("machine-0", "bot@im", now + LEASE_TTL_MS, "cur0", now),
+                ],
+                now - LEASE_SETTLE_MS,
+                true,
+            ),
+            LeaseDecision::Yield
+        );
+    }
+
+    #[test]
+    fn lease_election_without_live_peers_always_consumes() {
+        let now = 100_000u64;
+        // 断开: the board may still hold a fresh lease from a machine that is
+        // no longer reachable — honoring it would silence this side of the
+        // split, which is the failover case. Consume.
+        assert_eq!(
+            lease_decision(
+                now,
+                "machine-a",
+                &[lease_note(
+                    "machine-b",
+                    "bot@im",
+                    now + LEASE_TTL_MS,
+                    "cur-b",
+                    now - 1_000
+                )],
+                0,
+                false,
+            ),
+            LeaseDecision::Consume
+        );
+        // No peers at all: speak immediately, and there is no order to settle.
+        assert_eq!(
+            lease_decision(now, "machine-a", &[], 0, false),
+            LeaseDecision::Consume
+        );
+    }
+
+    #[test]
+    fn lease_election_first_contact_introduces_with_a_live_peer() {
+        // Cold start on both sides: empty board, live peer. Post the lease, but
+        // stay quiet for the settle window so a simultaneous first claim on the
+        // other side cannot double-answer the batch.
+        assert_eq!(
+            lease_decision(1_000, "machine-a", &[], 0, true),
+            LeaseDecision::Introduce
+        );
+        // A machine that claimed long ago meets the same empty board (its note
+        // was lost and so was the other side's): it still introduces, because
+        // with a live peer and no lease on the board nobody's word is current.
+        assert_eq!(
+            lease_decision(1_000, "machine-a", &[], 900_000, true),
+            LeaseDecision::Introduce
+        );
+        // The same situation with no live peer: no race possible, speak now.
+        assert_eq!(
+            lease_decision(1_000, "machine-a", &[], 0, false),
+            LeaseDecision::Consume
+        );
+    }
+
+    #[test]
+    fn a_successor_resumes_at_the_newest_foreign_cursor() {
+        let mut inbox = Inbox::default();
+        let binding = ChannelBinding {
+            id: "wechat-1".into(),
+            app_id: "a1beaee1847a@im.bot".into(),
+            ..Default::default()
+        };
+        inbox.cursors.insert("wechat-1".into(), "my-stale".into());
+        // Someone else's newest word on the account, with a consumed cursor:
+        // resume there, past what the dead voice already read.
+        let foreign = lease_note("machine-a", "bot@im", 2_000, "their-cursor", 1_000);
+        adopt_newer_cursor(
+            &mut inbox,
+            &binding,
+            std::slice::from_ref(&foreign),
+            "machine-b",
+        );
+        assert_eq!(
+            inbox.cursors.get("wechat-1").map(String::as_str),
+            Some("their-cursor")
+        );
+        // A note I wrote myself is never newer than my live cursor: skip.
+        let mine = lease_note("machine-b", "bot@im", 2_000, "my-old-note", 1_500);
+        adopt_newer_cursor(
+            &mut inbox,
+            &binding,
+            std::slice::from_ref(&mine),
+            "machine-b",
+        );
+        assert_eq!(
+            inbox.cursors.get("wechat-1").map(String::as_str),
+            Some("their-cursor")
+        );
+        // A newer foreign note with an empty cursor consumed nothing: keep my
+        // own position rather than walking backwards.
+        let empty = lease_note("machine-a", "bot@im", 2_000, "", 2_000);
+        adopt_newer_cursor(
+            &mut inbox,
+            &binding,
+            std::slice::from_ref(&empty),
+            "machine-b",
+        );
+        assert_eq!(
+            inbox.cursors.get("wechat-1").map(String::as_str),
+            Some("their-cursor")
+        );
+        // With no position of my own there is nothing to walk backwards to —
+        // the empty cursor is the same as none, and the first-round catch-up
+        // applies.
+        let mut bare = Inbox::default();
+        adopt_newer_cursor(
+            &mut bare,
+            &binding,
+            std::slice::from_ref(&empty),
+            "machine-b",
+        );
+        assert!(!bare.cursors.contains_key("wechat-1"));
+        adopt_newer_cursor(
+            &mut bare,
+            &binding,
+            std::slice::from_ref(&foreign),
+            "machine-b",
+        );
+        assert_eq!(
+            bare.cursors.get("wechat-1").map(String::as_str),
+            Some("their-cursor")
+        );
+    }
+
+    #[test]
+    fn lease_notes_parse_only_their_own_shape() {
+        fn note(origin: &str, ts: u64, text: &str) -> crate::talk::TalkMessage {
+            crate::talk::TalkMessage {
+                id: format!("{origin}:1"),
+                origin: origin.into(),
+                seq: 1,
+                ts,
+                scope: crate::talk::TalkScope::Path {
+                    machine: origin.into(),
+                    path: LEASE_PATH.into(),
+                },
+                author: Default::default(),
+                kind: crate::talk::TalkKind::Note,
+                to: None,
+                reply_to: None,
+                text: text.into(),
+            }
+        }
+        let good = note(
+            "machine-a",
+            42,
+            &format!("{LEASE_PREFIX}\naccount=bot@im\nuntil=999\ncursor=abc123"),
+        );
+        assert_eq!(
+            lease_from(&good, "bot@im"),
+            Some(Leased {
+                holder: "machine-a".into(),
+                until: 999,
+                cursor: "abc123".into(),
+                ts: 42,
+            })
+        );
+        // Another account's lease, a plain note, an old single-line note, and a
+        // note missing its cursor are all simply not a lease for this account.
+        assert_eq!(lease_from(&good, "other@im"), None);
+        assert_eq!(
+            lease_from(&note("machine-b", 1, "plain board note"), "bot@im"),
+            None
+        );
+        assert_eq!(
+            lease_from(
+                &note(
+                    "machine-b",
+                    1,
+                    &format!("{LEASE_PREFIX}account=bot@im until=999")
+                ),
+                "bot@im"
+            ),
+            None
+        );
+        assert_eq!(
+            lease_from(
+                &note(
+                    "machine-b",
+                    1,
+                    &format!("{LEASE_PREFIX}\naccount=bot@im\nuntil=999")
+                ),
+                "bot@im"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn account_key_uses_the_bot_identity_not_the_local_name() {
+        let binding = ChannelBinding {
+            id: "wechat-1".into(),
+            app_id: "  a1beaee1847a@im.bot ".into(),
+            route: "user-123".into(),
+            ..Default::default()
+        };
+        assert_eq!(account_key(&binding), "a1beaee1847a@im.bot");
+        // No bot id: fall back to the person it was scanned to.
+        let bare = ChannelBinding {
+            id: "wechat-2".into(),
+            app_id: String::new(),
+            route: "user-456".into(),
+            ..Default::default()
+        };
+        assert_eq!(account_key(&bare), "user-456");
+        // Nothing at all: the local binding id is the only key left.
+        let empty = ChannelBinding {
+            id: "wechat-3".into(),
+            ..Default::default()
+        };
+        assert_eq!(account_key(&empty), "wechat-3");
+    }
+
+    #[test]
+    fn reply_signatures_count_per_binding_and_survive_a_reload() {
+        let mut inbox = Inbox::default();
+        assert_eq!(
+            inbox.reply_signature("wechat-1", "G3HMWLJP75"),
+            "*— G3HMWLJP75 #1*"
+        );
+        assert_eq!(
+            inbox.reply_signature("wechat-1", "G3HMWLJP75"),
+            "*— G3HMWLJP75 #2*"
+        );
+        // A different binding starts its own count.
+        assert_eq!(inbox.reply_signature("lark-1", "macmini"), "*— macmini #1*");
+        // An unknown machine name means unsigned, as before.
+        assert_eq!(inbox.reply_signature("wechat-1", "   "), "");
+        // The counter survives a save/load round trip.
+        let dir = std::env::temp_dir().join(format!(
+            "muxloom-inbox-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = dir.join("channel-inbox.json");
+        inbox.save(&path).unwrap();
+        let mut loaded = Inbox::load(&path);
+        assert_eq!(
+            loaded.reply_signature("wechat-1", "G3HMWLJP75"),
+            "*— G3HMWLJP75 #3*"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_liveness_follows_the_last_reach_of_each_target() {
+        let local = Target::local();
+        no_longer_heard(&local);
+        assert!(!peers_are_live(std::slice::from_ref(&local)));
+        heard_from(&local);
+        assert!(peers_are_live(std::slice::from_ref(&local)));
+        no_longer_heard(&local);
+        assert!(!peers_are_live(std::slice::from_ref(&local)));
     }
 }
