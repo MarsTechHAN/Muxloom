@@ -247,6 +247,28 @@ pub fn send_text(
         }),
         environment,
     )?;
+    // A reply that is accepted but never delivered is indistinguishable from a
+    // real delivery unless the body is read: WeChat answers HTTP 200 for both
+    // and puts the whole verdict in the code and the reason. What is logged is
+    // the platform's own reply — the code, its human reason, and the shape of
+    // the body (its keys, never the values) — so a stale context token that is
+    // waved through as a success leaves a trace a person can read.
+    crate::debug::log(
+        "ilink",
+        format!(
+            "sendmessage accepted but unverified: code={} reason={} body_keys={:?}",
+            code_of(&answer),
+            answer
+                .get("errmsg")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("none"),
+            answer
+                .as_object()
+                .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        ),
+    );
     complain(&answer)?;
     Ok(id)
 }
@@ -284,38 +306,51 @@ pub fn updates(
         });
     }
     complain(&answer)?;
-    let mut round = Updates {
+    let msgs = answer
+        .get("msgs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Ok(Updates {
+        said: parse_said(msgs),
         cursor: Some(text_at(&answer, "get_updates_buf"))
             .filter(|moved| !moved.is_empty())
             .unwrap_or_else(|| cursor.to_string()),
         ..Updates::default()
-    };
-    for message in answer
-        .get("msgs")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
-        // Only what a person typed. The bot's own words come back through the
-        // same window, and reading those would be a chat talking to itself.
-        if message.get("message_type").and_then(Value::as_i64) != Some(1) {
-            continue;
-        }
-        let Some(text) = spoken(message) else {
-            continue;
-        };
-        round.said.push(Said {
-            message_id: number_or_text(message, "message_id"),
-            from: text_at(message, "from_user_id"),
-            text,
-            at: message
-                .get("create_time_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
-            context_token: text_at(message, "context_token"),
-        });
-    }
-    Ok(round)
+    })
+}
+
+/// Turn one batch of inbound messages into [`Said`], oldest first.
+///
+/// Only what a person typed survives: the bot's own words come back through the
+/// same window, and reading those would be a chat talking to itself.
+///
+/// The order is the point. WeChat does not promise the order of `msgs`, and the
+/// token that answers a conversation is the one off the newest message. Every
+/// consumer downstream — `channel::absorb` and the panel's "last one wins" —
+/// assumes oldest-first, so a reordered reply would silently pin a stale
+/// context token and mute the bot. Sort here, once, rather than trusting the
+/// wire.
+fn parse_said(msgs: &[Value]) -> Vec<Said> {
+    let mut said = msgs
+        .iter()
+        .filter(|message| message.get("message_type").and_then(Value::as_i64) == Some(1))
+        .filter_map(|message| {
+            let text = spoken(message)?;
+            Some(Said {
+                message_id: number_or_text(message, "message_id"),
+                from: text_at(message, "from_user_id"),
+                text,
+                at: message
+                    .get("create_time_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                context_token: text_at(message, "context_token"),
+            })
+        })
+        .collect::<Vec<_>>();
+    said.sort_by_key(|said| said.at);
+    said
 }
 
 /// The words out of one message, with everything that is not words left behind.
@@ -461,6 +496,36 @@ mod tests {
         );
         assert_eq!(spoken(&json!({ "item_list": [] })), None);
         assert_eq!(spoken(&json!({})), None);
+    }
+
+    #[test]
+    fn inbound_is_ordered_oldest_first_no_matter_the_wire_order() {
+        // The reply token is the one off the newest message, and the consumers
+        // of `said` assume oldest-first, so a reordered wire must not pin a
+        // stale context token.
+        let msgs = vec![
+            json!({ "message_type": 1, "create_time_ms": 3000, "context_token": "newest",
+                     "item_list": [{ "type": 1, "text_item": { "text": "c" } }] }),
+            json!({ "message_type": 1, "create_time_ms": 1000, "context_token": "oldest",
+                     "item_list": [{ "type": 1, "text_item": { "text": "a" } }] }),
+            json!({ "message_type": 1, "create_time_ms": 2000, "context_token": "middle",
+                     "item_list": [{ "type": 1, "text_item": { "text": "b" } }] }),
+        ];
+        let said = parse_said(&msgs);
+        assert_eq!(
+            said.iter()
+                .map(|s| s.context_token.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oldest", "middle", "newest"],
+            "the newest message — and its token — must come last"
+        );
+        // Bot-sent messages are left out: a chat must not read its own words.
+        let with_bot = vec![
+            msgs[1].clone(),
+            json!({ "message_type": 2, "create_time_ms": 1500,
+                     "item_list": [{ "type": 1, "text_item": { "text": "bot" } }] }),
+        ];
+        assert_eq!(parse_said(&with_bot).len(), 1);
     }
 
     #[test]
