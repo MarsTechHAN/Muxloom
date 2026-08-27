@@ -295,6 +295,12 @@ pub enum DaemonRequest {
     Delete {
         session_id: String,
     },
+    /// Set the head name (the dashboard row's label) for a session. Additive:
+    /// older daemons simply never receive this and ignore it.
+    SetLabel {
+        session_id: String,
+        label: String,
+    },
     RunShell {
         script: String,
         environment: Vec<(String, String)>,

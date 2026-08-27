@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 5;
+const SKILL_REVISION: u32 = 6;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -254,6 +254,23 @@ To wait for someone rather than poll them:
 ```
 talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 300 }
 ```
+
+## Name what you are doing
+
+Your session has a head name — the top line of your row in the dashboard and
+the agent list. Keep it saying what you are working on *as a whole*, so a
+person watching the board can see your progress without opening your screen:
+
+```
+set_head_name { name: \"fixing MCP timeout\" }
+```
+
+Update it whenever the shape of your work changes — picking up a new task,
+moving to a new sub-goal, delegating to a subagent, getting blocked, or
+finishing. Do not update it on every tool call; it should describe the whole
+task, not the file you happen to be in. Keep it short (under 60 characters)
+and in the language the user works in. A stale name misleads everyone
+watching; one that tracks the current task saves them a click.
 
 ## Ask another agent directly
 
@@ -335,6 +352,18 @@ for anything long-running, and the narrow tools — `list_sessions`,
 `read_screen`, `list_files`, `preview_file`, `search_history` — over shell
 equivalents; they are bounded and safe to repeat. `run_shell` is for a short,
 non-interactive, ideally read-only query that nothing else covers.
+
+## Spawn subagents through muxloom
+
+When you want to fan work out in parallel, launch a real muxloom session with
+`launch_session` (an opencode / codex / claude / pi agent in its own
+terminal) — not your harness's built-in subagent or task tool. Built-in
+subagents are invisible: they never appear in the dashboard, never post to
+the talk board, and die the moment your own process ends. A muxloom session
+is a colleague you can watch, message, and hand off to: the person at the
+dashboard sees it running and knows when it is done. Give each one a clear
+label and a specific brief, then follow it with `wait_for`, `read_screen`,
+and `message_agent` exactly like any other session.
 
 ## Ask the human first
 

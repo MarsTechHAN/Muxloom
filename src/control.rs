@@ -121,6 +121,7 @@ const WRITE_TOOLS: &[&str] = &[
     "trigger",
     "talk_post",
     "send_channel_message",
+    "set_head_name",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,17 +199,32 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              something done over there, ask an agent on that machine with message_agent.\n"
         }
     };
+    // Only a session has a head name of its own: the daemon flavor runs inside one,
+    // while the controller is the user's fleet-wide view and has no row to name.
+    let headname = match flavor {
+        Flavor::Daemon => {
+            "- Keep your head name honest: set_head_name {{ name: \"...\" }} updates the name on \
+             your row in the dashboard, so a person watching sees your current task at a glance. \
+             Update it when the shape of your work changes, not on every step; keep it a whole- \
+             task phrase under 60 characters.\n"
+        }
+        Flavor::Controller => "",
+    };
     let mut text = format!(
         "muxloom manages long-lived terminal sessions — Codex, Claude Code, pi, OpenCode, and \
          plain shells — \
          {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
          be watching any of them right now.\n\n\
          Work through the sessions rather than around them:\n\
-         - To get work done on a machine, talk to the agent session that lives there: \
-         message_agent to say something to another agent, send_input for raw keystrokes and for \
-         plain shells, then wait_for or read_screen to see what came of it. Treat a session as a \
-         colleague you are messaging, not as a subprocess you drive.\n\
-         - A message lands in the session's prompt box and is read when its turn ends. For pi and \
+          - To get work done on a machine, talk to the agent session that lives there: \
+          message_agent to say something to another agent, send_input for raw keystrokes and for \
+          plain shells, then wait_for or read_screen to see what came of it. Treat a session as a \
+          colleague you are messaging, not as a subprocess you drive.\n\
+          - Subagents are sessions too. To fan work out, launch one with launch_session so it \
+          shows up in the dashboard and on the task board where you and the person watching can \
+          both follow it. Do not reach for your harness's built-in subagent or task tool: those \
+          are invisible, untracked, and die with your process.\n\
+          - A message lands in the session's prompt box and is read when its turn ends. For pi and \
          OpenCode the box is read off their screen like the others: if it already holds an \
          unsent sentence your message is held until it clears, and if a model or effort picker is \
          up it waits rather than answering the dialog. When unsure whether a message went in, \
@@ -219,8 +235,9 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          session you could talk to would do better.\n\
          - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
          search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\n\
-         Work with the others out in the open:\n\
-         - talk_read before you start and after you have been away: the board carries what every \
+          Work with the others out in the open:\n\
+          {headname}\
+          - talk_read before you start and after you have been away: the board carries what every \
          other agent and every person at a dashboard is doing, on every machine. talk_post what \
          you are about to change before you change it, and post what you worked out as kind \
          \"note\" so whoever comes next finds it instead of working it out again. When you are \
@@ -811,6 +828,25 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             &["script"],
         ),
     });
+    // Daemon-only: only a session has its own head name. The controller is a
+    // fleet-wide view with no row of its own to rename.
+    if flavor == Flavor::Daemon {
+        tools.push(ToolSpec {
+            name: "set_head_name",
+            description: "Set your own session's head name (the name on your row in the dashboard / \
+                          agent list). Use it to reflect, as a whole, what you are currently working \
+                          on. Keep it short (under 60 chars) and update it when the shape of your \
+                          work changes, not on every step."
+                .into(),
+            input_schema: schema(
+                false,
+                json!({
+                    "name": { "type": "string", "description": "Short phrase describing your current task." },
+                }),
+                &["name"],
+            ),
+        });
+    }
     tools
 }
 
@@ -3294,6 +3330,32 @@ mod daemon_surface {
             }
         }
 
+        /// What the caller calls its own session in the dashboard. Only the
+        /// session itself may set it: the id comes from the environment this
+        /// surface was launched with, never from the arguments, so an agent
+        /// cannot rename somebody else's row.
+        fn set_head_name(&self, arguments: &Value) -> Result<String> {
+            let session_id = session_env("MUXLOOM_SESSION_ID")
+                .context("set_head_name can only be called from within a muxloom session")?;
+            const MAX_HEAD_NAME: usize = 80;
+            let name: String = required_str(arguments, "name")?
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            if name.is_empty() {
+                bail!("name must not be empty");
+            }
+            if name.chars().count() > MAX_HEAD_NAME {
+                bail!("name is too long: {MAX_HEAD_NAME} characters at most");
+            }
+            self.expect_ack(&DaemonRequest::SetLabel {
+                session_id,
+                label: name.clone(),
+            })?;
+            Ok(format!("Head name set to: {name}"))
+        }
+
         fn search_history(&self, arguments: &Value) -> Result<String> {
             let query = required_str(arguments, "query")?;
             let sessions: Vec<(String, String)> = match optional_str(arguments, "session_id") {
@@ -3463,6 +3525,7 @@ mod daemon_surface {
                     }
                 }
                 "run_shell" => self.run_shell(arguments),
+                "set_head_name" => self.set_head_name(arguments),
                 other => bail!("unknown tool {other}"),
             }
         }
@@ -3781,6 +3844,11 @@ mod tests {
         let daemon: Vec<_> = specs(Flavor::Daemon);
         let controller: Vec<_> = specs(Flavor::Controller);
         for tool in &daemon {
+            // The daemon runs inside one session and can name that row; the
+            // controller is a fleet view with no row of its own.
+            if tool.name == "set_head_name" {
+                continue;
+            }
             let twin = controller
                 .iter()
                 .find(|candidate| candidate.name == tool.name)
@@ -3828,6 +3896,10 @@ mod tests {
             assert!(controller.iter().any(|tool| tool.name == name));
             assert!(!daemon.iter().any(|tool| tool.name == name));
         }
+        // A head name belongs to one session's row; only the daemon
+        // surface, which lives inside a session, can set one.
+        assert!(daemon.iter().any(|tool| tool.name == "set_head_name"));
+        assert!(!controller.iter().any(|tool| tool.name == "set_head_name"));
     }
 
     #[test]
@@ -4394,6 +4466,117 @@ mod tests {
                 json!({ "include_archived": true }),
             );
             assert!(!listed.contains(&session_id));
+        }
+
+        // The tests below rewrite MUXLOOM_SESSION_ID, a process-global env var
+        // the whole binary reads, so they must not overlap one another.
+        static HEAD_NAME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Hold one env var at a value for a test, restoring it on drop.
+        struct EnvScope {
+            key: &'static str,
+            previous: Option<String>,
+        }
+        impl EnvScope {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let previous = std::env::var(key).ok();
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+                Self { key, previous }
+            }
+        }
+        impl Drop for EnvScope {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => unsafe { std::env::set_var(self.key, value) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+
+        #[test]
+        fn set_head_name_renames_the_callers_own_session_row() {
+            let _env_lock = HEAD_NAME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut surface = surface("headname");
+            let launched: Value = serde_json::from_str(&call(
+                &mut surface,
+                "launch_session",
+                json!({ "kind": "terminal", "path": std::env::temp_dir().to_str().unwrap() }),
+            ))
+            .unwrap();
+            let session_id = launched["session_id"].as_str().unwrap().to_string();
+
+            // The id comes from the environment this surface was launched in,
+            // never from the arguments, so set it for the call and clear it after.
+            let scope = EnvScope::set("MUXLOOM_SESSION_ID", Some(&session_id));
+            let reply = call(
+                &mut surface,
+                "set_head_name",
+                json!({ "name": "  fixing the lexer \u{7f} " }),
+            );
+            drop(scope);
+            assert!(
+                reply.contains("Head name set to: fixing the lexer"),
+                "{reply}"
+            );
+
+            // The row the dashboard reads now carries the new head name.
+            let listed: Value =
+                serde_json::from_str(&call(&mut surface, "list_sessions", json!({}))).unwrap();
+            let row = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|session| session["session_id"] == session_id)
+                .expect("session must still be listed");
+            assert_eq!(row["label"], "fixing the lexer");
+
+            call(
+                &mut surface,
+                "delete_session",
+                json!({ "session_id": session_id }),
+            );
+        }
+
+        #[test]
+        fn set_head_name_is_refused_outside_a_session_and_on_a_bad_name() {
+            let _env_lock = HEAD_NAME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let surface = surface("headname-none");
+
+            // No session id in the environment: this surface has no row to name.
+            let scope = EnvScope::set("MUXLOOM_SESSION_ID", None);
+            let error = surface
+                .call("set_head_name", &json!({ "name": "x" }))
+                .unwrap_err()
+                .to_string();
+            drop(scope);
+            assert!(
+                error.contains("only be called from within a muxloom session"),
+                "{error}"
+            );
+
+            // A name that is only control characters or whitespace clears to
+            // empty and is refused rather than stored blank.
+            let scope = EnvScope::set("MUXLOOM_SESSION_ID", Some("any-session"));
+            let error = surface
+                .call("set_head_name", &json!({ "name": "  \u{1f} " }))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must not be empty"), "{error}");
+
+            // And a name past the cap is refused before it reaches the daemon.
+            let error = surface
+                .call("set_head_name", &json!({ "name": "x".repeat(81) }))
+                .unwrap_err()
+                .to_string();
+            drop(scope);
+            assert!(error.contains("too long"), "{error}");
         }
 
         #[test]
