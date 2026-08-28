@@ -2398,9 +2398,15 @@ impl<'a> Desk<'a> {
         })
     }
 
-    /// Which machine a session is on, when a receipt only remembered its id.
+    /// Which machine a session is on. When the caller has remembered a machine
+    /// that is still among this desk's reachable targets, trust it — it is what
+    /// a receipt saved, and the cheap path. But a receipt is written once and
+    /// answered later, and a session may have moved or been resumed under a
+    /// different machine name in between, so a remembered machine that no
+    /// longer resolves is not an end of the road: the live session list knows
+    /// where the session really is, and matching by id is the source of truth.
     fn locate(&mut self, who: &Correspondent) -> Option<Correspondent> {
-        if !who.machine.is_empty() {
+        if !who.machine.is_empty() && self.target(&who.machine).is_some() {
             return Some(who.clone());
         }
         self.sessions()
@@ -4240,5 +4246,33 @@ mod tests {
         assert!(peers_are_live(std::slice::from_ref(&local)));
         no_longer_heard(&local);
         assert!(!peers_are_live(std::slice::from_ref(&local)));
+    }
+
+    #[test]
+    fn a_remembered_machine_that_stopped_resolving_is_not_trusted_for_a_live_session() {
+        // A receipt saves the machine a session was on when it answered, but
+        // the receipt is answered later and the session may have been resumed
+        // under a machine id the current desk no longer routes to (a hostname
+        // rename, a fleet resume, a controller that sees a different set).
+        // `locate` must not hand that stale machine straight through — the old
+        // behaviour did, and the routing step then claimed the agent "is on a
+        // machine muxloom cannot reach" even while the session was alive
+        // elsewhere. With no desk target and no live session present, the
+        // resolved correspondent is gone rather than poisoned.
+        let config = crate::config::Config::default();
+        let runtime = Runtime::new(&config);
+        let mut desk = Desk::new(&runtime, &[], &config);
+        let who = Correspondent {
+            machine: "seed".into(),
+            session_id: "session-9".into(),
+            label: "lexicon".into(),
+            ..Default::default()
+        };
+        let resolved = desk.locate(&who);
+        assert!(
+            resolved.is_none() || resolved.as_ref().unwrap().machine != "seed",
+            "a stale remembered machine must not survive locate unchanged \
+             (it would fail target() and report 'cannot reach'): {resolved:#?}"
+        );
     }
 }
