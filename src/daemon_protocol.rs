@@ -11,6 +11,10 @@ use crate::{
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// A daemon that watches its sessions for the moment they fall under a
+/// subagent's parent's notice, and will hand those moments to a controller
+/// that asks. Additive: a daemon too old to have it simply never gets asked.
+pub const PARENT_ALERT_CAPABILITY: &str = "parent-alerts-v1";
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const DATA_CHUNK_SIZE: usize = 64 * 1024;
@@ -244,6 +248,13 @@ pub enum DaemonRequest {
         /// from every launch a human makes.
         #[serde(default)]
         parent: Option<String>,
+        /// A prompt the runtime left out of the command line because that CLI
+        /// reads a positional argument as something else — OpenCode reads it as
+        /// the project directory and dies on the spot. The daemon types it in
+        /// once the session shows a ready prompt box, on the same path a queued
+        /// direct message takes. Absent from a client too old to send one.
+        #[serde(default)]
+        initial_prompt: Option<String>,
     },
     Resize {
         session_id: String,
@@ -412,6 +423,13 @@ pub enum DaemonRequest {
     ChannelSent {
         receipt: ChannelReceipt,
     },
+    /// A controller taking the attention edges this daemon has marked but not
+    /// yet handed over: child sessions that fell under their parent's notice
+    /// since the last ask. Answering hands them over and forgets them, the way
+    /// `ChannelsGet` hands over receipts; a controller that never delivers one
+    /// will hear about the same session again once the debounce has passed,
+    /// because the child is still sitting on its question.
+    DrainAlerts,
 }
 
 /// What a [`Trigger`] does when its pattern reaches a session's screen.
@@ -484,7 +502,7 @@ pub enum DaemonResponse {
         sessions: Vec<DaemonSession>,
     },
     Launched {
-        session: DaemonSession,
+        session: Box<DaemonSession>,
     },
     Ack,
     HistoryComplete {
@@ -592,6 +610,13 @@ pub enum DaemonResponse {
         #[serde(default)]
         receipts: Vec<ChannelReceipt>,
     },
+    /// Answers `DrainAlerts`. Empty from a daemon that has watched and seen
+    /// nothing, which is the usual answer and the same one a daemon too old
+    /// to watch would give.
+    Alerts {
+        #[serde(default)]
+        alerts: Vec<ParentAlert>,
+    },
     Error {
         message: String,
     },
@@ -641,10 +666,45 @@ pub struct DaemonSession {
     ///
     /// It names a session id and nothing else. A child started on another
     /// machine keeps the id of the agent that asked for it even though the two
-    /// are not on the same daemon; the id is enough to say they belong to the
-    /// same piece of work, which is what a reader wants to know.
+    /// are not on the same daemon; the id is enough to say they belong to
+    /// the same piece of work, which is what a reader wants to know.
     #[serde(default)]
     pub parent: Option<String>,
+    /// The archived session this one resumes, when a conversation came back
+    /// under a new muxloom id rather than its own. The alias is recorded on
+    /// both sides - `resumed_to` on the record it moved out of, `resumed_from`
+    /// on the session that carries it now - so late rewrites and board
+    /// archaeology still resolve either direction. Absent from every session
+    /// that never moved, and from daemons too old to record it.
+    #[serde(default)]
+    pub resumed_from: Option<String>,
+    /// The session this archived record's conversation moved to, when the
+    /// resume could not come back on this id. What still points at this id
+    /// - children above all - is repointed at the successor as the alias is
+    ///   written, so a split master never strands its fleet.
+    #[serde(default)]
+    pub resumed_to: Option<String>,
+}
+
+/// One attention edge the daemon saw but has not told anyone about yet: a
+/// session with a parent that started needing someone. It carries just enough
+/// for a controller to say what happened in its own words; the daemon has
+/// already decided *that* it happened, which is the part only this machine
+/// could know.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParentAlert {
+    pub session_id: String,
+    /// The session to tell. Always one this daemon also runs: a child is
+    /// launched on its parent's machine.
+    pub parent_session_id: String,
+    pub kind: String,
+    pub label: String,
+    pub attention_reason: Option<String>,
+    /// The last thing the child was seen to say, for the recap line.
+    #[serde(default)]
+    pub recap: Option<String>,
+    /// When the daemon marked the edge (epoch ms).
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -49,6 +49,11 @@ const MAX_MESSAGE_CHARS: usize = 180;
 /// be stamped a moment before muxloom records the launch. Anything inside this
 /// much slack counts as "started together".
 pub const START_GRACE_MS: u64 = 30_000;
+/// How much of a conversation's first words both accounts have to share an
+/// understanding of before agreement or contradiction means anything. "yes"
+/// and "no" are real first words, but they tell nothing about which of two
+/// transcripts heard them.
+pub const MIN_FIRST_TEXT_CHARS: usize = 12;
 
 /// One conversation as its CLI recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +74,11 @@ pub struct NativeThread {
     pub title: Option<String>,
     /// The last thing the agent said in it.
     pub last_message: Option<String>,
+    /// The first thing the person said in it, as recorded near the start of
+    /// the transcript. It is the thread's own account of who was talking to
+    /// it first, which is what tells one sibling's conversation from another
+    /// when two agents start in one folder seconds apart.
+    pub first_message: Option<String>,
 }
 
 /// Every thread in `cwd` that has been written to since `since` (epoch ms).
@@ -152,6 +162,12 @@ pub struct SessionFacts {
     pub claimed: Option<String>,
     /// Threads it has been moved off and must not drift back onto.
     pub abandoned: Vec<String>,
+    /// The first substantial thing the daemon saw typed into this session.
+    /// The transcript a session is writing records the same words as the
+    /// first thing the person said, so a session carrying this can check its
+    /// claim against content instead of timing, and can be re-matched when a
+    /// crossed claim contradicts what it was actually asked.
+    pub first_prompt: Option<String>,
 }
 
 /// Which thread each session is writing, as an index into `threads`.
@@ -163,16 +179,31 @@ pub struct SessionFacts {
 ///
 /// 1. A session already on a thread stays on it. Rematching every round would
 ///    let a newly started sibling take an older session's conversation away.
+///    A claim is only ever given up on positive evidence: the transcript's
+///    own first recorded words contradicting what this session was asked to
+///    do. That is the crossed claim - two siblings started together each
+///    matched to the other's conversation, which timing cannot see and the
+///    first messages can.
 /// 2. A session launched to resume a thread gets that thread, or - for a CLI
 ///    that opens a fresh file when it resumes - the newest fork descended from
 ///    it.
-/// 3. Whatever is left is matched by when it began: the session and the
+/// 3. What the daemon typed into a session and what a transcript recorded as
+///    the first thing said in it are the same words, so a session that knows
+///    what it was asked pairs with the free thread that agrees with it, when
+///    each has exactly one such partner. Two agents started seconds apart are
+///    told apart by their words, not by their timing.
+/// 4. Whatever is left is matched by when it began: the session and the
 ///    transcript that started closest together are paired off first, then the
 ///    next closest, and so on. A transcript that began before every session
-///    here belongs to an agent muxloom did not launch, and is left alone.
+///    here belongs to an agent muxloom did not launch, and is left alone. A
+///    session released by its own contradiction does not fall straight back
+///    onto the thread it just released.
 pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Vec<Option<usize>> {
     let mut picks = vec![None; sessions.len()];
     let mut taken = vec![false; threads.len()];
+    // Per session, the thread its claim contradicted: freed for the sibling
+    // that actually owns it, and barred from this session's timing round.
+    let mut released = vec![None; sessions.len()];
 
     for (index, session) in sessions.iter().enumerate() {
         let Some(claimed) = session.claimed.as_deref() else {
@@ -181,12 +212,23 @@ pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Ve
         if session.abandoned.iter().any(|id| id == claimed) {
             continue;
         }
-        if let Some(found) = threads.iter().position(|thread| thread.id == claimed)
-            && !taken[found]
-        {
-            picks[index] = Some(found);
-            taken[found] = true;
+        let Some(found) = threads.iter().position(|thread| thread.id == claimed) else {
+            continue;
+        };
+        if taken[found] {
+            continue;
         }
+        // Lock-in by default; contradiction is the one way off.
+        if first_text_agreement(
+            session.first_prompt.as_deref(),
+            threads[found].first_message.as_deref(),
+        ) == FirstText::Contradict
+        {
+            released[index] = Some(found);
+            continue;
+        }
+        picks[index] = Some(found);
+        taken[found] = true;
     }
 
     for (index, session) in sessions.iter().enumerate() {
@@ -202,9 +244,53 @@ pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Ve
         }
     }
 
-    // Every pairing still allowed, nearest in time first. Two agents started
-    // seconds apart are only told apart by which transcript appeared closest
-    // to which launch.
+    // First-message correlation. A thread claimed by nobody, or released by
+    // its holder's contradiction, is recognized by the words it opens with -
+    // but only where the pairing is one to one. Where two transcripts begin
+    // with the same sentence no content picks a winner, and timing does the
+    // best it can below.
+    let candidates = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            if picks[index].is_some() {
+                return Vec::new();
+            }
+            threads
+                .iter()
+                .enumerate()
+                .filter(|(thread_index, thread)| {
+                    !taken[*thread_index]
+                        && released[index] != Some(*thread_index)
+                        && !session.abandoned.contains(&thread.id)
+                        && first_text_agreement(
+                            session.first_prompt.as_deref(),
+                            thread.first_message.as_deref(),
+                        ) == FirstText::Match
+                })
+                .map(|(thread_index, _)| thread_index)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (index, matches) in candidates.iter().enumerate() {
+        let [only] = matches.as_slice() else {
+            continue;
+        };
+        if candidates
+            .iter()
+            .filter(|other| other.contains(only))
+            .count()
+            == 1
+        {
+            picks[index] = Some(*only);
+            taken[*only] = true;
+        }
+    }
+
+    // Every pairing still allowed, nearest in time first. This is what is
+    // left when a session knows nothing of what it was asked and a transcript
+    // said nothing of who spoke first: two agents started seconds apart are
+    // only told apart by which transcript appeared closest to which launch.
     let mut pairings = Vec::new();
     for (index, session) in sessions.iter().enumerate() {
         if picks[index].is_some() {
@@ -216,6 +302,7 @@ pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Ve
                 // recognized by its id.
                 || thread.started_at == 0
                 || session.abandoned.contains(&thread.id)
+                || released[index] == Some(thread_index)
                 || session.created_at > thread.started_at.saturating_add(START_GRACE_MS)
             {
                 continue;
@@ -235,6 +322,46 @@ pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Ve
         }
     }
     picks
+}
+
+/// How the two accounts of a conversation's opening line stand together:
+/// what the daemon typed into a session, and what the transcript recorded as
+/// the first thing the person said in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstText {
+    /// The same words, one account carrying the other.
+    Match,
+    /// One account is missing, or both are too short to mean anything. Says
+    /// nothing either way, and leaves the claim and the timing as they were.
+    Unknown,
+    /// Two real openings that are not the same words. The claim is on
+    /// somebody else's conversation.
+    Contradict,
+}
+
+fn first_text_agreement(prompt: Option<&str>, recorded: Option<&str>) -> FirstText {
+    let (Some(prompt), Some(recorded)) = (
+        prompt.and_then(clean_message),
+        recorded.and_then(clean_message),
+    ) else {
+        return FirstText::Unknown;
+    };
+    let (shorter, longer) = if prompt.chars().count() <= recorded.chars().count() {
+        (prompt, recorded)
+    } else {
+        (recorded, prompt)
+    };
+    if shorter.chars().count() < MIN_FIRST_TEXT_CHARS {
+        return FirstText::Unknown;
+    }
+    // Either account can carry more than the other: a delivered envelope
+    // around what was said, a preamble the CLI pinned in front of it. The
+    // words are the same when one reads as the whole of the other.
+    if longer.contains(&shorter) {
+        FirstText::Match
+    } else {
+        FirstText::Contradict
+    }
 }
 
 /// The furthest fork descended from `seed`, or `seed` itself. Codex opens a
@@ -385,6 +512,7 @@ fn claude_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
         .map(str::to_string);
     let mut cwd = None;
     let mut started_at = 0;
+    let mut first_message = None;
     for value in read_head(path, HEAD_BYTES)?.lines().filter_map(parse_line) {
         if cwd.is_none() {
             cwd = value.get("cwd").and_then(Value::as_str).map(normalize_path);
@@ -396,7 +524,10 @@ fn claude_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
                 .and_then(parse_timestamp)
                 .unwrap_or(0);
         }
-        if cwd.is_some() && started_at != 0 {
+        if first_message.is_none() {
+            first_message = claude_user_text(&value).and_then(clean_message);
+        }
+        if cwd.is_some() && started_at != 0 && first_message.is_some() {
             break;
         }
     }
@@ -436,7 +567,30 @@ fn claude_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
         forked_from: None,
         title: title.or(legacy_title),
         last_message,
+        first_message,
     })
+}
+
+/// What the person themselves said on a transcript line, if that is what it
+/// is. The runtimes file a great deal under the person's role besides what
+/// they said - see [`is_spoken`] - and the first real sentence is what a
+/// session's own first prompt gets matched against.
+fn claude_user_text(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) != Some("user")
+        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let content = value.get("message")?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return is_spoken(text).then_some(text);
+    }
+    content
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .find(|text| is_spoken(text))
 }
 
 /// What the agent itself said on a transcript line, if that is what it is. A
@@ -550,6 +704,11 @@ fn codex_thread(
         .get("forked_from_id")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let first_message = head
+        .lines()
+        .filter_map(parse_line)
+        .filter_map(|value| codex_user_text(&value).and_then(clean_message))
+        .next();
 
     let mut last_message = None;
     for value in read_tail(path, TAIL_BYTES)?.lines().filter_map(parse_line) {
@@ -567,7 +726,23 @@ fn codex_thread(
         updated_at,
         forked_from,
         last_message,
+        first_message,
     })
+}
+
+/// What the person themselves said on a rollout line. Codex files the
+/// environment it was handed as a message too; whatever is not a real
+/// sentence is no one's first words - see [`is_spoken`].
+fn codex_user_text(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+        return None;
+    }
+    let message = payload.get("message").and_then(Value::as_str)?;
+    is_spoken(message).then_some(message)
 }
 
 /// What the agent itself said on a rollout line. A subagent's activity is
@@ -672,6 +847,7 @@ fn pi_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
         forked_from,
         title,
         last_message,
+        first_message: None,
     })
 }
 
@@ -832,6 +1008,10 @@ fn opencode_thread(row: &Value, store: &Path) -> Option<NativeThread> {
         title: opencode_title(row).and_then(clean_message),
         last_message: row
             .get("last_text")
+            .and_then(Value::as_str)
+            .and_then(clean_message),
+        first_message: row
+            .get("first_text")
             .and_then(Value::as_str)
             .and_then(clean_message),
     })
@@ -1129,6 +1309,7 @@ mod tests {
             forked_from: None,
             title: None,
             last_message: None,
+            first_message: None,
         }
     }
 

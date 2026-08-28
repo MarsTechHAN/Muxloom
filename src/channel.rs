@@ -628,11 +628,12 @@ pub struct Sent {
     pub channel: String,
     /// That binding described without its secret, for the answer and the panel.
     pub through: String,
-    /// The id a reply can be matched against. Lark's is the platform's own,
-    /// which is what a human's reply points back at. WeChat's is the one this
-    /// side minted, because a reply there comes back naming something else
-    /// entirely — so a WeChat chat is answered by aim and by who spoke last,
-    /// not by which message was replied to.
+    /// The id a reply can be matched against: the platform's own, on both
+    /// kinds. A human's reply — Lark's `parent_id`, WeChat's quote — names
+    /// this id and nothing else, so a WeChat send that earned one keeps it.
+    /// Only a send the body gave no id for (accepted but never delivered, so
+    /// nothing can ever quote it) falls back to the id this side minted, and
+    /// that fallback buys receipt bookkeeping, not reply matching.
     pub message_id: String,
     /// WeChat only: the platform's verdict on this send. None for Lark, since
     /// its HTTP status alone is sufficient to know whether delivery succeeded.
@@ -649,13 +650,31 @@ pub fn send(
     message: &Outgoing,
     environment: &[(String, String)],
 ) -> Result<Sent> {
+    send_reply(binding, message, None, environment)
+}
+
+/// Post one message that answers another by name, on the platforms that can.
+///
+/// `reply_to` is the platform's id for the message being answered — the very
+/// id a prior send reported and a quote-reply arrived naming, which is the
+/// same number seen from either end. WeChat draws it as a quote of that
+/// message. Lark threads a reply by its own parent, which this send path does
+/// not drive, so there `reply_to` changes nothing. This is the seam the
+/// `send_channel_message` tool's `reply_to` argument comes through: whatever
+/// an agent was told to answer, it answers quoting that.
+pub fn send_reply(
+    binding: &ChannelBinding,
+    message: &Outgoing,
+    reply_to: Option<&str>,
+    environment: &[(String, String)],
+) -> Result<Sent> {
     binding.ready()?;
     if message.text.trim().is_empty() {
         bail!("a channel message needs something to say");
     }
     match binding.kind {
         ChannelKind::Lark => send_lark(binding, message, environment),
-        ChannelKind::WeChat => send_wechat(binding, message, environment),
+        ChannelKind::WeChat => send_wechat(binding, message, reply_to, environment),
     }
 }
 
@@ -1044,6 +1063,7 @@ fn inline(line: &str) -> String {
 fn send_wechat(
     binding: &ChannelBinding,
     message: &Outgoing,
+    reply_to: Option<&str>,
     environment: &[(String, String)],
 ) -> Result<Sent> {
     let (title, body) = message.compose(WECHAT_LIMIT);
@@ -1053,13 +1073,20 @@ fn send_wechat(
         true => plain(&body),
         false => format!("{title}\n\n{}", plain(&body)),
     };
-    let (message_id, verdict) = ilink::send_text(
+    let (client_id, verdict) = ilink::send_text(
         &wechat_account(binding),
         binding.context_token.trim(),
         &text,
+        reply_to,
         environment,
     )
     .with_context(|| format!("channel {} could not reach WeChat", binding.id))?;
+    // What a quote of this message will name is WeChat's own id from the
+    // reply body, not the `client_id` this side minted — so the id the tool
+    // result hands the agent and the receipt keeps is the platform's whenever
+    // it issued one. A send the body gave no id for was never delivered and
+    // can never be quoted; the minted id is kept for bookkeeping only.
+    let message_id = verdict.message_id.clone().unwrap_or(client_id);
     Ok(Sent {
         channel: binding.id.clone(),
         through: binding.describes(),
@@ -1176,6 +1203,10 @@ pub struct ChannelReceipt {
     pub channel: String,
     /// The platform's id for the message, which is what a reply names.
     pub message_id: String,
+    /// The machine the answering agent runs on, so a quote that lands on a
+    /// different dashboard can still name where its agent lives.
+    #[serde(default)]
+    pub machine: String,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -1303,7 +1334,7 @@ impl Inbox {
     /// settled later by whoever can ask.
     fn correspondent(receipt: &ChannelReceipt) -> Correspondent {
         Correspondent {
-            machine: String::new(),
+            machine: receipt.machine.clone(),
             session_id: receipt.session_id.clone(),
             label: receipt.label.clone(),
             // A recipient recovered from a receipt is assumed live for the
@@ -1570,9 +1601,11 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target], set: &ChannelSet) -> Chan
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Incoming {
     pub message_id: String,
-    /// The message it answers, when it answers one. Lark only: WeChat's reply
-    /// arrives pointing at an item id that has nothing to do with the id the
-    /// send gave back, so there is nothing honest to match it against.
+    /// The message it answers, when it answers one. Lark carries it as the
+    /// message's `parent_id`; WeChat delivers a quote-reply as an ordinary
+    /// message whose item names the quoted message by the very id that send's
+    /// reply body handed back — so on both kinds this matches a receipt, and
+    /// a quoted answer finds the agent that wrote the quoted message.
     pub reply_to: Option<String>,
     /// Epoch milliseconds, as the platform recorded it.
     pub at: u64,
@@ -1752,7 +1785,7 @@ fn wechat_inbox(
                 true => format!("wechat-{}-{}", binding.id, said.at),
                 false => said.message_id,
             },
-            reply_to: None,
+            reply_to: said.quoted_id,
             at: said.at,
             text: said.text,
             context_token: said.context_token,
@@ -2094,6 +2127,26 @@ fn lease_round(
     }
 }
 
+/// The message an answer should quote back, when the message just handled was
+/// itself a quote.
+///
+/// Two things have to hold. The quote has to name a message this side sent —
+/// its reference matches a receipt — or there is no exchange of ours to stay
+/// in; and WeChat has to have numbered the human's own message, since a
+/// synthetic catch-up id names a message the platform never gave a number and
+/// so nothing can point at it. The answer quotes the human's message rather
+/// than the one they quoted: their quote is drawn inside their message on the
+/// phone, so pointing at theirs keeps every level of the thread one tap away.
+fn quoting_target(message: &Incoming, inbox: &Inbox) -> Option<String> {
+    message
+        .reply_to
+        .as_deref()
+        .filter(|quoted| inbox.sender_of(quoted).is_some())?;
+    let numbered =
+        !message.message_id.is_empty() && message.message_id.chars().all(|c| c.is_ascii_digit());
+    numbered.then(|| message.message_id.clone())
+}
+
 /// Read every chat a human can answer through, and put what they said where it
 /// belongs.
 ///
@@ -2212,12 +2265,21 @@ pub fn run_inbox(
                 text: answer,
                 signature: inbox.reply_signature(&binding.id, &local_name),
             };
-            match send(&answering, &receipt, environment) {
+            // When the message just handled quoted one of our own, the answer
+            // quotes theirs back: the thread stays visible as the chain it is
+            // on the phone, and the next quote — theirs of this answer —
+            // matches the receipt below and finds this same agent again.
+            let quoting = match binding.kind {
+                ChannelKind::WeChat => quoting_target(&message, inbox),
+                ChannelKind::Lark => None,
+            };
+            match send_reply(&answering, &receipt, quoting.as_deref(), environment) {
                 Ok(sent) if !sent.message_id.is_empty() => {
                     if let Some(who) = desk.last_agent.clone() {
                         inbox.remember(ChannelReceipt {
                             channel: binding.id.clone(),
                             message_id: sent.message_id,
+                            machine: who.machine,
                             session_id: who.session_id,
                             label: who.label,
                         });
@@ -2824,6 +2886,27 @@ fn handle(
             let Some(target) = desk.target(&who.machine).cloned() else {
                 return format!("· {} is on a machine muxloom cannot reach", who.name());
             };
+            // When they replied by quoting one of this agent's own messages,
+            // the quoted platform id is the one thing the agent needs to
+            // answer quoting the same exchange, and nothing else carries it
+            // across the delivery: name it in the words they receive. Only a
+            // quote that matches this agent's receipt gets the note — a quote
+            // of somebody else's message is not theirs to answer quoting.
+            let text = match message.reply_to.as_deref() {
+                Some(quoted)
+                    if binding.kind == ChannelKind::WeChat
+                        && inbox
+                            .sender_of(quoted)
+                            .is_some_and(|from| from.session_id == who.session_id) =>
+                {
+                    format!(
+                        "{text}\n\n(muxloom: this quotes your message {quoted} — \
+                         answer with send_channel_message reply_to \"{quoted}\" \
+                         and it quotes the exchange back)"
+                    )
+                }
+                _ => text,
+            };
             let draft = crate::talk::TalkDraft {
                 scope: crate::talk::TalkScope::Machine {
                     machine: String::new(),
@@ -3366,6 +3449,7 @@ mod tests {
         inbox.remember(ChannelReceipt {
             channel: "lark-1".into(),
             message_id: "om_1".into(),
+            machine: String::new(),
             session_id: "s-lexer".into(),
             label: "lexer".into(),
         });
@@ -3402,6 +3486,7 @@ mod tests {
         inbox.remember(ChannelReceipt {
             channel: "wechat-1".into(),
             message_id: "m_1".into(),
+            machine: String::new(),
             session_id: "s-lexer".into(),
             label: "lexer".into(),
         });
@@ -3427,6 +3512,88 @@ mod tests {
             route("go ahead", None, "wechat-2", true, &inbox).0,
             Route::Board { asked: false }
         );
+    }
+
+    #[test]
+    fn a_wechat_quote_finds_the_agent_whose_message_it_named() {
+        let mut inbox = Inbox::default();
+        // The id is exactly what the send's reply body named and the quote
+        // arrived naming: a number, as a string, on both ends.
+        inbox.remember(ChannelReceipt {
+            channel: "wechat-1".into(),
+            message_id: "7498971037873973384".into(),
+            machine: "seed".into(),
+            session_id: "s-lexer".into(),
+            label: "lexer".into(),
+        });
+        // Even in a group, even unaimed: the quote is an address, and it is
+        // the shortest way back to the agent that wrote the quoted message.
+        assert_eq!(
+            route(
+                "你好你好",
+                Some("7498971037873973384"),
+                "wechat-1",
+                false,
+                &inbox
+            )
+            .0,
+            Route::Agent(who("s-lexer", "lexer"))
+        );
+        // A quote naming a message nobody here sent matches nothing, and
+        // falls through exactly as an unquoted sentence would.
+        assert_eq!(
+            route("hi", Some("7498971037873973999"), "wechat-1", false, &inbox).0,
+            Route::Board { asked: false }
+        );
+    }
+
+    #[test]
+    fn an_answer_to_a_quote_of_our_own_quotes_their_message_back() {
+        let mut inbox = Inbox::default();
+        inbox.remember(ChannelReceipt {
+            channel: "wechat-1".into(),
+            message_id: "7498971037873973384".into(),
+            machine: "seed".into(),
+            session_id: "s-lexer".into(),
+            label: "lexer".into(),
+        });
+        // The captured exchange: they quoted our 7498971037873973384, and
+        // their own message is 7498971246643971720. The answer points at
+        // theirs — the phone draws their quote inside it, so that one link
+        // carries the whole thread.
+        let quoting = Incoming {
+            message_id: "7498971246643971720".into(),
+            reply_to: Some("7498971037873973384".into()),
+            at: 1,
+            text: "你好你好".into(),
+            context_token: "ctx".into(),
+            stale: false,
+        };
+        assert_eq!(
+            quoting_target(&quoting, &inbox).as_deref(),
+            Some("7498971246643971720")
+        );
+
+        // A plain message quotes nothing back, however well-known its author
+        // is: the answer to it is a new message, not a thread.
+        let plain = Incoming {
+            reply_to: None,
+            ..quoting.clone()
+        };
+        assert_eq!(quoting_target(&plain, &inbox), None);
+        // A quote of a message we never sent is nobody's thread of ours.
+        let foreign = Incoming {
+            reply_to: Some("7498971037873973000".into()),
+            ..quoting.clone()
+        };
+        assert_eq!(quoting_target(&foreign, &inbox), None);
+        // A message WeChat never numbered has a synthetic catch-up id, and
+        // the platform cannot point a quote at something it never named.
+        let unnumbered = Incoming {
+            message_id: "wechat-wechat-1-1787894069221".into(),
+            ..quoting
+        };
+        assert_eq!(quoting_target(&unnumbered, &inbox), None);
     }
 
     #[test]
@@ -3486,6 +3653,7 @@ mod tests {
             inbox.remember(ChannelReceipt {
                 channel: "lark-1".into(),
                 message_id: format!("om_{number}"),
+                machine: String::new(),
                 session_id: "s-lexer".into(),
                 label: "lexer".into(),
             });

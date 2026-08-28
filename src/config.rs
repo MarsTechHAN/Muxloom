@@ -17,6 +17,11 @@ pub struct Config {
     pub history_limit: usize,
     pub history_chunk_lines: usize,
     pub attention_patterns: Vec<String>,
+    /// When a subagent session falls onto something only its parent agent can
+    /// answer — a permission request, a question, any waiting-for-input state —
+    /// muxloom tells the parent instead of making it poll. On by default; turn
+    /// it off to keep alerts agent-poll-only.
+    pub alerts_to_parent: bool,
     pub ssh_config: String,
     pub environment: String,
     pub reverse_tunnel: String,
@@ -64,6 +69,7 @@ impl Default for Config {
                 "waiting for your input".into(),
                 "press enter to confirm".into(),
             ],
+            alerts_to_parent: true,
             ssh_config: "~/.ssh/config".into(),
             environment: String::new(),
             reverse_tunnel: String::new(),
@@ -555,6 +561,9 @@ ssh_connect_timeout_secs = 5
 history_limit = 1000000
 history_chunk_lines = 500
 attention_patterns = ["do you want to", "would you like to", "allow command", "approve", "waiting for your input", "press enter to confirm"]
+# When a subagent lands on a permission request or a question, tell the agent
+# that started it rather than making it poll. On by default.
+alerts_to_parent = true
 ssh_config = "~/.ssh/config"
 environment = ""
 reverse_tunnel = ""
@@ -687,6 +696,18 @@ mod tests {
         };
         assert!(config.validate().is_err());
         assert!(EXAMPLE_CONFIG.contains("update_channel = \"auto\""));
+    }
+
+    #[test]
+    fn subagent_alerts_to_parent_are_on_unless_the_config_says_otherwise() {
+        // The stall this fixes is the silent one: a subagent waiting on a
+        // permission nobody was told about. Off has to be asked for.
+        assert!(Config::default().alerts_to_parent);
+        let off: Config = toml::from_str("alerts_to_parent = false\n").unwrap();
+        assert!(!off.alerts_to_parent);
+        let bare: Config = toml::from_str("").unwrap();
+        assert!(bare.alerts_to_parent);
+        assert!(EXAMPLE_CONFIG.contains("alerts_to_parent = true"));
     }
 
     #[test]

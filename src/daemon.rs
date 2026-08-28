@@ -27,8 +27,8 @@ mod platform {
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession,
-            Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PROTOCOL_VERSION, StreamOpened,
-            Trigger, TriggerAction, stream,
+            Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PARENT_ALERT_CAPABILITY,
+            PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger, TriggerAction, stream,
         },
         keeper,
         model::{
@@ -81,6 +81,12 @@ mod platform {
     /// again. Typing into a session costs whoever works there their attention,
     /// and two agents answering each other would spend it in a loop.
     const DIRECT_INTERVAL_MS: u64 = 10_000;
+    /// How often a child that stays under its parent's notice may ask for the
+    /// parent again. The first ask is an edge, not a poll: it fires the moment
+    /// the child stops working and starts waiting. The re-ask is what covers a
+    /// controller that was not there to carry the first one, and sixty seconds
+    /// is nagging often enough to matter without drowning the parent in repeats.
+    const PARENT_ALERT_DEBOUNCE_MS: u64 = 60_000;
     /// The most messages that may be waiting for sessions to be free. Past
     /// this something is queueing faster than the machine can read, and the
     /// oldest of them are already stale.
@@ -342,6 +348,14 @@ mod platform {
         /// attention reason until someone types into the session, which is the
         /// one signal that the message was seen.
         notice: Mutex<Option<String>>,
+        /// An attention edge for this session's parent that no controller has
+        /// carried yet. Set when the classification turns to attention (or the
+        /// debounce lapses while it stays attention), cleared when the edge is
+        /// handed over. The edge itself is decided by `note_parent_alert`.
+        alert_pending: AtomicBool,
+        /// When an edge was last marked for the parent (epoch ms), whatever
+        /// became of it afterwards.
+        alert_claimed_at: AtomicU64,
         /// The transcript the runtime in this session is writing about itself,
         /// once the folder has been looked at.
         native: Mutex<NativeLink>,
@@ -849,6 +863,61 @@ mod platform {
             }
         };
         Ok((message, "queued".into(), Some(reason.into())))
+    }
+
+    /// Hold the prompt a launch carried for its own first message until the
+    /// session shows a box ready to take it.
+    ///
+    /// OpenCode reads a positional argument as the project directory rather
+    /// than a prompt and dies on the spot, so the runtime leaves the prompt
+    /// out of the command line and sends it here instead. It waits in the same
+    /// outbox a queued direct message waits in, and goes in the same way: typed
+    /// once the prompt box is there, bounced to whoever started the session if
+    /// it never appears. It is not put on the board — this is not one agent
+    /// telling another something; it is the prompt the session was started to
+    /// work on.
+    fn queue_seed_prompt(
+        state: &Arc<DaemonState>,
+        session_id: &str,
+        parent: Option<String>,
+        prompt: &str,
+    ) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        let from = parent.map(|session_id| TalkAddress {
+            machine: state
+                .talk()
+                .map(|talk| talk.origin())
+                .unwrap_or_else(|_| String::new()),
+            session_id,
+        });
+        let queued = TalkQueued {
+            message_id: format!("seed-{session_id}"),
+            session_id: session_id.into(),
+            body: prompt.into(),
+            queued_at: now_ms(),
+            deliver: TalkDeliver::Auto,
+            from,
+            text: prompt.into(),
+        };
+        {
+            let mut outbox = state
+                .outbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if outbox.len() >= OUTBOX_LIMIT {
+                eprintln!(
+                    "muxloomd could not queue the initial prompt for session {session_id}: the \
+                     outbox is full"
+                );
+                return;
+            }
+            outbox.push(queued);
+            state.save_outbox(&outbox);
+        }
+        spawn_outbox_drainer(state);
     }
 
     /// Refuse a sender that just reached this session.
@@ -1388,6 +1457,8 @@ mod platform {
                 attention_reason: None,
                 composer: None,
                 parent: None,
+                resumed_from: None,
+                resumed_to: None,
             };
             if let Err(error) = persist_session_metadata(&metadata_path, &metadata) {
                 eprintln!("muxloomd could not record recovered session {id}: {error:#}");
@@ -1677,31 +1748,6 @@ mod platform {
                                 || pre_rows != session.rows.load(Ordering::Relaxed);
                             let subscriber_id =
                                 state.next_subscriber.fetch_add(1, Ordering::Relaxed);
-                            // Register for live broadcast immediately, so no
-                            // output is ever lost in a registration gap. Live
-                            // frames may interleave with the seed/snapshot on
-                            // the stream, but that is harmless: the snapshot is
-                            // an absolute screen state written last, so it
-                            // corrects whatever the interleaved frames did.
-                            session
-                                .subscribers
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .insert(
-                                    subscriber_id,
-                                    Subscriber {
-                                        stream_id: frame.stream_id,
-                                        writer: Arc::clone(&writer),
-                                    },
-                                );
-                            subscriptions.insert(
-                                frame.stream_id,
-                                ClientStream::Pty {
-                                    session: Arc::clone(&session),
-                                    subscriber_id,
-                                },
-                            );
-                            write_stream_opened(&writer, &frame, None)?;
                             // One payload, sent first: the daemon's absolute view of the
                             // live screen. When the parser mirrors the child's real
                             // screen, it is the full snapshot (modes + row dump) and
@@ -1752,24 +1798,87 @@ mod platform {
                             let force_repaint =
                                 (size_changed || rebuilt) && on_alt && repaints_on_resize;
                             if force_repaint {
-                                // Out and back is two real keeper RESIZE frames
-                                // (old-keeper compatible): the app gets SIGWINCH, and
-                                // the final size is exactly the attach size. Sent
-                                // before the payload, so the app's repaint frames
-                                // follow the preamble on this stream.
+                                // The preamble is an ending (alt buffer, region,
+                                // clear), so it must be the first payload byte a
+                                // client reads on this stream. The broadcast gate
+                                // is the subscriber registration itself: nothing
+                                // is written to an unregistered stream, so the
+                                // preamble goes down first while the gate is
+                                // still shut. A live frame that slipped in
+                                // between an opened gate and the clear would be
+                                // erased by it, and the repaint the nudge
+                                // provokes would land on a screen the clear had
+                                // already wiped behind it - leaving the client
+                                // fed only later diffs, which a cached terminal
+                                // then preserves across every switch back.
+                                write_stream_opened(&writer, &frame, None)?;
+                                for chunk in session.screen_preamble().chunks(DATA_CHUNK_SIZE) {
+                                    write_frame(
+                                        &writer,
+                                        &Frame::data(frame.stream_id, 0, chunk, true),
+                                    )?;
+                                }
+                            } else {
+                                // The snapshot is an absolute screen state, so
+                                // live frames interleaving ahead of it are
+                                // harmless: it corrects them. Register before it
+                                // is written, so no output is ever lost in a
+                                // registration gap.
+                                session
+                                    .subscribers
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(
+                                        subscriber_id,
+                                        Subscriber {
+                                            stream_id: frame.stream_id,
+                                            writer: Arc::clone(&writer),
+                                        },
+                                    );
+                                subscriptions.insert(
+                                    frame.stream_id,
+                                    ClientStream::Pty {
+                                        session: Arc::clone(&session),
+                                        subscriber_id,
+                                    },
+                                );
+                                write_stream_opened(&writer, &frame, None)?;
+                            }
+                            if force_repaint {
+                                // Open the gate only now, behind the clear, and
+                                // then nudge: out and back is two real keeper
+                                // RESIZE frames (old-keeper compatible), the app
+                                // gets SIGWINCH, the final size is exactly the
+                                // attach size, and the app's own repaint - now
+                                // broadcast onto this stream - paints over the
+                                // cleared screen.
+                                session
+                                    .subscribers
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(
+                                        subscriber_id,
+                                        Subscriber {
+                                            stream_id: frame.stream_id,
+                                            writer: Arc::clone(&writer),
+                                        },
+                                    );
+                                subscriptions.insert(
+                                    frame.stream_id,
+                                    ClientStream::Pty {
+                                        session: Arc::clone(&session),
+                                        subscriber_id,
+                                    },
+                                );
                                 session.resize(columns.saturating_add(1), rows)?;
                                 session.resize(columns, rows)?;
-                            }
-                            let payload = if force_repaint {
-                                session.screen_preamble()
                             } else {
-                                session.screen_snapshot()
-                            };
-                            for chunk in payload.chunks(DATA_CHUNK_SIZE) {
-                                write_frame(
-                                    &writer,
-                                    &Frame::data(frame.stream_id, 0, chunk, true),
-                                )?;
+                                for chunk in session.screen_snapshot().chunks(DATA_CHUNK_SIZE) {
+                                    write_frame(
+                                        &writer,
+                                        &Frame::data(frame.stream_id, 0, chunk, true),
+                                    )?;
+                                }
                             }
                         }
                         OpenStream::File {
@@ -2116,6 +2225,7 @@ mod platform {
                             DIRECT_CAPABILITY.into(),
                             RELAY_CAPABILITY.into(),
                             CHANNELS_CAPABILITY.into(),
+                            PARENT_ALERT_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -2190,7 +2300,16 @@ mod platform {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .values()
-                    .map(|session| session.snapshot())
+                    .map(|session| {
+                        // This pass of classification is also where a waiting
+                        // child gets marked for its parent: whoever is asking —
+                        // dashboard, MCP client, or controller round — runs the
+                        // same edge check, and the edge waits for whichever
+                        // controller comes round to collect it.
+                        let snapshot = session.snapshot();
+                        session.note_parent_alert(&snapshot);
+                        snapshot
+                    })
                     .collect();
                 sessions.extend(
                     state
@@ -2215,6 +2334,7 @@ mod platform {
                 columns,
                 rows,
                 parent,
+                initial_prompt,
             } => {
                 let _launch_guard = state
                     .client_gate
@@ -2225,7 +2345,7 @@ mod platform {
                 }
                 let session = launch_session(
                     state,
-                    session_id,
+                    session_id.clone(),
                     kind,
                     path,
                     label,
@@ -2236,13 +2356,16 @@ mod platform {
                     created_at,
                     columns,
                     rows,
-                    parent,
+                    parent.clone(),
                 )?;
+                if let Some(prompt) = initial_prompt.as_deref() {
+                    queue_seed_prompt(state, &session_id, parent, prompt);
+                }
                 write_response(
                     writer,
                     request_id,
                     &DaemonResponse::Launched {
-                        session: session.snapshot(),
+                        session: Box::new(session.snapshot()),
                     },
                 )
             }
@@ -2354,6 +2477,26 @@ mod platform {
                         reason,
                     },
                 )
+            }
+            DaemonRequest::DrainAlerts => {
+                // The edges are marked on every classification pass; a
+                // controller round takes them once and owns the telling. The
+                // sessions map is read and let go before anything is built:
+                // `take_parent_alert` snapshots, and a lock held across two
+                // maps is how this daemon would stop.
+                let sessions: Vec<_> = state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .filter(|session| session.alert_pending.load(Ordering::Relaxed))
+                    .cloned()
+                    .collect();
+                let alerts = sessions
+                    .iter()
+                    .filter_map(|session| session.take_parent_alert())
+                    .collect();
+                write_response(writer, request_id, &DaemonResponse::Alerts { alerts })
             }
             DaemonRequest::RelaySubmit {
                 tool,
@@ -3091,6 +3234,7 @@ mod platform {
                 .map(|claim| claim.id.clone())
                 .or(persisted),
             abandoned: native.abandoned.clone(),
+            first_prompt: None,
         }
     }
 
@@ -3124,19 +3268,38 @@ mod platform {
         } else {
             path
         };
-        if state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&session_id)
-            || state
-                .persisted_sessions
+        // A number already in use is a refusal or a revival, never a second
+        // identity for one conversation. A running session holds its id
+        // against a launch over it, and that is refused outright - shadowing
+        // it would strand the running side's parent links and board threads
+        // behind a number that now answers to someone else. An archived
+        // record holds its number only for the conversation it recorded; a
+        // launch arriving with that number is that conversation coming back,
+        // and it revives the record in place - same id, label, parent,
+        // creation and history file - instead of minting a fresh id the
+        // children's parent links would not follow.
+        let seed = kind
+            .parse::<AgentKind>()
+            .ok()
+            .and_then(|kind| crate::native_history::resume_seed(kind, &args));
+        let resuming = if temporary {
+            if state
+                .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains_key(&session_id)
-        {
-            bail!("daemon session already exists: {session_id}");
-        }
+                || state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&session_id)
+            {
+                bail!("daemon session already exists: {session_id}");
+            }
+            None
+        } else {
+            resume_in_place(state, &session_id)?
+        };
         // A temporary session runs in a folder of its own that muxloom makes
         // here and removes with it, whatever directory the client named. A
         // scratch chat that moves into the project you happened to have
@@ -3154,6 +3317,44 @@ mod platform {
         if !Path::new(&path).is_dir() {
             bail!("working directory does not exist: {path}");
         }
+        // A launch under a *new* id can still be somebody's resume: until
+        // dashboards ask for the archived id itself, reopening a conversation
+        // minted a fresh number, and that split is what orphaned fleets onto
+        // dead master ids. Find the archived record this launch reopens -
+        // same runtime, same folder, and its command line names the very
+        // conversation the record was reading - and repair the split as this
+        // launch happens: children repointed, alias written on both records.
+        let resumed_from: Option<DaemonSession> = match &resuming {
+            Some(_) => None,
+            None => archived_resume_match(state, &kind, &path, seed.as_deref()),
+        };
+        if let Some(previous) = &resumed_from {
+            if let Some(successor) = resumed_successor(state, previous) {
+                bail!(
+                    "session {} was already resumed as {successor}, which is still live; \
+                     talk to it instead of resuming twice",
+                    previous.id
+                );
+            }
+        }
+        let carried = resuming.as_ref().or(resumed_from.as_ref());
+        // What a resume carries with it, whatever number it comes back on:
+        // a caller who passed no name means the one the conversation had,
+        // and a master resumed on its own still hangs off whoever started
+        // it. Reviving in place additionally keeps the record's own creation
+        // - it is the same session, not a younger one wearing its number.
+        let label = if label.trim().is_empty() {
+            carried
+                .map(|record| record.label.clone())
+                .unwrap_or_else(|| label.clone())
+        } else {
+            label
+        };
+        let parent = carried.and_then(|record| record.parent.clone()).or(parent);
+        let created_at = resuming
+            .as_ref()
+            .map(|record| record.created_at)
+            .unwrap_or(created_at);
         let executable = if executable.trim().is_empty() {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
         } else {
@@ -3234,13 +3435,9 @@ mod platform {
                 .append(true)
                 .open(&history_path)?;
         }
-        // The command line is the one place that says outright which
-        // conversation this launch means to reopen, and it is about to be
-        // handed to the keeper.
-        let seed = kind
-            .parse::<AgentKind>()
-            .ok()
-            .and_then(|kind| crate::native_history::resume_seed(kind, &args));
+        // The command line was the one place that said outright which
+        // conversation this launch means to reopen; the seed was read off it
+        // above, before the id question was answered.
         let spec = keeper::KeeperSpec {
             session_id: session_id.clone(),
             program: program.to_string_lossy().into_owned(),
@@ -3252,6 +3449,18 @@ mod platform {
             history_path: (!temporary).then(|| history_path.clone()),
             socket_path: keeper::socket_path_for(&state.paths.keepers, &session_id),
         };
+        if let Some(previous) = &resumed_from {
+            // The split is only survivable if it is recorded while it
+            // happens: every child still naming the retired id moves to this
+            // one, and both records carry the alias so the move can be
+            // followed in either direction afterwards.
+            let moved = reparent_children(state, &previous.id, &session_id);
+            mark_resumed_to(state, &previous.id, &session_id);
+            eprintln!(
+                "muxloomd resumed archived session {} as {session_id} with {moved} children repointed",
+                previous.id
+            );
+        }
         let mut metadata = DaemonSession {
             id: session_id.clone(),
             kind,
@@ -3262,15 +3471,26 @@ mod platform {
             pid: None,
             dead: false,
             archived: false,
-            recap: None,
-            title: None,
-            thread: None,
+            // A revival in place keeps what the record knew: its last recap
+            // and the thread this very launch reopens. Without a native
+            // resume seed the conversation starts fresh, and the old thread
+            // belongs to the past.
+            recap: resuming.as_ref().and_then(|record| record.recap.clone()),
+            title: resuming.as_ref().and_then(|record| record.title.clone()),
+            thread: resuming
+                .as_ref()
+                .filter(|_| seed.is_some())
+                .and_then(|record| record.thread.clone()),
             seed: seed.clone(),
             working: false,
             needs_attention: false,
             attention_reason: None,
             composer: None,
             parent,
+            resumed_from: resumed_from.as_ref().map(|record| record.id.clone()),
+            resumed_to: resuming
+                .as_ref()
+                .and_then(|record| record.resumed_to.clone()),
         };
         // The record precedes the keeper so a crash between the two leaves a
         // session that can be retired, never a keeper nothing knows about.
@@ -3278,6 +3498,22 @@ mod platform {
         let (stream, status) = match start_keeper(state, &spec) {
             Ok(connection) => connection,
             Err(error) => {
+                if let Some(record) = &resuming {
+                    // A revival that never got its keeper must leave the
+                    // archive exactly as it found it: the record and its
+                    // history file both predate this launch.
+                    let _ = persist_session_metadata(&metadata_path, record);
+                    if let Ok(Some((id, entry))) =
+                        load_persisted_session(&state.paths, &metadata_path)
+                    {
+                        state
+                            .persisted_sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(id, entry);
+                    }
+                    return Err(error);
+                }
                 let _ = fs::remove_file(&metadata_path);
                 if temporary {
                     remove_scratch_dir(&state.paths, &session_id);
@@ -3308,6 +3544,8 @@ mod platform {
             screen_rebuilt: AtomicBool::new(false),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
+            alert_pending: AtomicBool::new(false),
+            alert_claimed_at: AtomicU64::new(0),
             native: Mutex::new(NativeLink {
                 seed,
                 ..NativeLink::default()
@@ -3340,6 +3578,222 @@ mod platform {
             .insert(session_id, Arc::clone(&session));
         spawn_session_reader(state, Arc::clone(&session), stream);
         Ok(session)
+    }
+
+    /// Reclaim a session id for the record that already holds it, or say the
+    /// id is taken. `Ok(Some(record))` hands the launch the archived record
+    /// this very id names - out of the daemon's index, its metadata left on
+    /// disk only until the revived record replaces it - because a launch
+    /// arriving with an archived session's number *is* that conversation
+    /// coming back, and it must come back as itself: the same id children and
+    /// board threads still name, the same label, the same history file. A
+    /// running session holding the id is a refusal, never a shadow: one
+    /// conversation never gets two ids, and one id never gets two.
+    fn resume_in_place(state: &DaemonState, session_id: &str) -> Result<Option<DaemonSession>> {
+        // Launches are serialized by the caller's client gate, so the two
+        // indexes cannot shift under this between look and take.
+        let ended = {
+            let mut live = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match live.get(session_id) {
+                Some(session) => {
+                    let snapshot = session.snapshot();
+                    if snapshot.temporary {
+                        bail!("daemon session already exists: {session_id}");
+                    }
+                    if !snapshot.archived && !snapshot.dead {
+                        bail!(
+                            "session {session_id} is still live; refusing to resume over a \
+                             running session - archive it first"
+                        );
+                    }
+                    // Archived or ended with the keeper already gone: the map
+                    // entry only stood where an archive retirement would have
+                    // retired it. The launch reclaims the slot.
+                    live.remove(session_id);
+                    Some(snapshot)
+                }
+                None => None,
+            }
+        };
+        if let Some(record) = &ended {
+            if let Some(successor) = resumed_successor(state, record) {
+                bail!(
+                    "session {session_id} was already resumed as {successor}, which is still \
+                     live; talk to it instead of resuming twice"
+                );
+            }
+            return Ok(ended);
+        }
+        let mut persisted = state
+            .persisted_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = persisted.get(session_id) {
+            let snapshot = entry.snapshot();
+            if !snapshot.archived {
+                // A live-keeper record that never got adopted is not a free
+                // number, whatever its dead flag claims.
+                bail!("daemon session already exists: {session_id}");
+            }
+            persisted.remove(session_id);
+            return Ok(Some(snapshot));
+        }
+        Ok(None)
+    }
+
+    /// The archived record a new-id launch reopens: same runtime, same
+    /// folder, and the command line names the very conversation the record
+    /// was matched to - or, never matched, the one its own launch was told to
+    /// reopen. Deliberately narrow: without that seed to agree on, a kind and
+    /// a folder are not evidence that two sessions are one conversation.
+    fn archived_resume_match(
+        state: &DaemonState,
+        kind: &str,
+        path: &str,
+        seed: Option<&str>,
+    ) -> Option<DaemonSession> {
+        let wanted = seed?;
+        let live = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|session| session.snapshot())
+            .collect::<Vec<_>>();
+        let persisted = state
+            .persisted_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.snapshot())
+            .collect::<Vec<_>>();
+        live.into_iter()
+            .chain(persisted)
+            .filter(|record| record.archived)
+            .filter(|record| record.kind == kind && record.path == path)
+            .filter(|record| {
+                record.thread.as_deref() == Some(wanted) || record.seed.as_deref() == Some(wanted)
+            })
+            .max_by(|left, right| {
+                (left.created_at, left.id.as_str()).cmp(&(right.created_at, right.id.as_str()))
+            })
+    }
+
+    /// The live session an archived record's conversation already moved to,
+    /// if any: resuming a record whose successor still runs would put one
+    /// conversation in two places at once.
+    fn resumed_successor(state: &DaemonState, record: &DaemonSession) -> Option<String> {
+        let successor = record.resumed_to.as_deref()?;
+        let live = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live.get(successor)
+            .map(|session| session.snapshot())
+            .filter(|snapshot| !snapshot.dead && !snapshot.archived)
+            .map(|_| successor.to_string())
+    }
+
+    /// Record on the retired side where its conversation moved to, in both
+    /// places it can rest: the archived index and an ended entry still held
+    /// live until the next daemon retires it.
+    fn mark_resumed_to(state: &DaemonState, previous_id: &str, successor: &str) {
+        let persisted = state
+            .persisted_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = persisted.get(previous_id) {
+            let record = {
+                let mut metadata = entry
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                metadata.resumed_to = Some(successor.to_string());
+                metadata.clone()
+            };
+            if let Err(error) = persist_session_metadata(&entry.metadata_path, &record) {
+                eprintln!("muxloomd could not record a resume alias on {previous_id}: {error:#}");
+            }
+        }
+        let live = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = live.get(previous_id) {
+            session
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resumed_to = Some(successor.to_string());
+            let _ = session.persist_metadata();
+        }
+    }
+
+    /// Point every child still naming a retired master at its successor,
+    /// live and archived alike, and persist each rewrite. The parent link is
+    /// the fleet's only spine - fleet listings, alerts, and the next resume's
+    /// subtree all read it - so leaving it on a dead id is how a resumed
+    /// master came back to an empty fleet.
+    fn reparent_children(state: &DaemonState, previous_id: &str, successor: &str) -> usize {
+        let mut moved = 0;
+        {
+            let live = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for session in live.values() {
+                if session.session_id() == successor {
+                    continue;
+                }
+                let reparented = {
+                    let mut metadata = session
+                        .metadata
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if metadata.parent.as_deref() == Some(previous_id) {
+                        metadata.parent = Some(successor.to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if reparented {
+                    let _ = session.persist_metadata();
+                    moved += 1;
+                }
+            }
+        }
+        let persisted = state
+            .persisted_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in persisted.values() {
+            if entry.snapshot().id == successor {
+                continue;
+            }
+            let record = {
+                let mut metadata = entry
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if metadata.parent.as_deref() == Some(previous_id) {
+                    metadata.parent = Some(successor.to_string());
+                    Some(metadata.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(record) = record {
+                if let Err(error) = persist_session_metadata(&entry.metadata_path, &record) {
+                    eprintln!("muxloomd could not repoint a child of {previous_id}: {error:#}");
+                }
+                moved += 1;
+            }
+        }
+        moved
     }
 
     /// The tail of the first `prefix` bytes of a history file, bounded by
@@ -3813,6 +4267,11 @@ mod platform {
             screen_rebuilt: AtomicBool::new(true),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
+            // A child that fell onto its question while no daemon was watching
+            // gets its edge marked on the first look: `alert_claimed_at` starts
+            // at zero, so adoption does not mute the parent's alert.
+            alert_pending: AtomicBool::new(false),
+            alert_claimed_at: AtomicU64::new(0),
             // The command line that started this one belongs to a keeper this
             // daemon did not spawn, so both of the things it said - what the
             // launch meant to reopen, and what the last generation matched it
@@ -4347,6 +4806,60 @@ mod platform {
                 }
             }
             snapshot
+        }
+
+        /// Mark the moment this session stopped working and started waiting on
+        /// someone, for the parent agent that launched it — but only for what
+        /// counts as an edge: a child with a parent, alive, and now asking for
+        /// attention. The first ask fires as the classification turns; while it
+        /// stays attention the same child may ask again no sooner than
+        /// `PARENT_ALERT_DEBOUNCE_MS` later, which covers a controller that was
+        /// away when the edge happened without nagging one that heard it.
+        ///
+        /// Marking is cheap and unconditional because a daemon does not know
+        /// whether any controller will ever ask for these; the gate that turns
+        /// the feature off is the controller's own config, on the way out.
+        fn note_parent_alert(&self, snapshot: &DaemonSession) {
+            if snapshot.parent.is_none() || snapshot.dead || snapshot.archived {
+                return;
+            }
+            if !snapshot.needs_attention {
+                return;
+            }
+            let now = now_ms();
+            if self.alert_pending.load(Ordering::Relaxed)
+                || now.saturating_sub(self.alert_claimed_at.load(Ordering::Relaxed))
+                    < PARENT_ALERT_DEBOUNCE_MS
+            {
+                return;
+            }
+            self.alert_claimed_at.store(now, Ordering::Relaxed);
+            self.alert_pending.store(true, Ordering::Relaxed);
+        }
+
+        /// Hand the marked edge over, once. The controller that takes it owns
+        /// the telling; if the telling fails, the debounce above turns the
+        /// still-unanswered question into a fresh edge within the minute.
+        /// A child that died or was archived while waiting says nothing: its
+        /// prompt is not asking anybody any more.
+        fn take_parent_alert(&self) -> Option<ParentAlert> {
+            if !self.alert_pending.swap(false, Ordering::AcqRel) {
+                return None;
+            }
+            let snapshot = self.snapshot();
+            if snapshot.dead || snapshot.archived {
+                return None;
+            }
+            let parent_session_id = snapshot.parent.clone()?;
+            Some(ParentAlert {
+                session_id: snapshot.id.clone(),
+                parent_session_id,
+                kind: snapshot.kind.clone(),
+                label: snapshot.label.clone(),
+                attention_reason: snapshot.attention_reason.clone(),
+                recap: snapshot.recap.clone(),
+                at: self.alert_claimed_at.load(Ordering::Relaxed),
+            })
         }
 
         fn persist_metadata(&self) -> Result<()> {
@@ -6284,6 +6797,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )
             .unwrap()
@@ -6615,6 +7129,7 @@ mod platform {
             let receipt = ChannelReceipt {
                 channel: "lark-1".into(),
                 message_id: "om_1".into(),
+                machine: String::new(),
                 session_id: "a7f3c1".into(),
                 label: "lexer".into(),
             };
@@ -6732,6 +7247,159 @@ mod platform {
             fs::remove_dir_all(root).unwrap();
         }
 
+        /// Launch a quiet `/bin/cat` child under a parent, for tests about
+        /// what the child's screen means to the agent that started it.
+        fn launch_child_with_parent(
+            state: &Arc<DaemonState>,
+            name: &str,
+            parent: Option<&str>,
+        ) -> Arc<ManagedSession> {
+            launch_session(
+                state,
+                format!("muxloomd-codex-{name}"),
+                "codex".into(),
+                "/tmp".into(),
+                name.into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                parent.map(str::to_string),
+            )
+            .unwrap()
+        }
+
+        /// The edge the parent depends on: not a level, not while working, once
+        /// per fall-onto-the-question, and no repeat within the debounce.
+        #[test]
+        fn a_waiting_child_is_marked_for_its_parent_once_and_repeats_only_after_the_debounce() {
+            let state = test_state("parent-edge");
+            let root = state.paths.root.clone();
+            *state
+                .attention_patterns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                vec!["gpu quota approval".into()];
+            let child = launch_child_with_parent(&state, "parent-edge", Some("the-parent"));
+            let note = |child: &ManagedSession| {
+                let snapshot = child.snapshot();
+                child.note_parent_alert(&snapshot);
+            };
+
+            // An idle child with an idle screen says nothing to its parent.
+            child.record_output(b"\x1b[2J\x1b[Hready when you are");
+            note(&child);
+            assert!(child.take_parent_alert().is_none());
+
+            // A working one says less: the edge is the fall onto a question,
+            // not the child being busy. The bullet and middle dot are spelled
+            // as their UTF-8 bytes because byte strings take no \u escapes.
+            child
+                .record_output(b"\x1b[2J\x1b[H\xe2\x80\xa2 Working (2s \xc2\xb7 esc to interrupt)");
+            assert!(child.snapshot().working);
+            note(&child);
+            assert!(child.take_parent_alert().is_none());
+
+            // The moment it stops working and asks for approval, the edge is
+            // marked and it says who is waiting and why.
+            child.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            note(&child);
+            let alert = child.take_parent_alert().expect("the edge is handed over");
+            assert_eq!(alert.session_id, "muxloomd-codex-parent-edge");
+            assert_eq!(alert.parent_session_id, "the-parent");
+            assert_eq!(alert.kind, "codex");
+            assert_eq!(
+                alert.attention_reason.as_deref(),
+                Some("gpu quota approval")
+            );
+
+            // Taken once: asking again in the same breath says nothing, and
+            // while the child sits on the question the next ask comes no
+            // sooner than the debounce, not before.
+            note(&child);
+            assert!(child.take_parent_alert().is_none());
+            child.alert_claimed_at.store(
+                now_ms().saturating_sub(PARENT_ALERT_DEBOUNCE_MS + 1),
+                Ordering::Relaxed,
+            );
+            note(&child);
+            assert!(child.take_parent_alert().is_some());
+
+            // A child nobody started is no one's errand: the same fall marks
+            // nothing for no parent to hear about.
+            let orphan = launch_child_with_parent(&state, "parent-edge-orphan", None);
+            orphan.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            let snapshot = orphan.snapshot();
+            assert!(snapshot.needs_attention);
+            orphan.note_parent_alert(&snapshot);
+            assert!(orphan.take_parent_alert().is_none());
+
+            child.archive().unwrap();
+            orphan.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// The other half of one round: whoever lists the sessions runs the
+        /// edge check, and the one `DrainAlerts` hands the marked edges over -
+        /// then forgets them, the way receipts are handed over.
+        #[test]
+        fn a_controller_round_collects_the_waiting_children_it_asked_for_once() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let state = test_state("drain-alerts");
+            let writer = Arc::new(Mutex::new(server));
+            let answer = |client: &mut UnixStream, id: u64| loop {
+                let frame = Frame::read_from(client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == id {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            };
+            *state
+                .attention_patterns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                vec!["gpu quota approval".into()];
+            let child = launch_child_with_parent(&state, "drain-alerts", Some("the-parent"));
+            child.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            assert!(child.snapshot().needs_attention);
+
+            // A ListSessions is what marks it - the dashboard's own poll does
+            // not take it away from the controller that will deliver it.
+            handle_request(&writer, &state, 1, DaemonRequest::ListSessions).unwrap();
+            assert!(matches!(
+                answer(&mut client, 1),
+                DaemonResponse::Sessions { .. }
+            ));
+            assert!(child.alert_pending.load(Ordering::Relaxed));
+            handle_request(&writer, &state, 2, DaemonRequest::ListSessions).unwrap();
+            assert!(matches!(
+                answer(&mut client, 2),
+                DaemonResponse::Sessions { .. }
+            ));
+
+            handle_request(&writer, &state, 3, DaemonRequest::DrainAlerts).unwrap();
+            match answer(&mut client, 3) {
+                DaemonResponse::Alerts { alerts } => {
+                    assert_eq!(alerts.len(), 1);
+                    assert_eq!(alerts[0].session_id, "muxloomd-codex-drain-alerts");
+                    assert_eq!(alerts[0].parent_session_id, "the-parent");
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+            // Handed over, so gone: the next ask hears nothing until the
+            // debounce lets the still-unanswered question mark itself again.
+            handle_request(&writer, &state, 4, DaemonRequest::DrainAlerts).unwrap();
+            match answer(&mut client, 4) {
+                DaemonResponse::Alerts { alerts } => assert!(alerts.is_empty()),
+                other => panic!("unexpected answer: {other:?}"),
+            }
+
+            child.archive().unwrap();
+            fs::remove_dir_all(&state.paths.root).ok();
+        }
+
         /// A session records when it was launched in seconds; a transcript
         /// stamps itself in milliseconds. Handed to the matching as they are,
         /// every launch looks like it happened decades before every
@@ -6751,6 +7419,7 @@ mod platform {
                     forked_from: None,
                     title: None,
                     last_message: None,
+                    first_message: None,
                 }
             }
 
@@ -7226,6 +7895,8 @@ mod platform {
                     attention_reason: None,
                     composer: None,
                     parent: None,
+                    resumed_from: None,
+                    resumed_to: None,
                 },
             )
             .unwrap();
@@ -7275,6 +7946,8 @@ mod platform {
                 title: None,
                 thread: None,
                 seed: None,
+                resumed_from: None,
+                resumed_to: None,
                 working: true,
                 needs_attention: false,
                 attention_reason: None,
@@ -7578,6 +8251,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )
             .unwrap()
@@ -7707,6 +8381,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -8096,6 +8771,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -8196,6 +8872,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )
             .unwrap()
@@ -8321,6 +8998,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )
             .unwrap()
@@ -8467,6 +9145,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -8552,11 +9231,12 @@ mod platform {
             .unwrap()
             .write_to(&mut client)
             .unwrap();
-            // Judge a window, not the first frame: the live frame from the
-            // nudge may land either side of the payload. The preamble must be
-            // in it, the partial snapshot must not be, and the child must have
-            // felt the nudge.
+            // Judge a window, not the first frame: the child's repaint arrives
+            // as live broadcast, so read until the whole exchange is in. The
+            // preamble must be in it, the partial snapshot must not be, and the
+            // child must have felt the nudge.
             let mut window = String::new();
+            let mut first_data: Option<String> = None;
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline
                 && !(window.contains("\x1b[?1049h") && window.contains("WINCHMARKER"))
@@ -8565,8 +9245,10 @@ mod platform {
                     Ok(Some(frame))
                         if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
                     {
-                        window
-                            .push_str(&String::from_utf8_lossy(&frame.decoded_payload().unwrap()));
+                        let payload =
+                            String::from_utf8_lossy(&frame.decoded_payload().unwrap()).into_owned();
+                        first_data.get_or_insert_with(|| payload.clone());
+                        window.push_str(&payload);
                     }
                     // The stream-open ack (and other housekeeping) comes first.
                     Ok(Some(_)) => {}
@@ -8588,6 +9270,20 @@ mod platform {
             assert!(
                 window.contains("WINCHMARKER"),
                 "the repaint nudge must SIGWINCH the child: {window:?}"
+            );
+            // And the order is the contract, not just the presence: the
+            // preamble is the first payload out - the broadcast gate opens
+            // only behind the clear - and the child's repaint lands after it.
+            // A live frame erased by a clear that follows it is the blank-pane
+            // bug this ordering exists to prevent.
+            let first_data = first_data.expect("the attach sends a payload");
+            assert!(
+                first_data.starts_with("\x1b[?1049h") && first_data.contains("\x1b[2J"),
+                "the preamble alone opens the stream: {first_data:?}"
+            );
+            assert!(
+                window.find("\x1b[2J") < window.find("WINCHMARKER"),
+                "every repaint must follow the clear: {window:?}"
             );
             // ...and the PTY ends at exactly the attach size.
             assert_eq!(adopted.columns.load(Ordering::Relaxed), 80);
@@ -9098,6 +9794,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    initial_prompt: None,
                 },
             )
             .unwrap();
@@ -9168,6 +9865,8 @@ mod platform {
                     title: None,
                     thread: None,
                     seed: None,
+                    resumed_from: None,
+                    resumed_to: None,
                     working: false,
                     needs_attention: false,
                     attention_reason: None,

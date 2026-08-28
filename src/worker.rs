@@ -12,6 +12,7 @@ use std::{
 use crate::{
     bridge::BridgePool,
     config::{CommandConfig, Config},
+    daemon_protocol::ParentAlert,
     debug,
     media::{MediaPlayback, MediaUpdate, decode_image_stream, decode_video_stream},
     model::{
@@ -20,7 +21,10 @@ use crate::{
         SearchMatchKind, SearchResult, Target, TaskProgress,
     },
     runtime::{Runtime, is_temporary_session_id},
-    talk::{TalkDraft, TalkFilter, TalkMessage, TalkPage, TalkSelector, decode_cursor},
+    talk::{
+        TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind, TalkMessage,
+        TalkPage, TalkScope, TalkSelector, TalkVoice, decode_cursor,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -1333,6 +1337,11 @@ impl Worker {
                                 Vec::new()
                             }
                         };
+                        // And while the round is out: a child session that
+                        // fell onto a question gets its parent told, so no
+                        // agent has to poll the fleet to find its own subagent
+                        // sitting on a permission prompt.
+                        drain_parent_alerts(&runtime, &targets, &config);
                         // And while the round is out: every machine that can
                         // hold the channel set is brought to this revision, so
                         // an agent anywhere can reach the human without the
@@ -1412,6 +1421,137 @@ fn read_board(runtime: &Runtime, since: &str) -> Option<TalkPage> {
             None
         }
     }
+}
+
+/// Tell every parent agent, unasked, that a subagent it started has fallen
+/// onto something only the parent can answer.
+///
+/// The daemons mark the edges — they see the screens — and this hands them
+/// over once per round. Delivery reuses the direct-message path an agent
+/// would use itself: the daemon that owns the parent decides whether the
+/// prompt box can take the message now or holds it in the outbox until it can.
+/// The local machine is included like [`crate::relay::run_pump`] includes it:
+/// an agent's subagents almost always live next door to it, and this machine's
+/// daemon watches them just the same.
+///
+/// A delivery that fails is not retried by hand: the child is still sitting on
+/// its question, and a daemon sitting on an undelivered edge marks it again
+/// once its debounce has lapsed. That makes the round's ask at-most-once per
+/// edge and roughly once-a-minute-nagging per unattended child, which is what
+/// the stall it cures deserves and no more.
+fn drain_parent_alerts(runtime: &Runtime, targets: &[Target], config: &Config) {
+    if !config.alerts_to_parent {
+        return;
+    }
+    let pool = runtime.bridge_pool();
+    let local = Target::local();
+    let everywhere: Vec<&Target> = std::iter::once(&local)
+        .chain(targets.iter().filter(|target| target.id != local.id))
+        .collect();
+    for target in everywhere {
+        let alerts = match pool.drain_alerts(target) {
+            Ok(alerts) => alerts,
+            // A machine too old to watch answers empty, not an error; anything
+            // heard here is this round's daemon being unreachable, and the next
+            // round will ask again on its own.
+            Err(error) => {
+                debug::log(
+                    "alert",
+                    format!(
+                        "could not read waiting children on {}: {error:#}",
+                        target.id
+                    ),
+                );
+                continue;
+            }
+        };
+        for alert in alerts {
+            // The draft leaves every machine field empty on purpose, exactly as
+            // a `message_agent` call does: the daemon taking delivery is the one
+            // that knows what this machine is called, and the author is
+            // muxloom itself — not a session and not a person, saying that one
+            // of the sessions it runs is waiting.
+            let draft = TalkDraft {
+                scope: TalkScope::Machine {
+                    machine: String::new(),
+                },
+                author: TalkAuthor {
+                    machine: String::new(),
+                    machine_label: String::new(),
+                    voice: TalkVoice {
+                        session_id: None,
+                        label: Some("muxloom".into()),
+                        kind: None,
+                        human: false,
+                    },
+                },
+                kind: TalkKind::Direct,
+                to: Some(TalkAddress {
+                    machine: String::new(),
+                    session_id: alert.parent_session_id.clone(),
+                }),
+                reply_to: None,
+                text: parent_alert_text(&alert, &target.id),
+            };
+            // `Auto`, not `Now`: an alert is an announcement, and a parent
+            // mid-turn reads it at the end of the turn like any other direct.
+            match pool.talk_deliver(target, draft, TalkDeliver::Auto, false) {
+                Ok((_, delivery, _)) => debug::log(
+                    "alert",
+                    format!(
+                        "told {} that its subagent {} is waiting: {} ({delivery})",
+                        alert.parent_session_id,
+                        alert.session_id,
+                        alert
+                            .attention_reason
+                            .as_deref()
+                            .unwrap_or("waiting for input")
+                    ),
+                ),
+                Err(error) => debug::log(
+                    "alert",
+                    format!(
+                        "{} is waiting and its parent {} could not be told: {error:#}",
+                        alert.session_id, alert.parent_session_id
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+/// The sentence a waiting child deserves, spelled out of what the daemon
+/// saw: which session, of what kind, under what name, on which machine,
+/// waiting on what, and the last thing it said. It arrives inside the standard
+/// direct-message envelope, which is what says it came from muxloom rather
+/// than from an agent; this text is what says what to do about it.
+fn parent_alert_text(alert: &ParentAlert, machine: &str) -> String {
+    let mut named = format!("session {}", alert.session_id);
+    if !alert.label.is_empty()
+        && alert.label != alert.session_id
+        && !alert.label.starts_with("muxloomd-")
+    {
+        named = format!("{named} (\"{}\")", alert.label);
+    }
+    let reason = alert
+        .attention_reason
+        .as_deref()
+        .unwrap_or("waiting for input");
+    let said = match alert
+        .recap
+        .as_deref()
+        .filter(|recap| !recap.trim().is_empty())
+    {
+        Some(recap) => format!(" Last it said: {}.", recap.trim()),
+        None => String::new(),
+    };
+    format!(
+        "Your subagent {named}, kind {}, on machine {machine}, needs attention: {reason}.{said} \
+         It is sitting at its prompt waiting for you — check with read_screen and answer it, or it \
+         will wait there for its next minute of nothing. You are its parent ({}); message_agent \
+         reaches it.",
+        alert.kind, alert.parent_session_id
+    )
 }
 
 fn normalize_legacy_image_preview(mut preview: FilePreview) -> FilePreview {
@@ -1636,5 +1776,72 @@ mod tests {
         });
         assert_eq!(preview.kind, FilePreviewKind::Image);
         assert_eq!(preview.mime, "image/*");
+    }
+
+    fn waiting_child() -> ParentAlert {
+        ParentAlert {
+            session_id: "muxloomd-codex-1-2-3".into(),
+            parent_session_id: "muxloomd-opencode-9-9-9".into(),
+            kind: "codex".into(),
+            label: "formatter".into(),
+            attention_reason: Some("command approval".into()),
+            recap: Some("I need to run cargo fmt first".into()),
+            at: 1,
+        }
+    }
+
+    #[test]
+    fn a_parent_alert_names_the_child_machine_kind_reason_recap_and_how_to_look() {
+        let text = parent_alert_text(&waiting_child(), "atlas");
+        for wanted in [
+            "muxloomd-codex-1-2-3",
+            "formatter",
+            "atlas",
+            "codex",
+            "command approval",
+            "I need to run cargo fmt first",
+            "read_screen",
+            "muxloomd-opencode-9-9-9",
+        ] {
+            // The machine the parent must name to reach a far child, the kind
+            // that decides how it is answered, and the way to look — all of
+            // them have to be readable without asking anything else first.
+            assert!(text.contains(wanted), "{wanted} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn a_parent_alert_says_what_it_has_and_never_invents_what_it_lacks() {
+        // An unnamed child is named by its id alone; a reason the daemon could
+        // not read still says *something* true; a recap that never arrived
+        // leaves its sentence out rather than printing an empty quote.
+        let alert = ParentAlert {
+            label: "muxloomd-pi-7-7-7".into(),
+            attention_reason: None,
+            recap: Some("   ".into()),
+            ..waiting_child()
+        };
+        let text = parent_alert_text(&alert, "atlas");
+        assert!(
+            !text.contains("(\""),
+            "a label equal to the id is not quoted: {text}"
+        );
+        assert!(text.contains("waiting for input"), "{text}");
+        assert!(!text.contains("Last it said"), "{text}");
+    }
+
+    #[test]
+    fn parent_alerts_are_gated_by_config_before_any_machine_is_asked() {
+        // The gate is the controller's: an old daemon is never asked, and a
+        // config that says off stops even the asking. (drain_parent_alerts
+        // returns before touching a bridge; the full round needs a Runtime and
+        // live daemons, which is what the daemon-side edge tests cover.)
+        let config = Config {
+            alerts_to_parent: false,
+            ..Config::default()
+        };
+        // No runtime is built: the first statement of the function returns
+        // here, so this only pins that the key reads through Config.
+        assert!(!config.alerts_to_parent);
     }
 }

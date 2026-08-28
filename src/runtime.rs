@@ -519,6 +519,11 @@ impl Runtime {
             environment.to_vec(),
             now,
             request.parent.clone(),
+            launch_seed(
+                request.kind,
+                request.resume_id.as_deref(),
+                request.initial_prompt.as_deref(),
+            ),
         );
         if let Err(daemon_error) = daemon_launch {
             debug::log(
@@ -545,6 +550,24 @@ impl Runtime {
                     "WARNING: muxloomd was unavailable, so this session uses legacy tmux; {daemon_error:#}"
                 ),
             );
+            if launch_seed(
+                request.kind,
+                request.resume_id.as_deref(),
+                request.initial_prompt.as_deref(),
+            )
+            .is_some()
+            {
+                // The prompt only travels on the daemon path; on tmux there is
+                // nothing to type it once the session is ready, and pretending
+                // it was delivered would hide an empty session behind a
+                // confident-looking launch.
+                self.bridges.record_notice(
+                    &request.target.id,
+                    "WARNING: the initial prompt could not be delivered on the legacy tmux path; \
+                     the session started without it"
+                        .to_string(),
+                );
+            }
             return Ok(legacy_session);
         }
         debug::log(
@@ -4680,11 +4703,31 @@ pub(crate) fn launch_arguments(
     }
     if resume_id.is_none()
         && kind != AgentKind::Terminal
+        // OpenCode reads its first positional argument as the project
+        // directory — a prompt lands there as a path, and the session dies on
+        // `Failed to change directory` (or `ENAMETOOLONG` for a long one). Its
+        // prompt travels to the daemon instead and is typed in once the session
+        // draws its box; see `launch_seed`.
+        && kind != AgentKind::OpenCode
         && let Some(prompt) = initial_prompt
     {
         args.push(prompt.into());
     }
     args
+}
+
+/// The prompt a launch wants typed into the session once it is ready, rather
+/// than passed on the command line. Only OpenCode needs this today, because
+/// only its CLI reads a positional argument as something other than a prompt.
+pub(crate) fn launch_seed(
+    kind: AgentKind,
+    resume_id: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> Option<String> {
+    (kind == AgentKind::OpenCode && resume_id.is_none())
+        .then(|| initial_prompt.unwrap_or_default().trim())
+        .filter(|prompt| !prompt.is_empty())
+        .map(str::to_string)
 }
 
 fn interactive_shell_command(command: &str) -> String {

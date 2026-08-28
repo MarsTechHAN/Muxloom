@@ -38,6 +38,10 @@ const BOT_TYPE: &str = "3";
 
 /// A text item, in the protocol's numbering.
 const ITEM_TEXT: i64 = 1;
+/// The item type the platform itself puts on the `message_item` inside a
+/// quote's `ref_msg`: 0 in every capture, inbound and outbound alike — the
+/// reference stands for someone else's message, not for a fresh text item.
+const QUOTED_REF: i64 = 0;
 /// Sent by a bot rather than by a person.
 const FROM_BOT: i64 = 2;
 /// A complete message rather than one still being streamed in.
@@ -100,6 +104,12 @@ pub struct Said {
     /// The token that has to travel on anything said back. Every message in
     /// carries a fresh one, and the newest is the one that works.
     pub context_token: String,
+    /// When this message was a quote-reply: the WeChat id of the message it
+    /// quoted, as a string. That is the very id `send_text`'s reply body named
+    /// when the quoted message went out, so it is what matches the quote back
+    /// to its sender. `None` when they simply typed — the common case, and
+    /// what every message looked like before this was read.
+    pub quoted_id: Option<String>,
 }
 
 /// What one round of asking for messages found.
@@ -230,6 +240,11 @@ pub struct Verdict {
     pub code: i64,
     pub reason: String,
     pub delivery_confirmed: bool,
+    /// WeChat's own id for the message that went out, from the reply body
+    /// (`message_id`), when the body carried one. This is the id a later quote
+    /// of the message names, so it is the one a receipt has to keep: the
+    /// `client_id` this side minted proves nothing to a reply.
+    pub message_id: Option<String>,
 }
 
 /// Say one thing to the person this bot belongs to.
@@ -242,10 +257,15 @@ pub struct Verdict {
 /// Returns the id this side minted for the send together with WeChat's own
 /// verdict on it. The id alone says nothing about delivery; the body does, and
 /// the caller is the only one in a position to read it before it is forgotten.
+///
+/// `quoted_id` is the WeChat message id this send answers, when it answers
+/// one: the same string a quote-reply arrives naming. With it the message
+/// shows on the phone as quoting that one; without it, as a plain message.
 pub fn send_text(
     account: &Account,
     context_token: &str,
     text: &str,
+    quoted_id: Option<&str>,
     environment: &[(String, String)],
 ) -> Result<(String, Verdict)> {
     if context_token.trim().is_empty() {
@@ -257,17 +277,7 @@ pub fn send_text(
     let answer = http::post_json(
         &endpoint(&account.base_url, "sendmessage"),
         &headers(&bearer, &nonce),
-        &json!({
-            "msg": {
-                "to_user_id": account.user_id,
-                "client_id": id,
-                "message_type": FROM_BOT,
-                "message_state": FINISHED,
-                "context_token": context_token,
-                "item_list": [{ "type": ITEM_TEXT, "text_item": { "text": text } }],
-            },
-            "base_info": { "channel_version": env!("CARGO_PKG_VERSION") },
-        }),
+        &send_body(&account.user_id, &id, context_token, text, quoted_id),
         environment,
     )?;
     capture_raw("send", &answer);
@@ -299,11 +309,52 @@ pub fn send_text(
     Ok((id, verdict))
 }
 
-/// Read the verdict off one reply body: the code, the human reason, and whether
+/// The outgoing body for one send, apart from the wire so the shape a quote
+/// travels on can be checked without a network.
+fn send_body(
+    to: &str,
+    id: &str,
+    context_token: &str,
+    text: &str,
+    quoted_id: Option<&str>,
+) -> Value {
+    json!({
+        "msg": {
+            "to_user_id": to,
+            "client_id": id,
+            "message_type": FROM_BOT,
+            "message_state": FINISHED,
+            "context_token": context_token,
+            "item_list": [text_item(text, quoted_id)],
+        },
+        "base_info": { "channel_version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
+/// One text item, quoting `quoted_id` when there is one.
+///
+/// The reference mirrors the shape a quote arrives in — `ref_msg` wrapping a
+/// `message_item` whose `msg_id` is a string of the platform's numeric id —
+/// because that is the only pairing of the two names ever captured off the
+/// wire. Minimal past that, like every other item this bot sends: fields the
+/// platform invented for its own bookkeeping (`create_time_ms` and the rest)
+/// are not ours to guess at.
+fn text_item(text: &str, quoted_id: Option<&str>) -> Value {
+    let mut item = json!({ "type": ITEM_TEXT, "text_item": { "text": text } });
+    if let Some(quoted) = quoted_id.filter(|id| !id.trim().is_empty()) {
+        item["ref_msg"] = json!({
+            "message_item": { "type": QUOTED_REF, "msg_id": quoted },
+        });
+    }
+    item
+}
+
+/// Read the verdict off one reply body: the code, the human reason, whether
 /// the body carries a delivery id of WeChat's own — a server-side id distinct
-/// from the `client_id` this side sent. That is the only evidence the message
-/// went out rather than merely being accepted; an accepted-but-dropped reply
-/// (a stale context token) comes back with none.
+/// from the `client_id` this side sent, which is the only evidence the message
+/// went out rather than merely being accepted (an accepted-but-dropped reply
+/// (a stale context token) comes back with none) — and that id itself, which
+/// is what a later quote of the message will name.
 fn verdict_of(answer: &Value, client_id: &str) -> Verdict {
     let code = code_of(answer);
     let reason = answer
@@ -323,10 +374,12 @@ fn verdict_of(answer: &Value, client_id: &str) -> Verdict {
             })
             .any(|value| value != client_id)
     });
+    let message_id = Some(number_or_text(answer, "message_id")).filter(|id| !id.is_empty());
     Verdict {
         code,
         reason,
         delivery_confirmed,
+        message_id,
     }
 }
 
@@ -453,6 +506,7 @@ fn parse_said(msgs: &[Value]) -> Vec<Said> {
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
                 context_token: text_at(message, "context_token"),
+                quoted_id: quoted(message),
             })
         })
         .collect::<Vec<_>>();
@@ -479,6 +533,29 @@ fn spoken(message: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(text).filter(|text| !text.trim().is_empty())
+}
+
+/// The message one of these quotes, when the person replied by quoting one.
+///
+/// A quote-reply is an ordinary message whose item carries a `ref_msg` with a
+/// `message_item` naming the quoted message by `msg_id` — the platform id the
+/// original send's reply body handed back, as a string. The first item that
+/// names something wins; a person quotes one message per message, and an item
+/// list with more than one reference is not a thing the captures show.
+fn quoted(message: &Value) -> Option<String> {
+    message
+        .get("item_list")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .find_map(|item| {
+            Some(number_or_text(
+                item.pointer("/ref_msg/message_item")?,
+                "msg_id",
+            ))
+            .filter(|id| !id.is_empty())
+        })
 }
 
 /// WeChat answers HTTP 200 and puts its refusal in the body, so the status line
@@ -650,7 +727,7 @@ mod tests {
 
     #[test]
     fn nothing_is_sent_into_a_conversation_that_was_never_opened() {
-        let error = send_text(&Account::default(), "  ", "hello", &[]).unwrap_err();
+        let error = send_text(&Account::default(), "  ", "hello", None, &[]).unwrap_err();
         assert!(
             format!("{error:#}").contains("say anything to this bot"),
             "{error:#}"
@@ -670,6 +747,7 @@ mod tests {
                 code: 0,
                 reason: "success".into(),
                 delivery_confirmed: true,
+                message_id: None,
             }
         );
         // Code 0 with only the complaint keys: accepted, delivery unconfirmed.
@@ -679,6 +757,7 @@ mod tests {
                 code: 0,
                 reason: "success".into(),
                 delivery_confirmed: false,
+                message_id: None,
             }
         );
         // An echo of the id this side minted is not a delivery.
@@ -688,6 +767,7 @@ mod tests {
                 code: 0,
                 reason: String::new(),
                 delivery_confirmed: false,
+                message_id: None,
             }
         );
         // A numeric delivery id counts, and a refusal carries its code.
@@ -697,6 +777,97 @@ mod tests {
         let asleep = verdict_of(&json!({ "errcode": ASLEEP }), client_id);
         assert_eq!(asleep.code, ASLEEP);
         assert!(!asleep.delivery_confirmed);
+        assert_eq!(asleep.message_id, None);
+    }
+
+    #[test]
+    fn the_reply_body_hands_back_the_id_a_later_quote_will_name() {
+        // Exactly the captured shape: a bare body whose `message_id` is a
+        // number. A later quote-reply names this very value as a string, so
+        // it has to come off the verdict in string form, whole.
+        let verdict = verdict_of(
+            &json!({ "message_id": 7498971037873973384u64 }),
+            "muxloom-x",
+        );
+        assert_eq!(verdict.message_id.as_deref(), Some("7498971037873973384"));
+        assert!(verdict.delivery_confirmed);
+        // A body that names nothing — the accepted-but-dropped reply — hands
+        // back nothing; no id is invented.
+        assert_eq!(
+            verdict_of(&json!({ "errcode": 0, "errmsg": "success" }), "muxloom-x").message_id,
+            None
+        );
+    }
+
+    #[test]
+    fn a_quoted_reply_arrives_naming_the_message_it_quotes() {
+        // The captured inbound shape: an ordinary message whose text item
+        // carries a ref_msg whose message_item names the sent message by its
+        // platform id, as a string.
+        let msgs = vec![json!({
+            "message_type": 1, "message_id": 7498971246643971720u64, "create_time_ms": 1000,
+            "context_token": "ctx",
+            "item_list": [{
+                "type": 1,
+                "msg_id": "v1:7593072987848423685",
+                "ref_msg": { "message_item": { "type": 0, "msg_id": "7498971037873973384" } },
+                "text_item": { "text": "你好你好" },
+            }],
+        })];
+        let said = parse_said(&msgs);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].quoted_id.as_deref(), Some("7498971037873973384"));
+        // And the very id the send handed back is the id the quote names.
+        let sent = verdict_of(
+            &json!({ "message_id": 7498971037873973384u64 }),
+            "muxloom-x",
+        );
+        assert_eq!(sent.message_id, said[0].quoted_id);
+    }
+
+    #[test]
+    fn a_plain_message_quotes_nothing() {
+        let msgs = vec![json!({
+            "message_type": 1, "message_id": 1u64, "create_time_ms": 1000,
+            "context_token": "ctx",
+            "item_list": [{ "type": 1, "text_item": { "text": "hi" } }],
+        })];
+        let said = parse_said(&msgs);
+        assert_eq!(said[0].quoted_id, None);
+        // An item that references nothing readable is still no quote.
+        let empty_ref = vec![json!({
+            "message_type": 1, "message_id": 2u64, "create_time_ms": 1000,
+            "item_list": [{ "type": 1, "ref_msg": {}, "text_item": { "text": "hi" } }],
+        })];
+        assert_eq!(parse_said(&empty_ref)[0].quoted_id, None);
+    }
+
+    #[test]
+    fn a_quoted_send_carries_the_reference_the_wire_shows() {
+        // Without one, the body is exactly what it always was: a plain text
+        // item and no reference anywhere.
+        let plain = send_body("u@im.wechat", "muxloom-x", "ctx", "hi", None);
+        assert_eq!(
+            plain["msg"]["item_list"],
+            json!([{ "type": ITEM_TEXT, "text_item": { "text": "hi" } }])
+        );
+        // With one, the reference mirrors the inbound shape: `ref_msg` around
+        // a `message_item`, and the id travels as a STRING.
+        let quoting = send_body(
+            "u@im.wechat",
+            "muxloom-x",
+            "ctx",
+            "hi",
+            Some("7498971037873973384"),
+        );
+        assert_eq!(
+            quoting["msg"]["item_list"][0]["ref_msg"],
+            json!({ "message_item": { "type": QUOTED_REF, "msg_id": "7498971037873973384" } })
+        );
+        assert!(quoting["msg"]["item_list"][0]["ref_msg"]["message_item"]["msg_id"].is_string());
+        // An empty id is no quote: it must not ride along as a broken one.
+        let blank = send_body("u@im.wechat", "muxloom-x", "ctx", "hi", Some("  "));
+        assert!(blank["msg"]["item_list"][0].get("ref_msg").is_none());
     }
 
     #[test]

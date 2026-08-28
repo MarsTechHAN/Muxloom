@@ -20,7 +20,7 @@ use crate::{
     channel::{CHANNELS_CAPABILITY, ChannelReceipt, ChannelSet},
     daemon_protocol::{
         DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
-        OpenStream, PROTOCOL_VERSION, Trigger, stream,
+        OpenStream, PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, Trigger, stream,
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
@@ -752,6 +752,7 @@ impl BridgeConnection {
         environment: Vec<(String, String)>,
         created_at: u64,
         parent: Option<String>,
+        initial_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         match self
             .request(DaemonRequest::Launch {
@@ -767,10 +768,11 @@ impl BridgeConnection {
                 columns: 120,
                 rows: 40,
                 parent,
+                initial_prompt,
             })?
             .response
         {
-            DaemonResponse::Launched { session } => Ok(session),
+            DaemonResponse::Launched { session } => Ok(*session),
             response => bail!("unexpected launch response: {response:?}"),
         }
     }
@@ -955,6 +957,20 @@ impl BridgeConnection {
     pub fn channels_put(&self, set: &ChannelSet) -> Result<()> {
         self.require_capability(CHANNELS_CAPABILITY)?;
         self.expect_ack(DaemonRequest::ChannelsPut { set: set.clone() })
+    }
+
+    /// Take the attention edges this daemon marked for parents but has not
+    /// told anyone about, handing them over in the same breath. A daemon too
+    /// old to watch has none, which is the same answer as a young one that
+    /// saw nothing.
+    pub fn drain_alerts(&self) -> Result<Vec<ParentAlert>> {
+        if !self.has_capability(PARENT_ALERT_CAPABILITY) {
+            return Ok(Vec::new());
+        }
+        match self.request(DaemonRequest::DrainAlerts)?.response {
+            DaemonResponse::Alerts { alerts } => Ok(alerts),
+            response => bail!("unexpected alerts response: {response:?}"),
+        }
     }
 
     fn has_capability(&self, capability: &str) -> bool {
@@ -2176,6 +2192,7 @@ impl BridgePool {
         environment: Vec<(String, String)>,
         created_at: u64,
         parent: Option<String>,
+        initial_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         let connection = self.connection_for_target(target)?;
         let error = match connection.launch(
@@ -2189,6 +2206,7 @@ impl BridgePool {
             environment.clone(),
             created_at,
             parent.clone(),
+            initial_prompt.clone(),
         ) {
             Ok(session) => return Ok(session),
             Err(error) => error,
@@ -2233,6 +2251,7 @@ impl BridgePool {
             environment,
             created_at,
             parent,
+            initial_prompt,
         )
     }
 
@@ -2323,6 +2342,10 @@ impl BridgePool {
         target: &Target,
     ) -> Result<Option<(ChannelSet, Vec<ChannelReceipt>)>> {
         self.connection_for_target(target)?.channels_get()
+    }
+
+    pub fn drain_alerts(&self, target: &Target) -> Result<Vec<ParentAlert>> {
+        self.connection_for_target(target)?.drain_alerts()
     }
 
     pub fn channel_sent(&self, target: &Target, receipt: ChannelReceipt) -> Result<()> {

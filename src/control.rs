@@ -1427,6 +1427,7 @@ fn send_channel(
         leave(crate::channel::ChannelReceipt {
             channel: sent.channel.clone(),
             message_id: sent.message_id.clone(),
+            machine: session_env("MUXLOOM_MACHINE").unwrap_or_else(|| "local".into()),
             session_id,
             label: session_env("MUXLOOM_SESSION_LABEL").unwrap_or_default(),
         });
@@ -3004,7 +3005,7 @@ mod daemon_surface {
             DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, Trigger, stream,
         },
         model::LOCAL_TARGET_ID,
-        runtime::{launch_arguments, new_daemon_session_id},
+        runtime::{launch_arguments, launch_seed, new_daemon_session_id},
     };
 
     /// How long one daemon request may run. Matches the bridge's own request
@@ -3434,6 +3435,11 @@ mod daemon_surface {
                 optional_str(arguments, "resume_id"),
                 optional_str(arguments, "initial_prompt"),
             );
+            let seed = launch_seed(
+                kind,
+                optional_str(arguments, "resume_id"),
+                optional_str(arguments, "initial_prompt"),
+            );
             let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
             let (session_id, created_at) = new_daemon_session_id(kind, false);
             let response = self
@@ -3452,6 +3458,7 @@ mod daemon_surface {
                     columns: 120,
                     rows: 40,
                     parent: launching_session(),
+                    initial_prompt: seed,
                 })?
                 .0;
             match response {
@@ -3763,6 +3770,8 @@ mod tests {
             attention_reason: attention.then(|| "waiting on a person".into()),
             composer: None,
             parent: None,
+            resumed_from: None,
+            resumed_to: None,
         }
     }
 
