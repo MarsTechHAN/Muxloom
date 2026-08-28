@@ -4540,6 +4540,19 @@ impl App {
         let Some(terminal) = self.terminal.as_mut() else {
             return desired;
         };
+        let max = terminal.max_scrollback();
+        if desired > max {
+            // The position the app asked for lies beyond the emulator's own
+            // buffer, so it is rendered from daemon history (`attached_history_is_buffered`
+            // is false) and the emulator must not be asked to scroll there —
+            // on an alt screen its scrollback is empty, so `set_scrollback`
+            // clamps back to 0 and every frame would snap `history_offset`
+            // back to live, hiding the daemon-paged rows. Leave the offset
+            // exactly as the daemon page was asked for; the emulator stays at
+            // live underneath.
+            self.terminal_scrollback_pin = 0;
+            return desired;
+        }
         if desired != pinned {
             terminal.set_scrollback(desired);
         }
@@ -14532,6 +14545,55 @@ mod tests {
             "no capture for missing rows"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_daemon_paged_offset_survives_the_draw_sync_on_an_alt_screen_attach() {
+        // The real render blocker behind "opencode 终端切回后 UI 未完整渲染": the
+        // per-frame `sync_terminal_scrollback` used to hand `history_offset` to
+        // the emulator and then take the emulator's clamped answer back. An
+        // alt-screen agent keeps no emulator scrollback (max_scrollback() == 0),
+        // so each frame set_scrollback clawed back to 0, history_offset was
+        // overwritten to live, `attached_history_is_buffered` flipped true, and
+        // the daemon-paged rows were hidden a frame after they were asked for.
+        // The paged offset must survive a frame.
+        let (mut app, request_rx, root, _boundary) = attached_claude_app("altsync");
+        // Sit the attached terminal on the alternate screen, exactly as a full
+        // screen TUI agent does - the emulator keeps no scrollback there.
+        let mut terminal = TerminalSession::detached(20, 5);
+        terminal.process_output_for_test(b"\x1b[?1049h".as_ref());
+        assert_eq!(terminal.max_scrollback(), 0);
+        app.terminal = Some(terminal);
+
+        // Scroll up: the emulator holds nothing, so the daemon is asked for a
+        // page and the view lands deep in daemon history (well past max 0).
+        app.scroll_history(true, 3);
+        let paged = app.history_offset;
+        assert!(paged > 0);
+        assert!(!app.attached_history_is_buffered());
+
+        // A frame draws - this is the `app.sync_terminal_scrollback()` call
+        // ui.rs:1047 makes before every terminal pane is drawn.
+        let settled = app.sync_terminal_scrollback();
+        assert_eq!(
+            app.history_offset, paged,
+            "a daemon-paged offset must survive the draw sync, not snap to 0"
+        );
+        assert_eq!(settled, paged);
+        assert!(
+            !app.attached_history_is_buffered(),
+            "still a daemon-paged view, not the emulator's live frame"
+        );
+
+        // And a second frame cannot snap it either.
+        let settled = app.sync_terminal_scrollback();
+        assert_eq!(
+            app.history_offset, paged,
+            "the offset must not recur on later frames"
+        );
+        assert_eq!(settled, paged);
+        drop(request_rx);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A page of history as the daemon hands one back, either rendered into
