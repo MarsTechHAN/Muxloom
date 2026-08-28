@@ -652,6 +652,14 @@ pub struct DaemonSession {
     /// when each started.
     #[serde(default)]
     pub seed: Option<String>,
+    /// The first substantial text the daemon typed into this session, in its
+    /// own hearing. The runtime's transcript records the same words as the
+    /// first thing the person said in the conversation, so this is what lets
+    /// a session check its claim against content instead of timing - and it
+    /// has to outlive the daemon that heard it, because the round that
+    /// matches can come after a restart.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     pub working: bool,
     pub needs_attention: bool,
     pub attention_reason: Option<String>,

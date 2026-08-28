@@ -110,6 +110,13 @@ mod platform {
     /// old transcript is closed where it stands and a new one begins. The wait
     /// is what lets a transcript that is slow to be flushed catch up.
     const NATIVE_CLAIM_STALE_MS: u64 = 60_000;
+    /// How many folder re-scans one claim may ask for while it is still a
+    /// timing guess - a claim never weighed against the transcript's own
+    /// first words. A crossed pair needs one round where both transcripts
+    /// have said their first thing and both sessions know what they were
+    /// asked; a transcript that says nothing at all is answered by the
+    /// screen, not by asking the folder forever.
+    const NATIVE_CLAIM_CHECK_LOOKS: u8 = 4;
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -333,6 +340,19 @@ mod platform {
         /// pass to age an unsent draft: a box that keeps changing has someone
         /// typing, and a box that has stopped is a draft we may deliver over.
         draft_watch: Mutex<Option<(String, u64)>>,
+        /// The first substantial submission typed into this session, as the
+        /// daemon itself heard it. What a runtime records as the first thing
+        /// the person said in a transcript is the same text, so a session
+        /// carrying this can check its claim against content rather than
+        /// timing. Recorded once, while it is still `None`: the opening words
+        /// are what identify a conversation, and later input is somebody
+        /// else's sentence.
+        first_prompt: Mutex<Option<String>>,
+        /// Whether this session can still hear its own opening at all. Only
+        /// a session this daemon spawned has its first input ahead of it; an
+        /// adopted session's opening lies in the past whatever its metadata
+        /// says, and a payload the new daemon hears must never pose as it.
+        first_prompt_armed: AtomicBool,
         /// Set on adoption only: this daemon rebuilt the screen by replaying a
         /// bounded tail of history into a fresh parser, so what it holds is a
         /// partial frame for an app that differential-renders. The first
@@ -388,6 +408,20 @@ mod platform {
         /// Listing a directory is the expensive half of this, and a session
         /// that has said nothing since cannot have begun writing anything.
         scanned_at: u64,
+        /// Whether the current claim has been weighed against the first
+        /// words both accounts keep - what this session was asked and what
+        /// the transcript says the person said first. A claim that has not
+        /// is a timing guess, and two siblings started together are exactly
+        /// what timing gets wrong: each can end up named by the other's
+        /// conversation, invisibly from inside a claimed session, because a
+        /// folder where every session is claimed is never looked through
+        /// again on its own.
+        claim_checked: bool,
+        /// Re-scans spent checking it. A guess stops asking after the bound
+        /// whether the transcript ever said its first words; the cost of
+        /// being wrong there is a title read off the screen, and the cost of
+        /// asking forever is listing the folder every round.
+        claim_looks: u8,
     }
 
     struct NativeClaim {
@@ -1452,6 +1486,9 @@ mod platform {
                 title: None,
                 thread: None,
                 seed: None,
+                // The account of what opened this conversation went missing
+                // with the metadata; nothing left can say what it was.
+                first_prompt: None,
                 working: false,
                 needs_attention: false,
                 attention_reason: None,
@@ -3147,11 +3184,45 @@ mod platform {
                     title: thread.title.clone(),
                     recap: thread.last_message.clone(),
                 });
+                // A claim just taken - or traded for a better one - has to
+                // earn this round's check like any other; the pass below
+                // closes it straight away when the first words already agree.
+                native.claim_checked = false;
+                native.claim_looks = 0;
             }
             // Outside the lock: persisting takes a snapshot, and a snapshot
             // reads the claim that was just made.
             if let Err(error) = session.persist_metadata() {
                 eprintln!("muxloomd could not record what a session is reading: {error:#}");
+            }
+        }
+        // The scan was this round's check. Whatever claim a session holds
+        // now, held through the scan or just taken from it, agrees with the
+        // transcript's own first words or the session keeps asking. Only a
+        // positive agreement closes the guess: silence is the transcript
+        // not having said its first thing yet, which is exactly when a
+        // crossed claim is still worth catching.
+        for (_, session) in group.iter() {
+            let prompt = session
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut native = session
+                .native
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(claim) = native.claim.as_ref() else {
+                continue;
+            };
+            if threads.iter().any(|thread| {
+                thread.id == claim.id
+                    && crate::native_history::first_text_agreement(
+                        prompt.as_deref(),
+                        thread.first_message.as_deref(),
+                    ) == crate::native_history::FirstText::Match
+            }) {
+                native.claim_checked = true;
             }
         }
     }
@@ -3165,17 +3236,47 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &native.claim {
-                Some(claim) => Ok((claim.id.clone(), claim.path.clone(), claim.read_at)),
+                Some(claim) => Ok((
+                    claim.id.clone(),
+                    claim.path.clone(),
+                    claim.read_at,
+                    native.claim_checked,
+                    native.claim_looks,
+                    native.scanned_at,
+                )),
                 None => Err(native.scanned_at),
             }
         };
         let last_output = session.last_output.load(Ordering::Relaxed);
-        let (id, path, read_at) = match claimed {
+        let (id, path, read_at, checked, looks, scanned_at) = match claimed {
             Ok(claim) => claim,
             // Never matched. A session that has produced nothing since the
             // last look cannot have started writing a transcript either.
             Err(scanned_at) => return scanned_at == 0 || last_output > scanned_at,
         };
+        // A claim taken on timing alone - never weighed against the first
+        // words both accounts keep - is still a guess, and a crossed pair of
+        // guesses is invisible from in here: each session reads the other's
+        // conversation, sees a title and a recap, and has no reason to doubt.
+        // Such a claim asks for the folder to be looked through a bounded
+        // number of times, on rounds where its own session is talking, until
+        // the first words say it is right or say whose it really is.
+        if !checked
+            && looks < NATIVE_CLAIM_CHECK_LOOKS
+            && last_output > scanned_at
+            && session
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        {
+            session
+                .native
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .claim_looks += 1;
+            return true;
+        }
         let written = crate::native_history::last_written(&path).unwrap_or_default();
         if written > read_at {
             let Some(thread) = crate::native_history::reread(kind, &path, &id) else {
@@ -3229,6 +3330,8 @@ mod platform {
             native.abandoned.push(id);
             native.claim = None;
             native.scanned_at = 0;
+            native.claim_checked = false;
+            native.claim_looks = 0;
         }
         {
             // The name and the last answer belonged to that conversation, and
@@ -3249,6 +3352,11 @@ mod platform {
 
     /// What the matching is given to go on about one session.
     fn session_facts(created_at: u64, session: &Arc<ManagedSession>) -> NativeFacts {
+        let first_prompt = session
+            .first_prompt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let persisted = session
             .metadata
             .lock()
@@ -3270,7 +3378,10 @@ mod platform {
                 .map(|claim| claim.id.clone())
                 .or(persisted),
             abandoned: native.abandoned.clone(),
-            first_prompt: None,
+            // What the daemon heard the session open with, in this
+            // generation's own hearing or the last one's - taken before any
+            // other lock here, so no path ever holds these two at once.
+            first_prompt,
         }
     }
 
@@ -3518,6 +3629,14 @@ mod platform {
                 .filter(|_| seed.is_some())
                 .and_then(|record| record.thread.clone()),
             seed: seed.clone(),
+            // A launch that reopens a thread reopens the conversation that
+            // opened with those words too; one that starts fresh has heard
+            // nothing yet, and the recorder will fill this in on the first
+            // substantial submission.
+            first_prompt: resuming
+                .as_ref()
+                .filter(|_| seed.is_some())
+                .and_then(|record| record.first_prompt.clone()),
             working: false,
             needs_attention: false,
             attention_reason: None,
@@ -3560,6 +3679,7 @@ mod platform {
             }
         };
         metadata.pid = status.child_pid;
+        let first_prompt = metadata.first_prompt.clone();
         let session = Arc::new(ManagedSession {
             metadata: Mutex::new(metadata),
             keeper: Mutex::new(
@@ -3577,6 +3697,15 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
+            // A revival that reopens the thread carries the opening words too;
+            // a fresh session starts with nothing heard, and the recorder
+            // holds the first substantial submission. A launch told to reopen
+            // a thread is a third case: this daemon spawned the child, but
+            // the conversation opened before it heard anything - and the CLI
+            // replays that opening into whatever file it writes now - so what
+            // it hears first is not the first thing the person said.
+            first_prompt: Mutex::new(first_prompt),
+            first_prompt_armed: AtomicBool::new(seed.is_none()),
             screen_rebuilt: AtomicBool::new(false),
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
@@ -4278,6 +4407,11 @@ mod platform {
         let archived = metadata.archived;
         let temporary = metadata.temporary;
         let seed = metadata.seed.clone();
+        // What the previous generation heard the session open with belongs
+        // to this one now: without it a first submission the new daemon never
+        // saw would be invented from whatever it types next, and the matcher
+        // would check a claim against the wrong words.
+        let first_prompt = metadata.first_prompt.clone();
         let columns = status.columns.max(20);
         let rows = status.rows.max(5);
         let session = Arc::new(ManagedSession {
@@ -4297,6 +4431,12 @@ mod platform {
             codex_activity: Mutex::new(CodexActivity::default()),
             recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
+            // Read back out of the metadata, the same as the seed and the
+            // claim below: this daemon did not hear the conversation open,
+            // and nothing it hears now is the opening, so the recorder is
+            // disarmed whatever the metadata held.
+            first_prompt: Mutex::new(first_prompt),
+            first_prompt_armed: AtomicBool::new(false),
             // The screen below is replayed from a bounded history tail (or is
             // empty for a temporary session): a partial frame for an app that
             // differential-renders, so its first attach forces a repaint.
@@ -4763,6 +4903,17 @@ mod platform {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             snapshot.archived = self.archived.load(Ordering::Relaxed);
+            // The opening words this daemon heard outrank the ones it loaded;
+            // an adopted session holds only what the last generation wrote,
+            // and that must survive the re-persist adoption does.
+            if let Some(prompt) = self
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                snapshot.first_prompt = Some(prompt);
+            }
             let visible_screen = self
                 .screen
                 .lock()
@@ -4945,8 +5096,64 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            self.last_input.store(now_ms(), Ordering::Relaxed);
+            // Take the clock by swapping, not storing: whether anything was
+            // ever asked of this session before this payload is what tells
+            // the opening words from the sentence that followed them. Only
+            // the very first input can be the opening of the conversation,
+            // and a prompt the daemon missed - typed at a terminal in pieces
+            // too small to record - is not to be invented from a later one.
+            let ever_asked = self.last_input.swap(now_ms(), Ordering::Relaxed) != 0;
+            if !ever_asked && self.first_prompt_armed.load(Ordering::Relaxed) {
+                self.record_first_prompt(bytes);
+            }
             self.keeper_frame(keeper::frame::DATA, bytes)
+        }
+
+        /// Keep the first words this session was opened with, in the daemon's
+        /// own hearing.
+        ///
+        /// A submission arrives whole - delivered messages as one bracketed
+        /// paste, controller input as one payload - while keystrokes typed at
+        /// an attached terminal arrive a few bytes at a time, each too short
+        /// to pass the length floor and the escape-sequence guard. So the
+        /// first payload that reads as a sentence is the opening line, and
+        /// nothing later overwrites it.
+        fn record_first_prompt(&self, bytes: &[u8]) {
+            if self
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+            {
+                return;
+            }
+            let Ok(submitted) = std::str::from_utf8(bytes) else {
+                return;
+            };
+            // The paste brackets and the Enter that submits are how the text
+            // travelled, not what was said; an escape anywhere else is raw
+            // key noise, not words.
+            let submitted = submitted.replace("\x1b[200~", "").replace("\x1b[201~", "");
+            let submitted = submitted.trim();
+            if submitted.contains('\x1b')
+                || submitted.chars().count() < crate::native_history::MIN_FIRST_TEXT_CHARS
+            {
+                return;
+            }
+            {
+                let mut first = self
+                    .first_prompt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if first.is_some() {
+                    return;
+                }
+                *first = Some(submitted.to_string());
+            }
+            // The one write that makes the opening outlive this daemon: a
+            // restarted generation that never heard what the session was
+            // asked cannot check its claim against content.
+            let _ = self.persist_metadata();
         }
 
         fn set_notice(&self, text: String) {
@@ -6509,6 +6716,247 @@ mod platform {
         }
 
         #[test]
+        fn an_archived_session_revives_on_its_own_id_and_keeps_its_record() {
+            let state = test_state("revive-id");
+            let id = "muxloomd-terminal-revive-id";
+            let first = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            first.write_input(b"marker line\r").unwrap();
+            let history = state.paths.history.join(format!("{id}.ansi"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read(&history)
+                .unwrap_or_default()
+                .windows(11)
+                .any(|w| w == b"marker line")
+            {
+                assert!(Instant::now() < deadline, "the history never saw the input");
+                thread::sleep(Duration::from_millis(20));
+            }
+            first.archive().unwrap();
+            drop(first);
+
+            // The same number arriving again is that conversation coming back,
+            // not a second identity for it: the record revives in place.
+            let revived = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            let snapshot = revived.snapshot();
+            assert_eq!(snapshot.id, id);
+            assert_eq!(snapshot.label, "coordinator");
+            assert_eq!(snapshot.created_at, 111);
+            assert!(!snapshot.archived);
+            // The archived record is gone from the archive and there is
+            // exactly one holder of the number again.
+            assert!(
+                !state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(id)
+            );
+            assert_eq!(
+                state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .filter(|session| session.snapshot().id == id)
+                    .count(),
+                1
+            );
+            // And its history was appended to, not replaced.
+            assert!(
+                fs::read(&history)
+                    .unwrap()
+                    .windows(11)
+                    .any(|w| w == b"marker line")
+            );
+        }
+
+        #[test]
+        fn a_live_session_refuses_a_launch_over_its_number() {
+            let state = test_state("live-holder-refuse");
+            let id = "muxloomd-terminal-live-holder";
+            let first = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "first".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            let error = match launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "second".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+            ) {
+                Ok(_) => panic!("a live session's number must never be launched over"),
+                Err(error) => error,
+            };
+            assert!(format!("{error:#}").contains("still live"), "{error:#}");
+            assert_eq!(first.snapshot().label, "first");
+        }
+
+        #[test]
+        fn a_new_launch_for_an_archived_conversation_takes_its_fleet_and_leaves_an_alias() {
+            let state = test_state("compat-alias");
+            let master = "muxloomd-claude-compat-master";
+            let successor = "muxloomd-claude-compat-successor";
+            let old = launch_session(
+                &state,
+                master.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-old".into()],
+                vec![],
+                100,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            let live_child = launch_session(
+                &state,
+                "muxloomd-claude-compat-live".into(),
+                "claude".into(),
+                "/tmp".into(),
+                "worker-one".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                101,
+                80,
+                24,
+                Some(master.into()),
+            )
+            .unwrap();
+            let archived_child = launch_session(
+                &state,
+                "muxloomd-claude-compat-arch".into(),
+                "claude".into(),
+                "/tmp".into(),
+                "worker-two".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                102,
+                80,
+                24,
+                Some(master.into()),
+            )
+            .unwrap();
+            archived_child.archive().unwrap();
+            drop(archived_child);
+            old.archive().unwrap();
+            drop(old);
+
+            // The old conversation coming back under a fresh number is the
+            // split the alias fields exist to record: the fleet follows the
+            // number that answers, and the old record points at it. In this
+            // process the archived records still sit in the live map under
+            // their archived flag (the persisted map is a restarted daemon's
+            // recollection of the same files); both views are what
+            // archived_resume_match and reparent_children read.
+            let revived = launch_session(
+                &state,
+                successor.into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-old".into()],
+                vec![],
+                200,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            let snapshot = revived.snapshot();
+            assert_eq!(snapshot.label, "coordinator");
+            assert_eq!(snapshot.resumed_from.as_deref(), Some(master));
+            // The live child was repointed at the successor.
+            assert_eq!(live_child.snapshot().parent.as_deref(), Some(successor));
+
+            // The archived child and the retired master, still in the live
+            // map as archived records, took the rewrite too.
+            let sessions = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let arch_child = sessions
+                .get("muxloomd-claude-compat-arch")
+                .expect("the archived child is still recorded here")
+                .snapshot();
+            assert!(arch_child.archived);
+            assert_eq!(arch_child.parent.as_deref(), Some(successor));
+            let retired = sessions
+                .get(master)
+                .expect("the retired master is still recorded here")
+                .snapshot();
+            assert!(retired.archived);
+            assert_eq!(retired.resumed_to.as_deref(), Some(successor));
+            drop(sessions);
+
+            // The resumed-successor guard that stops a second fork of one
+            // conversation needs the successor to still be live, which this
+            // unit harness's /bin/cat stand-in cannot guarantee past its own
+            // exit; the guard itself is exercised end-to-end by the control
+            // surface test `a_resume_by_muxloom_id_refuses_the_session_that_is_still_live`.
+        }
+
+        #[test]
         fn a_trigger_outlives_the_daemon_that_took_it() {
             let state = test_state("triggers-reload");
             state.save_triggers(&[armed_trigger(false, 5_000, Some(400))]);
@@ -7636,6 +8084,219 @@ mod platform {
             fs::remove_dir_all(root).unwrap();
         }
 
+        /// The matching can only tell a claim from a guess if the facts it is
+        /// handed carry what the session was asked to open with - the live
+        /// recording of this generation, the persisted one after a restart.
+        #[test]
+        fn the_matching_is_told_what_the_session_was_asked() {
+            let state = test_state("native-facts");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-facts".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                session_facts(1, &session).first_prompt,
+                None,
+                "nothing has been heard yet"
+            );
+            *session
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some("fix the render glitch in the pty reader".into());
+            assert_eq!(
+                session_facts(1, &session).first_prompt.as_deref(),
+                Some("fix the render glitch in the pty reader"),
+                "the live recording reaches the matching"
+            );
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// A second launch into the same folder is a second conversation, not
+        /// an echo of the first: the opening line is recorded once, from the
+        /// first payload the session is ever given, and what a restart brings
+        /// back is the recording - never a later payload dressed as it.
+        #[test]
+        fn the_first_thing_a_session_is_asked_is_recorded_once_and_kept() {
+            let state = test_state("native-record");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-record".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+
+            session
+                .write_input(b"fix the render glitch in the pty reader\r")
+                .unwrap();
+            assert_eq!(
+                session
+                    .first_prompt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_deref(),
+                Some("fix the render glitch in the pty reader"),
+                "the opening is heard and kept"
+            );
+            // Persisted, so the next daemon generation matches against the
+            // same opening the first one heard.
+            let stored: DaemonSession =
+                serde_json::from_slice(&fs::read(&session.metadata_path).unwrap()).unwrap();
+            assert_eq!(
+                stored.first_prompt.as_deref(),
+                Some("fix the render glitch in the pty reader")
+            );
+
+            session
+                .write_input(b"and now a second, quite different sentence\r")
+                .unwrap();
+            assert_eq!(
+                session
+                    .first_prompt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_deref(),
+                Some("fix the render glitch in the pty reader"),
+                "the second payload is somebody else's sentence"
+            );
+
+            // A session whose real opening was a keystroke burst too small to
+            // be a sentence keeps its opening unknown: the next substantial
+            // payload came after the conversation started and must not be
+            // recorded in its place.
+            let burst = launch_session(
+                &state,
+                "muxloomd-claude-native-burst".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            burst.write_input(b"hi\r").unwrap();
+            burst
+                .write_input(b"a longer payload, arriving only second\r")
+                .unwrap();
+            assert_eq!(
+                burst
+                    .first_prompt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_deref(),
+                None,
+                "a missed opening is not invented from a later input"
+            );
+
+            session.archive().unwrap();
+            burst.archive().unwrap();
+            fs::remove_dir_all(root).ok();
+        }
+
+        /// A claim taken on timing - which is how a crossed pair is made -
+        /// asks for the folder to be looked through until the first words
+        /// settle it, and stops asking once settled or out of budget.
+        #[test]
+        fn an_unweighed_claim_asks_for_the_folder_a_bounded_number_of_times() {
+            let state = test_state("native-check");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-check".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                native.claim = Some(NativeClaim {
+                    id: "maybe-mine".into(),
+                    path: root.join("maybe-mine.jsonl"),
+                    // Nothing new to read; only the check can ask for a look.
+                    read_at: u64::MAX,
+                    title: None,
+                    recap: None,
+                });
+            }
+            *session
+                .first_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some("fix the render glitch in the pty reader".into());
+            session.last_output.store(now_ms(), Ordering::Relaxed);
+
+            for _ in 0..NATIVE_CLAIM_CHECK_LOOKS {
+                assert!(
+                    refresh_native_claim(AgentKind::Claude, &session),
+                    "an unchecked claim asks the folder once more"
+                );
+            }
+            assert!(
+                !refresh_native_claim(AgentKind::Claude, &session),
+                "and stops asking once the budget is spent"
+            );
+
+            // A claim the first words have agreed with stops asking at once.
+            {
+                let mut native = session
+                    .native
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                native.claim_checked = true;
+            }
+            assert!(!refresh_native_claim(AgentKind::Claude, &session));
+
+            session.archive().unwrap();
+            // The keeper may still be closing its history file; removing the
+            // scratch root is best-effort, as elsewhere in these tests.
+            fs::remove_dir_all(root).ok();
+        }
+
         /// Put a file's modification time where a test needs it, so a
         /// transcript can be one that stopped growing a while ago.
         fn set_modified(path: &std::path::Path, epoch_ms: u64) {
@@ -8005,6 +8666,7 @@ mod platform {
                     title: None,
                     thread: None,
                     seed: None,
+                    first_prompt: None,
                     working: false,
                     needs_attention: false,
                     attention_reason: None,
@@ -8061,6 +8723,7 @@ mod platform {
                 title: None,
                 thread: None,
                 seed: None,
+                first_prompt: None,
                 resumed_from: None,
                 resumed_to: None,
                 working: true,
@@ -9980,6 +10643,7 @@ mod platform {
                     title: None,
                     thread: None,
                     seed: None,
+                    first_prompt: None,
                     resumed_from: None,
                     resumed_to: None,
                     working: false,

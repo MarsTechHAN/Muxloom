@@ -2510,6 +2510,7 @@ mod tests {
             title: None,
             thread: thread.map(str::to_string),
             seed: None,
+            first_prompt: None,
             working: false,
             needs_attention: false,
             attention_reason: None,

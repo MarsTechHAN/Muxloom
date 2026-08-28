@@ -576,7 +576,7 @@ Reply `approve-{id}` to allow once, `always-{id}` for the whole conversation, or
                         runtime.clone(),
                     )?),
                 };
-                match run(surface, &job.tool, &job.arguments) {
+                match run(surface, &job.tool, &job.arguments, &job.session) {
                     Ok(output) => {
                         round.ran += 1;
                         // A one-shot grant is spent by the run it let through.
@@ -637,10 +637,28 @@ fn hear(heard: &mut Vec<RelayPeer>, known: Vec<RelayPeer>, mine: &[RelayPeer], v
 
 /// Run one job against the controller's own tools. The arguments crossed the
 /// wire as text, so a malformed set is the submitter's error to hear.
-fn run(surface: &mut ControllerControl, tool: &str, arguments: &str) -> Result<String> {
+///
+/// The controller's own process runs outside every session, so a launch
+/// relayed from one would lose its parent entirely: the submitting session's
+/// id travels along in the arguments, where only the controller flavor reads
+/// it (the daemon flavor answers from its own environment, so an id named
+/// here cannot spoof a parent on the submitter's machine).
+fn run(
+    surface: &mut ControllerControl,
+    tool: &str,
+    arguments: &str,
+    session: &str,
+) -> Result<String> {
     let arguments = serde_json::from_str(arguments)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    surface.call(tool, &bounded(arguments))
+    let mut arguments = bounded(arguments);
+    if !session.trim().is_empty() {
+        if let Some(map) = arguments.as_object_mut() {
+            map.entry("_muxloom_caller")
+                .or_insert_with(|| serde_json::Value::String(session.to_string()));
+        }
+    }
+    surface.call(tool, &arguments)
 }
 
 /// The arguments a relayed job actually runs with.

@@ -598,8 +598,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       and plain lists: Lark renders headings, tables and code fences, WeChat \
                       renders none of them and gets a flattened version where the words and line \
                       breaks survive and the marks do not. muxloom signs it with the machine and \
-                      session you are in, so do not write that yourself, and never put a token, a \
-                      key, or an absolute home path in it. Their reply comes back to you as a \
+                       session you are in, so do not write that yourself, and never put a token, a \
+                       key, or an absolute home path in it. The receipt reports what you sent as \
+                       `message_id`; when a reply reaches you quoting one of your messages it \
+                       names the quoted id, and answering with that id as `reply_to` draws \
+                       WeChat's quote on the same message. Their reply comes back to you as a \
                       direct message: watch for it with talk_read { scope: \"direct\", \
                       wait_seconds }. This is a second surface, independent of the talk board: it \
                       posts nothing there and reads nothing from it, so do not use talk_post to \
@@ -611,6 +614,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "text": { "type": "string", "description": "The message, as markdown." },
                 "title": { "type": "string", "description": "A few words saying what this is about. Shown as the card's title; taken from a leading \"# \" line if you leave it out." },
                 "channel": { "type": "string", "description": "Which bound channel, by id. Defaults to the one marked default, or to the only one there is." },
+                "reply_to": { "type": "string", "description": "Optional platform id of a message this one answers — the message_id from an earlier send_channel_message receipt, or the id a quote-relayed message named. WeChat draws the answer as a quote of that message; other kinds ignore it." },
             }),
             &["text"],
         ),
@@ -621,8 +625,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             "Start a persistent codex, claude, pi, opencode, or terminal session in a working \
              directory. Use \
              this for anything long-running or interactive instead of run_shell. `resume_id` \
-             resumes that agent-native conversation; `initial_prompt` seeds a fresh agent \
-             instead. The session survives this process: pair every launch with a later archive \
+             resumes an agent-native conversation, or — when it names one of muxloom's own \
+             session ids — revives that archived session as itself on the same number with its \
+             recorded label and parent, and relaunches the children recorded under it with it; \
+             `initial_prompt` seeds a fresh agent instead. The session survives this process: \
+             pair every launch with a later archive \
              or delete. A session you start is recorded as yours — it shows in the dashboard \
              indented under you, and it is part of your task on the talk board — so this is how \
              you hand work to a subagent rather than losing it in a list of unrelated \
@@ -650,7 +657,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                     },
                 },
                 "label": { "type": "string", "description": "Display name shown in the dashboard." },
-                "resume_id": { "type": "string", "description": "Agent-native session id to resume." },
+                "resume_id": { "type": "string", "description": "Agent-native session id to \
+                    resume, or a muxloom session id of an archived session: by muxloom id it \
+                    comes back as the same session (same id, label, parent, history) and its \
+                    recorded children come back with it." },
                 "initial_prompt": { "type": "string", "description": "First prompt for a fresh agent." },
             }),
             match flavor {
@@ -1321,6 +1331,268 @@ fn launching_session() -> Option<String> {
     session_env("MUXLOOM_SESSION_ID")
 }
 
+/// The caller a relayed launch names for itself. The controller's own process
+/// never runs inside a session, so a launch arriving through a relay has no
+/// environment to read and would otherwise lose its parent entirely: the
+/// relay runner copies the submitting session's id into the arguments, and it
+/// is consulted only when the environment says nothing. The daemon flavor
+/// never reads it - an agent on its own machine already has the environment,
+/// and trusting an argument there would let any caller name a parent it likes.
+fn relayed_caller(arguments: &Value) -> Option<String> {
+    launching_session().or_else(|| {
+        optional_str(arguments, "_muxloom_caller")
+            .map(str::trim)
+            .filter(|id| crate::runtime::is_managed_session_id(id))
+            .map(str::to_string)
+    })
+}
+
+/// The deepest child chain one fleet resume walks. A coordinator five
+/// handoffs from its master is already a team; below that the sessions have
+/// their own coordinators, and it is their resumes that walk their fleets.
+const FLEET_RESUME_MAX_DEPTH: usize = 5;
+/// The most children one fleet resume will relaunch. A runaway tree becomes
+/// a truncated line in the master's caption rather than a stampede of
+/// launches.
+const FLEET_RESUME_MAX_SESSIONS: usize = 32;
+
+/// The conversation a stored session would resume as: the thread the daemon
+/// had matched it to while it ran, or - never matched - the conversation its
+/// launch was told to reopen.
+pub(crate) fn native_resume_id(session: &DaemonSession) -> Option<&str> {
+    session
+        .thread
+        .as_deref()
+        .or(session.seed.as_deref())
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// What a fleet resume does with one child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FleetMemberAction {
+    /// Dead or archived: it comes back on its own record, same id and label,
+    /// native conversation and all if the runtime can reopen one.
+    Relaunch,
+    /// Still running under its master: nobody relaunches a live agent; the
+    /// master is only told it exists.
+    Running,
+    /// A temporary scratch chat: it left nothing behind to resume.
+    Ephemeral,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FleetMember {
+    pub(crate) record: DaemonSession,
+    pub(crate) native: Option<String>,
+    pub(crate) action: FleetMemberAction,
+}
+
+/// Everything still hanging off `root_id` by its recorded parent link,
+/// shallowest first, within the walk's depth and total bounds. The parent
+/// link is the only account of a fleet that survives a split, which is
+/// exactly why the walk reads nothing else. Live children are reported and
+/// not restarted; temporary ones are only reported.
+pub(crate) fn fleet_resume_plan(
+    sessions: &[DaemonSession],
+    root_id: &str,
+) -> (Vec<FleetMember>, bool) {
+    let mut members = Vec::new();
+    let mut truncated = false;
+    let mut seen: BTreeSet<&str> = [root_id].into_iter().collect();
+    let mut frontier: Vec<&str> = vec![root_id];
+    let mut depth = 0usize;
+    while !frontier.is_empty() {
+        depth += 1;
+        let mut level: Vec<&DaemonSession> = sessions
+            .iter()
+            .filter(|child| {
+                child
+                    .parent
+                    .as_deref()
+                    .is_some_and(|parent| frontier.contains(&parent))
+                    && !seen.contains(child.id.as_str())
+            })
+            .collect();
+        level.sort_by_key(|child| (child.created_at, child.id.as_str()));
+        let mut next: Vec<&str> = Vec::new();
+        for child in level {
+            if members.len() >= FLEET_RESUME_MAX_SESSIONS {
+                truncated = true;
+                break;
+            }
+            seen.insert(child.id.as_str());
+            let action = if child.temporary {
+                FleetMemberAction::Ephemeral
+            } else if child.dead || child.archived {
+                FleetMemberAction::Relaunch
+            } else {
+                FleetMemberAction::Running
+            };
+            next.push(child.id.as_str());
+            members.push(FleetMember {
+                record: child.clone(),
+                native: native_resume_id(child).map(str::to_string),
+                action,
+            });
+        }
+        if truncated {
+            break;
+        }
+        if depth >= FLEET_RESUME_MAX_DEPTH {
+            truncated = sessions.iter().any(|child| {
+                child
+                    .parent
+                    .as_deref()
+                    .is_some_and(|parent| next.contains(&parent))
+                    && !seen.contains(child.id.as_str())
+            });
+            break;
+        }
+        frontier = next;
+    }
+    (members, truncated)
+}
+
+/// What became of one child during a fleet resume.
+#[derive(Debug, Clone)]
+pub(crate) struct FleetOutcome {
+    pub(crate) record: DaemonSession,
+    /// "restored" | "fresh" | "running" | "temporary" | "out_of_scope" |
+    /// "unresumed"
+    pub(crate) status: &'static str,
+    /// The native conversation the child came back with, when it did.
+    pub(crate) resumed_with: Option<String>,
+    /// Why it did not, when it did not.
+    pub(crate) detail: Option<String>,
+}
+
+pub(crate) fn fleet_outcome_json(outcomes: &[FleetOutcome]) -> Vec<Value> {
+    outcomes
+        .iter()
+        .map(|outcome| {
+            json!({
+                "old_session_id": outcome.record.id,
+                "label": outcome.record.label,
+                "kind": outcome.record.kind,
+                "native": native_resume_id(&outcome.record),
+                "status": outcome.status,
+                "resumed_with": outcome.resumed_with,
+                "detail": outcome.detail,
+                "recap": outcome.record.recap,
+            })
+        })
+        .collect()
+}
+
+/// The caption a resumed master's first turn carries: the machine-readable
+/// list of its children with what muxloom could do for each, and the exact
+/// calls that can still reach the ones it could not. A master must never come
+/// back ignorant of its fleet again - that silence is what let five children
+/// go unread for a day.
+fn fleet_resume_caption(
+    master_id: &str,
+    master_label: &str,
+    outcomes: &[FleetOutcome],
+    truncated: bool,
+) -> String {
+    let count = |wanted: &str| outcomes.iter().filter(|o| o.status == wanted).count();
+    let name = if master_label.trim().is_empty() {
+        master_id
+    } else {
+        master_label
+    };
+    let mut lines = vec![format!(
+        "[muxloom] Fleet resume report for {name} ({master_id}): {} children found by parent \
+         links - restored {}, fresh {}, still running {}, unresumed {}, temporary {}{}.",
+        outcomes.len(),
+        count("restored"),
+        count("fresh"),
+        count("running"),
+        count("unresumed"),
+        count("temporary"),
+        if truncated {
+            ", walk truncated at the cap"
+        } else {
+            ""
+        },
+    )];
+    for outcome in outcomes {
+        let reachable = outcome.status != "unresumed" && outcome.status != "out_of_scope";
+        lines.push(format!(
+            "child old={} label=\"{}\" kind={} native={} status={} session={} recap=\"{}\"",
+            outcome.record.id,
+            outcome.record.label,
+            outcome.record.kind,
+            native_resume_id(&outcome.record).unwrap_or("none"),
+            outcome.status,
+            if reachable {
+                outcome.record.id.as_str()
+            } else {
+                "-"
+            },
+            outcome.record.recap.as_deref().unwrap_or("-"),
+        ));
+        if !reachable {
+            lines.push(format!(
+                "  resume with: launch_session {{\"kind\": \"{}\", \"resume_id\": \"{}\", \"path\": \
+                 \"{}\", \"label\": \"{}\"}}",
+                outcome.record.kind,
+                native_resume_id(&outcome.record).unwrap_or(&outcome.record.id),
+                outcome.record.path,
+                outcome.record.label,
+            ));
+        }
+    }
+    lines.push(
+        "Children are found by their recorded parent link; muxloom keeps that link pointed at \
+         the id that answers, so it survived your absence."
+            .into(),
+    );
+    lines.join("\n")
+}
+
+/// What a `launch_session` resume_id means when it names a muxloom session:
+/// `Ok(None)` passes it on as the ordinary relaunch of an agent-native
+/// conversation; `Ok(Some(record))` is an archived session coming back as
+/// itself. An error is the explicit refusal - a live session still holds that
+/// number, and one conversation never gets a second shadow identity - or a
+/// number this machine has never heard of.
+fn fleet_resume_target<'a>(
+    sessions: &'a [DaemonSession],
+    resume_id: &str,
+) -> Result<Option<&'a DaemonSession>> {
+    if !crate::runtime::is_daemon_session_id(resume_id) {
+        return Ok(None);
+    }
+    let Some(record) = sessions.iter().find(|session| session.id == resume_id) else {
+        bail!(
+            "no session {resume_id} on this machine to resume; launch_session's resume_id is \
+             either a muxloom session id recorded here or an agent-native conversation id"
+        );
+    };
+    if record.temporary {
+        bail!("{resume_id} is a temporary scratch chat; it left nothing to resume");
+    }
+    if !record.dead && !record.archived {
+        bail!(
+            "session {resume_id} is still live; refusing to resume over a running session - \
+             send it a message instead"
+        );
+    }
+    Ok(Some(record))
+}
+
+/// The first-turn prompt for a resumed child with no native conversation to
+/// reopen: it wakes knowing what it was and where the rest of it lives.
+fn synthetic_child_prompt(record: &DaemonSession) -> String {
+    let name = if record.label.trim().is_empty() {
+        record.id.as_str()
+    } else {
+        record.label.as_str()
+    };
+    format!("You are resumed as \"{name}\" without your old context; ask the coordinator.")
+}
+
 /// Where a launch asked for on the daemon surface may actually run: the
 /// caller's own folder, or somewhere inside it.
 ///
@@ -1399,6 +1671,17 @@ fn folder_name(path: &str) -> Option<String> {
         .filter(|name| !name.is_empty() && name != "/")
 }
 
+/// Which message this one answers, if the caller named one.
+///
+/// Blank is "none". An id the chat never saw travels through untouched: the
+/// phone then shows the message unquoted, and losing the message over a
+/// decoration is the worse failure.
+fn channel_reply_to(arguments: &Value) -> Option<&str> {
+    optional_str(arguments, "reply_to")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
 /// Post one channel message and report what became of it.
 ///
 /// Shared by both surfaces. Which machine dials the chat app differs — its own,
@@ -1416,7 +1699,8 @@ fn send_channel(
         text: required_str(arguments, "text")?.into(),
         signature: speaker(),
     };
-    let sent = crate::channel::send(binding, &message, environment)?;
+    let sent =
+        crate::channel::send_reply(binding, &message, channel_reply_to(arguments), environment)?;
     // A receipt is what turns the human's reply into an answer: without one it
     // lands on the board, which is not wrong but is not this conversation. It
     // needs a session to name, so a call from outside a session leaves none.
@@ -2627,6 +2911,17 @@ impl ControllerControl {
 
     fn launch_session(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
+        // A resume_id naming a muxloom session is an id-stable fleet resume:
+        // the archived session comes back as itself - same number, label,
+        // parent, history - and everything that still hangs off it by parent
+        // link comes back with it. A resume_id that names an agent-native
+        // conversation instead stays the ordinary relaunch below.
+        if let Some(resume_id) = optional_str(arguments, "resume_id") {
+            let sessions = self.runtime.bridge_pool().list_sessions(&target)?;
+            if let Some(master) = fleet_resume_target(&sessions, resume_id)? {
+                return self.resume_fleet(&target, master, arguments);
+            }
+        }
         let kind = agent_kind(arguments)?;
         let request = LaunchRequest {
             target: target.clone(),
@@ -2636,7 +2931,7 @@ impl ControllerControl {
             temporary: false,
             resume_id: optional_str(arguments, "resume_id").map(Into::into),
             initial_prompt: optional_str(arguments, "initial_prompt").map(Into::into),
-            parent: launching_session(),
+            parent: relayed_caller(arguments),
         };
         let command = self.config.command_for(&target.id, kind).clone();
         let environment = self.config.environment_for(&target.id)?;
@@ -2647,6 +2942,143 @@ impl ControllerControl {
             "kind": kind.as_str(),
             "path": request.path,
             "parent": request.parent,
+        })))
+    }
+
+    /// Resume one archived session and its whole subtree on the numbers its
+    /// records already hold, through the bridge directly: `Runtime::launch`
+    /// mints a fresh id, which is exactly the mistake that split fleets
+    /// children off from their masters. Children first - each on its own
+    /// record, with its own native conversation when the runtime can reopen
+    /// one and a synthetic first prompt when it cannot - and the master last,
+    /// carrying the caption that says what came back and what did not.
+    fn resume_fleet(
+        &self,
+        target: &Target,
+        master: &DaemonSession,
+        arguments: &Value,
+    ) -> Result<String> {
+        let environment = self.config.environment_for(&target.id)?;
+        let sessions = self.runtime.bridge_pool().list_sessions(target)?;
+        let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
+        let pool = self.runtime.bridge_pool();
+        let mut outcomes: Vec<FleetOutcome> = Vec::new();
+        for member in &plan {
+            let outcome = |status: &'static str,
+                           resumed_with: Option<String>,
+                           detail: Option<String>| FleetOutcome {
+                record: member.record.clone(),
+                status,
+                resumed_with,
+                detail,
+            };
+            match member.action {
+                FleetMemberAction::Running => {
+                    outcomes.push(outcome("running", None, None));
+                    continue;
+                }
+                FleetMemberAction::Ephemeral => {
+                    outcomes.push(outcome("temporary", None, None));
+                    continue;
+                }
+                FleetMemberAction::Relaunch => {}
+            }
+            let Ok(kind) = member.record.kind.parse::<AgentKind>() else {
+                outcomes.push(outcome(
+                    "unresumed",
+                    None,
+                    Some(format!("unknown kind {}", member.record.kind)),
+                ));
+                continue;
+            };
+            let command = self.config.command_for(&target.id, kind).clone();
+            if command.command.trim().is_empty() && kind != AgentKind::Terminal {
+                outcomes.push(outcome(
+                    "unresumed",
+                    None,
+                    Some(format!("no {} command configured", kind.as_str())),
+                ));
+                continue;
+            }
+            let resume_with = member.native.clone();
+            let args = crate::runtime::launch_arguments(
+                &command,
+                kind,
+                false,
+                resume_with.as_deref(),
+                None,
+            );
+            let synthetic = resume_with
+                .is_none()
+                .then(|| synthetic_child_prompt(&member.record));
+            let launched = pool.launch(
+                target,
+                member.record.id.clone(),
+                member.record.kind.clone(),
+                member.record.path.clone(),
+                String::new(),
+                false,
+                command.command.clone(),
+                args,
+                environment.clone(),
+                member.record.created_at,
+                Some(master.id.clone()),
+                synthetic,
+            );
+            match launched {
+                Ok(_) => outcomes.push(outcome(
+                    if resume_with.is_some() {
+                        "restored"
+                    } else {
+                        "fresh"
+                    },
+                    resume_with,
+                    None,
+                )),
+                Err(error) => outcomes.push(outcome(
+                    "unresumed",
+                    resume_with,
+                    Some(format!("{error:#}")),
+                )),
+            }
+        }
+        let kind = master
+            .kind
+            .parse::<AgentKind>()
+            .map_err(|error: String| anyhow::anyhow!(error))?;
+        let command = self.config.command_for(&target.id, kind).clone();
+        let resume_with = native_resume_id(master).map(str::to_string);
+        let args =
+            crate::runtime::launch_arguments(&command, kind, false, resume_with.as_deref(), None);
+        let caption = fleet_resume_caption(&master.id, &master.label, &outcomes, truncated);
+        let label = optional_str(arguments, "label")
+            .unwrap_or_default()
+            .replace(['\t', '\n', '\r'], " ");
+        // The daemon revives the record in place: the same number answers,
+        // and the record's own label and parent survive an empty request.
+        let session = pool.launch(
+            target,
+            master.id.clone(),
+            master.kind.clone(),
+            master.path.clone(),
+            label,
+            false,
+            command.command.clone(),
+            args,
+            environment,
+            master.created_at,
+            relayed_caller(arguments),
+            Some(caption),
+        )?;
+        Ok(pretty(&json!({
+            "session_id": session.id,
+            "machine": target.id,
+            "kind": session.kind,
+            "path": session.path,
+            "label": session.label,
+            "parent": session.parent,
+            "resumed": true,
+            "fleet": fleet_outcome_json(&outcomes),
         })))
     }
 
@@ -2990,12 +3422,14 @@ mod daemon_surface {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_SCREEN_LINES, Flavor, SEARCH_MAX_MATCHES, WAIT_SCREEN_LINES, agent_kind,
-        allowed_specs, build_input, delivery_json, direct_author, direct_draft, enforce_policy,
-        instructions, launch_path_within, launching_session, optional_bool, optional_str,
-        optional_usize, plain_screen, pretty, preview_text, required_str, screen_page,
-        send_channel, session_env, session_json, session_kind, shell_report, talk_draft,
-        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
+        DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
+        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, delivery_json, direct_author,
+        direct_draft, enforce_policy, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
+        fleet_resume_target, instructions, launch_path_within, launching_session, native_resume_id,
+        optional_bool, optional_str, optional_usize, plain_screen, pretty, preview_text,
+        required_str, screen_page, send_channel, session_env, session_json, session_kind,
+        shell_report, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
+        trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         channel::ChannelSet,
@@ -3004,7 +3438,7 @@ mod daemon_surface {
         daemon_protocol::{
             DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, Trigger, stream,
         },
-        model::LOCAL_TARGET_ID,
+        model::{AgentKind, LOCAL_TARGET_ID},
         runtime::{launch_arguments, launch_seed, new_daemon_session_id},
     };
 
@@ -3417,6 +3851,17 @@ mod daemon_surface {
         }
 
         fn launch_session(&self, arguments: &Value) -> Result<String> {
+            // A resume_id naming one of this machine's own archived sessions
+            // is an id-stable fleet resume, answered before the ordinary
+            // launch's rules - the folder rule below is re-checked inside it
+            // for every session it would relaunch. A resume_id naming an
+            // agent-native conversation stays the ordinary relaunch.
+            if let Some(resume_id) = optional_str(arguments, "resume_id") {
+                let sessions = self.sessions()?;
+                if let Some(master) = fleet_resume_target(&sessions, resume_id)? {
+                    return self.resume_fleet(master, arguments);
+                }
+            }
             let kind = agent_kind(arguments)?;
             let own = self.own_folder.as_deref().context(
                 "launch_session starts a session where you are, and muxloom cannot tell which \
@@ -3468,6 +3913,160 @@ mod daemon_surface {
                     "kind": session.kind,
                     "path": session.path,
                     "parent": session.parent,
+                }))),
+                response => bail!("unexpected launch response: {response:?}"),
+            }
+        }
+
+        /// Resume one archived session and its subtree on the numbers their
+        /// records already hold, scoped to the caller's own folder exactly as
+        /// an ordinary launch is: a child recorded somewhere else belongs to
+        /// the agent that lives there, not to whoever resumes the master, and
+        /// the caption says so rather than quietly launching across folders.
+        /// Children first, master last with the caption as its first prompt.
+        fn resume_fleet(&self, master: &DaemonSession, arguments: &Value) -> Result<String> {
+            let own = self.own_folder.as_deref().context(
+                "resume_fleet brings back sessions where you are, and muxloom cannot tell which \
+                 folder that is",
+            )?;
+            if !crate::moderator::within(own, &master.path) {
+                bail!(
+                    "launch_session resumes sessions in your own folder, {own}, and {} is \
+                     outside it. Ask the agent that lives there, or a muxloom moderator.",
+                    master.path
+                );
+            }
+            let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
+            let sessions = self.sessions()?;
+            let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
+            let mut outcomes: Vec<FleetOutcome> = Vec::new();
+            for member in &plan {
+                let outcome = |status: &'static str,
+                               resumed_with: Option<String>,
+                               detail: Option<String>| FleetOutcome {
+                    record: member.record.clone(),
+                    status,
+                    resumed_with,
+                    detail,
+                };
+                match member.action {
+                    FleetMemberAction::Running => {
+                        outcomes.push(outcome("running", None, None));
+                        continue;
+                    }
+                    FleetMemberAction::Ephemeral => {
+                        outcomes.push(outcome("temporary", None, None));
+                        continue;
+                    }
+                    FleetMemberAction::Relaunch => {}
+                }
+                if !crate::moderator::within(own, &member.record.path) {
+                    outcomes.push(outcome(
+                        "out_of_scope",
+                        None,
+                        Some(format!("{} is outside your folder", member.record.path)),
+                    ));
+                    continue;
+                }
+                let Ok(kind) = member.record.kind.parse::<AgentKind>() else {
+                    outcomes.push(outcome(
+                        "unresumed",
+                        None,
+                        Some(format!("unknown kind {}", member.record.kind)),
+                    ));
+                    continue;
+                };
+                let command = self.config.command_for(LOCAL_TARGET_ID, kind).clone();
+                if command.command.trim().is_empty() && kind != AgentKind::Terminal {
+                    outcomes.push(outcome(
+                        "unresumed",
+                        None,
+                        Some(format!("no {} command configured", kind.as_str())),
+                    ));
+                    continue;
+                }
+                let resume_with = member.native.clone();
+                let args = launch_arguments(&command, kind, false, resume_with.as_deref(), None);
+                let synthetic = resume_with
+                    .is_none()
+                    .then(|| synthetic_child_prompt(&member.record));
+                let request = DaemonRequest::Launch {
+                    session_id: member.record.id.clone(),
+                    kind: member.record.kind.clone(),
+                    path: member.record.path.clone(),
+                    label: String::new(),
+                    temporary: false,
+                    executable: command.command.clone(),
+                    args,
+                    environment: environment.clone(),
+                    created_at: member.record.created_at,
+                    columns: 120,
+                    rows: 40,
+                    parent: Some(master.id.clone()),
+                    initial_prompt: synthetic,
+                };
+                match self.transact(&request) {
+                    Ok((DaemonResponse::Launched { .. }, _)) => outcomes.push(outcome(
+                        if resume_with.is_some() {
+                            "restored"
+                        } else {
+                            "fresh"
+                        },
+                        resume_with,
+                        None,
+                    )),
+                    Ok((response, _)) => outcomes.push(outcome(
+                        "unresumed",
+                        resume_with,
+                        Some(format!("unexpected launch response: {response:?}")),
+                    )),
+                    Err(error) => outcomes.push(outcome(
+                        "unresumed",
+                        resume_with,
+                        Some(format!("{error:#}")),
+                    )),
+                }
+            }
+            let kind = master
+                .kind
+                .parse::<AgentKind>()
+                .map_err(|error: String| anyhow::anyhow!(error))?;
+            let command = self.config.command_for(LOCAL_TARGET_ID, kind).clone();
+            if command.command.trim().is_empty() && kind != AgentKind::Terminal {
+                bail!("command for {kind} is empty; the master cannot come back either");
+            }
+            let resume_with = native_resume_id(master).map(str::to_string);
+            let args = launch_arguments(&command, kind, false, resume_with.as_deref(), None);
+            let caption = fleet_resume_caption(&master.id, &master.label, &outcomes, truncated);
+            let response = self
+                .transact(&DaemonRequest::Launch {
+                    session_id: master.id.clone(),
+                    kind: master.kind.clone(),
+                    path: master.path.clone(),
+                    label: optional_str(arguments, "label")
+                        .unwrap_or_default()
+                        .replace(['\t', '\n', '\r'], " "),
+                    temporary: false,
+                    executable: command.command.clone(),
+                    args,
+                    environment,
+                    created_at: master.created_at,
+                    columns: 120,
+                    rows: 40,
+                    parent: launching_session(),
+                    initial_prompt: Some(caption),
+                })?
+                .0;
+            match response {
+                DaemonResponse::Launched { session } => Ok(pretty(&json!({
+                    "session_id": session.id,
+                    "machine": LOCAL_TARGET_ID,
+                    "kind": session.kind,
+                    "path": session.path,
+                    "label": session.label,
+                    "parent": session.parent,
+                    "resumed": true,
+                    "fleet": fleet_outcome_json(&outcomes),
                 }))),
                 response => bail!("unexpected launch response: {response:?}"),
             }
@@ -3765,6 +4364,7 @@ mod tests {
             title: None,
             thread: None,
             seed: None,
+            first_prompt: None,
             working,
             needs_attention: attention,
             attention_reason: attention.then(|| "waiting on a person".into()),
@@ -4179,6 +4779,19 @@ mod tests {
                 "a channel message goes to a person, not to a machine"
             );
             assert_eq!(tool.input_schema["required"], json!(["text"]));
+            // Answering means being able to say what you answer: the receipt
+            // names the sent message on both surfaces, and `reply_to` accepts
+            // that name back on both, so the loop closes however you reach it.
+            assert!(
+                tool.description.contains("message_id"),
+                "{}",
+                tool.description
+            );
+            assert_eq!(
+                tool.input_schema["properties"]["reply_to"]["type"],
+                json!("string"),
+                "an answer must be able to name the message it answers"
+            );
             // Both chats are named, and so is the difference between them: an
             // agent told "markdown renders" writes a table, and a table on a
             // phone that renders no markdown is the one thing this must not
@@ -4218,6 +4831,20 @@ mod tests {
         // And speaking is acting, so read-only refuses it.
         assert!(WRITE_TOOLS.contains(&"send_channel_message"));
         assert!(instructions(Flavor::Daemon, &McpConfig::default()).contains("their phone"));
+    }
+
+    #[test]
+    fn a_reply_to_travels_as_written_and_blank_is_no_answer() {
+        assert_eq!(channel_reply_to(&json!({})), None);
+        assert_eq!(channel_reply_to(&json!({ "reply_to": "" })), None);
+        assert_eq!(channel_reply_to(&json!({ "reply_to": "  " })), None);
+        assert_eq!(
+            channel_reply_to(&json!({ "reply_to": " 7498971037873973384 " })),
+            Some("7498971037873973384")
+        );
+        // Even a number the chat has never seen travels: the message simply
+        // arrives unquoted, and refusing would lose the answer over a bubble.
+        assert_eq!(channel_reply_to(&json!({ "reply_to": "1" })), Some("1"));
     }
 
     #[test]
@@ -4529,6 +5156,224 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fleet_row(id: &str, parent: Option<&str>) -> DaemonSession {
+        DaemonSession {
+            id: id.into(),
+            kind: "claude".into(),
+            path: "/tmp".into(),
+            label: id.into(),
+            temporary: false,
+            created_at: 1,
+            pid: None,
+            dead: true,
+            archived: true,
+            recap: None,
+            title: None,
+            thread: None,
+            seed: None,
+            first_prompt: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            composer: None,
+            parent: parent.map(str::to_string),
+            resumed_from: None,
+            resumed_to: None,
+        }
+    }
+
+    #[test]
+    fn the_fleet_walk_stops_at_its_depth_and_total_bounds() {
+        // A chain seven deep: the walk takes five levels and tells the
+        // master the rest exist, it does not chase them.
+        let mut chain = Vec::new();
+        for depth in 0..8 {
+            let id = format!("muxloomd-claude-{depth}-chain");
+            let parent = (depth > 0).then(|| format!("muxloomd-claude-{}-chain", depth - 1));
+            chain.push(fleet_row(&id, parent.as_deref()));
+        }
+        let (members, truncated) = fleet_resume_plan(&chain, "muxloomd-claude-0-chain");
+        assert_eq!(members.len(), FLEET_RESUME_MAX_DEPTH);
+        assert!(truncated);
+
+        // Forty siblings under one master: the cap counts children, and the
+        // remainder becomes a truncated line rather than a stampede.
+        let mut wide = vec![fleet_row("muxloomd-claude-wide-master", None)];
+        for sibling in 0..FLEET_RESUME_MAX_SESSIONS + 8 {
+            wide.push(fleet_row(
+                &format!("muxloomd-claude-{sibling}-wide"),
+                Some("muxloomd-claude-wide-master"),
+            ));
+        }
+        let (members, truncated) = fleet_resume_plan(&wide, "muxloomd-claude-wide-master");
+        assert_eq!(members.len(), FLEET_RESUME_MAX_SESSIONS);
+        assert!(truncated);
+
+        // A live child is reported, never scheduled for relaunch; a
+        // temporary one is only reported.
+        let mut mixed = vec![
+            fleet_row("muxloomd-claude-mixed-master", None),
+            fleet_row(
+                "muxloomd-claude-mixed-live",
+                Some("muxloomd-claude-mixed-master"),
+            ),
+            fleet_row(
+                "muxloomd-temp-mixed-scratch",
+                Some("muxloomd-claude-mixed-master"),
+            ),
+        ];
+        mixed[0].dead = false;
+        mixed[0].archived = false;
+        mixed[1].dead = false;
+        mixed[1].archived = false;
+        mixed[2].temporary = true;
+        let (members, truncated) = fleet_resume_plan(&mixed, "muxloomd-claude-mixed-master");
+        assert!(!truncated);
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| (member.record.id.as_str(), member.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("muxloomd-claude-mixed-live", FleetMemberAction::Running),
+                ("muxloomd-temp-mixed-scratch", FleetMemberAction::Ephemeral),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resume_by_muxloom_number_refuses_the_live_and_hands_over_the_archived() {
+        let live = fleet_row("muxloomd-claude-target", None);
+        let mut running = live.clone();
+        running.dead = false;
+        running.archived = false;
+        let live_slice = std::slice::from_ref(&live);
+        // An agent-native id passes the gate untouched.
+        assert_eq!(
+            fleet_resume_target(live_slice, "ses-native")
+                .unwrap()
+                .map(|record| record.id.clone()),
+            None::<String>
+        );
+        // The same number, still lived in: refused, never shadowed.
+        let error = fleet_resume_target(&[running], "muxloomd-claude-target")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("still live"), "{error}");
+        // A number nobody ever had: refused with its name.
+        let error = fleet_resume_target(live_slice, "muxloomd-claude-absent")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("muxloomd-claude-absent"), "{error}");
+        // Archived on this machine: the record, to come back as itself.
+        let found = fleet_resume_target(live_slice, "muxloomd-claude-target")
+            .unwrap()
+            .map(|record| record.id.clone());
+        assert_eq!(found, Some("muxloomd-claude-target".to_string()));
+    }
+
+    #[test]
+    fn the_resume_caption_names_every_child_and_hands_back_the_exact_call() {
+        let mut restored = fleet_row("muxloomd-claude-captioned", None);
+        restored.thread = Some("ses-deep".into());
+        let outcomes = vec![
+            FleetOutcome {
+                record: restored,
+                status: "restored",
+                resumed_with: Some("ses-deep".into()),
+                detail: None,
+            },
+            FleetOutcome {
+                record: fleet_row("muxloomd-claude-lost", None),
+                status: "unresumed",
+                resumed_with: None,
+                detail: Some("no claude command configured".into()),
+            },
+        ];
+        let caption =
+            fleet_resume_caption("muxloomd-claude-master", "coordinator", &outcomes, false);
+        assert!(
+            caption.contains("Fleet resume report for coordinator"),
+            "{caption}"
+        );
+        assert!(caption.contains("restored 1"), "{caption}");
+        assert!(caption.contains("muxloomd-claude-captioned"), "{caption}");
+        // The child that did not come back carries the call that can.
+        assert!(
+            caption.contains(
+                "launch_session {\"kind\": \"claude\", \"resume_id\": \"muxloomd-claude-lost\""
+            ),
+            "{caption}"
+        );
+    }
+
+    #[test]
+    fn a_relayed_caller_is_taken_only_when_the_environment_says_nothing() {
+        // These rewrite a process-global; they run beside the daemon tests
+        // that do the same, so they wait for the same lock.
+        let _lock = daemon_env_lock();
+        let _none = EnvScope::set("MUXLOOM_SESSION_ID", None);
+        assert_eq!(
+            relayed_caller(&json!({ "_muxloom_caller": "muxloomd-claude-3-1-0" })).as_deref(),
+            Some("muxloomd-claude-3-1-0")
+        );
+        // A caller that is not a session id is not a caller.
+        assert_eq!(
+            relayed_caller(&json!({ "_muxloom_caller": "whoever says so" })),
+            None
+        );
+        assert_eq!(relayed_caller(&json!({})), None);
+        // The environment outranks an argument: an agent cannot rename its
+        // parent by naming one, and neither can a relay.
+        let _env = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-4-1-0"));
+        assert_eq!(
+            relayed_caller(&json!({ "_muxloom_caller": "muxloomd-claude-3-1-0" })).as_deref(),
+            Some("muxloomd-claude-4-1-0")
+        );
+    }
+
+    /// The same process-global the daemon-surface tests rewrite; the gate
+    /// runs them one thread at a time, and this keeps them honest if that
+    /// ever changes.
+    fn daemon_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENVELOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENVELOPE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Set an environment variable for the duration of a test; the same
+    /// discipline the daemon-surface tests use, at module scope.
+    struct EnvScope {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl EnvScope {
+        fn set(key: &str, value: Option<&str>) -> Self {
+            let scope = Self {
+                key: key.into(),
+                previous: std::env::var(key).ok(),
+            };
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            scope
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(&self.key, value) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -5140,6 +5985,188 @@ mod tests {
             assert_eq!(machines[1]["remote"], true);
             assert_eq!(machines[1]["via"], "laptop");
             assert_eq!(machines[1]["connected"], true);
+        }
+
+        /// A stand-in for Claude Code that survives a `--resume <id>` riding
+        /// onto its command line: sh runs the script and passes the extra
+        /// words as positional arguments the script never reads. It echoes
+        /// each line it is handed so a test can read back what was typed.
+        fn fake_claude_script(name: &str) -> PathBuf {
+            let script = std::env::temp_dir().join(format!(
+                "mxl-{name}-{}-{}.sh",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+            ));
+            std::fs::write(
+                &script,
+                "rule='────────────────────────────────────────'\n\
+                 draw() { printf '%s\\n❯ \\n%s\\n' \"$rule\" \"$rule\"; }\n\
+                 draw\n\
+                 while IFS= read -r line; do\n\
+                 \x20 printf '%s\\n' \"$line\"\n\
+                 \x20 draw\n\
+                 done\n",
+            )
+            .unwrap();
+            script
+        }
+
+        fn claude_config(script: &std::path::Path) -> Config {
+            let mut config = Config::default();
+            config.agents.claude.command = "sh".into();
+            config.agents.claude.args = vec![script.to_str().unwrap().to_string()];
+            config
+        }
+
+        #[test]
+        fn resuming_a_coordinator_by_its_muxloom_id_comes_back_with_its_fleet() {
+            let _env_lock = HEAD_NAME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let script = fake_claude_script("fleet-resume");
+            let config = claude_config(&script);
+            let (mut surface, paths) = surface_and_paths("fleet-resume", config);
+            let workdir = std::env::temp_dir().to_str().unwrap().to_string();
+            let launched = |surface: &mut DaemonControl, arguments: Value| -> Value {
+                serde_json::from_str(&call(surface, "launch_session", arguments)).unwrap()
+            };
+
+            // A coordinator and two children: one child carries a native
+            // conversation, the other never matched one.
+            let _no_caller = EnvScope::set("MUXLOOM_SESSION_ID", None);
+            let master = launched(
+                &mut surface,
+                json!({ "kind": "claude", "path": workdir, "label": "coordinator",
+                        "resume_id": "ses-master-native" }),
+            );
+            let master_id = master["session_id"].as_str().unwrap().to_string();
+            assert!(master["parent"].is_null(), "{master}");
+            let _caller = EnvScope::set("MUXLOOM_SESSION_ID", Some(&master_id));
+            let first = launched(
+                &mut surface,
+                json!({ "kind": "claude", "path": workdir, "label": "child-one",
+                        "resume_id": "ses-child-one" }),
+            );
+            let second = launched(
+                &mut surface,
+                json!({ "kind": "claude", "path": workdir, "label": "child-two" }),
+            );
+            let first_id = first["session_id"].as_str().unwrap().to_string();
+            let second_id = second["session_id"].as_str().unwrap().to_string();
+            assert_eq!(first["parent"], json!(master_id));
+            assert_eq!(second["parent"], json!(master_id));
+
+            // The fleet dies: archive leaves the records and the parent
+            // links behind, which is the whole account that outlives a master.
+            for id in [&first_id, &second_id, &master_id] {
+                call(&mut surface, "archive_session", json!({ "session_id": id }));
+            }
+
+            // The master comes back asking only to be itself: same number,
+            // same label, and both children back on their own numbers.
+            let resumed = launched(
+                &mut surface,
+                json!({ "kind": "claude", "path": workdir, "resume_id": master_id }),
+            );
+            assert_eq!(resumed["session_id"], json!(master_id));
+            assert_eq!(resumed["label"], json!("coordinator"));
+            assert_eq!(resumed["resumed"], json!(true));
+            let status_of = |wanted: &str| {
+                resumed["fleet"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|member| member["old_session_id"] == json!(wanted))
+                    .unwrap()["status"]
+                    .clone()
+            };
+            assert_eq!(status_of(&first_id), json!("restored"));
+            assert_eq!(status_of(&first_id), json!("restored"));
+            assert_eq!(status_of(&second_id), json!("fresh"));
+
+            let listed: Value =
+                serde_json::from_str(&call(&mut surface, "list_sessions", json!({}))).unwrap();
+            for (id, label) in [
+                (master_id.as_str(), "coordinator"),
+                (first_id.as_str(), "child-one"),
+                (second_id.as_str(), "child-two"),
+            ] {
+                let row = listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["session_id"] == json!(id))
+                    .unwrap_or_else(|| panic!("{id} never came back: {listed:#}"));
+                assert_eq!(row["label"], json!(label));
+                assert_eq!(row["archived"], json!(false));
+            }
+            let child_row = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["session_id"] == json!(first_id))
+                .unwrap();
+            assert_eq!(child_row["parent"], json!(master_id));
+
+            // The master's first turn carries the caption: queued into the
+            // outbox as the launch's seed, it is either still waiting there
+            // or already typed onto the screen this moment.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let captioned = loop {
+                let queued = std::fs::read_to_string(&paths.outbox).unwrap_or_default();
+                if queued.contains("Fleet resume report") && queued.contains(&first_id) {
+                    break true;
+                }
+                let screen = call(
+                    &mut surface,
+                    "read_screen",
+                    json!({ "session_id": master_id, "lines": 80 }),
+                );
+                if screen.contains("Fleet resume report") && screen.contains(&first_id) {
+                    break true;
+                }
+                assert!(Instant::now() < deadline, "the caption never arrived");
+                thread::sleep(Duration::from_millis(100));
+            };
+            assert!(captioned);
+        }
+
+        #[test]
+        fn a_resume_by_muxloom_id_refuses_the_session_that_is_still_live() {
+            let _env_lock = HEAD_NAME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let script = fake_claude_script("fleet-alive");
+            let mut surface = surface_with("fleet-alive", claude_config(&script));
+            let workdir = std::env::temp_dir().to_str().unwrap().to_string();
+            let _no_caller = EnvScope::set("MUXLOOM_SESSION_ID", None);
+            let launched: Value = serde_json::from_str(&call(
+                &mut surface,
+                "launch_session",
+                json!({ "kind": "claude", "path": workdir, "label": "running" }),
+            ))
+            .unwrap();
+            let id = launched["session_id"].as_str().unwrap().to_string();
+            let error = surface
+                .call(
+                    "launch_session",
+                    &json!({ "kind": "claude", "path": workdir, "resume_id": id }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("still live"), "{error}");
+            let listed: Value =
+                serde_json::from_str(&call(&mut surface, "list_sessions", json!({}))).unwrap();
+            let holders = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["session_id"] == json!(id))
+                .count();
+            assert_eq!(holders, 1);
         }
 
         #[test]
