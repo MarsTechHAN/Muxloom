@@ -7195,6 +7195,12 @@ mod platform {
             assert!(!archived.needs_attention);
         }
 
+        /// A question as the daemon sees it: the configured words, and the
+        /// yes/no pair that makes them a question rather than prose.
+        fn approval_screen(reason_word: &str) -> Vec<u8> {
+            format!("\x1b[2J\x1b[H{reason_word} needed\n> 1. Yes\n  2. No").into_bytes()
+        }
+
         #[test]
         fn a_quiet_pty_stops_counting_as_working_and_sunk_patterns_classify_waiting() {
             let state = test_state("freshness");
@@ -7230,7 +7236,7 @@ mod platform {
 
             // Patterns a controller sank down classify waiting on the
             // daemon's own snapshots, custom wording included.
-            session.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            session.record_output(&approval_screen("gpu quota approval"));
             *state
                 .attention_patterns
                 .lock()
@@ -7305,7 +7311,7 @@ mod platform {
 
             // The moment it stops working and asks for approval, the edge is
             // marked and it says who is waiting and why.
-            child.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            child.record_output(&approval_screen("gpu quota approval"));
             note(&child);
             let alert = child.take_parent_alert().expect("the edge is handed over");
             assert_eq!(alert.session_id, "muxloomd-codex-parent-edge");
@@ -7331,7 +7337,7 @@ mod platform {
             // A child nobody started is no one's errand: the same fall marks
             // nothing for no parent to hear about.
             let orphan = launch_child_with_parent(&state, "parent-edge-orphan", None);
-            orphan.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            orphan.record_output(&approval_screen("gpu quota approval"));
             let snapshot = orphan.snapshot();
             assert!(snapshot.needs_attention);
             orphan.note_parent_alert(&snapshot);
@@ -7362,7 +7368,7 @@ mod platform {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 vec!["gpu quota approval".into()];
             let child = launch_child_with_parent(&state, "drain-alerts", Some("the-parent"));
-            child.record_output(b"\x1b[2J\x1b[Hgpu quota approval needed");
+            child.record_output(&approval_screen("gpu quota approval"));
             assert!(child.snapshot().needs_attention);
 
             // A ListSessions is what marks it - the dashboard's own poll does

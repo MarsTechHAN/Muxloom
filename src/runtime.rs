@@ -3369,20 +3369,6 @@ pub(crate) fn attention_reason(
     patterns: &[String],
 ) -> Option<String> {
     let screen = attention_tail(screen).to_lowercase();
-    if let Some(pattern) = patterns.iter().find(|pattern| {
-        let pattern = pattern.trim();
-        !pattern.is_empty() && screen.contains(&pattern.to_lowercase())
-    }) {
-        return Some(pattern.clone());
-    }
-
-    // OpenCode draws its permission dialog header before the options. The
-    // options ("Allow once  Allow always  Reject") sit on a single row, which
-    // the per-line choice detection below cannot split into a pair, so a plain
-    // `has_choice` gate would miss it. The header text is unambiguous.
-    if kind == AgentKind::OpenCode && screen.contains("permission required") {
-        return Some("permission request".into());
-    }
 
     let has_yes = screen.lines().any(|line| choice_line(line, "yes"));
     let has_no = screen.lines().any(|line| choice_line(line, "no"));
@@ -3393,6 +3379,40 @@ pub(crate) fn attention_reason(
     let has_choice = (has_yes && has_no)
         || (has_allow && has_deny)
         || (has_yes && (screen.contains("esc to cancel") || screen.contains("enter to confirm")));
+    // OpenCode draws its permission dialog inside a bordered box: a header
+    // ("△ Permission required") over the request and a single row of buttons
+    // ("Allow once  Allow always  Reject"). The options sit on one row, which
+    // the per-line choice detection cannot split into a pair, so the buttons
+    // carry the shape and the header says what it is. The words alone do not:
+    // an agent summarising yesterday's permission asks has them too.
+    let permission_shape = kind == AgentKind::OpenCode
+        && screen.contains("permission required")
+        && (screen.contains("allow once") || screen.contains("allow always"));
+    let working_hint = screen.contains("esc to interrupt") || screen.contains("esc interrupt");
+    let menu_open = !working_hint && bottom_menu_is_open(&screen);
+    let dialog_open = has_choice || permission_shape || menu_open;
+
+    // A configured pattern is a word, and words are what transcripts are made
+    // of: a briefing quoted on screen asking to "approve" things, a recap
+    // mentioning a "user-approved" path, an agent saying "Standing by" — each
+    // matched blind `contains` and flagged a session as waiting when nothing
+    // was asking. What tells a live question from a remembered one is the
+    // shape it is drawn in, so a pattern counts on a row that is itself part
+    // of a question's shape, or anywhere once a dialog stands open on screen.
+    if let Some(pattern) = patterns.iter().find(|pattern| {
+        let needle = pattern.trim().to_lowercase();
+        !needle.is_empty()
+            && screen.lines().any(|line| {
+                line.contains(needle.as_str()) && (dialog_open || interactive_line(line))
+            })
+    }) {
+        return Some(pattern.clone());
+    }
+
+    if permission_shape {
+        return Some("permission request".into());
+    }
+
     let builtins: &[(&str, &[&str])] = match kind {
         AgentKind::Codex => &[
             (
@@ -3461,10 +3481,7 @@ pub(crate) fn attention_reason(
     // count, and a real menu shows several numbered options, exactly one
     // cursor, and a key hint. The interrupt marker rules out the working
     // phase, whose panels can also draw pointed lists.
-    if !screen.contains("esc to interrupt")
-        && !screen.contains("esc interrupt")
-        && bottom_menu_is_open(&screen)
-    {
+    if menu_open {
         return Some("interactive choice".into());
     }
     None
@@ -4014,6 +4031,63 @@ fn attention_debug_tail(screen: &str) -> String {
         .chars()
         .take(600)
         .collect()
+}
+
+/// Whether a row belongs to the shape of something asking: a choice or cursor
+/// row, a button row, a boxed-dialog border, the agent's prompt line, or its
+/// live status line. Words only ask a question inside one of these shapes;
+/// the same words in scrolled transcript prose are a memory of a question,
+/// not a question — that distinction is what keeps a quoted briefing from
+/// flagging a session as waiting.
+fn interactive_line(line: &str) -> bool {
+    if line.chars().count() > 120 {
+        return false;
+    }
+    let value = line.trim_start();
+    if value.is_empty() {
+        return false;
+    }
+    // A box border opens or closes a dialog; the opencode composer and its
+    // dialogs are drawn as `┃` rows over a `╹▀▀▀` bottom rule, Claude Code
+    // fences questions between full-width rules.
+    if value.starts_with([
+        '│', '┃', '┆', '┇', '╻', '╽', '┏', '┓', '┌', '┐', '└', '┘', '╭', '╮', '╯', '╰', '┖', '┗',
+        '┕', '┙', '╹', '╺', '─', '━', '❙', '❚',
+    ]) || value.starts_with("╹▀")
+    {
+        return true;
+    }
+    // Prompt glyphs and selection cursors head the live input line.
+    if value.starts_with(['❯', '›', '»', '▸', '>'])
+        || numbered_option_line(value)
+        || selector_line(value)
+    {
+        return true;
+    }
+    // The agent's own spinner status line is current state, never prose.
+    if value.starts_with(SPINNER_FRAMES) {
+        return true;
+    }
+    // A button row: two or more action tokens side by side never occur in
+    // prose at once, and every dialog closes with one.
+    let buttons = [
+        "allow once",
+        "allow always",
+        "reject",
+        "deny",
+        "cancel",
+        "esc to",
+        "enter to confirm",
+        "enter confirm",
+        "tab to",
+        "⇆ select",
+        "(y/n)",
+        "y/n",
+    ]
+    .iter()
+    .filter(|token| line.contains(**token))
+    .count();
+    buttons >= 2
 }
 
 fn choice_line(line: &str, label: &str) -> bool {
@@ -5741,6 +5815,76 @@ mod tests {
         );
         assert_eq!(attention_reason(AgentKind::Codex, &stale_prompt, &[]), None);
         assert!(attention_reason(AgentKind::Codex, "working...", &[]).is_none());
+    }
+
+    #[test]
+    fn a_word_pattern_counts_only_where_a_question_is_being_asked() {
+        // Today's two real false positives, quoted as they sat on screen. Both
+        // sessions were idle; the only thing on screen resembling the user's
+        // configured "approve" pattern was an ordinary sentence remembering
+        // the word. Blind `contains` over the screen tail flagged each one —
+        // and since parent alerts landed, every such flag interrupts somebody.
+        let patterns: Vec<String> = ["approve", "批准"]
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect();
+        let quoted_briefing = concat!(
+            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL) · 9.3s\n",
+            "\n",
+            "     Coordinator note: I will approve the plan once the gates are\n",
+            "     green, and reply to the thread with the results. Standing by.\n",
+            "\n",
+            "  ┃\n",
+            "  ┃  Ask anything... \"What should we work on next?\"\n",
+            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL)\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "   /work/project        ctrl+p commands    • OpenCode 1.18.24\n",
+        );
+        assert_eq!(
+            attention_reason(AgentKind::OpenCode, quoted_briefing, &patterns),
+            None,
+            "a briefing quoting the word approve is prose, not a question"
+        );
+        let remembered_path = format!(
+            "TASK D delivered via the user-approved send path.\n\
+             Standing by.\n{}\n❯ \nmanual mode on · ? for shortcuts\n",
+            rule()
+        );
+        assert_eq!(
+            attention_reason(AgentKind::Claude, &remembered_path, &patterns),
+            None,
+            "a recap remembering a user-approved path is prose, not a question"
+        );
+
+        // The same words do count when a dialog is open: the question sits in
+        // the box while the yes/no pair is up.
+        let asking = format!(
+            "{}\nAllow this change to the approved list?\n❯ 1. Yes\n  2. No\n{}\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(
+            attention_reason(AgentKind::Claude, &asking, &patterns).as_deref(),
+            Some("approve"),
+            "the pattern belongs in a live question box"
+        );
+        // And on a shaped row even without a full dialog: the prompt glyph
+        // heads the live input line, the y/n token heads a question's tail.
+        assert_eq!(
+            attention_reason(AgentKind::Codex, "❯ approve now?\n", &patterns).as_deref(),
+            Some("approve"),
+            "the agent's own prompt line counts"
+        );
+        assert_eq!(
+            attention_reason(
+                AgentKind::Codex,
+                "Approve this patch? (y/n)\ngpt-5.6-sol max · /work/project\n",
+                &patterns
+            )
+            .as_deref(),
+            Some("approve"),
+            "a y/n question line counts"
+        );
     }
 
     /// A rule as wide as Claude Code draws one.
