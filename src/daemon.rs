@@ -81,12 +81,14 @@ mod platform {
     /// again. Typing into a session costs whoever works there their attention,
     /// and two agents answering each other would spend it in a loop.
     const DIRECT_INTERVAL_MS: u64 = 10_000;
-    /// How often a child that stays under its parent's notice may ask for the
-    /// parent again. The first ask is an edge, not a poll: it fires the moment
-    /// the child stops working and starts waiting. The re-ask is what covers a
-    /// controller that was not there to carry the first one, and sixty seconds
-    /// is nagging often enough to matter without drowning the parent in repeats.
-    const PARENT_ALERT_DEBOUNCE_MS: u64 = 60_000;
+    /// When a child that stays under its parent's notice may ask again. The
+    /// first ask is an edge and fires as the classification turns; this is the
+    /// reminder schedule after it - 60 seconds, then 5 minutes, then 15 - and
+    /// the whole length of the leash: a fourth tell, and then silence until
+    /// the child is waiting on something actually *different*. The schedule
+    /// exists because one stuck screen must not become a minute-ticker at its
+    /// parent: an hour of an unanswered question costs four tells, not sixty.
+    const PARENT_ALERT_REMINDERS_MS: [u64; 3] = [60_000, 300_000, 900_000];
     /// The most messages that may be waiting for sessions to be free. Past
     /// this something is queueing faster than the machine can read, and the
     /// oldest of them are already stale.
@@ -369,13 +371,16 @@ mod platform {
         /// one signal that the message was seen.
         notice: Mutex<Option<String>>,
         /// An attention edge for this session's parent that no controller has
-        /// carried yet. Set when the classification turns to attention (or the
-        /// debounce lapses while it stays attention), cleared when the edge is
-        /// handed over. The edge itself is decided by `note_parent_alert`.
+        /// carried yet. Set when `note_parent_alert` claims a tell, cleared
+        /// when that tell is handed over.
         alert_pending: AtomicBool,
-        /// When an edge was last marked for the parent (epoch ms), whatever
-        /// became of it afterwards.
-        alert_claimed_at: AtomicU64,
+        /// The edge currently nagging about, if this session ever had one:
+        /// *which* question it is (the reason and the last thing said - the
+        /// pair that says whether it changed), how many tells that pair has
+        /// had, and when the last one was claimed. Replaced the moment either
+        /// half changes - the ceiling is silence *until something new*, not
+        /// silence forever.
+        alert_edge: Mutex<Option<AlertEdge>>,
         /// The transcript the runtime in this session is writing about itself,
         /// once the folder has been looked at.
         native: Mutex<NativeLink>,
@@ -385,6 +390,17 @@ mod platform {
         line_count: AtomicUsize,
         columns: AtomicU16,
         rows: AtomicU16,
+    }
+
+    /// One waiting state a parent has been told about, as far as the alerting
+    /// machine remembers it. While both keys hold, the child sits on the same
+    /// question, and tells about it run out: the first, then the reminders of
+    /// `PARENT_ALERT_REMINDERS_MS`, then nothing until a key changes.
+    struct AlertEdge {
+        reason_key: String,
+        recap_key: String,
+        told: u32,
+        last_claimed_at: u64,
     }
 
     /// What a session knows about the transcript its runtime keeps.
@@ -3710,7 +3726,7 @@ mod platform {
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             alert_pending: AtomicBool::new(false),
-            alert_claimed_at: AtomicU64::new(0),
+            alert_edge: Mutex::new(None),
             native: Mutex::new(NativeLink {
                 seed,
                 ..NativeLink::default()
@@ -4444,10 +4460,10 @@ mod platform {
             screen_recap: Mutex::new(None),
             notice: Mutex::new(None),
             // A child that fell onto its question while no daemon was watching
-            // gets its edge marked on the first look: `alert_claimed_at` starts
-            // at zero, so adoption does not mute the parent's alert.
+            // gets its edge marked on the first look: no edge is recorded yet,
+            // so adoption does not mute the parent's alert.
             alert_pending: AtomicBool::new(false),
-            alert_claimed_at: AtomicU64::new(0),
+            alert_edge: Mutex::new(None),
             // The command line that started this one belongs to a keeper this
             // daemon did not spawn, so both of the things it said - what the
             // launch meant to reopen, and what the last generation matched it
@@ -4995,13 +5011,20 @@ mod platform {
             snapshot
         }
 
-        /// Mark the moment this session stopped working and started waiting on
-        /// someone, for the parent agent that launched it — but only for what
-        /// counts as an edge: a child with a parent, alive, and now asking for
-        /// attention. The first ask fires as the classification turns; while it
-        /// stays attention the same child may ask again no sooner than
-        /// `PARENT_ALERT_DEBOUNCE_MS` later, which covers a controller that was
-        /// away when the edge happened without nagging one that heard it.
+        /// Mark a tell owed to this session's parent - but only for what
+        /// counts as an edge: a child with a parent, alive, and now asking
+        /// for attention. The first tell fires as the classification turns;
+        /// while the *same* question sits there the tells run out along
+        /// `PARENT_ALERT_REMINDERS_MS` and then stop, because a stuck screen,
+        /// most of all a wrongly-classified one, must not become a
+        /// minute-ticker at its parent. A different reason or different last
+        /// words is a different question and is told about at once.
+        ///
+        /// An attention pass that reads *not* attention does not reset the
+        /// schedule either: a classifier blinking off and back onto the same
+        /// question would hand the ticker back, and the blink is the thing
+        /// being fixed, not a new event. Only the keys expiring a replaced
+        /// edge can restart the count.
         ///
         /// Marking is cheap and unconditional because a daemon does not know
         /// whether any controller will ever ask for these; the gate that turns
@@ -5013,20 +5036,58 @@ mod platform {
             if !snapshot.needs_attention {
                 return;
             }
-            let now = now_ms();
-            if self.alert_pending.load(Ordering::Relaxed)
-                || now.saturating_sub(self.alert_claimed_at.load(Ordering::Relaxed))
-                    < PARENT_ALERT_DEBOUNCE_MS
-            {
+            let reason_key = snapshot.attention_reason.clone().unwrap_or_default();
+            let recap_key = snapshot
+                .recap
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if self.alert_pending.load(Ordering::Relaxed) {
                 return;
             }
-            self.alert_claimed_at.store(now, Ordering::Relaxed);
+            let now = now_ms();
+            let mut guard = self
+                .alert_edge
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let replace = match guard.as_ref() {
+                Some(edge) => edge.reason_key != reason_key || edge.recap_key != recap_key,
+                None => true,
+            };
+            if replace {
+                // A new question: told about like it is new, schedule and all.
+                *guard = Some(AlertEdge {
+                    reason_key,
+                    recap_key,
+                    told: 0,
+                    last_claimed_at: 0,
+                });
+            }
+            let edge = guard.as_mut().expect("an edge was just installed");
+            // `told` counts what has been claimed for this pair, first tell
+            // included; reminder n (1-based) waits PARENT_ALERT_REMINDERS[n-1]
+            // since the last claim, and nothing is ever due past the schedule.
+            let due = match edge.told {
+                0 => true,
+                n if usize::try_from(n).is_ok_and(|n| n <= PARENT_ALERT_REMINDERS_MS.len()) => {
+                    now.saturating_sub(edge.last_claimed_at)
+                        >= PARENT_ALERT_REMINDERS_MS[usize::try_from(n).unwrap() - 1]
+                }
+                _ => false,
+            };
+            if !due {
+                return;
+            }
+            edge.told += 1;
+            edge.last_claimed_at = now;
+            drop(guard);
             self.alert_pending.store(true, Ordering::Relaxed);
         }
 
-        /// Hand the marked edge over, once. The controller that takes it owns
-        /// the telling; if the telling fails, the debounce above turns the
-        /// still-unanswered question into a fresh edge within the minute.
+        /// Hand the marked tell over, once. The controller that takes it owns
+        /// the delivery; if the delivery fails, the schedule above covers it:
+        /// the still-unanswered question is a reminder away, not an hour.
         /// A child that died or was archived while waiting says nothing: its
         /// prompt is not asking anybody any more.
         fn take_parent_alert(&self) -> Option<ParentAlert> {
@@ -5038,6 +5099,13 @@ mod platform {
                 return None;
             }
             let parent_session_id = snapshot.parent.clone()?;
+            let at = self
+                .alert_edge
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .map(|edge| edge.last_claimed_at)
+                .unwrap_or(0);
             Some(ParentAlert {
                 session_id: snapshot.id.clone(),
                 parent_session_id,
@@ -5045,7 +5113,7 @@ mod platform {
                 label: snapshot.label.clone(),
                 attention_reason: snapshot.attention_reason.clone(),
                 recap: snapshot.recap.clone(),
-                at: self.alert_claimed_at.load(Ordering::Relaxed),
+                at,
             })
         }
 
@@ -7835,17 +7903,32 @@ mod platform {
             .unwrap()
         }
 
-        /// The edge the parent depends on: not a level, not while working, once
-        /// per fall-onto-the-question, and no repeat within the debounce.
+        /// Rewind the current edge's last tell so the next reminder comes due
+        /// without the test waiting real minutes for it.
+        fn age_parent_alert(child: &ManagedSession, ms: u64) {
+            if let Some(edge) = child
+                .alert_edge
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+            {
+                edge.last_claimed_at = edge.last_claimed_at.saturating_sub(ms);
+            }
+        }
+
+        /// What the parent depends on: one tell per question, widening
+        /// reminders (60s, 5min, 15min) while it sits unanswered, then silence
+        /// until the question actually changes - so one stuck screen, least
+        /// of all a wrongly-classified one, cannot become a minute-ticker.
         #[test]
-        fn a_waiting_child_is_marked_for_its_parent_once_and_repeats_only_after_the_debounce() {
+        fn a_waiting_child_is_told_about_once_and_the_reminders_widen_to_silence() {
             let state = test_state("parent-edge");
             let root = state.paths.root.clone();
             *state
                 .attention_patterns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into()];
+                vec!["gpu quota approval".into(), "second opinion".into()];
             let child = launch_child_with_parent(&state, "parent-edge", Some("the-parent"));
             let note = |child: &ManagedSession| {
                 let snapshot = child.snapshot();
@@ -7866,8 +7949,8 @@ mod platform {
             note(&child);
             assert!(child.take_parent_alert().is_none());
 
-            // The moment it stops working and asks for approval, the edge is
-            // marked and it says who is waiting and why.
+            // The moment it stops working and asks for approval, the first
+            // tell is immediate, and it says who is waiting and why.
             child.record_output(&approval_screen("gpu quota approval"));
             note(&child);
             let alert = child.take_parent_alert().expect("the edge is handed over");
@@ -7879,17 +7962,62 @@ mod platform {
                 Some("gpu quota approval")
             );
 
-            // Taken once: asking again in the same breath says nothing, and
-            // while the child sits on the question the next ask comes no
-            // sooner than the debounce, not before.
+            // The same question afterwards: nothing in the same breath, the
+            // first reminder at a minute, the second not before five.
             note(&child);
             assert!(child.take_parent_alert().is_none());
-            child.alert_claimed_at.store(
-                now_ms().saturating_sub(PARENT_ALERT_DEBOUNCE_MS + 1),
-                Ordering::Relaxed,
-            );
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[0] + 1);
             note(&child);
-            assert!(child.take_parent_alert().is_some());
+            assert!(child.take_parent_alert().is_some(), "first reminder at 60s");
+            // The margins are minutes wide, not a millisecond: the test's own
+            // clock has to fit inside the "not yet" one.
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[1] - 60_000);
+            note(&child);
+            assert!(
+                child.take_parent_alert().is_none(),
+                "the second reminder waits the full five minutes"
+            );
+            age_parent_alert(&child, 60_001);
+            note(&child);
+            assert!(child.take_parent_alert().is_some(), "second at 5min");
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[2] + 1);
+            note(&child);
+            assert!(child.take_parent_alert().is_some(), "third at 15min");
+
+            // Ceiling: the first tell and three reminders is all the same
+            // question ever gets. An hour later, still silence - and a
+            // classifier blinking off and back onto the same question does
+            // not hand the ticker back.
+            age_parent_alert(&child, 3_600_000);
+            note(&child);
+            assert!(
+                child.take_parent_alert().is_none(),
+                "four tells is the leash"
+            );
+            let mut blink = child.snapshot();
+            blink.needs_attention = false;
+            child.note_parent_alert(&blink);
+            age_parent_alert(&child, 3_600_000);
+            note(&child);
+            assert!(
+                child.take_parent_alert().is_none(),
+                "an attention flicker resets nothing"
+            );
+
+            // Silence means *until the question changes*: different last
+            // words is a new question, and so is a different reason - both
+            // are told about at once, schedule and all.
+            let mut moved = child.snapshot();
+            moved.recap = Some("but this line is new".into());
+            child.note_parent_alert(&moved);
+            assert!(
+                child.take_parent_alert().is_some(),
+                "new recap is a new edge"
+            );
+            child.record_output(&approval_screen("second opinion"));
+            note(&child);
+            let alert = child.take_parent_alert().expect("new reason is a new edge");
+            assert_eq!(alert.attention_reason.as_deref(), Some("second opinion"));
 
             // A child nobody started is no one's errand: the same fall marks
             // nothing for no parent to hear about.
@@ -7952,7 +8080,7 @@ mod platform {
                 other => panic!("unexpected answer: {other:?}"),
             }
             // Handed over, so gone: the next ask hears nothing until the
-            // debounce lets the still-unanswered question mark itself again.
+            // reminder schedule marks the still-unanswered question again.
             handle_request(&writer, &state, 4, DaemonRequest::DrainAlerts).unwrap();
             match answer(&mut client, 4) {
                 DaemonResponse::Alerts { alerts } => assert!(alerts.is_empty()),

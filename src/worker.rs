@@ -1435,9 +1435,10 @@ fn read_board(runtime: &Runtime, since: &str) -> Option<TalkPage> {
 /// daemon watches them just the same.
 ///
 /// A delivery that fails is not retried by hand: the child is still sitting on
-/// its question, and a daemon sitting on an undelivered edge marks it again
-/// once its debounce has lapsed. That makes the round's ask at-most-once per
-/// edge and roughly once-a-minute-nagging per unattended child, which is what
+/// its question, and the daemon's reminder schedule will offer the tell again
+/// while it goes unanswered. That bounds the whole thing — the round's ask is
+/// at-most-once per tell, and one stuck question is told about a handful of
+/// times at widening spacing, then not at all until it changes, which is what
 /// the stall it cures deserves and no more.
 fn drain_parent_alerts(runtime: &Runtime, targets: &[Target], config: &Config) {
     if !config.alerts_to_parent {

@@ -427,8 +427,8 @@ pub enum DaemonRequest {
     /// yet handed over: child sessions that fell under their parent's notice
     /// since the last ask. Answering hands them over and forgets them, the way
     /// `ChannelsGet` hands over receipts; a controller that never delivers one
-    /// will hear about the same session again once the debounce has passed,
-    /// because the child is still sitting on its question.
+    /// will hear about the same session again on the daemon's reminder
+    /// schedule, because the child is still sitting on its question.
     DrainAlerts,
 }
 
