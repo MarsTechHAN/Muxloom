@@ -1721,241 +1721,277 @@ mod platform {
                             }
                         });
                     }
-                    FrameKind::OpenStream => match frame.decode_json::<OpenStream>()? {
-                        OpenStream::Pty {
-                            session_id,
-                            columns,
-                            rows,
-                            ..
-                        } => {
-                            let session = daemon_session(&state, &session_id)?;
-                            // Capture the size before the resize so we can tell
-                            // whether this attach actually changed the viewport.
-                            // A changed size means the daemon's parser just
-                            // reflowed the old-size screen, so a snapshot taken
-                            // now is an intermediate frame, not the live one.
-                            let pre_cols = session.columns.load(Ordering::Relaxed);
-                            let pre_rows = session.rows.load(Ordering::Relaxed);
-                            // Adoption rebuilt this screen from a bounded tail of
-                            // history: a partial frame for an app that
-                            // differential-renders. The first attach must force a
-                            // full repaint instead of shipping the snapshot.
-                            // Consume the flag here so a second attach behaves
-                            // as usual.
-                            let rebuilt = session.screen_rebuilt.swap(false, Ordering::Relaxed);
-                            session.resize(columns, rows)?;
-                            let size_changed = pre_cols != session.columns.load(Ordering::Relaxed)
-                                || pre_rows != session.rows.load(Ordering::Relaxed);
-                            let subscriber_id =
-                                state.next_subscriber.fetch_add(1, Ordering::Relaxed);
-                            // One payload, sent first: the daemon's absolute view of the
-                            // live screen. When the parser mirrors the child's real
-                            // screen, it is the full snapshot (modes + row dump) and
-                            // that is exactly the live screen.
-                            //
-                            // Two cases break that mirror, and both leave a frame the
-                            // app has not painted: an attach that CHANGED the size
-                            // (the parser just reflowed the old-size content into the
-                            // new size — a stale intermediate frame), and a fresh
-                            // adoption (the screen was rebuilt by replaying a bounded
-                            // history tail that starts mid-stream, so most cells were
-                            // never painted at all). In both, a full-screen TUI agent
-                            // repaints itself on SIGWINCH: send only the mode preamble
-                            // (alt buffer, scroll region, clear), nudge the child with
-                            // a two-frame resize, and let the app's own repaint —
-                            // already streaming as live frames — paint the screen. That
-                            // optimization only applies to agent kinds that are
-                            // full-screen TUIs: a plain terminal (or any unknown kind)
-                            // has no such repaint, so it keeps the snapshot.
-                            //
-                            // No scrollback seed goes out here any more: rendering a
-                            // redraw-heavy session's history costs seconds, and while it
-                            // ran the snapshot waited behind it, so the client committed
-                            // a partial live frame and sat on it. Older history is paged
-                            // on demand through read_history when the client scrolls past
-                            // its own emulator buffer.
-                            let on_alt = {
-                                let screen = session
-                                    .screen
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                screen.screen().alternate_screen()
-                            };
-                            let kind = session
-                                .metadata
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .kind
-                                .parse::<AgentKind>()
-                                .ok();
-                            let repaints_on_resize = matches!(
-                                kind,
-                                Some(AgentKind::Codex)
-                                    | Some(AgentKind::Claude)
-                                    | Some(AgentKind::OpenCode)
-                                    | Some(AgentKind::Pi)
-                            );
-                            let force_repaint =
-                                (size_changed || rebuilt) && on_alt && repaints_on_resize;
-                            if force_repaint {
-                                // The preamble is an ending (alt buffer, region,
-                                // clear), so it must be the first payload byte a
-                                // client reads on this stream. The broadcast gate
-                                // is the subscriber registration itself: nothing
-                                // is written to an unregistered stream, so the
-                                // preamble goes down first while the gate is
-                                // still shut. A live frame that slipped in
-                                // between an opened gate and the clear would be
-                                // erased by it, and the repaint the nudge
-                                // provokes would land on a screen the clear had
-                                // already wiped behind it - leaving the client
-                                // fed only later diffs, which a cached terminal
-                                // then preserves across every switch back.
-                                write_stream_opened(&writer, &frame, None)?;
-                                for chunk in session.screen_preamble().chunks(DATA_CHUNK_SIZE) {
-                                    write_frame(
-                                        &writer,
-                                        &Frame::data(frame.stream_id, 0, chunk, true),
-                                    )?;
-                                }
-                            } else {
-                                // The snapshot is an absolute screen state, so
-                                // live frames interleaving ahead of it are
-                                // harmless: it corrects them. Register before it
-                                // is written, so no output is ever lost in a
-                                // registration gap.
-                                session
-                                    .subscribers
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .insert(
-                                        subscriber_id,
-                                        Subscriber {
-                                            stream_id: frame.stream_id,
-                                            writer: Arc::clone(&writer),
-                                        },
+                    FrameKind::OpenStream => {
+                        let decoded = frame.decode_json::<OpenStream>()?;
+                        // One failing stream must not tear down the whole
+                        // multiplexed connection: every stream on it (other
+                        // live terminals, keystrokes, file streams) would be
+                        // cut and force a seconds-long re-dial. So each arm
+                        // returns a Result and the failures are answered where
+                        // the stream failed - a per-stream error reply - while
+                        // only the pipe staying healthy (being able to write
+                        // that reply at all) is allowed to end the connection.
+                        let opened = (|| -> anyhow::Result<()> {
+                            match decoded {
+                                OpenStream::Pty {
+                                    session_id,
+                                    columns,
+                                    rows,
+                                    ..
+                                } => {
+                                    let session = daemon_session(&state, &session_id)?;
+                                    // Capture the size before the resize so we can tell
+                                    // whether this attach actually changed the viewport.
+                                    // A changed size means the daemon's parser just
+                                    // reflowed the old-size screen, so a snapshot taken
+                                    // now is an intermediate frame, not the live one.
+                                    let pre_cols = session.columns.load(Ordering::Relaxed);
+                                    let pre_rows = session.rows.load(Ordering::Relaxed);
+                                    // Adoption rebuilt this screen from a bounded tail of
+                                    // history: a partial frame for an app that
+                                    // differential-renders. The first attach must force a
+                                    // full repaint instead of shipping the snapshot. The
+                                    // flag is only cleared once this attach has actually
+                                    // delivered its preamble or snapshot: an attach that
+                                    // errors out partway (or is abandoned mid-mash) must
+                                    // not burn the one repaint chance the next good
+                                    // attach gets.
+                                    let rebuilt = session.screen_rebuilt.load(Ordering::Relaxed);
+                                    session.resize(columns, rows)?;
+                                    let size_changed = pre_cols
+                                        != session.columns.load(Ordering::Relaxed)
+                                        || pre_rows != session.rows.load(Ordering::Relaxed);
+                                    let subscriber_id =
+                                        state.next_subscriber.fetch_add(1, Ordering::Relaxed);
+                                    // One payload, sent first: the daemon's absolute view of the
+                                    // live screen. When the parser mirrors the child's real
+                                    // screen, it is the full snapshot (modes + row dump) and
+                                    // that is exactly the live screen.
+                                    //
+                                    // Two cases break that mirror, and both leave a frame the
+                                    // app has not painted: an attach that CHANGED the size
+                                    // (the parser just reflowed the old-size content into the
+                                    // new size — a stale intermediate frame), and a fresh
+                                    // adoption (the screen was rebuilt by replaying a bounded
+                                    // history tail that starts mid-stream, so most cells were
+                                    // never painted at all). In both, a full-screen TUI agent
+                                    // repaints itself on SIGWINCH: send only the mode preamble
+                                    // (alt buffer, scroll region, clear), nudge the child with
+                                    // a two-frame resize, and let the app's own repaint —
+                                    // already streaming as live frames — paint the screen. That
+                                    // optimization only applies to agent kinds that are
+                                    // full-screen TUIs: a plain terminal (or any unknown kind)
+                                    // has no such repaint, so it keeps the snapshot.
+                                    //
+                                    // No scrollback seed goes out here any more: rendering a
+                                    // redraw-heavy session's history costs seconds, and while it
+                                    // ran the snapshot waited behind it, so the client committed
+                                    // a partial live frame and sat on it. Older history is paged
+                                    // on demand through read_history when the client scrolls past
+                                    // its own emulator buffer.
+                                    let on_alt = {
+                                        let screen = session
+                                            .screen
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        screen.screen().alternate_screen()
+                                    };
+                                    let kind = session
+                                        .metadata
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .kind
+                                        .parse::<AgentKind>()
+                                        .ok();
+                                    let repaints_on_resize = matches!(
+                                        kind,
+                                        Some(AgentKind::Codex)
+                                            | Some(AgentKind::Claude)
+                                            | Some(AgentKind::OpenCode)
+                                            | Some(AgentKind::Pi)
                                     );
-                                subscriptions.insert(
-                                    frame.stream_id,
-                                    ClientStream::Pty {
-                                        session: Arc::clone(&session),
-                                        subscriber_id,
-                                    },
-                                );
-                                write_stream_opened(&writer, &frame, None)?;
-                            }
-                            if force_repaint {
-                                // Open the gate only now, behind the clear, and
-                                // then nudge: out and back is two real keeper
-                                // RESIZE frames (old-keeper compatible), the app
-                                // gets SIGWINCH, the final size is exactly the
-                                // attach size, and the app's own repaint - now
-                                // broadcast onto this stream - paints over the
-                                // cleared screen.
-                                session
-                                    .subscribers
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .insert(
-                                        subscriber_id,
-                                        Subscriber {
-                                            stream_id: frame.stream_id,
-                                            writer: Arc::clone(&writer),
-                                        },
-                                    );
-                                subscriptions.insert(
-                                    frame.stream_id,
-                                    ClientStream::Pty {
-                                        session: Arc::clone(&session),
-                                        subscriber_id,
-                                    },
-                                );
-                                session.resize(columns.saturating_add(1), rows)?;
-                                session.resize(columns, rows)?;
-                            } else {
-                                for chunk in session.screen_snapshot().chunks(DATA_CHUNK_SIZE) {
-                                    write_frame(
-                                        &writer,
-                                        &Frame::data(frame.stream_id, 0, chunk, true),
-                                    )?;
-                                }
-                            }
-                        }
-                        OpenStream::File {
-                            path,
-                            offset,
-                            length,
-                        } => {
-                            open_download_stream(
-                                &writer, &flow, &frame, path, offset, length, true,
-                            )?;
-                        }
-                        OpenStream::Media {
-                            path,
-                            offset,
-                            length,
-                        } => {
-                            open_download_stream(
-                                &writer, &flow, &frame, path, offset, length, false,
-                            )?;
-                        }
-                        OpenStream::Upload { path, size } => {
-                            let destination = PathBuf::from(path);
-                            let parent = destination
-                                .parent()
-                                .context("upload destination has no parent")?;
-                            if !parent.is_dir() {
-                                bail!("upload destination directory does not exist");
-                            }
-                            let nonce = state.next_subscriber.fetch_add(1, Ordering::Relaxed);
-                            let temporary_path = parent
-                                .join(format!(".muxloom-upload-{}-{nonce}", std::process::id()));
-                            let file = OpenOptions::new()
-                                .create_new(true)
-                                .write(true)
-                                .open(&temporary_path)?;
-                            subscriptions.insert(
-                                frame.stream_id,
-                                ClientStream::Upload {
-                                    file,
-                                    temporary_path,
-                                    destination,
-                                    remaining: size,
-                                },
-                            );
-                            write_stream_opened(&writer, &frame, Some(size))?;
-                        }
-                        OpenStream::Tcp { host, port } => {
-                            match TcpStream::connect((host.as_str(), port)) {
-                                Ok(socket) => {
-                                    socket.set_nodelay(true)?;
-                                    let reader = socket.try_clone()?;
-                                    subscriptions
-                                        .insert(frame.stream_id, ClientStream::Tcp { socket });
-                                    write_stream_opened(&writer, &frame, None)?;
-                                    flow.open(frame.stream_id);
-                                    let writer = Arc::clone(&writer);
-                                    let flow = Arc::clone(&flow);
-                                    let stream_id = frame.stream_id;
-                                    thread::spawn(move || {
-                                        if let Err(error) =
-                                            stream_tcp(&writer, &flow, stream_id, reader)
+                                    let force_repaint =
+                                        (size_changed || rebuilt) && on_alt && repaints_on_resize;
+                                    if force_repaint {
+                                        // The preamble is an ending (alt buffer, region,
+                                        // clear), so it must be the first payload byte a
+                                        // client reads on this stream. The broadcast gate
+                                        // is the subscriber registration itself: nothing
+                                        // is written to an unregistered stream, so the
+                                        // preamble goes down first while the gate is
+                                        // still shut. A live frame that slipped in
+                                        // between an opened gate and the clear would be
+                                        // erased by it, and the repaint the nudge
+                                        // provokes would land on a screen the clear had
+                                        // already wiped behind it - leaving the client
+                                        // fed only later diffs, which a cached terminal
+                                        // then preserves across every switch back.
+                                        write_stream_opened(&writer, &frame, None)?;
+                                        for chunk in
+                                            session.screen_preamble().chunks(DATA_CHUNK_SIZE)
                                         {
-                                            eprintln!(
-                                                "muxloomd TCP stream {stream_id} failed: {error:#}"
+                                            write_frame(
+                                                &writer,
+                                                &Frame::data(frame.stream_id, 0, chunk, true),
+                                            )?;
+                                        }
+                                    } else {
+                                        // The snapshot is an absolute screen state, so
+                                        // live frames interleaving ahead of it are
+                                        // harmless: it corrects them. Register before it
+                                        // is written, so no output is ever lost in a
+                                        // registration gap.
+                                        session
+                                            .subscribers
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .insert(
+                                                subscriber_id,
+                                                Subscriber {
+                                                    stream_id: frame.stream_id,
+                                                    writer: Arc::clone(&writer),
+                                                },
+                                            );
+                                        subscriptions.insert(
+                                            frame.stream_id,
+                                            ClientStream::Pty {
+                                                session: Arc::clone(&session),
+                                                subscriber_id,
+                                            },
+                                        );
+                                        write_stream_opened(&writer, &frame, None)?;
+                                    }
+                                    if force_repaint {
+                                        // Open the gate only now, behind the clear, and
+                                        // then nudge: out and back is two real keeper
+                                        // RESIZE frames (old-keeper compatible), the app
+                                        // gets SIGWINCH, the final size is exactly the
+                                        // attach size, and the app's own repaint - now
+                                        // broadcast onto this stream - paints over the
+                                        // cleared screen.
+                                        session
+                                            .subscribers
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .insert(
+                                                subscriber_id,
+                                                Subscriber {
+                                                    stream_id: frame.stream_id,
+                                                    writer: Arc::clone(&writer),
+                                                },
+                                            );
+                                        subscriptions.insert(
+                                            frame.stream_id,
+                                            ClientStream::Pty {
+                                                session: Arc::clone(&session),
+                                                subscriber_id,
+                                            },
+                                        );
+                                        session.resize(columns.saturating_add(1), rows)?;
+                                        session.resize(columns, rows)?;
+                                    } else {
+                                        for chunk in
+                                            session.screen_snapshot().chunks(DATA_CHUNK_SIZE)
+                                        {
+                                            write_frame(
+                                                &writer,
+                                                &Frame::data(frame.stream_id, 0, chunk, true),
+                                            )?;
+                                        }
+                                    }
+                                    // Delivered: the repaint (or the absolute snapshot)
+                                    // has been written to this stream, so the rebuild is
+                                    // answered and the next attach runs normally. An
+                                    // earlier `?` would have left the flag armed for the
+                                    // next attach instead.
+                                    session.screen_rebuilt.store(false, Ordering::Relaxed);
+                                }
+                                OpenStream::File {
+                                    path,
+                                    offset,
+                                    length,
+                                } => {
+                                    open_download_stream(
+                                        &writer, &flow, &frame, path, offset, length, true,
+                                    )?;
+                                }
+                                OpenStream::Media {
+                                    path,
+                                    offset,
+                                    length,
+                                } => {
+                                    open_download_stream(
+                                        &writer, &flow, &frame, path, offset, length, false,
+                                    )?;
+                                }
+                                OpenStream::Upload { path, size } => {
+                                    let destination = PathBuf::from(path);
+                                    let parent = destination
+                                        .parent()
+                                        .context("upload destination has no parent")?;
+                                    if !parent.is_dir() {
+                                        bail!("upload destination directory does not exist");
+                                    }
+                                    let nonce =
+                                        state.next_subscriber.fetch_add(1, Ordering::Relaxed);
+                                    let temporary_path = parent.join(format!(
+                                        ".muxloom-upload-{}-{nonce}",
+                                        std::process::id()
+                                    ));
+                                    let file = OpenOptions::new()
+                                        .create_new(true)
+                                        .write(true)
+                                        .open(&temporary_path)?;
+                                    subscriptions.insert(
+                                        frame.stream_id,
+                                        ClientStream::Upload {
+                                            file,
+                                            temporary_path,
+                                            destination,
+                                            remaining: size,
+                                        },
+                                    );
+                                    write_stream_opened(&writer, &frame, Some(size))?;
+                                }
+                                OpenStream::Tcp { host, port } => {
+                                    match TcpStream::connect((host.as_str(), port)) {
+                                        Ok(socket) => {
+                                            socket.set_nodelay(true)?;
+                                            let reader = socket.try_clone()?;
+                                            subscriptions.insert(
+                                                frame.stream_id,
+                                                ClientStream::Tcp { socket },
+                                            );
+                                            write_stream_opened(&writer, &frame, None)?;
+                                            flow.open(frame.stream_id);
+                                            let writer = Arc::clone(&writer);
+                                            let flow = Arc::clone(&flow);
+                                            let stream_id = frame.stream_id;
+                                            thread::spawn(move || {
+                                                if let Err(error) =
+                                                    stream_tcp(&writer, &flow, stream_id, reader)
+                                                {
+                                                    eprintln!(
+                                                        "muxloomd TCP stream {stream_id} failed: {error:#}"
+                                                    );
+                                                }
+                                                flow.close(stream_id);
+                                            });
+                                        }
+                                        Err(error) => {
+                                            anyhow::bail!(
+                                                "cannot connect to {host}:{port}: {error}"
                                             );
                                         }
-                                        flow.close(stream_id);
-                                    });
+                                    }
                                 }
-                                Err(error) => write_stream_error(
-                                    &writer,
-                                    &frame,
-                                    format!("cannot connect to {host}:{port}: {error}"),
-                                )?,
                             }
+                            Ok(())
+                        })();
+                        if let Err(error) = opened {
+                            write_stream_error(&writer, &frame, error.to_string())?;
                         }
-                    },
+                    }
                     FrameKind::Data => {
                         if let Some(stream) = subscriptions.get_mut(&frame.stream_id) {
                             let payload = frame.decoded_payload()?;
@@ -6542,6 +6578,79 @@ mod platform {
             assert_eq!(stdout, b"shell-output");
             assert_eq!(stderr, b"shell-error");
             assert_eq!(exit, Some(7));
+            drop(client);
+            handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn a_failing_stream_reply_keeps_the_multiplexed_connection_alive() {
+            // One bad open must not tear the whole client connection down: an
+            // unknown session id answers with a per-stream error, and the next
+            // request still gets its reply on the same socket. Before the
+            // isolation this returned an error straight up the frame loop and
+            // closed the connection, killing every other live stream and
+            // forcing a seconds-long re-dial on the next operation.
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let state = test_state("stream-isolation");
+            let handle = thread::spawn(move || serve_client(server, state));
+
+            Frame::json(
+                FrameKind::OpenStream,
+                99,
+                0,
+                &OpenStream::Pty {
+                    session_id: "no-such-session".into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 0,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+
+            let reply = Frame::read_from(&mut client).unwrap().unwrap();
+            assert_eq!(
+                reply.kind,
+                FrameKind::Error,
+                "the bad open is an error reply"
+            );
+            assert_eq!(
+                reply.stream_id, 99,
+                "the error names the stream that failed"
+            );
+            match reply.decode_json::<DaemonResponse>().unwrap() {
+                DaemonResponse::Error { message } => {
+                    assert!(
+                        message.contains("no-such-session") || message.contains("session"),
+                        "the message names the failed stream: {message}"
+                    );
+                }
+                response => panic!("expected an error, got {response:?}"),
+            }
+
+            // The connection is still alive: the same client is served again.
+            Frame::json(FrameKind::Request, 0, 8, &DaemonRequest::Ping)
+                .unwrap()
+                .write_to(&mut client)
+                .unwrap();
+            let mut pong = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !pong && std::time::Instant::now() < deadline {
+                if let Some(frame) = Frame::read_from(&mut client).unwrap() {
+                    if frame.kind == FrameKind::Response && frame.request_id == 8 {
+                        assert!(
+                            matches!(
+                                frame.decode_json::<DaemonResponse>().unwrap(),
+                                DaemonResponse::Pong { .. }
+                            ),
+                            "the connection must survive the failed stream"
+                        );
+                        pong = true;
+                    }
+                }
+            }
+            assert!(pong, "the ping after the failed stream must be answered");
             drop(client);
             handle.join().unwrap().unwrap();
         }
