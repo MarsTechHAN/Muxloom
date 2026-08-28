@@ -1863,8 +1863,26 @@ mod platform {
                                             | Some(AgentKind::OpenCode)
                                             | Some(AgentKind::Pi)
                                     );
+                                    // For an adoption, `on_alt` cannot gate the force path: the mirror was
+                                    // rebuilt by replaying only the bounded history tail
+                                    // (RECENT_OUTPUT_LIMIT), and a real alt-screen agent
+                                    // enters the alt buffer once, at startup, which a
+                                    // multi-megabyte transcript pushes out of any such
+                                    // tail. The replayed parser therefore reads primary
+                                    // even though the running child is genuinely on alt,
+                                    // so an adopted alt screen must force the repaint on
+                                    // the rebuilt flag alone, whatever the mirror reports.
+                                    // A size change without a rebuild still needs the live
+                                    // mirror's alt flag to choose: only an alt-screen TUI
+                                    // repaints on the SIGWINCH the nudge sends, and a
+                                    // primary-mode session (a kind running a plain child,
+                                    // say) has no such repaint to lean on and keeps the
+                                    // snapshot. The preamble echoes the mirror's state,
+                                    // but the child's own post-SIGWINCH repaint re-emits
+                                    // the correct alt entry, so a mismatched preamble byte
+                                    // on the adopted path is self-corrected.
                                     let force_repaint =
-                                        (size_changed || rebuilt) && on_alt && repaints_on_resize;
+                                        repaints_on_resize && (rebuilt || (on_alt && size_changed));
                                     if force_repaint {
                                         // The preamble is an ending (alt buffer, region,
                                         // clear), so it must be the first payload byte a
@@ -10195,6 +10213,164 @@ mod platform {
             assert_eq!(adopted.columns.load(Ordering::Relaxed), 80);
             assert_eq!(adopted.rows.load(Ordering::Relaxed), 24);
             // The flag is consumed: the next attach is an ordinary one.
+            assert!(!adopted.screen_rebuilt.load(Ordering::Relaxed));
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                2,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 2 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        #[test]
+        fn an_adopted_alt_screen_with_a_deep_tail_still_forces_a_repaint_on_a_same_size_attach() {
+            // The real-world adoption: by the time a daemon hands over, a
+            // redraw-heavy alt-screen agent has produced far more history than
+            // the RECENT_OUTPUT_LIMIT adoption tail replays, and it entered the
+            // alt buffer once at the very start - long before that tail. So the
+            // rebuilt mirror ends on the *primary* screen even though the running
+            // child is genuinely on alt. The old gate keyed the force-repaint on
+            // the mirror's alt flag, so this attach shipped the stale primary
+            // snapshot, cleared screen_rebuilt, and left the alt UI blank; seen
+            // by the user as "opencode 终端切回后 UI 未完整渲染". It must instead
+            // force a repaint: preamble first, then a resize nudge the child
+            // actually feels, so its own SIGWINCH repaint restores the alt screen.
+            //
+            // To reproduce, the child enters alt then writes >RECENT_OUTPUT_LIMIT
+            // of filler, so the adopted (bounded) tail contains no alt entry and
+            // the parser rebuilds primary.
+            let state = test_state("adoptdeepalt");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-opencode-adoptdeepalt";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "opencode".into(),
+                "/tmp".into(),
+                "adoptdeepalt".into(),
+                false,
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\033[?1049h'; printf 'ALTSCREENMARKER\\n'; \
+                     head -c 3145728 /dev/zero | tr '\\0' x; \
+                     trap 'printf WINCHMARKER' WINCH; while :; do sleep 0.1; done"
+                        .into(),
+                ],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            // Give the child time to enter alt and flush >2 MiB to history.
+            thread::sleep(Duration::from_secs(3));
+            assert!(
+                !launched.screen_rebuilt.load(Ordering::Relaxed),
+                "a self-launched session is never rebuilt"
+            );
+            // The old generation drains and dies; the child's keeper survives.
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            assert!(
+                adopted.screen_rebuilt.load(Ordering::Relaxed),
+                "adoption rebuilds from a bounded tail and must mark the screen rebuilt"
+            );
+            // The adopted mirror reads primary: the deep tail never saw the alt entry.
+            {
+                let screen = adopted
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    !screen.screen().alternate_screen(),
+                    "the replayed 2 MiB tail must start after the alt entry, leaving the \
+                     adopted mirror on the primary screen - that is the inadequate mirror \
+                     the old gate trusted"
+                );
+            }
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let serve = Arc::clone(&restarted);
+            let handle = thread::spawn(move || serve_client(server, serve));
+            // Same-size attach: no reflow, so only the rebuilt flag can justify
+            // the repaint path - and it must, because the mirror is inadequate.
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                1,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 0,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            let mut window = String::new();
+            let mut first_data: Option<String> = None;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && !window.contains("WINCHMARKER") {
+                match Frame::read_from(&mut client) {
+                    Ok(Some(frame))
+                        if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
+                    {
+                        let payload =
+                            String::from_utf8_lossy(&frame.decoded_payload().unwrap()).into_owned();
+                        first_data.get_or_insert_with(|| payload.clone());
+                        window.push_str(&payload);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            // The force path — not the stale snapshot — ran: the child was nudged,
+            // so it physically received SIGWINCH. The old gate (keyed on the
+            // primary-reading mirror) never ran this, which is the regression.
+            assert!(
+                window.contains("WINCHMARKER"),
+                "an adopted alt-screen with a deep tail must be nudged into repainting \
+                 even though its rebuilt mirror reads primary: {window:?}"
+            );
+            let first_data = first_data.expect("the attach sends a payload");
+            assert!(
+                (first_data.starts_with("\x1b[?1049h") || first_data.starts_with("\x1b[?1049l"))
+                    && first_data.contains("\x1b[2J"),
+                "the force path opens the stream with a mode preamble (mirror state + clear), \
+                 never the raw snapshot: {first_data:?}"
+            );
+            // The flag is consumed only because a real repaint was demanded.
             assert!(!adopted.screen_rebuilt.load(Ordering::Relaxed));
 
             Frame::json(
