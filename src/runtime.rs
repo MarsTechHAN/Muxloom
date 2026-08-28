@@ -3543,8 +3543,26 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     // of a running turn is its ▣ activity line ticking an elapsed counter:
     // `▣  Build · <model> · 6.0s`. A ▣ line with no counter (a turn paused at
     // a permission dialog, for instance) is not a running turn.
-    if kind == AgentKind::OpenCode && tail.lines().any(opencode_turn_counter) {
-        return true;
+    if kind == AgentKind::OpenCode {
+        // An idle OpenCode keeps the previous turn's ▣ activity line in the
+        // visible transcript when the pane is tall, so a ▣ counter on its own
+        // is not proof of a running turn. What a running turn suppresses is
+        // the composer: a live turn draws no prompt box (the model status line
+        // replaces the input), while at the end the bordered box returns with
+        // its placeholder or a draft. So a ▣ counter only counts as working
+        // when no open composer sits below it.
+        let mut lines: Vec<&str> = screen.lines().collect();
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        let box_tail = &lines[lines.len().saturating_sub(COMPOSER_TAIL_LINES)..];
+        let at_prompt = matches!(
+            opencode_composer(box_tail),
+            Composer::Ready | Composer::Occupied
+        );
+        if !at_prompt && tail.lines().any(opencode_turn_counter) {
+            return true;
+        }
     }
     // Not every phase offers an interrupt, though. Claude Code drops the hint
     // while it compacts a conversation — which can run for minutes — and while
@@ -6220,6 +6238,36 @@ mod tests {
         );
         assert!(agent_is_working(AgentKind::OpenCode, screen));
         assert!(attention_reason(AgentKind::OpenCode, screen, &[]).is_none());
+    }
+
+    #[test]
+    fn opencode_stale_turn_counter_above_an_idle_composer_is_not_working() {
+        // A tall pane keeps a just-finished turn's ▣ activity line in the tail
+        // after the turn is over: the status bar and the bordered composer sit
+        // below it, so the ▣ counter is a memory of work, not a turn running.
+        // A ▣ counter must not read as working while the open composer is on
+        // screen. (Live fixture: the coordinator's own idle session showed
+        // `▣ Build · ... · 2.9s` above an open `┃` box and was misread as busy.)
+        let idle_after_turn = concat!(
+            "▣ Compaction · Qwen3.8-27B (SGLang via SOIL) · 14.8s\n",
+            "\n",
+            "  ┃\n",
+            "  ┃  Ask anything... \"Fix a TODO in the codebase\"\n",
+            "  ┃\n",
+            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "  tab agents  ctrl+p commands\n",
+        );
+        assert!(!agent_is_working(AgentKind::OpenCode, idle_after_turn));
+
+        // A genuinely working turn draws the ▣ counter with no composer box
+        // beneath it — the live activity row is the bottom of the screen.
+        let running = concat!(
+            "▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n",
+            "\n",
+            "  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)  ~/Works/Terminal:main\n",
+        );
+        assert!(agent_is_working(AgentKind::OpenCode, running));
     }
 
     #[test]
