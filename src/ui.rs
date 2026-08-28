@@ -1059,11 +1059,16 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         " Switching terminal - keeping previous frame ".into()
     } else if current_matches && app.terminal.is_some() && app.history_offset == 0 {
         format!(
-            " Attached terminal [{}] ",
+            " Attached terminal [{}{}] ",
             if app.interactive {
                 "INPUT"
             } else {
                 "CONNECTED"
+            },
+            if app.terminal_scroll_lock {
+                " wheel:history"
+            } else {
+                ""
             }
         )
     } else if app.history_offset > 0 {
@@ -3308,6 +3313,10 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         Line::raw(""),
         help_header("History And Search"),
         help_row("Wheel / PageUp", "Scroll one line / move one history page"),
+        help_row(
+            "Alt+Wheel / F2",
+            "Take the wheel from an app that claimed it (F2 holds it)",
+        ),
         help_row("PageDown", "Move back toward the live terminal"),
         help_row("/ / Ctrl-p", "Search every discovered agent history"),
         help_row("Enter in search", "Open the selected match"),

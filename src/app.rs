@@ -792,7 +792,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 91;
+pub const HELP_CONTENT_ROWS: usize = 92;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1503,6 +1503,11 @@ pub struct App {
     /// `sync_terminal_scrollback` can tell an app-driven move from the drift
     /// the emulator applies itself as new output arrives.
     terminal_scrollback_pin: usize,
+    /// F2 holds the wheel for Muxloom's history even over an app that claimed
+    /// the mouse. Alt is the usual way through that claim, but some terminals
+    /// (Ghostty) deliver the wheel without the modifier, so the way through
+    /// needs a key of its own.
+    pub(crate) terminal_scroll_lock: bool,
     pub interactive: bool,
     pub modal: Option<Modal>,
     port_forwards: PortForwardManager,
@@ -1716,6 +1721,7 @@ impl App {
             history_loading: false,
             history_offset: 0,
             terminal_scrollback_pin: 0,
+            terminal_scroll_lock: false,
             interactive: false,
             modal: None,
             port_forwards: PortForwardManager::default(),
@@ -2432,6 +2438,21 @@ impl App {
             self.open_file_manager();
             return Action::Continue;
         }
+        // The wheel's owner, toggled. Some terminals drop the Alt modifier from
+        // the wheel (Ghostty sends Option+wheel as a plain wheel), so the way
+        // through an app's mouse claim needs a key that survives: F2 keeps the
+        // wheel on Muxloom's history until pressed again. It is held here,
+        // before the interactive branch, so it toggles while watching too and
+        // never reaches the application.
+        if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+            self.terminal_scroll_lock = !self.terminal_scroll_lock;
+            self.status_message = if self.terminal_scroll_lock {
+                "Wheel held for Muxloom's history - F2 gives it back".into()
+            } else {
+                "Wheel back with the application".into()
+            };
+            return Action::Continue;
+        }
         if let Some(direction) = self.focus_direction_for_key(key) {
             self.move_focus(direction);
             return Action::Continue;
@@ -2943,14 +2964,18 @@ impl App {
             MouseEventKind::ScrollUp => {
                 // Alt short-circuits the forward: with it held nothing is
                 // written toward the app, the wheel scrolls Muxloom instead.
-                if mouse.modifiers.contains(KeyModifiers::ALT)
+                // F2 holds that state open for terminals that cannot send
+                // the modifier with the wheel at all.
+                if self.terminal_scroll_lock
+                    || mouse.modifiers.contains(KeyModifiers::ALT)
                     || !self.forward_terminal_mouse(mouse)
                 {
                     self.scroll_at(mouse.column, mouse.row, true);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if mouse.modifiers.contains(KeyModifiers::ALT)
+                if self.terminal_scroll_lock
+                    || mouse.modifiers.contains(KeyModifiers::ALT)
                     || !self.forward_terminal_mouse(mouse)
                 {
                     self.scroll_at(mouse.column, mouse.row, false);
@@ -3425,6 +3450,10 @@ impl App {
             modifiers: KeyModifiers::NONE,
         };
         if self.handle_file_mouse(event) {
+            return;
+        }
+        if self.terminal_scroll_lock {
+            self.scroll_at(column, row, up);
             return;
         }
         if !self.forward_terminal_mouse(event) {
@@ -7142,6 +7171,9 @@ impl App {
         self.clear_pending_terminal();
         self.terminal_retry_at = None;
         self.terminal_failures = 0;
+        // The wheel belongs to the next session's app again until F2 says
+        // otherwise; a lock carried across sessions silently steals its wheel.
+        self.terminal_scroll_lock = false;
         self.selected_session_id = Some(id.clone());
         if is_file_watch_id(&id) {
             // A pseudo-session has no terminal of its own; the recap pane
@@ -13750,6 +13782,115 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn f2_holds_the_wheel_for_history_when_the_terminal_cannot_send_alt() {
+        // Ghostty drops the modifier bits from the wheel, so Alt+wheel is a
+        // dead end there and a claimed mouse means the history is unreachable.
+        // F2 holds the wheel for Muxloom without any modifier; F2 again gives
+        // it back, and switching sessions gives it back on its own.
+        let prepped = |name: &str| -> (App, std::sync::mpsc::Receiver<Request>, PathBuf) {
+            let (mut app, request_rx, root, _boundary) = attached_claude_app(name);
+            app.interactive = true;
+            app.pane_layout.recap = Some(Rect::new(0, 0, 80, 24));
+            app.terminal
+                .as_mut()
+                .expect("terminal attached")
+                .process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
+            app.history_offset = 0;
+            app.terminal_scrollback_pin = 0;
+            (app, request_rx, root)
+        };
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let (mut app, _rx, root) = prepped("f2-hold");
+        // Before the key: the app owns the wheel (the fixture has no PTY, so
+        // the forwarded write's failure is the evidence the forward ran).
+        app.handle_mouse(wheel);
+        assert!(
+            app.status_message.contains("Mouse input failed"),
+            "a plain wheel stays the app's until F2: {}",
+            app.status_message
+        );
+        // F2: the same unmodified notch moves Muxloom's history and writes
+        // nothing toward the app.
+        app.handle_key(KeyEvent::from(KeyCode::F(2)));
+        assert!(
+            app.status_message.contains("history"),
+            "the toggle must say what it took over: {}",
+            app.status_message
+        );
+        app.status_message.clear();
+        // (The forwarded write failed above, and a failed forward falls back
+        // to Muxloom's scrollback — so measure the held notch as an increment
+        // from wherever that left the view.)
+        let before = app.history_offset;
+        app.handle_mouse(wheel);
+        assert_eq!(
+            app.history_offset,
+            before + 1,
+            "the held wheel scrolls Muxloom's history"
+        );
+        assert!(
+            !app.status_message.contains("Mouse input failed"),
+            "the held wheel must not touch the app's PTY: {}",
+            app.status_message
+        );
+        // F2 again: the app owns the wheel once more. A scrolled view is
+        // Muxloom's by design, so walk back to the bottom first; from there
+        // the next notch must reach the app again.
+        app.handle_key(KeyEvent::from(KeyCode::F(2)));
+        while app.history_offset > 0 {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        app.status_message.clear();
+        app.handle_mouse(wheel);
+        assert!(
+            app.status_message.contains("Mouse input failed"),
+            "F2 again returns the wheel to the app: {}",
+            app.status_message
+        );
+
+        // Selecting another session returns the wheel silently; a lock
+        // carried over would steal the next application's wheel.
+        let (mut app, _rx, second_root) = prepped("f2-reset");
+        app.handle_key(KeyEvent::from(KeyCode::F(2)));
+        assert!(app.terminal_scroll_lock);
+        app.sessions.push(AgentSession {
+            id: "muxloomd-claude-next".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work".into(),
+            label: "next".into(),
+            created_at: 2,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+        });
+        app.select_session("muxloomd-claude-next".into());
+        assert!(
+            !app.terminal_scroll_lock,
+            "switching sessions must give the wheel back"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(second_root);
     }
 
     #[test]
