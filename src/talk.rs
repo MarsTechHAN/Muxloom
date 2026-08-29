@@ -1047,6 +1047,18 @@ pub struct TalkQueued {
     /// without the sender having to go and look the message up.
     #[serde(default)]
     pub text: String,
+    /// The chat binding this came in through, when a person on a chat app sent
+    /// it rather than an agent. Their return address: they have no session to
+    /// be written back to, and the chat is the only place they are reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// What the session was called when this was queued, for the bounce that
+    /// goes to a person. They aimed at a name and never saw an id, so an id is
+    /// not something they can match this against. Kept here rather than looked
+    /// up later because the commonest thing to be told is that the session is
+    /// gone, and a session that is gone has no name left to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_label: Option<String>,
 }
 
 impl TalkQueued {
@@ -1134,6 +1146,44 @@ pub fn render_bounce(queued: &TalkQueued, why: &TalkUndelivered) -> String {
         "[muxloom] Your message to session {} never reached it: {}. Nobody read it, so no answer \
          is coming — stop waiting on it, and either do without or find another agent.{quoted}",
         queued.session_id,
+        why.reason()
+    )
+}
+
+/// How much of a person's own message is quoted back to them on a chat.
+///
+/// Enough to recognise which one this was about, and no more: they are holding
+/// the phone they typed it on and can scroll up to the rest. What they cannot
+/// work out for themselves is that it never arrived.
+const CHANNEL_BOUNCE_QUOTE: usize = 160;
+
+/// What a person on a chat app is told when the message they sent from it
+/// never reached the agent it was for.
+///
+/// A separate rendering from the board's because the reader is separate: an
+/// agent is told to stop waiting and reads a session id as a name, and a person
+/// is holding a phone and knows only the name they aimed at. What they both
+/// need is the same and comes first — this did not arrive, and here is why.
+pub fn render_channel_bounce(queued: &TalkQueued, why: &TalkUndelivered) -> String {
+    let who = queued
+        .session_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(&queued.session_id);
+    let said = queued.text.trim();
+    let quoted = if said.is_empty() {
+        String::new()
+    } else {
+        let mut short: String = said.chars().take(CHANNEL_BOUNCE_QUOTE).collect();
+        if short.chars().count() < said.chars().count() {
+            short.push('…');
+        }
+        format!("\n\n--- what you sent ---\n{short}")
+    };
+    format!(
+        "Your message to {who} never got there: {}.\n\nNobody read it, so no answer is coming. \
+         `/who` lists what is running, and `/select` points this chat at one of them.{quoted}",
         why.reason()
     )
 }
@@ -2019,6 +2069,8 @@ mod tests {
                 session_id: "session-1".into(),
             }),
             text: "the parser is yours".into(),
+            channel: None,
+            session_label: None,
         };
         // The turn in progress is beside the point: the prompt is empty, so the
         // message lands whole and is read when the turn ends.
@@ -2042,6 +2094,8 @@ mod tests {
                 session_id: "session-1".into(),
             }),
             text: "the parser is yours".into(),
+            channel: None,
+            session_label: None,
         };
         // A runtime that has not drawn its prompt is usually still starting up.
         assert!(waiting.due(Composer::Absent, false, false, 1_000 + DELIVER_ABSENT_MS));
@@ -2080,6 +2134,8 @@ mod tests {
                 session_id: "session-1".into(),
             }),
             text: "can you take the lexer?".into(),
+            channel: None,
+            session_label: None,
         };
 
         let bounce = render_bounce(&queued, &TalkUndelivered::Ended);
@@ -2110,6 +2166,68 @@ mod tests {
             ..queued
         };
         let bounce = render_bounce(&empty, &TalkUndelivered::Gone);
+        assert!(!bounce.contains("what you sent"), "{bounce}");
+    }
+
+    #[test]
+    fn a_message_a_person_sent_from_a_chat_is_bounced_back_to_the_chat() {
+        let queued = TalkQueued {
+            message_id: "lark-1:1".into(),
+            session_id: "muxloomd-claude-1788002025-2669-0".into(),
+            body: "[muxloom] Message from …".into(),
+            queued_at: 1_000,
+            deliver: TalkDeliver::Auto,
+            // A person has no session to be written back to on the board, which
+            // is exactly why this path exists.
+            from: None,
+            text: "can you take the lexer?".into(),
+            channel: Some("lark-1".into()),
+            session_label: Some("lexer".into()),
+        };
+
+        let bounce = render_channel_bounce(&queued, &TalkUndelivered::Ended);
+        // The name they aimed at, never the id: an id is not something they
+        // have ever seen, let alone something they can match this against.
+        assert!(bounce.contains("lexer"), "{bounce}");
+        assert!(!bounce.contains("muxloomd-claude"), "{bounce}");
+        assert!(
+            bounce.contains("the session ended while the message was waiting"),
+            "{bounce}"
+        );
+        // What to do next, in the two commands this chat takes.
+        assert!(bounce.contains("/who"), "{bounce}");
+        assert!(bounce.contains("/select"), "{bounce}");
+        assert!(bounce.contains("can you take the lexer?"), "{bounce}");
+
+        // A session that never had a name is named by the only thing left.
+        let nameless = TalkQueued {
+            session_label: None,
+            ..queued.clone()
+        };
+        let bounce = render_channel_bounce(&nameless, &TalkUndelivered::Gone);
+        assert!(
+            bounce.contains("muxloomd-claude-1788002025-2669-0"),
+            "{bounce}"
+        );
+
+        // Long enough to recognise, short enough to read on a phone: this
+        // lands on one, and they can scroll up to the rest themselves.
+        let essay = TalkQueued {
+            text: "x".repeat(CHANNEL_BOUNCE_QUOTE * 3),
+            ..queued.clone()
+        };
+        let bounce = render_channel_bounce(&essay, &TalkUndelivered::NoPrompt);
+        assert!(
+            bounce.ends_with(&format!("{}…", "x".repeat(CHANNEL_BOUNCE_QUOTE))),
+            "{bounce}"
+        );
+
+        // Nothing to quote is not an empty pair of markers here either.
+        let empty = TalkQueued {
+            text: String::new(),
+            ..queued
+        };
+        let bounce = render_channel_bounce(&empty, &TalkUndelivered::Gone);
         assert!(!bounce.contains("what you sent"), "{bounce}");
     }
 }

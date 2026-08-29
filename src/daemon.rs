@@ -941,6 +941,12 @@ mod platform {
                     session_id,
                 }),
             text: message.text.clone(),
+            // A sender that is not a session is a person on a chat app, and the
+            // binding they wrote from is the only way back to them.
+            channel: message.author.voice.channel.clone(),
+            session_label: Some(snapshot.label.trim())
+                .filter(|label| !label.is_empty())
+                .map(str::to_string),
         };
         let draft_age = (composer == Composer::Occupied)
             .then(|| draft_age_ms(&session, &kind, queued.queued_at))
@@ -1034,6 +1040,10 @@ mod platform {
             deliver: TalkDeliver::Auto,
             from,
             text: prompt.into(),
+            // A launch prompt comes from whoever asked for the session, and
+            // that is a session or a dashboard, never a chat.
+            channel: None,
+            session_label: None,
         };
         {
             let mut outbox = state
@@ -1250,6 +1260,10 @@ mod platform {
             why.reason()
         );
         let Some(from) = queued.from.clone() else {
+            // No session to write back to. A person who sent this from a chat
+            // app is still waiting on it, and the board is not somewhere they
+            // read — so the chat, or nowhere.
+            bounce_to_channel(state, queued, why);
             return;
         };
         let posted = state.talk().and_then(|talk| {
@@ -1287,6 +1301,63 @@ mod platform {
                 queued.message_id
             );
         }
+    }
+
+    /// Tell a person on a chat app that what they sent from it never landed.
+    ///
+    /// This machine dials the chat itself, out of the bindings a controller
+    /// sank down, for the same reason `send_channel_message` does: the message
+    /// failed here, and a machine nobody is watching is exactly the machine a
+    /// person is most likely to be left waiting on. Proxy settings come from
+    /// this daemon's own environment — it has no config of its own to read one
+    /// out of, and it was started from a shell that had whatever the machine
+    /// uses to reach the outside.
+    ///
+    /// On its own thread: a chat API is a network round trip with a minute of
+    /// timeout behind it, and the outbox drain that called this has other
+    /// sessions' messages to deliver.
+    fn bounce_to_channel(state: &DaemonState, queued: &TalkQueued, why: &TalkUndelivered) {
+        let Some(channel) = queued.channel.clone() else {
+            return;
+        };
+        let set = state
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let binding = match set.pick(Some(&channel)) {
+            Ok(binding) => binding.clone(),
+            Err(error) => {
+                eprintln!(
+                    "muxloomd could not tell the person who sent {} that it never arrived: \
+                     {error:#}",
+                    queued.message_id
+                );
+                return;
+            }
+        };
+        let machine = state.talk().map(|talk| talk.label()).unwrap_or_default();
+        let message = crate::channel::Outgoing {
+            title: "Message not delivered".into(),
+            text: crate::talk::render_channel_bounce(queued, why),
+            // Not an agent speaking. Saying so is the difference between a
+            // person reading this as muxloom's own bookkeeping and reading it
+            // as the agent they wrote to finally answering.
+            signature: [String::from("muxloom"), machine]
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
+        };
+        let message_id = queued.message_id.clone();
+        thread::spawn(move || {
+            if let Err(error) = crate::channel::send(&binding, &message, &[]) {
+                eprintln!(
+                    "muxloomd could not tell the person who sent {message_id} that it never \
+                     arrived: {error:#}"
+                );
+            }
+        });
     }
 
     /// Keep an eye on the outbox for as long as it holds anything.
@@ -10184,6 +10255,8 @@ mod platform {
                 deliver,
                 from: None,
                 text: "hello".into(),
+                channel: None,
+                session_label: None,
             }
         }
 
