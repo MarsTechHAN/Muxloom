@@ -3752,6 +3752,7 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
 /// Code's hint is the line under its composer, OpenCode's is its bottom bar;
 /// three lines covers both, and is tight enough that the same words sitting in
 /// the transcript are outside it.
+#[cfg_attr(not(unix), allow(dead_code))]
 const STATUS_BAR_LINES: usize = 3;
 
 /// Whether the sign that a turn is running is one the CLI painted once and
@@ -3772,6 +3773,12 @@ const STATUS_BAR_LINES: usize = 3;
 /// writing — a grep hit, a diff, the tests in this very file — and a transcript
 /// that happens to quote it must not buy a session that stopped talking ten
 /// minutes of looking busy.
+///
+/// Only the daemon weighs a session's patience, and there is no daemon off
+/// Unix, so this is unreachable there. Allowed rather than `cfg`'d out, like
+/// [`composer`] below it: it is plain text work, and the tests for it are
+/// worth running wherever they can run.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn working_marker_is_held(screen: &str) -> bool {
     let tail = attention_tail(screen);
     if tail
