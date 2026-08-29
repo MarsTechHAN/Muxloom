@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 8;
+const SKILL_REVISION: u32 = 9;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -330,6 +330,24 @@ Their reply comes back to you as a direct message, so end your turn and wait:
 ```
 talk_read { scope: \"direct\", wait_seconds: 45 }
 ```
+
+### Answer them before you start
+
+A message from the person is not another agent's request to weigh up. They are
+on a phone, they cannot see your screen, and until you send something the only
+thing they know is that they typed. Reply first — before the search, before the
+fix, before the file you were about to read — even when all you have is what you
+understood and roughly how long it will take:
+
+```
+send_channel_message { text: \"收到。先看 CI 红在哪一格，大概十分钟回你\" }
+```
+
+Then do the work and send the result when it is done. One message at each end
+is the shape. Going quiet for twenty minutes and coming back with a finished
+job reads, from their side, exactly like an agent that never heard them — and
+a question they asked in passing (\"干的怎么样了\") is answered now, in a line,
+not by a report at the end.
 
 ## Watch instead of poll
 
@@ -1159,6 +1177,23 @@ mod tests {
         // act, and shells are what you reach for last.
         assert!(text.contains("Start by reading the board"), "{text}");
         assert!(text.contains("Shells are the last resort"), "{text}");
+    }
+
+    /// The person is on a phone with no screen to look at, so an agent that
+    /// starts working instead of answering looks, from their end, exactly like
+    /// one that never heard them. The stamp has to carry it too: a file
+    /// already on disk is replaced by revision, so a body that changes under
+    /// the old number reaches nobody who has one.
+    #[test]
+    fn the_skill_says_to_answer_the_person_first_under_a_stamp_that_replaces_the_old_one() {
+        let text = skill_document();
+        assert!(text.contains("Answer them before you start"), "{text}");
+        assert!(text.contains("send_channel_message"), "{text}");
+        assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
+        assert!(
+            !text.contains(&format!("{SKILL_MARKER}8 ")),
+            "the body changed under the stamp it shipped with"
+        );
     }
 
     /// One machine, one entry. The controller's surface reaches the whole

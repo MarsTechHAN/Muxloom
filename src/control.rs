@@ -264,7 +264,11 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          answer comes back to you as a direct message. This and the talk board are independent \
          surfaces: a channel message posts nothing to the board, and a talk_post tells the \
          person on their phone nothing. Reply to a person on the surface they wrote to — over \
-         the channel, not the board.\n\n\
+         the channel, not the board.\n\
+         - When the person writes to you, answer before you start the work. They are on a phone \
+         and cannot see your screen, so what you understood and roughly how long it will take is \
+         worth a line straight away; the result follows when it is done. Silence for twenty \
+         minutes reads exactly like an agent that never heard them.\n\n\
          Boundaries that are not negotiable:\n\
          - Machines the user has not enabled are unreachable. Naming one is an error, not a \
          workaround to route around.\n\
@@ -5090,6 +5094,19 @@ mod tests {
         assert!(daemon.contains("put to the person first"));
         assert!(daemon.contains("message_agent"));
         assert!(daemon.contains("not a reason to retry"));
+    }
+
+    /// OpenCode has no skill file, so this text is the whole of what it is
+    /// told. A person writing in from their phone sees nothing at all until an
+    /// agent sends something back, and an agent that starts working instead of
+    /// answering is indistinguishable, from that end, from one that never
+    /// heard them.
+    #[test]
+    fn an_agent_is_told_to_answer_the_person_before_it_starts_working() {
+        for flavor in [Flavor::Controller, Flavor::Daemon] {
+            let text = instructions(flavor, &McpConfig::default());
+            assert!(text.contains("answer before you start the work"), "{text}");
+        }
     }
 
     /// A controller surface over a throwaway home: its own SSH config and its
