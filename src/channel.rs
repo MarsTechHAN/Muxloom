@@ -679,12 +679,36 @@ pub struct Sent {
     /// kinds. A human's reply — Lark's `parent_id`, WeChat's quote — names
     /// this id and nothing else, so a WeChat send that earned one keeps it.
     /// Only a send the body gave no id for (accepted but never delivered, so
-    /// nothing can ever quote it) falls back to the id this side minted, and
-    /// that fallback buys receipt bookkeeping, not reply matching.
+    /// nothing can ever quote it) falls back to the id this side minted. That
+    /// fallback is bookkeeping and nothing else: no receipt is kept for a send
+    /// [`Self::delivered`] rejects, so the minted id never has to stand in for
+    /// reply matching it could not do anyway.
     pub message_id: String,
     /// WeChat only: the platform's verdict on this send. None for Lark, since
     /// its HTTP status alone is sufficient to know whether delivery succeeded.
     pub wechat: Option<ilink::Verdict>,
+}
+
+impl Sent {
+    /// Whether the platform confirmed this went out, rather than merely
+    /// accepting it.
+    ///
+    /// Only WeChat can accept and drop. It answers a delivered send and a
+    /// dropped one identically — HTTP 200, code 0, the same shape of body —
+    /// apart from an id of its own, so that id's absence is the whole of the
+    /// evidence there is. A channel that reports no verdict has nothing of the
+    /// sort to distrust: its status line already said so, and a send it did not
+    /// refuse went out.
+    ///
+    /// What hangs on this is everything downstream that treats a send as a
+    /// thing the person read — the receipt that decides where their next word
+    /// goes, and the sentence that tells an agent whether to expect an answer.
+    /// Both are worse than useless about a message nobody received.
+    pub fn delivered(&self) -> bool {
+        self.wechat
+            .as_ref()
+            .is_none_or(|verdict| verdict.delivery_confirmed)
+    }
 }
 
 /// Post one message to a human through one binding.
@@ -2415,6 +2439,21 @@ pub fn run_inbox(
                 ChannelKind::Lark => None,
             };
             match send_reply(&answering, &receipt, quoting.as_deref(), environment) {
+                // Accepted and dropped: WeChat took the send and issued no id
+                // of its own, which is what a stale conversation token does to
+                // one. Nobody read the agent's answer, so no receipt is filed —
+                // a receipt would make this agent the one the person spoke to
+                // last and aim their next unaddressed word at an answer they
+                // never saw — and the round carries it as a failure, because an
+                // answer swallowed in silence is the exact thing this path
+                // exists to prevent.
+                Ok(sent) if !sent.delivered() => round.failures.push((
+                    binding.id.clone(),
+                    "the answer was accepted without a delivery id, so it went nowhere — most \
+                     likely a stale conversation token, which reopens when the person says \
+                     anything to the bot."
+                        .into(),
+                )),
                 Ok(sent) if !sent.message_id.is_empty() => {
                     if let Some(who) = desk.last_agent.clone() {
                         inbox.remember(ChannelReceipt {
@@ -3728,6 +3767,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unpicked.destination(), "no chat picked yet");
+    }
+
+    /// The distinction everything downstream of a send now hangs on, including
+    /// the one channel that has no verdict to offer and must not be punished
+    /// for it.
+    #[test]
+    fn a_send_is_delivered_unless_wechat_declined_to_say_so() {
+        let sent = |wechat| Sent {
+            channel: "wechat-1".into(),
+            through: "WeChat · your WeChat".into(),
+            message_id: "id".into(),
+            wechat,
+        };
+        let verdict = |delivery_confirmed| {
+            Some(ilink::Verdict {
+                code: 0,
+                reason: "success".into(),
+                delivery_confirmed,
+                message_id: None,
+            })
+        };
+        assert!(sent(verdict(true)).delivered());
+        // Accepted, and no id of WeChat's own: nobody read it.
+        assert!(!sent(verdict(false)).delivered());
+        // Lark says so with its status line and reports no verdict at all. A
+        // send it did not refuse went out.
+        assert!(sent(None).delivered());
     }
 
     #[test]

@@ -833,7 +833,13 @@ receives. What goes to a phone is capped — 1200 characters of text, 48 of
 title — and a message over either is refused rather than trimmed: a trim takes
 whatever the agent put last, which is usually the ask, and tells it nothing.
 The refusal says what to send instead, which is the only thing that gets a
-shorter message written.
+shorter message written. WeChat can also take a message and drop it — the same
+HTTP 200, the same success code, no delivery id of its own — which is what a
+conversation token gone stale looks like from this side. A send like that is
+reported as not delivered rather than as sent, leaves no receipt for a reply to
+find its way back to, and counts as a failure on the dashboard. The only repair
+is the person saying anything at all to the bot; nothing here can hurry it, and
+sending again before then lands in the same place.
 
 **Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
 a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.

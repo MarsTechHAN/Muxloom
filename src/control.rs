@@ -2118,10 +2118,23 @@ fn send_channel(
     crate::channel::refuse_if_too_long(&message)?;
     let sent =
         crate::channel::send_reply(binding, &message, channel_reply_to(arguments), environment)?;
+    // WeChat answers a send it accepted and then dropped exactly as it answers
+    // one it delivered — code 0, HTTP 200 — except that it issues no id of its
+    // own, which is what a stale conversation token looks like from here. The
+    // verdict has always known the difference; from here on so does everything
+    // built on top of it, because a message the person never saw must not be
+    // recorded or described as one they did.
+    let delivered = sent.delivered();
     // A receipt is what turns the human's reply into an answer: without one it
     // lands on the board, which is not wrong but is not this conversation. It
-    // needs a session to name, so a call from outside a session leaves none.
-    if let (false, Some(session_id)) = (
+    // needs a session to name, so a call from outside a session leaves none —
+    // and so does a send that was never delivered. Such a receipt could never be
+    // matched by a quote anyway, since the id in it is one this side minted and
+    // no reply will ever name; all it could still do is make this session the
+    // one the person spoke to last, and aim their next unaddressed word at an
+    // agent whose message they never read.
+    if let (true, false, Some(session_id)) = (
+        delivered,
         sent.message_id.is_empty(),
         session_env("MUXLOOM_SESSION_ID"),
     ) {
@@ -2151,8 +2164,20 @@ fn send_channel(
         "message_id": sent.message_id,
         "signed": message.signature,
         "wechat": wechat_json,
-        "note": "Sent to a person, not to an agent. Their answer comes back as a direct message: \
-                 talk_read { scope: \"direct\", wait_seconds }.",
+        "note": match delivered {
+            true => "Sent to a person, not to an agent. Their answer comes back as a direct \
+                     message: talk_read { scope: \"direct\", wait_seconds }.",
+            // Promising an answer here is the one thing this result must not
+            // do: an agent told its message landed will sit waiting on a reply
+            // to something nobody received, which is a worse failure than being
+            // told plainly that the send went nowhere.
+            false => "NOT DELIVERED. WeChat accepted this and issued no id of its own, which is \
+                      what a message dropped on a stale conversation token looks like — assume \
+                      the person did not see it and do not wait for an answer. Nothing this side \
+                      can do repairs it: only an inbound message renews the token, so the \
+                      conversation opens again when they say anything at all to the bot. Sending \
+                      it again before then lands in the same place.",
+        },
     })))
 }
 
