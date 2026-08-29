@@ -1494,11 +1494,10 @@ fn check_may_launch(own: &Powers, kind: AgentKind) -> Result<()> {
 /// handoffs down is still on the same piece of work, and past that a cycle is
 /// the likelier explanation than a team.
 ///
-/// This and the four below are the daemon flavor's alone, and the daemon runs
-/// on Unix — off it there is no `muxloomd` to compile them for. The controller
-/// weighs the same powers, but it does it against its own fleet rather than
-/// against one machine's records.
-#[cfg(unix)]
+/// This and the walk below are both surfaces': a moderator's session is served
+/// by the controller and can have been started by another agent like anyone
+/// else, so the same dial has to answer there. Only the list they walk differs
+/// — one machine's records, or a target machine's out of the fleet.
 const TASK_WALK_MAX: usize = 16;
 
 /// Whether `target` is on the same piece of work as this session.
@@ -1510,7 +1509,6 @@ const TASK_WALK_MAX: usize = 16;
 /// there. A chain that runs out unrecognised belongs to somebody else.
 ///
 /// A process running in no session has no task to be outside of, so nothing is.
-#[cfg(unix)]
 fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
     let mine: Vec<String> = [task_root(), launching_session()]
         .into_iter()
@@ -1531,7 +1529,6 @@ fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
 /// word to the helper leaves it holding something it cannot use — and the
 /// helper, which reaches its parent by definition, asking questions upward that
 /// can never be answered.
-#[cfg(unix)]
 fn started_here(lineage: &[(String, Option<String>)], target: &str) -> bool {
     match launching_session() {
         Some(mine) => descends_from(lineage, target, &[mine]),
@@ -1545,7 +1542,6 @@ fn started_here(lineage: &[(String, Option<String>)], target: &str) -> bool {
 /// belongs to somebody else. `mine` is never empty here: a caller with nothing
 /// to compare against has already decided what that means, and the two callers
 /// decide it differently.
-#[cfg(unix)]
 fn descends_from(lineage: &[(String, Option<String>)], target: &str, mine: &[String]) -> bool {
     let mut at = target.trim().to_string();
     for _ in 0..TASK_WALK_MAX {
@@ -1565,7 +1561,6 @@ fn descends_from(lineage: &[(String, Option<String>)], target: &str, mine: &[Str
 }
 
 /// Who begat whom, taken from session records.
-#[cfg(unix)]
 fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
     sessions
         .iter()
@@ -1594,7 +1589,6 @@ fn lineage_of_answer(rendered: &str) -> Vec<(String, Option<String>)> {
 
 /// Refuse a message this session may not send, saying who it may speak to and
 /// who set that, so the answer is a route rather than a flag.
-#[cfg(unix)]
 fn check_may_message(
     own: &Powers,
     target: &str,
@@ -3798,6 +3792,21 @@ impl ControlSurface for ControllerControl {
 
     fn call(&self, name: &str, arguments: &Value) -> Result<String> {
         enforce_policy(&self.config.mcp, name)?;
+        // A moderator is served by this surface rather than the daemon's, and
+        // a moderator can have been started by another agent like anyone else:
+        // the three other dials are already weighed here, and reach was the one
+        // that was not. The list to walk it against is the target machine's,
+        // because this surface can aim at any of them.
+        if let Some(session_id) = written_to(name, arguments) {
+            let own = own_powers();
+            if own.reach != Reach::Fleet {
+                let sessions = self
+                    .runtime
+                    .bridge_pool()
+                    .list_sessions(&self.target(arguments)?)?;
+                check_may_message(&own, session_id, &lineage(&sessions))?;
+            }
+        }
         match name {
             "list_machines" => self.list_machines(),
             "set_machine_enabled" => self.set_machine_enabled(arguments),
