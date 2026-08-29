@@ -186,6 +186,20 @@ pub enum Request {
         /// board is filled the first time it is drawn.
         board_since: String,
     },
+    /// Run whatever errands the agents on the given targets left for a
+    /// controller, and nothing else.
+    ///
+    /// This is the one thing in a round that somebody is *waiting* on: a
+    /// relayed call sits unanswered until this runs, so it rides its own short
+    /// cadence rather than the back of the board round. Carrying the board
+    /// contacts every machine and can take seconds on a slow link, and an
+    /// agent's cross-machine call should not cost whatever that took.
+    RelayPump {
+        targets: Vec<Target>,
+        /// The errands are run through the same tool surface the MCP adapter
+        /// serves, policy included, so the config travels with them.
+        config: Box<Config>,
+    },
     /// Say something on the board as the person at the keyboard. The draft goes
     /// to this machine's daemon like any other post; replication carries it from
     /// there.
@@ -409,9 +423,6 @@ pub enum Event {
     TalkSynced {
         result: Result<String, String>,
         board: Option<TalkPage>,
-        /// Machines another controller told one of these daemons it could
-        /// reach, which this one cannot. Shown, never opened.
-        forwarded: Vec<crate::relay::RelayPeer>,
         /// How far the channel set got: which machines now hold this revision,
         /// and which could not be told.
         channels: crate::channel::ChannelRound,
@@ -419,6 +430,12 @@ pub enum Event {
         /// straight back so the next round starts where this one stopped.
         inbox: Box<crate::channel::Inbox>,
         mail: crate::channel::InboxRound,
+    },
+    /// One round of errands finished.
+    RelayPumped {
+        /// Machines another controller told one of these daemons it could
+        /// reach, which this one cannot. Shown, never opened.
+        forwarded: Vec<crate::relay::RelayPeer>,
     },
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
@@ -1354,21 +1371,7 @@ impl Worker {
                         if let Err(error) = &result {
                             debug::log("worker", format!("talk sync failed: {error}"));
                         }
-                        // Errands run whether or not the board moved: an agent
-                        // waiting on one is waiting on this round.
-                        let forwarded = match crate::relay::run_pump(&runtime, &config, &targets) {
-                            Ok(round) => {
-                                if round.busy() {
-                                    debug::log("relay", round.to_string());
-                                }
-                                round.heard
-                            }
-                            Err(error) => {
-                                debug::log("relay", format!("errands failed: {error:#}"));
-                                Vec::new()
-                            }
-                        };
-                        // And while the round is out: a child session that
+                        // While the round is out: a child session that
                         // fell onto a question gets its parent told, so no
                         // agent has to poll the fleet to find its own subagent
                         // sitting on a permission prompt.
@@ -1409,11 +1412,28 @@ impl Worker {
                         let _ = events.send(Event::TalkSynced {
                             result,
                             board,
-                            forwarded,
                             channels: round,
                             inbox,
                             mail,
                         });
+                    }
+                    Request::RelayPump { targets, config } => {
+                        // Errands run whether or not anything else is due: an
+                        // agent waiting on one is waiting on this round, and
+                        // this is the only round it waits on.
+                        let forwarded = match crate::relay::run_pump(&runtime, &config, &targets) {
+                            Ok(round) => {
+                                if round.busy() {
+                                    debug::log("relay", round.to_string());
+                                }
+                                round.heard
+                            }
+                            Err(error) => {
+                                debug::log("relay", format!("errands failed: {error:#}"));
+                                Vec::new()
+                            }
+                        };
+                        let _ = events.send(Event::RelayPumped { forwarded });
                     }
                 });
             }

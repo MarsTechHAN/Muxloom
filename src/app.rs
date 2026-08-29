@@ -806,6 +806,12 @@ const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(350);
 /// slow is still a conversation; a machine polled faster than this is being
 /// asked to answer more often than anyone types.
 const TALK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the fleet is asked for errands to run. Much faster than the board
+/// round, because an agent is sitting blocked on every one of these: a
+/// cross-machine call costs whatever this is, plus the call. The poll itself is
+/// a small question down a connection that is already open, and a daemon with
+/// nothing waiting answers it with an empty list.
+const RELAY_PUMP_INTERVAL: Duration = Duration::from_millis(200);
 /// How often a chat app is asked what the human said. Long enough not to be a
 /// nuisance to the platform, short enough that an answer feels like an answer.
 const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -1606,6 +1612,8 @@ pub struct App {
     backup_in_flight: bool,
     last_talk_sync: Option<Instant>,
     talk_in_flight: bool,
+    last_relay_pump: Option<Instant>,
+    relay_in_flight: bool,
     /// The aggregated history store, beside the state file. Restoring reads it;
     /// listing a machine's lost sessions reads its index.
     backup_root: PathBuf,
@@ -1783,6 +1791,8 @@ impl App {
             backup_in_flight: false,
             last_talk_sync: None,
             talk_in_flight: false,
+            last_relay_pump: None,
+            relay_in_flight: false,
             backup_root,
             recoverable: HashMap::new(),
             restoring: HashSet::new(),
@@ -2395,6 +2405,7 @@ impl App {
         self.sweep_forced_updates();
         self.maybe_backup_sync();
         self.maybe_talk_sync();
+        self.maybe_relay_pump();
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -5854,7 +5865,6 @@ impl App {
             Event::TalkSynced {
                 result,
                 board,
-                forwarded,
                 channels,
                 inbox,
                 mail,
@@ -5872,6 +5882,12 @@ impl App {
                     Ok(summary) => debug::log("talk", summary),
                     Err(error) => debug::log("talk", format!("sync failed: {error}")),
                 }
+                if let Some(page) = board {
+                    self.absorb_board(page);
+                }
+            }
+            Event::RelayPumped { forwarded } => {
+                self.relay_in_flight = false;
                 // A machine this dashboard has of its own is not forwarded,
                 // even while it is disabled: the row for it is already there,
                 // and it says what it is.
@@ -5884,9 +5900,6 @@ impl App {
                             .any(|status| status.target.id == peer.id)
                     })
                     .collect();
-                if let Some(page) = board {
-                    self.absorb_board(page);
-                }
             }
             Event::TalkPosted { result } => match *result {
                 Ok(message) => {
@@ -6284,11 +6297,7 @@ impl App {
             .collect();
         self.last_talk_sync = Some(Instant::now());
         self.talk_in_flight = true;
-        // This runs even with nowhere to carry anything to: the round is also
-        // when agents on this machine get the errands they cannot run
-        // themselves, and an agent asking for another machine while nothing
-        // polls for work is told so rather than left waiting.
-        // A chat app is asked far less often than the errand queue: a human
+        // A chat app is asked far less often than the board is carried: a human
         // waits seconds for an answer without noticing, and a rate limit is
         // shared with everything else the app does.
         let read_inbox = self
@@ -6309,6 +6318,40 @@ impl App {
             inbox: Box::new(self.inbox.clone()),
             read_inbox,
             board_since: self.board.cursor.clone(),
+        });
+    }
+
+    /// Ask the fleet for errands to run when a round is due and none is
+    /// running.
+    ///
+    /// Its own round, on its own clock, because this is the one the fleet
+    /// blocks on: every relayed call an agent makes waits here, and carrying
+    /// the board is slow enough on a bad link that riding along with it turned
+    /// a cross-machine call into a pause. This runs even with nowhere to carry
+    /// anything to — an agent on this very machine asks its daemon for another
+    /// machine, and with nothing polling for work it would be left waiting
+    /// rather than told.
+    fn maybe_relay_pump(&mut self) {
+        if self.relay_in_flight {
+            return;
+        }
+        let due = self
+            .last_relay_pump
+            .is_none_or(|at| at.elapsed() >= RELAY_PUMP_INTERVAL);
+        if !due {
+            return;
+        }
+        let targets: Vec<Target> = self
+            .targets
+            .iter()
+            .filter(|status| status.enabled && status.target.id != LOCAL_TARGET_ID)
+            .map(|status| status.target.clone())
+            .collect();
+        self.last_relay_pump = Some(Instant::now());
+        self.relay_in_flight = true;
+        let _ = self.worker.requests.send(Request::RelayPump {
+            targets,
+            config: Box::new(self.config.clone()),
         });
     }
 
@@ -19673,6 +19716,44 @@ mod tests {
         ));
         app.open_board();
         assert_eq!(app.board.unread, 0, "reading the board clears the mark");
+    }
+
+    /// An agent's cross-machine call waits on the errand round and on nothing
+    /// else. The board round contacts every machine and can take seconds; while
+    /// errands rode along with it, that was the price of every relayed call.
+    #[test]
+    fn errands_are_asked_for_on_their_own_clock_not_the_boards() {
+        let (mut app, requests) = board_app();
+        app.maybe_talk_sync();
+        app.maybe_relay_pump();
+        assert!(matches!(
+            receive_request(&requests),
+            Request::TalkSync { .. }
+        ));
+        assert!(matches!(
+            receive_request(&requests),
+            Request::RelayPump { .. }
+        ));
+        // One round at a time: a round still out is not asked for again.
+        app.last_relay_pump = None;
+        app.maybe_relay_pump();
+        assert!(
+            requests.try_recv().is_err(),
+            "a round already out is not asked for twice"
+        );
+        app.handle_worker_event(Event::RelayPumped {
+            forwarded: Vec::new(),
+        });
+        // But a board round still out in the fleet holds nothing back, which is
+        // the whole point of the split: the board is carried on its own clock,
+        // and an agent's errand does not queue behind whatever that cost.
+        assert!(app.talk_in_flight, "the board round has not come back");
+        app.last_relay_pump = None;
+        app.maybe_relay_pump();
+        assert!(
+            matches!(receive_request(&requests), Request::RelayPump { .. }),
+            "errands are asked for while the board round is still running"
+        );
     }
 
     #[test]
