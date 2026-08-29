@@ -6443,17 +6443,30 @@ mod platform {
         }
     }
 
-    /// Whether this build is a newer *version* than the one running, which is
-    /// the only case that justifies stopping a daemon that will not step aside
-    /// on its own. Two builds of the same version take turns by design — a
-    /// developer's working tree beside an installed release — and forcing the
-    /// question there would only make the turns violent.
-    fn outranks_running_version(running: &str) -> bool {
+    /// Whether this build outranks the one running, which is the only case
+    /// that justifies stopping a daemon that will not step aside on its own.
+    ///
+    /// The whole rank, not the version alone. Comparing versions meant a fleet
+    /// on nightlies could never escalate: every build between two releases
+    /// carries one version number, so a daemon six weeks behind read as an
+    /// equal, the patience clock never started, and the only way past a daemon
+    /// that kept deferring was somebody pressing the forced-update key on each
+    /// machine in turn.
+    ///
+    /// Strictly outranks, and that is what keeps this from turning into a
+    /// fight. Equal rank never forces, so two builds of one commit leave each
+    /// other alone; and where one does outrank the other the ordering is the
+    /// same on both sides, so the lower one reads the higher as current and
+    /// does not ask at all. A build made by hand sits above every numbered
+    /// build of its version and can retire an installed release, which is what
+    /// somebody who just compiled it meant to happen; the release cannot do it
+    /// back.
+    fn outranks_running_generation(running: &str) -> bool {
         match (
             generation_rank(running),
             generation_rank(&current_generation()),
         ) {
-            (Some(running), Some(current)) => running.version < current.version,
+            (Some(running), Some(current)) => running < current,
             // Nothing legible to order it by: a stamp from before there were
             // any, which every build since outranks.
             (None, _) => true,
@@ -6472,7 +6485,7 @@ mod platform {
     fn handover_ask_age(paths: &DaemonPaths) -> Option<Duration> {
         let running = fs::read_to_string(&paths.generation).unwrap_or_default();
         let running = running.trim();
-        if !outranks_running_version(running) {
+        if !outranks_running_generation(running) {
             return None;
         }
         let now = SystemTime::now()
@@ -7724,36 +7737,57 @@ mod platform {
                 generation_rank(&current),
                 "and it is still the same rank, so it asks rather than insists"
             );
-            assert!(!outranks_running_version(&rebuilt));
+            assert!(!outranks_running_generation(&rebuilt));
         }
 
-        /// Asking is not the same as being allowed to insist. A rebuild of the
-        /// same version asks and waits; only a newer version may end the
-        /// argument, because only there is somebody actually being upgraded.
+        /// Asking is not the same as being allowed to insist. Equal rank asks
+        /// and waits; only a build that actually outranks the one running may
+        /// end the argument, because only there is somebody being upgraded.
         #[test]
-        fn only_a_newer_version_may_stop_a_daemon_that_will_not_step_aside() {
+        fn only_a_build_that_outranks_the_running_one_may_stop_it() {
             let current = current_generation();
-            assert!(!outranks_running_version(&current), "itself");
-            assert!(outranks_running_version("0.0.1:protocol-1:abc123:1"));
+            assert!(!outranks_running_generation(&current), "itself");
+            assert!(outranks_running_generation("0.0.1:protocol-1:abc123:1"));
             assert!(
-                outranks_running_version("0.5.4:protocol-1:96012c2"),
+                outranks_running_generation("0.5.4:protocol-1:96012c2"),
                 "the stamp a daemon from before heights were recorded leaves"
             );
-            assert!(!outranks_running_version("999.0.0:protocol-3:abc123:99999"));
+            assert!(!outranks_running_generation(
+                "999.0.0:protocol-3:abc123:99999"
+            ));
             assert!(
-                outranks_running_version(""),
+                outranks_running_generation(""),
                 "no stamp at all predates generations, and every build outranks that"
             );
 
-            // A developer's tree and an installed release of the same version
-            // replace each other all day; neither gets to shoot the other.
+            // Two compiles of one tree are the same rank, and the same rank
+            // never insists: they replace each other all day and neither gets
+            // to shoot the other.
             let mut fields: Vec<&str> = current.split(':').collect();
             fields[2] = "a-different-commit";
-            fields[3] = "1";
             assert!(
-                !outranks_running_version(&fields.join(":")),
-                "same version, different build: ask, do not insist"
+                !outranks_running_generation(&fields.join(":")),
+                "same rank, different build: ask, do not insist"
             );
+        }
+
+        /// The escalation a fleet on nightlies needs. Every build between two
+        /// releases carries one version number, so while only the version was
+        /// compared a daemon six weeks behind read as an equal: the patience
+        /// clock never started, and the only way past a daemon that kept
+        /// deferring was somebody pressing the forced-update key on each
+        /// machine in turn.
+        #[test]
+        fn a_later_nightly_of_one_version_outranks_an_earlier_one() {
+            let earlier = generation_rank("0.5.5:protocol-1:aaac2e0:265:1-1");
+            let later = generation_rank("0.5.5:protocol-1:3af6b11:287:1-1");
+            assert!(earlier < later);
+
+            // And a build somebody compiled by hand sits above every numbered
+            // build of its version, so a working tree may retire the release
+            // installed beside it and not the other way about.
+            let by_hand = generation_rank("0.5.5:protocol-1:local:local:1-1");
+            assert!(later < by_hand);
         }
 
         /// The ask has to survive the client that made it: every bridge and
