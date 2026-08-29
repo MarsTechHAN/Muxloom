@@ -1124,6 +1124,12 @@ pub struct Correspondent {
     /// idle rather than guessing.
     #[serde(default)]
     pub working: bool,
+    /// Whether the session has stopped on a question - an approval prompt, a
+    /// menu - and is waiting for a person. Shown in `/list` too: an agent
+    /// nobody answers waits for ever, and from a phone that reads exactly
+    /// like an agent that is working.
+    #[serde(default)]
+    pub needs_attention: bool,
     /// A glance at what the session has been doing, for `/list`. This is the
     /// daemon's `recap` — the last thing the model said.
     #[serde(default)]
@@ -1172,6 +1178,25 @@ impl Correspondent {
             .next()
             .unwrap_or(&self.session_id)
             .to_string()
+    }
+
+    /// What the agent is doing, in the words a person reading their phone can
+    /// act on. There is no colour in a chat message and no spinner: without
+    /// this, the only thing under an agent's name is its recap, and a recap
+    /// that reads like live activity is what an agent looks like whether it
+    /// is mid-turn, stopped on a question nobody answered, or finished hours
+    /// ago.
+    fn state(&self) -> &'static str {
+        if !self.alive {
+            return "finished";
+        }
+        if self.needs_attention {
+            return "waiting for you";
+        }
+        match self.working {
+            true => "working",
+            false => "idle",
+        }
     }
 
     /// Whether a `/select` word picks this session out.
@@ -2455,6 +2480,7 @@ impl<'a> Desk<'a> {
                             path: session.path.clone(),
                             alive: !session.dead && session.pid.is_some(),
                             working: session.working,
+                            needs_attention: session.needs_attention,
                             recap: session.recap.clone(),
                         }),
                 );
@@ -2607,9 +2633,14 @@ impl<'a> Desk<'a> {
 }
 
 /// Render active agents grouped by the folder they run in, each numbered so
-/// `/select <machine>-<n>` can reach it, and each carrying its `recap` (the
-/// last thing the model said) on the line under it. A folder with no path — a
-/// session that did not say where it runs — is grouped under `~`.
+/// `/select <machine>-<n>` can reach it, each saying what it is doing, and
+/// each carrying its `recap` (the last thing the model said) on the line under
+/// it. A folder with no path — a session that did not say where it runs — is
+/// grouped under `~`.
+///
+/// The state is on the name's own line, not in the recap: the recap is the
+/// last thing the model said, and the last thing a model said reads exactly
+/// the same whether it said it ten seconds ago or yesterday.
 fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut heading: Option<&str> = None;
@@ -2626,7 +2657,12 @@ fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
             lines.push(folder.to_string());
             heading = Some(folder);
         }
-        lines.push(format!("  {}  {}", index + 1, who.list_name()));
+        lines.push(format!(
+            "  {}  {} · {}",
+            index + 1,
+            who.list_name(),
+            who.state()
+        ));
         if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
             let one = recap.split('\n').next().unwrap_or("").trim();
             if !one.is_empty() {
@@ -2689,7 +2725,7 @@ fn handle(
             let mut lines: Vec<String> = desk
                 .sessions()
                 .iter()
-                .map(|who| format!("- {}", who.name()))
+                .map(|who| format!("- {} · {}", who.name(), who.state()))
                 .collect();
             if lines.is_empty() {
                 lines.push("- nobody is running".into());
@@ -4016,6 +4052,7 @@ mod tests {
             path: path.into(),
             alive,
             working: false,
+            needs_attention: false,
             recap: None,
         };
         // As a real machine reports itself: piles of finished conversations,
@@ -4077,6 +4114,7 @@ mod tests {
                 path: "/works/x/".into(),
                 alive: true,
                 working: true,
+                needs_attention: false,
                 recap: Some("splitting the lexer".into()),
             },
             Correspondent {
@@ -4086,6 +4124,7 @@ mod tests {
                 path: "/works/x/".into(),
                 alive: true,
                 working: false,
+                needs_attention: false,
                 recap: None,
             },
             Correspondent {
@@ -4095,6 +4134,7 @@ mod tests {
                 path: "/works/x/".into(),
                 alive: false,
                 working: false,
+                needs_attention: false,
                 recap: None,
             },
         ];
@@ -4116,7 +4156,51 @@ mod tests {
         );
         // Numbering stays stable across folders, so /select's machine-agent
         // numbers stay stable even as folders move around.
-        assert!(rendered.contains("  1  lexer"), "numbering starts at one");
+        assert!(
+            rendered.contains("  1  lexer · working"),
+            "numbering starts at one: {rendered}"
+        );
+    }
+
+    /// A chat has no colour and no spinner, so an agent's line has to say
+    /// outright what it is doing. Without it the only thing under a name is
+    /// the recap, and a recap reads the same whether the agent said it a
+    /// moment ago or hours before it stopped — which is how a row of agents
+    /// nobody had touched all looked like they were running.
+    #[test]
+    fn a_listed_agent_says_whether_it_is_working_waiting_or_idle() {
+        let agent = |label: &str, working: bool, needs_attention: bool| Correspondent {
+            machine: "m".into(),
+            session_id: format!("s-{label}"),
+            label: label.into(),
+            path: "/works/x".into(),
+            alive: true,
+            working,
+            needs_attention,
+            recap: Some("✻ Burrowing… (3h 59m 0s · ↓ 794.8k tokens)".into()),
+        };
+        let agents = [
+            agent("busy", true, false),
+            agent("asking", false, true),
+            agent("done", false, false),
+        ];
+        let listed: Vec<&Correspondent> = agents.iter().collect();
+        let rendered = folder_grouped(&listed).join("\n");
+        assert!(rendered.contains("  1  busy · working"), "{rendered}");
+        assert!(
+            rendered.contains("  2  asking · waiting for you"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  3  done · idle"), "{rendered}");
+
+        // A session that has stopped for good says so rather than keeping
+        // whatever it last happened to be.
+        let finished = Correspondent {
+            alive: false,
+            working: true,
+            ..agents[0].clone()
+        };
+        assert_eq!(finished.state(), "finished");
     }
 
     #[test]
