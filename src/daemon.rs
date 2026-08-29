@@ -7208,6 +7208,40 @@ mod platform {
             Arc::new(DaemonState::new(paths, KeeperMode::InProcess))
         }
 
+        /// Take the state directory away once the daemon has finished writing
+        /// to it.
+        ///
+        /// Serving the last request is not the daemon going quiet. A stop is
+        /// asynchronous on purpose — the kill goes to the keeper and the death
+        /// lands later, on the session's own reader thread, which marks the
+        /// record dead and writes it out one more time — and the transcript
+        /// scan persists on its own schedule besides. So joining the thread
+        /// that served the client says nothing about the two threads still
+        /// holding a pen.
+        ///
+        /// What that costs a removal is not a permissions error or a missing
+        /// file, either of which would name itself. `persist_session_metadata`
+        /// publishes by writing a uniquely named temporary beside the record
+        /// and renaming it, so a write landing mid-walk puts a *new* entry in a
+        /// directory the removal has already emptied, and the failure surfaces
+        /// three levels up as `ENOTEMPTY` on the root — the one error message
+        /// that says nothing about which file or why. Retrying is the whole
+        /// answer: those writers are finishing, not starting, and a loaded CI
+        /// runner is only the machine slow enough to let one of them be caught
+        /// at it.
+        fn discard_root(root: PathBuf) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match fs::remove_dir_all(&root) {
+                    Ok(()) => return,
+                    Err(error) if Instant::now() >= deadline => {
+                        panic!("could not remove {}: {error}", root.display())
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(25)),
+                }
+            }
+        }
+
         fn armed_trigger(
             matched: bool,
             cooldown_ms: u64,
@@ -9269,7 +9303,7 @@ mod platform {
             assert!(!state.sessions.lock().unwrap().contains_key(session_id));
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9318,7 +9352,7 @@ mod platform {
                 thread::yield_now();
             }
             assert!(!scratch.exists(), "the folder ends with the session");
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9350,7 +9384,7 @@ mod platform {
             assert!(tail.chars().count() <= 301, "{}", tail.chars().count());
             assert!(tail.ends_with('…'), "{tail}");
 
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         /// Searching a fleet means reading every capture it has ever written,
@@ -9401,7 +9435,7 @@ mod platform {
             assert!(!query_needs_unicode_folding("改好了分页器"));
             assert!(query_needs_unicode_folding("rien à"));
 
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9467,7 +9501,7 @@ mod platform {
                 assert_eq!(matches[0].line_number, 2);
             }
 
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         fn live_metadata(session_id: &str, kind: &str, pid: Option<u32>) -> DaemonSession {
@@ -9540,7 +9574,7 @@ mod platform {
             let recorded: DaemonSession =
                 serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
             assert!(recorded.dead && recorded.pid.is_none());
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9566,7 +9600,7 @@ mod platform {
             assert!(restarted.persisted_sessions.lock().unwrap().is_empty());
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9608,7 +9642,7 @@ mod platform {
                     .unwrap()
                     .contains_key(session_id)
             );
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9629,7 +9663,7 @@ mod platform {
             let history = persisted.read_history(0, 10, false).unwrap();
             assert!(history.rows.is_empty() && history.total_lines == 0);
             assert!(persisted.search_history("anything", 10).unwrap().is_empty());
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         /// A resumed conversation began long before the session that reopened
@@ -9692,7 +9726,7 @@ mod platform {
             while !adopted.snapshot().dead && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));
             }
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -9766,7 +9800,7 @@ mod platform {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(adopted.snapshot().dead, "a stopped adopted session dies");
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         /// The test above sets the flag by hand because that is what the loop
@@ -9799,7 +9833,7 @@ mod platform {
                 "the flag outlives the signal that set it"
             );
 
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         /// The screen an adopted session is handed is a replay of what its
@@ -9880,7 +9914,7 @@ mod platform {
             while !adopted.snapshot().dead && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));
             }
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -10141,7 +10175,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -10191,7 +10225,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -10243,7 +10277,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         fn queued_message(deliver: TalkDeliver) -> TalkQueued {
@@ -10505,7 +10539,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -10629,7 +10663,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -10777,7 +10811,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         /// Launch an alt-screen child that draws a marker row, prints
@@ -10981,7 +11015,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -11140,7 +11174,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -11211,7 +11245,7 @@ mod platform {
             }
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -11667,7 +11701,7 @@ mod platform {
 
             daemon_session(&state, session_id).unwrap().stop().unwrap();
             drop(client);
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -11727,7 +11761,7 @@ mod platform {
             assert_eq!(reloaded.label, "renamed afterwards");
 
             drop(client);
-            fs::remove_dir_all(paths.root).unwrap();
+            discard_root(paths.root);
         }
     }
 }
