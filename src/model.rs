@@ -179,6 +179,158 @@ impl std::str::FromStr for AgentKind {
     }
 }
 
+/// How far a session may write. Ordered from the narrowest outwards, because
+/// narrowing is the only direction this ever moves: what a parent hands a
+/// child is the smaller of what it has and what it asked for, and `min` is
+/// exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reach {
+    /// Only back to the agent that started it. A pair of hands, reporting to
+    /// the one pair of eyes that asked for the work.
+    Parent,
+    /// Anyone on the same piece of work: the agent that started it, the ones
+    /// started alongside it, and the ones it starts itself. Coordination
+    /// within a team, without the rest of the fleet hearing it.
+    Task,
+    /// Anyone, anywhere, which is what an agent a person started has.
+    Fleet,
+}
+
+impl Reach {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Task => "task",
+            Self::Fleet => "fleet",
+        }
+    }
+}
+
+impl std::str::FromStr for Reach {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "parent" => Ok(Self::Parent),
+            "task" => Ok(Self::Task),
+            "fleet" => Ok(Self::Fleet),
+            other => Err(format!(
+                "unknown reach: {other} — one of parent, task, fleet"
+            )),
+        }
+    }
+}
+
+/// What a session started on another agent's behalf is allowed to do.
+///
+/// A subagent is part of somebody else's piece of work, and the agent that
+/// handed it out is the one answering for it. Which parts of muxloom that
+/// subagent needs is a judgement about the work rather than about the code, so
+/// it belongs to the agent making the handoff, at the moment it makes it — and
+/// it can only ever be narrowed on the way down. A parent hands over the
+/// smaller of what it holds and what it was asked for, so no chain of launches
+/// ever ends somewhere with more than it started.
+///
+/// A session nobody started carries none of this, which is what full powers
+/// look like: an agent a person started answers to that person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Powers {
+    /// How far its messages may go.
+    pub reach: Reach,
+    /// The kinds it may start sessions of, in `AgentKind::ALL` order. Empty
+    /// means it starts none: the work it was given is the work it does.
+    pub launches: Vec<AgentKind>,
+    /// Whether it may put a message in front of the person through a bound
+    /// chat. Off by default for anything an agent started, because a phone
+    /// that five subagents can each write to is a phone the person stops
+    /// reading — and their parent is the one that owes them an answer.
+    pub may_reach_person: bool,
+}
+
+impl Powers {
+    /// Everything there is, which is what a session nobody started holds.
+    pub fn whole() -> Self {
+        Self {
+            reach: Reach::Fleet,
+            launches: AgentKind::ALL.to_vec(),
+            may_reach_person: true,
+        }
+    }
+
+    /// Nothing but the work: report back to whoever asked, and do it yourself.
+    pub fn none() -> Self {
+        Self {
+            reach: Reach::Parent,
+            launches: Vec::new(),
+            may_reach_person: false,
+        }
+    }
+
+    /// What a child gets when the agent starting it says nothing about any of
+    /// this — the common case, and the one that has to be sensible on its own.
+    ///
+    /// It may talk to the team it is on, it may hand work out further in the
+    /// same runtime it is itself (which is the runtime the person picked, all
+    /// the way up the chain), and it does not write to the person: the agent
+    /// that started it does that, because the person asked *it*.
+    pub fn default_child_of(parent_kind: Option<AgentKind>, parent: &Powers) -> Self {
+        let launches = match parent_kind {
+            Some(kind) => vec![kind],
+            // A caller that cannot say what runtime it is - a controller, a
+            // session from a daemon too old to stamp one - hands on its own
+            // list rather than guessing at a narrower one.
+            None => parent.launches.clone(),
+        };
+        Powers {
+            reach: Reach::Task,
+            launches,
+            may_reach_person: false,
+        }
+    }
+
+    /// What this holder may actually hand over when a child asks for `asked`:
+    /// the smaller of the two, dial by dial. Asking for more than the parent
+    /// has is not an error — a parent that repeats its own defaults down a
+    /// chain that has already been narrowed would fail at the second link —
+    /// it simply does not get it.
+    pub fn narrowed(&self, asked: &Powers) -> Self {
+        Powers {
+            reach: self.reach.min(asked.reach),
+            launches: AgentKind::ALL
+                .into_iter()
+                .filter(|kind| self.launches.contains(kind) && asked.launches.contains(kind))
+                .collect(),
+            may_reach_person: self.may_reach_person && asked.may_reach_person,
+        }
+    }
+
+    /// The kinds, as the comma-separated list the environment carries and a
+    /// refusal quotes back. Empty string for none, which is why the variable is
+    /// always set rather than left out: absent means "nobody said", and that
+    /// reads as full powers. Spaced for the sentence it lands in; the reader
+    /// trims, so the two uses are the one format.
+    pub fn launches_list(&self) -> String {
+        self.launches
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Read a comma-separated list of kinds back, in `AgentKind::ALL` order so
+    /// the same set always reads the same way. A word that names no runtime is
+    /// dropped rather than refused: this is read back out of an environment a
+    /// newer muxloom wrote, which may know a runtime this one does not, and a
+    /// launch is not the place to find that out.
+    pub fn launches_from(list: &str) -> Vec<AgentKind> {
+        AgentKind::ALL
+            .into_iter()
+            .filter(|kind| list.split(',').any(|word| word.trim() == kind.as_str()))
+            .collect()
+    }
+}
+
 /// What an agent's prompt box says about a message typed into it right now.
 ///
 /// This, and not "is the agent working", is the question worth asking before
@@ -466,6 +618,10 @@ pub struct LaunchRequest {
     /// The session asking for this one, when an agent is. A launch a person
     /// makes from the dashboard has no parent: it is its own piece of work.
     pub parent: Option<String>,
+    /// What the asking agent is handing over, already narrowed against what it
+    /// holds. `None` for every launch a person makes, which is what full
+    /// powers look like.
+    pub powers: Option<Powers>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,6 +773,105 @@ impl HistoryPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one rule the whole thing rests on: whatever a child asks for, it
+    /// gets no more than the agent starting it already had. Without it a chain
+    /// of launches is a way to climb back to full powers one hop at a time.
+    #[test]
+    fn a_grant_is_the_smaller_of_what_was_held_and_what_was_asked_for() {
+        let held = Powers {
+            reach: Reach::Task,
+            launches: vec![AgentKind::Claude],
+            may_reach_person: false,
+        };
+        let asked = Powers::whole();
+        let granted = held.narrowed(&asked);
+        assert_eq!(granted, held, "asking for everything gets what was held");
+
+        // And the other way round: a holder of everything hands over exactly
+        // what was asked for, which is how a parent restricts a child.
+        let narrow = Powers {
+            reach: Reach::Parent,
+            launches: Vec::new(),
+            may_reach_person: false,
+        };
+        assert_eq!(Powers::whole().narrowed(&narrow), narrow);
+
+        // Dial by dial, so a child asking wide on one and narrow on another
+        // gets the narrow answer on both.
+        let mixed = Powers::whole().narrowed(&Powers {
+            reach: Reach::Fleet,
+            launches: vec![AgentKind::Codex, AgentKind::Terminal],
+            may_reach_person: true,
+        });
+        assert_eq!(mixed.reach, Reach::Fleet);
+        assert_eq!(mixed.launches, vec![AgentKind::Codex, AgentKind::Terminal]);
+        // Kinds come back in the one order, whatever order they were asked in.
+        let unordered = Powers::whole().narrowed(&Powers {
+            reach: Reach::Task,
+            launches: vec![AgentKind::Terminal, AgentKind::Codex],
+            may_reach_person: false,
+        });
+        assert_eq!(
+            unordered.launches,
+            vec![AgentKind::Codex, AgentKind::Terminal]
+        );
+        // Narrowing is idempotent, so re-applying a chain's own grant at every
+        // link leaves it where it was rather than eroding it.
+        assert_eq!(held.narrowed(&held), held);
+    }
+
+    /// What a child gets when nobody says anything, which is most launches.
+    #[test]
+    fn a_child_nobody_spoke_for_works_within_its_team_in_its_parents_runtime() {
+        let child = Powers::default_child_of(Some(AgentKind::Claude), &Powers::whole());
+        assert_eq!(child.reach, Reach::Task);
+        assert_eq!(child.launches, vec![AgentKind::Claude]);
+        assert!(
+            !child.may_reach_person,
+            "the agent that was asked is the one that answers the person"
+        );
+        // A grandchild of that child keeps the runtime rather than widening
+        // back out to every kind the fleet has.
+        let grandchild = Powers::default_child_of(Some(AgentKind::Claude), &child);
+        assert_eq!(grandchild.launches, vec![AgentKind::Claude]);
+        // A caller that cannot say what runtime it is hands on its own list,
+        // which after one narrowing is already the right one.
+        assert_eq!(
+            Powers::default_child_of(None, &child).launches,
+            vec![AgentKind::Claude]
+        );
+    }
+
+    /// The environment is where a grant is read back, so the round trip has to
+    /// be exact — and "no kinds at all" has to survive it, because that is the
+    /// setting that stops a subagent starting more of them.
+    #[test]
+    fn a_set_of_kinds_survives_the_trip_through_an_environment_variable() {
+        for launches in [
+            AgentKind::ALL.to_vec(),
+            vec![AgentKind::Claude],
+            vec![AgentKind::Codex, AgentKind::Terminal],
+            Vec::new(),
+        ] {
+            let powers = Powers {
+                reach: Reach::Task,
+                launches: launches.clone(),
+                may_reach_person: false,
+            };
+            assert_eq!(Powers::launches_from(&powers.launches_list()), launches);
+        }
+        assert_eq!(Powers::none().launches_list(), "");
+        // A runtime this build has never heard of is dropped rather than
+        // failing the launch: the variable may have been written by a newer
+        // muxloom that knows one more.
+        assert_eq!(
+            Powers::launches_from("claude,quantum-agent"),
+            vec![AgentKind::Claude]
+        );
+        assert_eq!(Reach::Fleet.as_str().parse(), Ok(Reach::Fleet));
+        assert!("everyone".parse::<Reach>().is_err());
+    }
 
     /// The whole point of carrying the stamp across the wire. A fleet on
     /// nightlies reads the same package version everywhere, so before this the

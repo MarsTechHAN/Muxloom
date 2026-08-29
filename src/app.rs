@@ -2264,6 +2264,7 @@ impl App {
                 initial_prompt: None,
                 // A person at the dashboard is nobody's subagent.
                 parent: None,
+                powers: None,
             };
             let remove_archive_session_id = self
                 .state
@@ -11019,6 +11020,7 @@ impl App {
             resume_id,
             initial_prompt,
             parent: None,
+            powers: None,
         };
         if self
             .worker

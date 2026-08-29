@@ -763,6 +763,7 @@ impl BridgeConnection {
         environment: Vec<(String, String)>,
         created_at: u64,
         parent: Option<String>,
+        powers: Option<crate::model::Powers>,
         initial_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         match self
@@ -779,6 +780,7 @@ impl BridgeConnection {
                 columns: 120,
                 rows: 40,
                 parent,
+                powers,
                 initial_prompt,
             })?
             .response
@@ -2203,6 +2205,7 @@ impl BridgePool {
         environment: Vec<(String, String)>,
         created_at: u64,
         parent: Option<String>,
+        powers: Option<crate::model::Powers>,
         initial_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         let connection = self.connection_for_target(target)?;
@@ -2217,6 +2220,7 @@ impl BridgePool {
             environment.clone(),
             created_at,
             parent.clone(),
+            powers.clone(),
             initial_prompt.clone(),
         ) {
             Ok(session) => return Ok(session),
@@ -2262,6 +2266,7 @@ impl BridgePool {
             environment,
             created_at,
             parent,
+            powers,
             initial_prompt,
         )
     }

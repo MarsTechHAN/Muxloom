@@ -2522,6 +2522,7 @@ mod tests {
             attention_reason: None,
             composer: None,
             parent: None,
+            powers: None,
             resumed_from: None,
             resumed_to: None,
         }

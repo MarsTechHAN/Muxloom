@@ -733,6 +733,20 @@ dashboard, survive the MCP client exiting, and are archived or deleted like
 any other. A machine that is not enabled stays untouched — calls addressing
 it are refused.
 
+An agent launching a subagent also says what that subagent may do, and cannot
+say more than it holds itself. `may_message` is how far the new session may
+write — `parent` back to the agent that started it, `task` to everyone on the
+same piece of work, `fleet` to any agent anywhere — and defaults to `task`.
+`may_launch` is which runtimes it may start sessions of, defaulting to the
+launcher's own kind, so a team stays one kind of agent; an empty list means it
+starts none. `may_reach_person` is whether it may write to the chat app with
+`send_channel_message`, and is off unless asked for, so the person hears about
+the work once rather than from every session doing it. What a person launches
+begins whole. The grant is written into the session's environment by the daemon
+and recorded beside it, never taken from a tool argument the agent could have
+written about itself, and a resume restores what the record held — so a session
+cannot shed its limits by dying and coming back.
+
 The tool surface itself is transport-agnostic (`src/control.rs`); MCP stdio
 is its first adapter, and the same seam is intended to carry a TCP or serial
 adapter so hardware status panels can read agent state.

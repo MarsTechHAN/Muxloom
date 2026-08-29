@@ -139,6 +139,7 @@ fn local_session_survives_agent_exit_and_is_discoverable() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     // Nothing keeps this child alive for the launch to finish against: it is
     // gone by the time the daemon has connected to its keeper, as often as
@@ -287,6 +288,7 @@ fn missing_local_companion_falls_back_to_a_clearly_identified_tmux_session() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -329,6 +331,7 @@ fn embedded_pty_attaches_renders_and_accepts_input() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -382,6 +385,7 @@ fn ordinary_terminal_with_empty_command_stays_running() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let session_id = runtime
         .launch(&request, config.agents.get(AgentKind::Terminal), &[])
@@ -419,6 +423,7 @@ fn exited_terminal_is_removed_instead_of_archived() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -462,6 +467,7 @@ fn live_agent_can_be_archived_before_permanent_removal() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let command = CommandConfig {
         command: "sh".into(),
@@ -621,6 +627,7 @@ fn history_reads_do_not_resize_attached_pane_and_full_search_finds_matches() {
         resume_id: None,
         initial_prompt: None,
         parent: None,
+        powers: None,
     };
     let command = CommandConfig {
         command: "sh".into(),

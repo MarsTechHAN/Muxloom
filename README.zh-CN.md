@@ -433,6 +433,16 @@ Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）�
 通过 MCP 启动的会话就是普通托管会话：会出现在 Dashboard 中、在 MCP 客户端退出后继续运
 行，也要像其他会话一样归档或删除。未启用的机器不会被触碰——指向它的调用会被拒绝。
 
+Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能超过它自己持有的权限。
+`may_message` 决定新会话能写到多远——`parent` 只能回复起它的 Agent，`task` 是同一件工
+作上的所有人，`fleet` 是任意机器上的任意 Agent——默认是 `task`。`may_launch` 是它能起
+哪些运行时的会话，默认与起它的 Agent 同类，让一支队伍保持同一种 Agent；空列表表示它谁
+也起不了。`may_reach_person` 决定它能否用 `send_channel_message` 写到聊天软件，不明确
+要求就是关的，这样人只会被通知一次，而不是每个干活的会话各说一遍。人自己起的会话则是完
+整权限。这份授权由 daemon 写进会话环境并记录在会话记录上，绝不取自 Agent 可以自说自话
+的工具参数；resume 时恢复记录里的那一份——因此会话无法通过"死一次再回来"甩掉自己的
+限制。
+
 工具面本身与传输无关（`src/control.rs`）；MCP stdio 是它的第一个适配器，同一接缝将来
 可以接 TCP 或串口适配器，让硬件状态面板读取 Agent 状态。
 

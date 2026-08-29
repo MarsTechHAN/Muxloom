@@ -1599,6 +1599,7 @@ mod platform {
                 attention_reason: None,
                 composer: None,
                 parent: None,
+                powers: None,
                 resumed_from: None,
                 resumed_to: None,
             };
@@ -2699,6 +2700,7 @@ mod platform {
                 columns,
                 rows,
                 parent,
+                powers,
                 initial_prompt,
             } => {
                 let _launch_guard = state
@@ -2722,6 +2724,7 @@ mod platform {
                     columns,
                     rows,
                     parent.clone(),
+                    powers,
                 )?;
                 if let Some(prompt) = initial_prompt.as_deref() {
                     queue_seed_prompt(state, &session_id, parent, prompt);
@@ -3692,6 +3695,7 @@ mod platform {
         columns: u16,
         rows: u16,
         parent: Option<String>,
+        powers: Option<crate::model::Powers>,
     ) -> Result<Arc<ManagedSession>> {
         validate_session_id(&session_id)?;
         // A parent is a session id and is written down as given, even when it
@@ -3866,6 +3870,30 @@ mod platform {
         if !label.trim().is_empty() {
             keeper_environment.push(("MUXLOOM_SESSION_LABEL".into(), label.clone()));
         }
+        // A revival in place that was told nothing takes what the record
+        // already held: it is the same session coming back, not a new one
+        // being started with nobody watching, and a resume that quietly handed
+        // a subagent full powers would be a way to shed its limits by dying.
+        let powers = powers.or_else(|| resuming.as_ref().and_then(|record| record.powers.clone()));
+        // What the agent that asked for this session handed it. Set here and
+        // nowhere else, so an agent cannot read its own limits off a variable
+        // it could have written: the muxloom tools inside the session read
+        // these, and only a launch puts them there. All three go in together
+        // or none do — a variable that is absent means nobody said anything
+        // about this session, which is what a person's own agent looks like,
+        // and a half-written set would read as full powers on the missing
+        // dial.
+        if let Some(powers) = &powers {
+            keeper_environment.push(("MUXLOOM_MAY_MESSAGE".into(), powers.reach.as_str().into()));
+            keeper_environment.push(("MUXLOOM_MAY_LAUNCH".into(), powers.launches_list()));
+            keeper_environment.push((
+                "MUXLOOM_MAY_REACH_PERSON".into(),
+                match powers.may_reach_person {
+                    true => "yes".into(),
+                    false => "no".into(),
+                },
+            ));
+        }
         let history_path = state.paths.history.join(format!("{session_id}.ansi"));
         let metadata_path = state.paths.sessions.join(format!("{session_id}.json"));
         if !temporary {
@@ -3937,6 +3965,9 @@ mod platform {
             attention_reason: None,
             composer: None,
             parent,
+            // Kept so a resume can hand over the same thing again, and so the
+            // next launch of this session stamps the same environment.
+            powers,
             resumed_from: resumed_from.as_ref().map(|record| record.id.clone()),
             resumed_to: resuming
                 .as_ref()
@@ -7164,6 +7195,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             first.write_input(b"marker line\r").unwrap();
@@ -7195,6 +7227,7 @@ mod platform {
                 999,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -7249,6 +7282,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             let error = match launch_session(
@@ -7264,6 +7298,7 @@ mod platform {
                 999,
                 80,
                 24,
+                None,
                 None,
             ) {
                 Ok(_) => panic!("a live session's number must never be launched over"),
@@ -7292,6 +7327,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             let live_child = launch_session(
@@ -7308,6 +7344,7 @@ mod platform {
                 80,
                 24,
                 Some(master.into()),
+                None,
             )
             .unwrap();
             let archived_child = launch_session(
@@ -7324,6 +7361,7 @@ mod platform {
                 80,
                 24,
                 Some(master.into()),
+                None,
             )
             .unwrap();
             archived_child.archive().unwrap();
@@ -7351,6 +7389,7 @@ mod platform {
                 200,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -7553,6 +7592,7 @@ mod platform {
                     80,
                     24,
                     parent.map(Into::into),
+                    None,
                 )
                 .unwrap()
             };
@@ -7648,6 +7688,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -7785,6 +7826,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )
@@ -8222,6 +8264,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -8265,6 +8308,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -8346,6 +8390,7 @@ mod platform {
                 80,
                 24,
                 parent.map(str::to_string),
+                None,
             )
             .unwrap()
         }
@@ -8603,6 +8648,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
 
@@ -8683,6 +8729,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
 
@@ -8727,6 +8774,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -8783,6 +8831,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             burst.write_input(b"hi\r").unwrap();
@@ -8824,6 +8873,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -8911,6 +8961,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -9018,6 +9069,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
 
@@ -9057,6 +9109,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -9115,6 +9168,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
 
@@ -9164,6 +9218,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -9302,6 +9357,7 @@ mod platform {
                     attention_reason: None,
                     composer: None,
                     parent: None,
+                    powers: None,
                     resumed_from: None,
                     resumed_to: None,
                 },
@@ -9362,6 +9418,7 @@ mod platform {
                 attention_reason: None,
                 composer: None,
                 parent: None,
+                powers: None,
             }
         }
 
@@ -9532,6 +9589,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -9579,6 +9637,7 @@ mod platform {
                 5,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -9695,6 +9754,7 @@ mod platform {
                 80,
                 24,
                 None,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -9773,6 +9833,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )
@@ -9903,6 +9964,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )?
@@ -10293,6 +10355,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )?
@@ -10394,6 +10457,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )
@@ -10520,6 +10584,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )
@@ -10667,6 +10732,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )?
@@ -10710,6 +10776,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -10878,6 +10945,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
             )
             .unwrap();
@@ -11475,6 +11543,7 @@ mod platform {
                     columns: 80,
                     rows: 24,
                     parent: None,
+                    powers: None,
                     initial_prompt: None,
                 },
             )
@@ -11555,6 +11624,7 @@ mod platform {
                     attention_reason: None,
                     composer: None,
                     parent: None,
+                    powers: None,
                 },
             )
             .unwrap();

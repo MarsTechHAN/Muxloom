@@ -119,6 +119,7 @@ fn a_launch_that_loses_its_bridge_still_reaches_the_daemon() {
                 1_700_000_000_000 + round,
                 None,
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("round {round} fell off the daemon: {error:#}"));
         assert_eq!(session.id, session_id);

@@ -2661,6 +2661,7 @@ impl<'a> Desk<'a> {
             resume_id: None,
             initial_prompt,
             parent: None,
+            powers: None,
         };
         let command = self.config.command_for(&target.id, kind);
         let environment = self.config.environment_for(&target.id).unwrap_or_default();

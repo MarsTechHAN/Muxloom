@@ -248,6 +248,14 @@ pub enum DaemonRequest {
         /// from every launch a human makes.
         #[serde(default)]
         parent: Option<String>,
+        /// What the agent starting this session is handing it: how far it may
+        /// write, what it may start, whether it may reach the person. Already
+        /// narrowed against what the caller itself holds by the time it gets
+        /// here — this is the grant, not the request. Absent from every launch
+        /// a person makes and from a client too old to send one, and absent is
+        /// what full powers look like.
+        #[serde(default)]
+        powers: Option<crate::model::Powers>,
         /// A prompt the runtime left out of the command line because that CLI
         /// reads a positional argument as something else — OpenCode reads it as
         /// the project directory and dies on the spot. The daemon types it in
@@ -692,6 +700,15 @@ pub struct DaemonSession {
     /// the same piece of work, which is what a reader wants to know.
     #[serde(default)]
     pub parent: Option<String>,
+    /// What the agent that started it handed over, kept so a resume can hand
+    /// the same thing again. The grant is stamped into the session's
+    /// environment at launch and read from there for the session's life, but a
+    /// resumed session is launched afresh with an environment built from the
+    /// config — so without this on the record, coming back would quietly
+    /// restore a subagent to full powers. Absent from every session nobody
+    /// started, and from records a daemon too old to keep one wrote.
+    #[serde(default)]
+    pub powers: Option<crate::model::Powers>,
     /// The archived session this one resumes, when a conversation came back
     /// under a new muxloom id rather than its own. The alias is recorded on
     /// both sides - `resumed_to` on the record it moved out of, `resumed_from`

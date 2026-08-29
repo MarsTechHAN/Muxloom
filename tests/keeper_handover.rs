@@ -195,6 +195,7 @@ fn a_live_session_survives_a_generation_handover_with_its_process() {
                 columns: 80,
                 rows: 24,
                 parent: None,
+                powers: None,
                 initial_prompt: None,
             },
         );

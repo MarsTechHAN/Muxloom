@@ -579,6 +579,7 @@ impl Runtime {
             environment.to_vec(),
             now,
             request.parent.clone(),
+            request.powers.clone(),
             launch_seed(
                 request.kind,
                 request.resume_id.as_deref(),
