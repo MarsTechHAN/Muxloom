@@ -454,6 +454,14 @@ pub struct State {
     pub last_launch_kinds: BTreeMap<String, AgentKind>,
     /// Custom display names for agents, keyed by session id.
     pub session_labels: BTreeMap<String, String>,
+    /// Sessions muxloom itself removed, by machine (target id). A closed agent
+    /// and the archive a resume supersedes both leave their conversation in the
+    /// local backup, and the backup lists what a machine no longer has as
+    /// something the machine lost - so without this the entry that was just
+    /// removed comes straight back on the next refresh. The transcript stays in
+    /// the store and stays searchable; only the offer to put it back is
+    /// withdrawn.
+    pub removed_sessions: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for State {
@@ -473,6 +481,7 @@ impl Default for State {
             last_launch_dirs: BTreeMap::new(),
             last_launch_kinds: BTreeMap::new(),
             session_labels: BTreeMap::new(),
+            removed_sessions: BTreeMap::new(),
         }
     }
 }

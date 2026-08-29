@@ -5268,11 +5268,16 @@ impl App {
                     }
                 }
             }
-            Event::Killed { target_id, result } => {
+            Event::Killed {
+                target_id,
+                session_id,
+                result,
+            } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 self.forced_update_ack(&target_id);
                 match result {
                     Ok(()) => {
+                        self.note_removed_session(&target_id, &session_id);
                         self.status_message = "Agent session closed".into();
                         if self.selected_session_id.as_deref().is_some_and(|id| {
                             self.terminal_session_id.as_deref() == Some(id)
@@ -5334,6 +5339,7 @@ impl App {
                         self.history_cache
                             .remove(&history_cache_key(&target_id, &session_id));
                         self.state.session_labels.remove(&session_id);
+                        self.note_removed_session(&target_id, &session_id);
                         self.status_message =
                             "Agent resumed; the previous Archived entry was removed".into();
                         self.persist_state();
@@ -5986,10 +5992,34 @@ impl App {
             .filter(|session| session.target_id == target_id)
             .map(|session| session.id.clone())
             .collect();
+        // A number that is back on the machine is not a removal any more: the
+        // only way that happens is a record reviving in place under its own id,
+        // and that conversation is live again whatever was done to it before.
+        if let Some(removed) = self.state.removed_sessions.get_mut(target_id) {
+            let before = removed.len();
+            removed.retain(|session_id| !live.contains(session_id));
+            let after = removed.len();
+            if after == 0 {
+                self.state.removed_sessions.remove(target_id);
+            }
+            if before != after {
+                self.persist_state();
+            }
+        }
         for record in recoverable_backup_records(&self.backup_root, target_id, &live) {
             let Ok(kind) = record.kind.parse::<AgentKind>() else {
                 continue;
             };
+            // Removed on purpose: the store keeps the conversation for search,
+            // but it is not one the machine lost, so it is not offered back.
+            if self
+                .state
+                .removed_sessions
+                .get(target_id)
+                .is_some_and(|removed| removed.contains(&record.session_id))
+            {
+                continue;
+            }
             if self
                 .restored
                 .contains(&(target_id.to_string(), record.session_id.clone()))
@@ -11112,6 +11142,31 @@ impl App {
         {
             self.busy_operations += 1;
             self.status_message = "Closing agent session...".into();
+        }
+    }
+
+    /// Write down that muxloom removed this session itself, so the local backup
+    /// stops offering it back. The store lists what a machine no longer has as a
+    /// conversation the machine lost, which is right for a box that was
+    /// reimaged and wrong for the entry somebody just closed - or for the
+    /// archive a resume superseded, which came back on the next refresh and read
+    /// as the removal having failed. The transcript stays in the store, so the
+    /// conversation is still searchable and still readable; only its place in
+    /// the agent list goes.
+    fn note_removed_session(&mut self, target_id: &str, session_id: &str) {
+        // Nothing is kept of a temporary chat anyway, so there is nothing to
+        // withdraw and no reason to grow the state file with its number.
+        if is_temporary_session_id(session_id) {
+            return;
+        }
+        if self
+            .state
+            .removed_sessions
+            .entry(target_id.to_string())
+            .or_default()
+            .insert(session_id.to_string())
+        {
+            self.persist_state();
         }
     }
 
@@ -18948,6 +19003,156 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The archive a resume supersedes is removed from its machine, and the
+    /// machine then has nothing to report for it - which is exactly the shape of
+    /// a conversation the machine lost. Listing it again put the entry the
+    /// person had just removed straight back, and it read as the removal having
+    /// silently failed. What was removed stays removed; the transcript stays in
+    /// the store.
+    #[test]
+    #[cfg(feature = "controller")]
+    fn an_archive_a_resume_superseded_does_not_come_back_out_of_the_backup() {
+        use crate::{
+            backup::{BackupIndex, BackupRecord, BackupStore, CAPTURE_BLOB},
+            model::Probe,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-app-superseded-{nonce}"));
+        let state_path = std::env::temp_dir().join(format!("muxloom-superseded-{nonce}.json"));
+        let store = BackupStore::new(root.clone());
+        store
+            .append_frame(
+                "local",
+                "muxloomd-codex-old",
+                CAPTURE_BLOB,
+                b"$ cargo test\nall green\n",
+            )
+            .unwrap();
+        let mut index = BackupIndex::default();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-old".into(),
+            kind: "codex".into(),
+            cwd: "/work/project".into(),
+            created_at: 42,
+            label: "old".into(),
+            dead: true,
+            archived: true,
+            native_id: "native-old".into(),
+            jsonl_bytes_synced: 128,
+            message_count: 4,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.backup_root = root.clone();
+        app.targets[0].probe.set(AgentKind::Codex, true);
+
+        // Until it is removed on purpose, a session the machine no longer has is
+        // history worth offering back.
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((Probe::default(), Vec::new())),
+        });
+        assert!(app.is_recoverable("local", "muxloomd-codex-old"));
+
+        app.handle_worker_event(Event::ResumedArchiveRemoved {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-old".into(),
+            result: Ok(()),
+        });
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((Probe::default(), Vec::new())),
+        });
+        assert!(
+            app.sessions.is_empty(),
+            "the removed archive must not be listed again"
+        );
+        assert!(!app.is_recoverable("local", "muxloomd-codex-old"));
+        // Across a restart too: the decision is in the state file, not in a
+        // list that dies with the process.
+        assert!(
+            State::load(&state_path).unwrap().removed_sessions["local"]
+                .contains("muxloomd-codex-old"),
+        );
+        // Closing an agent by hand is the same decision, and the conversation
+        // stays in the store either way - searchable, readable, just not offered
+        // back as something to put on a machine.
+        app.handle_worker_event(Event::Killed {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-gone".into(),
+            result: Ok(()),
+        });
+        assert!(
+            State::load(&state_path).unwrap().removed_sessions["local"]
+                .contains("muxloomd-codex-gone"),
+        );
+        assert!(store.blob_len("local", "muxloomd-codex-old", CAPTURE_BLOB) > 0);
+        assert!(
+            store
+                .load_index()
+                .unwrap()
+                .position("local", "muxloomd-codex-old")
+                .is_some()
+        );
+
+        // A number only comes back by reviving in place, and that conversation
+        // is live again whatever was done to it before.
+        app.handle_worker_event(Event::Scanned {
+            target_id: "local".into(),
+            result: Ok((
+                Probe::default(),
+                vec![AgentSession {
+                    id: "muxloomd-codex-old".into(),
+                    target_id: "local".into(),
+                    kind: AgentKind::Codex,
+                    path: "/work/project".into(),
+                    label: "old".into(),
+                    created_at: 42,
+                    archived_at: None,
+                    dead: false,
+                    pid: Some(7),
+                    working: false,
+                    needs_attention: false,
+                    attention_reason: None,
+                    recap: None,
+                    title: None,
+                    thread: None,
+                    parent: None,
+                }],
+            )),
+        });
+        let remembered = State::load(&state_path).unwrap().removed_sessions;
+        assert!(!remembered["local"].contains("muxloomd-codex-old"));
+        assert!(remembered["local"].contains("muxloomd-codex-gone"));
+
+        drop(request_rx);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&state_path);
     }
 
     /// A capture blob holds every row a session ever printed, and the terminal

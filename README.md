@@ -243,7 +243,9 @@ started, so the conversation you just closed is at the top of its folder.
 Resuming an Archived agent asks whether to remove the superseded archive after
 the new agent starts successfully. Removal is enabled by default, can be toggled
 with `Space`, and the choice is remembered; launch or cleanup failure keeps the
-archive intact.
+archive intact. A removal sticks: a closed agent and a superseded archive are
+not offered back from the local backup, which lists only what a machine lost.
+Their transcripts stay in the store and stay searchable.
 
 **Keys** — `/` or `Ctrl-p` search · `Enter` jump to a result · `x`
 archive/delete · `a` show archived.

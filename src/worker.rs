@@ -297,6 +297,7 @@ pub enum Event {
     },
     Killed {
         target_id: String,
+        session_id: String,
         result: Result<(), String>,
     },
     Archived {
@@ -720,7 +721,11 @@ impl Worker {
                                 format!("kill failed target={target_id}: {error}"),
                             );
                         }
-                        let _ = events.send(Event::Killed { target_id, result });
+                        let _ = events.send(Event::Killed {
+                            target_id,
+                            session_id,
+                            result,
+                        });
                     }
                     Request::Archive { target, session_id } => {
                         let target_id = target.id.clone();
