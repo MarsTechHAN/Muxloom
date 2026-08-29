@@ -1181,6 +1181,13 @@ pub struct Correspondent {
     /// daemon's `recap` — the last thing the model said.
     #[serde(default)]
     pub recap: Option<String>,
+    /// The agent that started this one, when an agent did. `/list` leaves those
+    /// out: work an agent hands to a subagent is still that agent's to answer
+    /// for, and a phone showing every one of them shows a list nobody can find
+    /// their own agent in. Absent from an old record, which is what a session
+    /// nobody started looks like too, so both read as a main agent.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -2529,6 +2536,7 @@ impl<'a> Desk<'a> {
                             working: session.working,
                             needs_attention: session.needs_attention,
                             recap: session.recap.clone(),
+                            parent: session.parent.clone(),
                         }),
                 );
             }
@@ -2569,16 +2577,25 @@ impl<'a> Desk<'a> {
     }
 
     /// The agents on one machine exactly as `/list` prints them: the active
-    /// ones, in folder order. `/select <machine>-<n>` counts along this same
-    /// list, so a number read off the screen and a number typed back mean the
-    /// same agent. Anything else - counting the dead ones in, or counting them
-    /// in the order the daemon happens to list them - aims the chat at whoever
-    /// is sitting at that offset instead, which is a stranger.
+    /// ones an agent did not start, in folder order. `/select <machine>-<n>`
+    /// counts along this same list, so a number read off the screen and a
+    /// number typed back mean the same agent. Anything else - counting the dead
+    /// ones in, or counting them in the order the daemon happens to list them -
+    /// aims the chat at whoever is sitting at that offset instead, which is a
+    /// stranger.
+    ///
+    /// Subagents are left out on purpose. A phone is not a dashboard: work an
+    /// agent handed to a subagent is still that agent's to answer for, so the
+    /// person reading this wants the agent they gave the work to, and a list
+    /// that grows by five every time one of them fans out is a list nobody can
+    /// find that agent in. Nothing is hidden by it — the dashboard shows them
+    /// all, indented under whoever started them, and a chat already aimed at
+    /// one goes on reaching it.
     fn listed_agents(&mut self, machine: &str) -> Vec<Correspondent> {
         let mut agents: Vec<Correspondent> = self
             .sessions()
             .iter()
-            .filter(|it| it.machine == machine && it.alive)
+            .filter(|it| it.machine == machine && it.alive && it.parent.is_none())
             .cloned()
             .collect();
         // Sorted by folder alone, and stably: within a folder they stay in the
@@ -2778,18 +2795,24 @@ fn handle(
             // aiming at. A machine that has been up for days carries dozens of
             // finished sessions, and a roster where the agents you can still
             // talk to are outnumbered several times over by the ones you
-            // cannot is a roster nobody reads to the end on a phone. Dropping
-            // them without a word would be its own kind of lie, so the count
-            // stays.
+            // cannot is a roster nobody reads to the end on a phone. The same
+            // goes for the subagents those running agents started: whoever
+            // gave the work out is the one to ask about it. Dropping either
+            // without a word would be its own kind of lie, so the counts stay.
             let (live, finished): (Vec<&Correspondent>, Vec<&Correspondent>) =
                 desk.sessions().iter().partition(|who| who.alive);
             let finished = finished.len();
+            let helpers = live.iter().filter(|who| who.parent.is_some()).count();
             let mut lines: Vec<String> = live
                 .iter()
+                .filter(|who| who.parent.is_none())
                 .map(|who| format!("- {} · {}", who.name(), who.state()))
                 .collect();
             if lines.is_empty() {
                 lines.push("- nobody is running".into());
+            }
+            if helpers > 0 {
+                lines.push(format!("- ({helpers} working under them)"));
             }
             if finished > 0 {
                 lines.push(format!("- ({finished} finished, not listed)"));
@@ -4171,6 +4194,7 @@ mod tests {
             working: alive,
             needs_attention: false,
             recap: None,
+            parent: None,
         };
         desk.sessions = Some(vec![
             session("s-old", "arena", false),
@@ -4246,6 +4270,7 @@ mod tests {
             working: false,
             needs_attention: false,
             recap: None,
+            parent: None,
         };
         // As a real machine reports itself: piles of finished conversations,
         // a handful of live ones, in no particular order.
@@ -4294,6 +4319,91 @@ mod tests {
         assert_eq!(desk.resolve_numbered(1, listed.len() + 1), None);
     }
 
+    /// A phone is not a dashboard. One agent handing its work out five ways is
+    /// an ordinary morning, and every one of those subagents used to arrive in
+    /// the chat list beside the agent that started them — so the list the human
+    /// reads to find their own agent was mostly agents they had never heard of,
+    /// and the numbers beside it moved every time somebody fanned out.
+    #[test]
+    fn the_chat_lists_the_agents_a_person_started_and_not_the_ones_agents_did() {
+        let config = crate::config::Config::default();
+        let runtime = Runtime::new(&config);
+        let mut desk = Desk::new(&runtime, &[], &config);
+        let session = |id: &str, label: &str, parent: Option<&str>| Correspondent {
+            machine: "local".into(),
+            session_id: id.into(),
+            label: label.into(),
+            path: "/works/arena".into(),
+            alive: true,
+            working: false,
+            needs_attention: false,
+            recap: None,
+            parent: parent.map(str::to_string),
+        };
+        desk.sessions = Some(vec![
+            session("s-lead", "the arena", None),
+            session("s-child-1", "reviewing the parser", Some("s-lead")),
+            session("s-child-2", "reviewing the lexer", Some("s-lead")),
+            session("s-other", "the seo run", None),
+        ]);
+
+        let listed = desk.listed_agents("local");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|it| it.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s-lead", "s-other"],
+            "only the agents a person started belong in a chat list"
+        );
+        let refs: Vec<&Correspondent> = listed.iter().collect();
+        let printed = folder_grouped(&refs).join("\n");
+        assert!(
+            !printed.contains("reviewing the"),
+            "a subagent is not printed: {printed}"
+        );
+        // And the numbers count along that same list, so `/select 1-2` is the
+        // second agent printed rather than the second session on the machine.
+        assert!(printed.contains("  2  the seo run"), "{printed}");
+        assert_eq!(
+            desk.resolve_numbered_from("1-2").map(|it| it.session_id),
+            Some("s-other".into())
+        );
+        // `/who` is the same roster read a different way, so it counts the
+        // same agents - and says how many are working under them, because
+        // dropping them in silence would read as nobody being on it.
+        let binding = ChannelBinding {
+            id: "wechat-1".into(),
+            kind: ChannelKind::WeChat,
+            ..Default::default()
+        };
+        let mut inbox = Inbox::default();
+        let roster = handle(
+            &mut desk,
+            &binding,
+            &Incoming {
+                text: "/who".into(),
+                ..Default::default()
+            },
+            &mut inbox,
+        );
+        assert!(roster.contains("- the arena · local"), "{roster}");
+        assert!(roster.contains("- the seo run · local"), "{roster}");
+        assert!(!roster.contains("reviewing the"), "{roster}");
+        assert!(roster.contains("(2 working under them)"), "{roster}");
+
+        // Nothing is hidden by leaving them out: a chat already aimed at a
+        // subagent still finds it, because that goes by id and not by number.
+        let aimed = Correspondent {
+            machine: String::new(),
+            ..session("s-child-1", "reviewing the parser", Some("s-lead"))
+        };
+        assert_eq!(
+            desk.locate(&aimed).map(|it| it.session_id),
+            Some("s-child-1".into())
+        );
+    }
+
     #[test]
     fn list_groups_active_agents_by_folder_and_carries_their_recap() {
         // Two folders, a working agent and an idle one, and a dead one that
@@ -4308,6 +4418,7 @@ mod tests {
                 working: true,
                 needs_attention: false,
                 recap: Some("splitting the lexer".into()),
+                parent: None,
             },
             Correspondent {
                 machine: "m".into(),
@@ -4318,6 +4429,7 @@ mod tests {
                 working: false,
                 needs_attention: false,
                 recap: None,
+                parent: None,
             },
             Correspondent {
                 machine: "m".into(),
@@ -4328,6 +4440,7 @@ mod tests {
                 working: false,
                 needs_attention: false,
                 recap: None,
+                parent: None,
             },
         ];
         // Route's job is only to say "a /list" — the active filter and the
@@ -4370,6 +4483,7 @@ mod tests {
             working,
             needs_attention,
             recap: Some("✻ Burrowing… (3h 59m 0s · ↓ 794.8k tokens)".into()),
+            parent: None,
         };
         let agents = [
             agent("busy", true, false),
