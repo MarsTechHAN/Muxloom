@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 11;
+const SKILL_REVISION: u32 = 12;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -425,6 +425,32 @@ report, and what not to touch — and keep the coordinating, the aggregating,
 and the commit for yourself. Doing it all in your own context is the right
 choice only when the tasks genuinely depend on each other, or when there is
 one of them.
+
+### Say what each one may do
+
+A launch also sets what the new session may do in its own turn, and you cannot
+hand out more than you hold:
+
+```
+launch_session {
+  kind: \"claude\", label: \"review: relay latency\",
+  may_message: \"task\",          # parent | task | fleet — default task
+  may_launch: [\"claude\"],       # default: your own kind
+  may_reach_person: false,      # default false
+}
+```
+
+The defaults are the right answer most of the time, and they are deliberately
+narrow: a helper talks to your team, starts more of what you are, and leaves
+the person to you. Widen one when the work actually calls for it — `fleet` for
+a session whose findings are genuinely somebody else's business, an empty
+`may_launch` for a single job you want done rather than delegated onward. The
+grant follows the session through an archive and a resume, so it cannot be
+shed by dying and coming back.
+
+If a tool refuses you with \"the agent that started it set that\", that is this,
+and the flag is not yours to change — say what you need to whoever started you
+and let them carry it, or ask them to start the next session wider.
 
 ## Ask the human first
 
