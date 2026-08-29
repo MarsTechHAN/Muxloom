@@ -174,8 +174,14 @@ folder row has gone off the top, the agent left at the top of the pane keeps
 its folder on the pane's own edge, in that same colour. Working means the CLI's interrupt marker or a
 live status line — a turning spinner over a counter, which is all a phase that
 offers no interrupt leaves behind, compaction included — is on screen *and* the
-PTY produced output in the last seconds; a leftover spinner over a quiet
-session goes back to idle. Codex
+daemon has heard the session speak. How long such a screen outlives the last
+byte off the PTY depends on which marker it is: seconds for a spinner, which
+stops turning the moment the CLI stops painting, but minutes for an interrupt
+hint held on a status bar, because a turn that shells out to a build holds one
+the whole time it says nothing at all. A session a new daemon adopted has its
+screen replayed out of the capture, which may be drawing a turn that ended an
+hour ago, so it counts as working only once this daemon has heard it — a
+rebuild no longer lights up every untouched agent on the machine at once. Codex
 activity additionally follows its OSC title spinner, so status survives the
 CLI erasing and repainting the visible `Working` line. When a session needs
 input — approval prompts, numbered menus, or your own `attention_patterns`,

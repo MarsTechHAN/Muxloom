@@ -3748,6 +3748,23 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     tail.lines().any(spinner_status_line)
 }
 
+/// Whether the sign that a turn is running is one the CLI keeps redrawing.
+///
+/// A spinner and the counter beside it tick about once a second for as long as
+/// the turn lasts, so the same frame still on screen much later means the
+/// terminal stopped being painted, not that the turn is still going. An
+/// interrupt hint on a status bar is the opposite: drawn once when the turn
+/// starts and left alone until it ends. Its stillness says nothing at all — a
+/// turn that shells out to a build, or waits on a model that streams nothing,
+/// holds that hint for minutes without a byte crossing the PTY — so how long a
+/// quiet session may go on being read as working depends on which of the two
+/// its screen is showing.
+pub(crate) fn working_marker_ticks(screen: &str) -> bool {
+    let tail = attention_tail(screen);
+    tail.lines()
+        .any(|line| spinner_status_line(line) || opencode_turn_counter(line))
+}
+
 /// The frames Claude Code and Pi cycle at the head of their status line.
 /// Claude Code uses ✻ ✽ ✶ ✳ ✢ ·; Pi uses braille dots ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.
 const SPINNER_FRAMES: [char; 16] = [
@@ -6517,6 +6534,40 @@ mod tests {
             "  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)  ~/Works/Terminal:main\n",
         );
         assert!(agent_is_working(AgentKind::OpenCode, running));
+    }
+
+    /// Which marker a screen is claiming a running turn with decides how long
+    /// the claim outlives the last byte off the PTY: a spinner stops turning
+    /// within a second of the CLI going quiet, while an interrupt hint is
+    /// painted once and sits untouched for the whole of a turn that shelled
+    /// out to something slow.
+    #[test]
+    fn a_held_interrupt_hint_is_told_apart_from_a_ticking_counter() {
+        // Live capture: an OpenCode session minutes into a benchmark it shelled
+        // out to. The status bar holds the hint, the ▣ line carries no counter,
+        // and nothing at all is written to the PTY while the run goes on.
+        let held = concat!(
+            "  ┃  === ORIGINAL seed-0 (3x, current conditions) ===\n",
+            "  ┃\n",
+            "     ▣  Build · DeepSeek-V4-Flash\n",
+            "  ┃\n",
+            "  ┃  Build · DeepSeek-V4-Flash SGLang via SOIL\n",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                    211.7K (81%)  ctrl+p commands\n",
+        );
+        assert!(agent_is_working(AgentKind::OpenCode, held));
+        assert!(!working_marker_ticks(held));
+
+        // The counters both CLIs redraw about once a second.
+        assert!(working_marker_ticks(
+            "✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)\n"
+        ));
+        assert!(working_marker_ticks(
+            "▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n"
+        ));
+
+        // Nothing on a screen at rest ticks.
+        assert!(!working_marker_ticks("❯ \nCtrl+N new session\n"));
     }
 
     #[test]

@@ -6286,14 +6286,21 @@ mod tests {
                     .unwrap_or_default()
                     .subsec_nanos()
             ));
+            // It repaints the whole screen each time, as the real one does:
+            // an agent's marker leaves the screen when its turn ends, and a
+            // stand-in that let the old frame scroll up would still be showing
+            // the interrupt hint in the transcript above its idle prompt box.
             std::fs::write(
                 &script,
                 "rule='────────────────────────────────────────'\n\
                  hint='  esc to interrupt'\n\
-                 draw() { printf '%s\\n❯ \\n%s\\n%s\\n' \"$rule\" \"$rule\" \"$hint\"; }\n\
+                 said=''\n\
+                 draw() { printf '\\033[2J\\033[H%s\\n%s\\n❯ \\n%s\\n%s\\n' \\\n\
+                 \x20 \"$said\" \"$rule\" \"$rule\" \"$hint\"; }\n\
                  draw\n\
                  while IFS= read -r line; do\n\
-                 \x20 printf '%s\\n' \"$line\"\n\
+                 \x20 said=\"$said\n\
+                 $line\"\n\
                  \x20 case $line in\n\
                  \x20   *settled*) hint='  ⏵⏵ accepts edits on' ;;\n\
                  \x20 esac\n\

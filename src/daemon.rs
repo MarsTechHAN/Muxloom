@@ -40,7 +40,7 @@ mod platform {
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
             DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer, composer_text,
-            is_temporary_session_id,
+            is_temporary_session_id, working_marker_ticks,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
@@ -51,9 +51,18 @@ mod platform {
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
-    /// How recently the PTY must have produced output for a session to count
-    /// as working. Working CLIs repaint their spinners far more often.
-    const WORKING_OUTPUT_FRESHNESS_MS: u64 = 15_000;
+    /// How recently the PTY must have produced output for a session whose
+    /// screen shows a *ticking* working marker (a spinner, an elapsed counter)
+    /// to count as working. A CLI redraws those about once a second for the
+    /// whole of a turn, so one that has gone this quiet is not drawing them.
+    const WORKING_TICKING_QUIET_MS: u64 = 15_000;
+    /// The same, for a marker the CLI paints once and holds: an interrupt hint
+    /// on a status bar. A turn that shells out to a build, or waits on a model
+    /// that streams nothing back, sits silent for minutes with that hint on
+    /// screen the whole time, and calling that quiet "stopped" is what makes a
+    /// working agent report itself finished. What the bound still catches is
+    /// the frame frozen by a process that died or wedged mid-turn.
+    const WORKING_HELD_QUIET_MS: u64 = 10 * 60_000;
     /// The least of a session's log to render when seeding a client's
     /// scrollback. Enough on its own for an agent that writes its transcript
     /// out plainly, and cheap enough to read whether or not it is.
@@ -318,9 +327,13 @@ mod platform {
         /// and the history append. The daemon is only this session's current
         /// client; it can disconnect — or die — without ending the session.
         keeper: Mutex<UnixStream>,
-        /// When the PTY last produced output (epoch ms). Both CLIs repaint
-        /// their spinner continuously while working, so a screen that still
-        /// says "working" over a quiet PTY is a leftover, not a state.
+        /// When the PTY last produced output (epoch ms), as *this daemon*
+        /// heard it. A screen says what a session is doing only while
+        /// something vouches that it is the screen the session has now, and
+        /// that something is having heard it. A launch has, from the child's
+        /// first byte; an adoption has not, and starts at `0`, because the
+        /// screen it was handed was replayed out of the capture and may be
+        /// drawing a turn that ended an hour ago.
         last_output: AtomicU64,
         /// When something was last typed into the session (epoch ms), by
         /// anyone - a person at a dashboard, another agent, a trigger. Unlike
@@ -3728,8 +3741,10 @@ mod platform {
                     .try_clone()
                     .context("failed to clone keeper stream")?,
             ),
+            // This daemon has owned the PTY since before the child's first
+            // byte, so whatever the screen comes to show is this session's
+            // own. Nothing has been asked of it yet.
             last_output: AtomicU64::new(now_ms()),
-            // Nothing has been asked of it yet.
             last_input: AtomicU64::new(0),
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
@@ -4462,8 +4477,16 @@ mod platform {
                     .try_clone()
                     .context("failed to clone keeper stream")?,
             ),
-            last_output: AtomicU64::new(now_ms()),
-            // Nothing has been asked of it yet.
+            // Nothing heard from it yet, and nothing asked of it yet. A screen
+            // is evidence of what a session is doing only while something
+            // vouches that it is the screen the session has *now*, and that
+            // something is having heard it. Which matters most on adoption:
+            // there the screen is replayed out of the capture and may be
+            // drawing a turn that ended an hour ago, so counting the takeover
+            // as the session having just spoken is how every untouched agent
+            // on a machine lit up as working at once whenever a new build took
+            // over.
+            last_output: AtomicU64::new(0),
             last_input: AtomicU64::new(0),
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
@@ -5012,11 +5035,22 @@ mod platform {
                         .clone();
                     snapshot.attention_reason = attention_reason(kind, &visible_screen, &patterns);
                     snapshot.needs_attention = snapshot.attention_reason.is_some();
-                    // Both CLIs repaint their spinner continuously while
-                    // working; a screen still claiming so over a PTY that has
-                    // gone quiet is a leftover of an ended or wedged turn.
-                    let fresh = now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
-                        < WORKING_OUTPUT_FRESHNESS_MS;
+                    // A screen claiming a turn is running is believed for as
+                    // long as the marker it is claiming it with can be
+                    // believed while nothing comes off the PTY: seconds for a
+                    // spinner, which stops turning the moment the CLI stops
+                    // painting, but minutes for an interrupt hint held on a
+                    // status bar, which is exactly what a turn that shells out
+                    // to a build leaves behind while it says nothing at all.
+                    // Either way it takes having heard the session at least
+                    // once: a screen replayed into an adopted session is a
+                    // record of what it was doing, not of what it is doing.
+                    let heard = self.last_output.load(Ordering::Relaxed);
+                    let patience = match working_marker_ticks(&visible_screen) {
+                        true => WORKING_TICKING_QUIET_MS,
+                        false => WORKING_HELD_QUIET_MS,
+                    };
+                    let fresh = heard != 0 && now_ms().saturating_sub(heard) < patience;
                     let working_hint = self
                         .codex_activity
                         .lock()
@@ -7951,10 +7985,33 @@ mod platform {
             session.record_output("\x1b[2J\x1b[H• Working (2s • esc to interrupt)".as_bytes());
             assert!(session.snapshot().working);
 
-            // A screen still claiming work over a PTY that has gone quiet is a
-            // leftover of an ended turn, not a state.
+            // An interrupt hint is painted once and held for the whole turn,
+            // so a quiet PTY under one says nothing: a turn that shells out to
+            // a build sounds exactly like this, and calling it stopped is how
+            // a working agent came to report itself finished.
             session.last_output.store(
-                now_ms().saturating_sub(WORKING_OUTPUT_FRESHNESS_MS + 1),
+                now_ms().saturating_sub(WORKING_TICKING_QUIET_MS + 1),
+                Ordering::Relaxed,
+            );
+            assert!(session.snapshot().working);
+
+            // Quiet for long enough, though, and what is on screen is a frame
+            // frozen by a turn that ended or wedged.
+            session.last_output.store(
+                now_ms().saturating_sub(WORKING_HELD_QUIET_MS + 1),
+                Ordering::Relaxed,
+            );
+            assert!(!session.snapshot().working);
+            session.last_output.store(now_ms(), Ordering::Relaxed);
+            assert!(session.snapshot().working);
+
+            // A spinner and its counter are the other kind of marker: drawn
+            // afresh about once a second, so one that has not moved in a
+            // quarter of a minute is one nobody is drawing.
+            session.record_output("\x1b[2J\x1b[H✻ Cogitating… (12s · ↓ 1.2k tokens)".as_bytes());
+            assert!(session.snapshot().working);
+            session.last_output.store(
+                now_ms().saturating_sub(WORKING_TICKING_QUIET_MS + 1),
                 Ordering::Relaxed,
             );
             assert!(!session.snapshot().working);
@@ -9288,6 +9345,86 @@ mod platform {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(adopted.snapshot().dead, "a stopped adopted session dies");
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        /// The screen an adopted session is handed is a replay of what its
+        /// keeper captured while no daemon was watching, so the turn it is
+        /// drawing may have ended hours before the handover. Taking the
+        /// takeover for a session that has just spoken is how a machine's
+        /// untouched agents all lit up as working together, every time a new
+        /// build took over.
+        #[test]
+        fn an_adopted_session_only_counts_as_working_once_this_daemon_has_heard_it() {
+            let state = test_state("handover-working");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-codex-1700000000-9-4";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "codex".into(),
+                "/tmp".into(),
+                "mid-turn at the handover".into(),
+                false,
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\033[2J\\033[H• Working (2s • esc to interrupt)'; cat".into(),
+                ],
+                vec![],
+                5,
+                80,
+                24,
+                None,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !launched.snapshot().working && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                launched.snapshot().working,
+                "the child painted a turn that is running"
+            );
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            let replayed = adopted
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .screen()
+                .contents();
+            assert!(
+                agent_is_working(AgentKind::Codex, &replayed),
+                "the replayed screen still carries the marker"
+            );
+            assert!(
+                !adopted.snapshot().working,
+                "but nothing has been heard from the session since the handover"
+            );
+
+            // Once it speaks for itself the same screen means what it says.
+            adopted.write_input(b"\r").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().working && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                adopted.snapshot().working,
+                "hearing the session makes its screen current again"
+            );
+
+            adopted.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().dead && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
             fs::remove_dir_all(paths.root).unwrap();
         }
 

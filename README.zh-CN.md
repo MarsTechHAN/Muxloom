@@ -247,8 +247,13 @@ Claude 使用橙色 sparkle（`✻✽✶✳`），OpenCode 使用紫色菱形（
 输入的子会话时变黄，有工作中的变绿；Machines 行为该机器实际装有的每个 Runtime 显示一
 个静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）**或**实时状态行
 （行首 spinner + 计时器，如 `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`，这
-是不提供中断的阶段唯一留下的痕迹）可见 **且** PTY 最近数秒内有输出，残留在屏幕上的旧
-spinner 会自动回到 Idle；压缩对话、subagent 并行阶段、无 token 计数的早期阶段都能正确
+是不提供中断的阶段唯一留下的痕迹）可见 **且** daemon 自己听见过这个会话说话。屏幕能在
+PTY 沉默后被信任多久，取决于它用的是哪种标记：spinner 和计时器每秒重画，停住就说明没人
+在画了（数秒即失效）；而状态栏上那行一次画好就不动的中断提示，正是一个 shell 出去跑构
+建、整段时间一个字节都不吐的回合会留下的东西，因此可以信任数分钟。被新 daemon 接管
+（adopt）的会话，其屏幕是从录像里重放出来的，可能还在画一小时前就结束的回合，所以必须
+等这个 daemon 亲耳听见它出声才算 Working——重启一次不会再让整台机器上没人碰过的 agent
+一起亮起来。压缩对话、subagent 并行阶段、无 token 计数的早期阶段都能正确
 识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
 示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
 用；Waiting Agent 的整个条目会变成黄色加粗。
