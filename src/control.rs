@@ -1625,6 +1625,34 @@ fn check_may_message(
     }
 }
 
+/// The session a call would put words into, when it is one of the calls that
+/// does.
+///
+/// `message_agent` is not the only door into another agent's prompt box.
+/// `send_input` types straight into it, without even the envelope that says who
+/// is speaking, and a trigger types into it later on a pattern. All three are
+/// this session speaking to that one, so one dial has to answer for all three —
+/// a reach enforced on the politest of them and nowhere else is a fence with a
+/// gate beside it.
+///
+/// A call that names no session is left alone: the tool itself refuses it a
+/// moment later, and with a better sentence than this could manage.
+fn written_to<'a>(name: &str, arguments: &'a Value) -> Option<&'a str> {
+    let writes = match name {
+        "message_agent" | "send_input" => true,
+        // Only the kind that types. A `notify` trigger raises a flag on the
+        // session for a person to see, and says nothing to the agent in it.
+        "trigger" => {
+            optional_str(arguments, "action") == Some("set")
+                && optional_str(arguments, "action_kind") == Some("send_input")
+        }
+        _ => false,
+    };
+    writes
+        .then(|| optional_str(arguments, "session_id"))
+        .flatten()
+}
+
 /// Refuse a message to the person from a session that was not handed the
 /// person to talk to. One agent answers them, and it is not this one.
 fn check_may_reach_person(own: &Powers) -> Result<()> {
@@ -3869,7 +3897,7 @@ mod daemon_surface {
         optional_usize, own_powers, plain_screen, pretty, preview_text, required_str, screen_page,
         send_channel, session_env, session_json, session_kind, session_name_now, shell_report,
         stamp_powers, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
-        trigger_json, trigger_spec, wait_loop,
+        trigger_json, trigger_spec, wait_loop, written_to,
     };
     use crate::{
         channel::ChannelSet,
@@ -3983,6 +4011,19 @@ mod daemon_surface {
                 DaemonResponse::Sessions { sessions } => Ok(sessions),
                 response => bail!("unexpected session-list response: {response:?}"),
             }
+        }
+
+        /// Weigh a write aimed at one of this machine's sessions against how
+        /// far this session may speak.
+        ///
+        /// Reading the list is a round trip to the daemon, so the full reach —
+        /// which asks nothing of a lineage — never pays for it.
+        fn check_reach(&self, session_id: &str) -> Result<()> {
+            let own = own_powers();
+            if own.reach == Reach::Fleet {
+                return Ok(());
+            }
+            check_may_message(&own, session_id, &lineage(&self.sessions()?))
         }
 
         fn expect_ack(&self, request: &DaemonRequest) -> Result<()> {
@@ -4280,14 +4321,9 @@ mod daemon_surface {
         }
 
         fn message_agent(&self, arguments: &Value) -> Result<String> {
-            let own = own_powers();
-            if own.reach != Reach::Fleet {
-                check_may_message(
-                    &own,
-                    required_str(arguments, "session_id")?,
-                    &lineage(&self.sessions()?),
-                )?;
-            }
+            // Reach is weighed in `call`, where every door into another
+            // session's prompt box is weighed together.
+            //
             // The board here is the one the message will be filed on, so an
             // author with no machine on it would be right anyway; asking keeps
             // the record the same shape as one that crossed a machine.
@@ -4685,24 +4721,28 @@ mod daemon_surface {
                     check_may_reach_person(&own_powers())?;
                 }
                 // How far this session may speak is written here too, and a
-                // message crossing a machine is still it speaking. The chain
+                // write crossing a machine is still it speaking. The chain
                 // above the session it is aimed at lives over there, so the
                 // list comes back first and the walk happens on this side,
-                // where what counts as "our task" is known.
-                if name == "message_agent" {
+                // where what counts as "our task" is known. A person on the far
+                // machine approving the call is a separate question from this
+                // one: they are saying yes to a stranger touching their box,
+                // not lifting a limit the agent's own parent set.
+                if let Some(target) = written_to(name, arguments) {
                     let own = own_powers();
                     if own.reach != Reach::Fleet {
                         let machine = elsewhere.clone().unwrap_or_default();
                         let over_there =
                             self.relay("list_sessions", &json!({ "machine": machine }))?;
-                        check_may_message(
-                            &own,
-                            required_str(arguments, "session_id")?,
-                            &lineage_of_answer(&over_there),
-                        )?;
+                        check_may_message(&own, target, &lineage_of_answer(&over_there))?;
                     }
                 }
                 return self.relay(name, arguments);
+            }
+            // The same weighing for this machine's own sessions, against the
+            // records the daemon beside us holds.
+            if let Some(target) = written_to(name, arguments) {
+                self.check_reach(target)?;
             }
             match name {
                 "list_machines" => self.list_machines(),
@@ -6122,6 +6162,48 @@ mod tests {
             check_may_message(&own_powers(), mine, &here).unwrap();
         }
         assert!(check_may_message(&own_powers(), "muxloomd-claude-lead", &here).is_err());
+    }
+
+    /// Every door into another agent's prompt box is the same door as far as
+    /// the reach dial is concerned, or the narrow settings mean nothing.
+    #[test]
+    fn typing_into_a_session_counts_as_speaking_to_it() {
+        let aimed = json!({ "session_id": "muxloomd-claude-hand", "text": "ping" });
+        assert_eq!(
+            written_to("message_agent", &aimed),
+            Some("muxloomd-claude-hand")
+        );
+        assert_eq!(
+            written_to("send_input", &aimed),
+            Some("muxloomd-claude-hand")
+        );
+
+        // A trigger types on a pattern, which is a send_input with a delay on
+        // it; a notify one raises a flag for a person and says nothing.
+        let types = json!({
+            "action": "set",
+            "action_kind": "send_input",
+            "session_id": "muxloomd-claude-hand",
+            "pattern": "done",
+            "text": "carry on",
+        });
+        assert_eq!(written_to("trigger", &types), Some("muxloomd-claude-hand"));
+        let mut notifies = types.clone();
+        notifies["action_kind"] = json!("notify");
+        assert_eq!(written_to("trigger", &notifies), None);
+        // The default action_kind is notify, and listing or deleting one is
+        // not typing at all.
+        let mut bare = types.clone();
+        bare.as_object_mut().unwrap().remove("action_kind");
+        assert_eq!(written_to("trigger", &bare), None);
+        let mut listing = types.clone();
+        listing["action"] = json!("list");
+        assert_eq!(written_to("trigger", &listing), None);
+
+        // Reading a session is not writing to it, and a call that names no
+        // session is the tool's own to refuse.
+        assert_eq!(written_to("read_screen", &aimed), None);
+        assert_eq!(written_to("send_input", &json!({ "text": "ping" })), None);
     }
 
     /// The person hears about a piece of work from the agent they asked, not

@@ -757,7 +757,11 @@ anything under its own task — including a subagent it started on another
 machine, which a cross-machine message resolves by fetching that machine's
 list first — and a `parent` session reaches the one agent that started it plus
 its own subtree, since an agent that may start a helper and may not speak to it
-is holding something it cannot use.
+is holding something it cannot use. `send_input` and a `send_input` trigger are
+weighed by the same walk, because they are the same act with less ceremony:
+raw keystrokes into another agent's prompt box, with no envelope saying who
+typed them. A reach enforced on the politest door and nowhere else is a fence
+with a gate beside it.
 `talk_post` is held to the same reach, because the board is a set of rooms and
 posting to the wider ones is another way of being heard: `task` scope is always
 open, `path` opens once the session may talk to the others working in that
