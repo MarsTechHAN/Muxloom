@@ -213,10 +213,12 @@ fn a_daemon_that_cannot_answer_the_ask_is_replaced_instead_of_failing_the_call()
     // through a shell that exits at once, so it belongs to init and not to
     // this test: a child of the test process would linger as a zombie after
     // being stopped, and a zombie still answers kill(pid, 0), which is how a
-    // daemon is told apart from a pid file left behind.
+    // daemon is told apart from a pid file left behind. Its descriptors go to
+    // /dev/null or it would hold this call's stdout pipe open for its whole
+    // life, and the pid would be read back from a process already gone.
     let spawned = Command::new("sh")
         .arg("-c")
-        .arg("sleep 30 & echo $!")
+        .arg("sleep 30 </dev/null >/dev/null 2>&1 & echo $!")
         .output()
         .unwrap();
     let standing_in: u32 = String::from_utf8_lossy(&spawned.stdout)
@@ -307,4 +309,61 @@ fn a_second_daemon_cannot_serve_a_directory_that_is_already_served() {
     );
 
     stop(serve);
+}
+
+/// A pid file outlives the daemon that wrote it whenever one dies without
+/// clearing up — a `kill -9`, a power cut — and after a reboot the number in it
+/// is as likely to belong to a stranger as to anything of muxloom's. Signalling
+/// that stranger was how `stop` reported a daemon stopped and changed nothing,
+/// and believing it was how a machine could refuse to start one forever. The
+/// lock file records which daemon last held the lock, so a pid file naming that
+/// same daemon, with the lock free, names somebody who has gone.
+#[test]
+fn a_pid_file_left_behind_by_a_daemon_that_died_is_not_mistaken_for_one() {
+    let state = TestState::new();
+
+    // Whoever the kernel handed the number to next: alive, and none of
+    // muxloom's business. Started at arm's length so it belongs to init and
+    // not to this test — see the note on the handover test above.
+    let spawned = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30 </dev/null >/dev/null 2>&1 & echo $!")
+        .output()
+        .unwrap();
+    let stranger: u32 = String::from_utf8_lossy(&spawned.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = || unsafe { libc::kill(stranger as i32, 0) == 0 };
+
+    // What a daemon that served under that number and died leaves behind: the
+    // lock free but remembering it, its pid file, and its socket.
+    fs::write(state.root.join("muxloomd.pid"), format!("{stranger}\n")).unwrap();
+    fs::write(state.root.join("muxloomd.lock"), format!("{stranger}\n")).unwrap();
+    fs::write(state.root.join("muxloomd.sock"), b"what is left of one").unwrap();
+
+    let stopped = state.command().arg("stop").output().unwrap();
+    assert!(
+        stopped.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("not running"),
+        "stop claimed to have stopped something: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+    assert!(alive(), "stop signalled a process that was not a daemon");
+
+    // And the wreckage must not be a machine that can never start one again.
+    let new_pid = status_pid(&status(&state));
+    assert_ne!(new_pid, stranger);
+    assert!(
+        alive(),
+        "starting a daemon signalled a process that was not one"
+    );
+
+    unsafe {
+        libc::kill(stranger as i32, libc::SIGKILL);
+    }
 }

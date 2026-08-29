@@ -1684,7 +1684,7 @@ mod platform {
         // Settled before anything is looked at, and held until this process
         // ends: everything below reads and rewrites the state directory on the
         // strength of what it found a moment ago.
-        let _serving = match hold_the_serving_lock(paths)? {
+        let mut serving = match hold_the_serving_lock(paths)? {
             Some(lock) => lock,
             None => bail!("muxloomd is already running"),
         };
@@ -1692,7 +1692,9 @@ mod platform {
             if UnixStream::connect(&paths.socket).is_ok() {
                 bail!("muxloomd is already running");
             }
-            if daemon_process_alive(paths) {
+            // The lock is this process's, so nothing that knows about one is
+            // serving; only a daemon from before there was one can be.
+            if the_pid_file_still_names_a_daemon(paths) {
                 bail!("muxloomd is running but its socket is not accessible");
             }
             fs::remove_file(&paths.socket).with_context(|| {
@@ -1703,6 +1705,10 @@ mod platform {
             .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
         fs::write(&paths.pid, format!("{}\n", std::process::id()))?;
+        // Only now, with everything the last daemon left behind read and swept
+        // up: until this the lock file is still its record, and its record is
+        // what says it has gone.
+        record_the_serving_daemon(&mut serving);
         fs::write(&paths.generation, format!("{}\n", current_generation()))?;
         // Whatever generation was being asked to make way, it has. The ask is
         // keyed by generation and would be ignored anyway, but leaving it lying
@@ -1805,9 +1811,9 @@ mod platform {
     /// up by the kernel however the process ends — including the ends that run
     /// no destructor.
     struct ServeLock {
-        /// Nothing reads it; the lock lasts exactly as long as the descriptor
-        /// stays open, so holding it is the whole job.
-        #[allow(dead_code)]
+        /// Held open for the life of the daemon, because that is exactly how
+        /// long the lock lasts, and written into once the daemon knows it is
+        /// the one serving.
         held: File,
     }
 
@@ -1829,6 +1835,11 @@ mod platform {
     /// never removed, so the lock is on one inode for the life of the directory
     /// and cannot be lost by somebody unlinking the thing it is held on.
     ///
+    /// Taking the lock does not record who took it: what the file still says
+    /// is how the checks below tell a pid file left behind by a daemon that
+    /// died from one that still names a daemon, so it is left alone until
+    /// those have been made. See [`record_the_serving_daemon`].
+    ///
     /// `Ok(None)` means another daemon is already serving here. A filesystem
     /// that cannot lock at all is not a reason to refuse to serve: say so and
     /// go on, which is no worse than every build before this one.
@@ -1840,18 +1851,96 @@ mod platform {
             .truncate(false)
             .open(&paths.lock)
             .with_context(|| format!("failed to open {}", paths.lock.display()))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // Everything that only wants to *know* whether a daemon is serving
+        // takes this same lock for a moment to find out, so an occupied answer
+        // is worth asking for twice: one held for microseconds is a question
+        // being asked, and one held by a daemon is held for its whole life.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let taken = loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                break Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        if let Err(error) = taken {
+            eprintln!(
+                "muxloomd cannot lock {}, so it is serving without one: {error}",
+                paths.lock.display()
+            );
             return Ok(Some(ServeLock { held: file }));
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(None);
-        }
-        eprintln!(
-            "muxloomd cannot lock {}, so it is serving without one: {error}",
-            paths.lock.display()
-        );
         Ok(Some(ServeLock { held: file }))
+    }
+
+    /// Write this daemon into the locked file, beside the pid file and saying
+    /// the same thing, so that whoever finds the two of them after this daemon
+    /// is gone can tell that it is gone. See
+    /// [`the_pid_file_still_names_a_daemon`].
+    fn record_the_serving_daemon(lock: &mut ServeLock) {
+        let _ = lock.held.set_len(0);
+        let _ = lock.held.rewind();
+        let _ = lock
+            .held
+            .write_all(format!("{}\n", std::process::id()).as_bytes());
+        let _ = lock.held.flush();
+    }
+
+    /// Whether a daemon is serving this directory, asked of the kernel rather
+    /// than of a number in a file.
+    ///
+    /// The lock is released the moment the process ends, however it ends, so
+    /// this is true exactly while a daemon is there. `kill(pid, 0)` is not:
+    /// it is true of a daemon that has exited and not yet been reaped, and
+    /// after a reboot it is true of whichever stranger the kernel handed the
+    /// number to next. Both made "muxloomd is running but its socket is not
+    /// accessible" a wedge nothing could clear on its own.
+    fn a_daemon_is_serving(paths: &DaemonPaths) -> bool {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&paths.lock) else {
+            // Nothing that knows about the lock has ever served here, so the
+            // number is all there is to go on.
+            return daemon_process_alive(paths);
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return true;
+        }
+        // It came free, so nothing is serving under a lock; a daemon from
+        // before there was one still might be.
+        the_pid_file_still_names_a_daemon(paths)
+    }
+
+    /// Whether the number in the pid file still names the daemon that wrote it.
+    ///
+    /// Asked only where the lock is known to be free, and it is the record in
+    /// the lock file that answers it. A daemon that dies without clearing up —
+    /// a `kill -9`, a power cut — leaves its pid file behind, and after a
+    /// reboot that number belongs to whoever the kernel handed it to next.
+    /// Signalling that stranger was how `stop` reported success and changed
+    /// nothing, and treating it as a daemon was how a machine could refuse to
+    /// start one forever. The lock file remembers which daemon last held the
+    /// lock: a pid file naming that same daemon, with the lock now free, names
+    /// somebody who has gone.
+    fn the_pid_file_still_names_a_daemon(paths: &DaemonPaths) -> bool {
+        if !daemon_process_alive(paths) {
+            return false;
+        }
+        let number = |path: &Path| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        };
+        match number(&paths.lock) {
+            Some(last_to_serve) => number(&paths.pid) != Some(last_to_serve),
+            // No record: a daemon from before the lock existed, and the number
+            // is all there is to go on.
+            None => true,
+        }
     }
 
     struct SocketGuard {
@@ -6403,7 +6492,7 @@ mod platform {
                 }
             }
         }
-        if daemon_process_alive(paths) {
+        if a_daemon_is_serving(paths) {
             bail!("muxloomd is running but its socket is not accessible");
         }
         paths.prepare()?;
@@ -6711,7 +6800,7 @@ mod platform {
     /// the newer daemon serving until something stops it, and this is that
     /// something.
     pub fn stop(paths: &DaemonPaths) -> Result<()> {
-        if !daemon_process_alive(paths) {
+        if !a_daemon_is_serving(paths) {
             println!("muxloomd is not running");
             return Ok(());
         }
@@ -6721,6 +6810,15 @@ mod platform {
     }
 
     fn stop_running_daemon(paths: &DaemonPaths) -> Result<()> {
+        // Nothing is serving, so the pid file is what a daemon that died
+        // without clearing up left behind and the number in it is nobody's
+        // business of muxloom's to signal. Sweep up instead: this used to
+        // report a daemon stopped after sending a stranger a SIGTERM.
+        if !a_daemon_is_serving(paths) {
+            let _ = fs::remove_file(&paths.socket);
+            let _ = fs::remove_file(&paths.pid);
+            return Ok(());
+        }
         let pid = fs::read_to_string(&paths.pid)
             .context("muxloomd has no pid file")?
             .trim()
@@ -6730,25 +6828,29 @@ mod platform {
         if result != 0 {
             return Err(io::Error::last_os_error()).context("failed to stop muxloomd");
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while daemon_process_alive(paths) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-        }
-        if daemon_process_alive(paths) {
-            bail!("muxloomd did not stop");
-        }
-        let _ = fs::remove_file(&paths.socket);
-        let _ = fs::remove_file(&paths.pid);
-        Ok(())
+        wait_for_daemon_stop_saying(paths, "muxloomd did not stop")
     }
 
     fn wait_for_daemon_stop(paths: &DaemonPaths) -> Result<()> {
+        wait_for_daemon_stop_saying(
+            paths,
+            "muxloomd did not stop after accepting generation handover",
+        )
+    }
+
+    /// Wait for the daemon to be gone, then clear away what it left.
+    ///
+    /// Gone by the lock, not by the pid: a daemon that has exited and not yet
+    /// been reaped by the client that started it still answers `kill(pid, 0)`,
+    /// so waiting on the number alone timed out on a daemon that had already
+    /// stopped and turned an ordinary handover into a failed call.
+    fn wait_for_daemon_stop_saying(paths: &DaemonPaths, complaint: &str) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while daemon_process_alive(paths) && Instant::now() < deadline {
+        while a_daemon_is_serving(paths) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
-        if daemon_process_alive(paths) {
-            bail!("muxloomd did not stop after accepting generation handover");
+        if a_daemon_is_serving(paths) {
+            bail!("{complaint}");
         }
         let _ = fs::remove_file(&paths.socket);
         let _ = fs::remove_file(&paths.pid);
