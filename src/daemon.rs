@@ -1351,11 +1351,24 @@ mod platform {
         };
         let message_id = queued.message_id.clone();
         thread::spawn(move || {
-            if let Err(error) = crate::channel::send(&binding, &message, &[]) {
-                eprintln!(
+            // Bad news that is itself swallowed leaves the person waiting on an
+            // answer to a message nobody has, and this log is the only place
+            // that would ever say so. WeChat drops a send on a stale
+            // conversation token while answering as though it had taken it, so a
+            // bounce is one of the sends most likely to go that way: the person
+            // has not written to the bot recently, which is the whole reason
+            // there is something to bounce.
+            match crate::channel::send(&binding, &message, &[]) {
+                Ok(sent) if !sent.delivered() => eprintln!(
+                    "muxloomd told nobody that {message_id} never arrived: the chat accepted the \
+                     notice without a delivery id, which is what a stale conversation token does \
+                     to one"
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!(
                     "muxloomd could not tell the person who sent {message_id} that it never \
                      arrived: {error:#}"
-                );
+                ),
             }
         });
     }

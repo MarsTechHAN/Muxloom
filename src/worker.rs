@@ -1239,9 +1239,25 @@ impl Worker {
                             signature: "muxloom dashboard".into(),
                         };
                         let id = binding.id.clone();
+                        // This is the one send whose entire purpose is to answer
+                        // "does this reach me?", so it is the one send that must
+                        // not confuse being accepted with arriving. WeChat takes
+                        // a message on a stale conversation token exactly as it
+                        // takes a good one and issues no id of its own, and a
+                        // test reported as delivered on that evidence sends the
+                        // person off to look for a fault everywhere except where
+                        // it is. The dashboard prints a failure whole, so the
+                        // repair goes in it: nothing here renews a token, only
+                        // the person saying something does.
                         let result = crate::channel::send(&binding, &message, &environment)
-                            .map(|sent| sent.through)
-                            .map_err(|error| format!("{error:#}"));
+                            .map_err(|error| format!("{error:#}"))
+                            .and_then(|sent| match sent.delivered() {
+                                true => Ok(sent.through),
+                                false => Err("WeChat took it and sent nothing — a stale \
+                                              conversation token. Say anything to the bot, then \
+                                              test again."
+                                    .into()),
+                            });
                         if let Err(error) = &result {
                             debug::log("channel", format!("test through {id} failed: {error}"));
                         }
