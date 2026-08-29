@@ -37,7 +37,8 @@ jobs:
           rustup component add rustfmt
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        shell: bash
+        run: bash .github/gate.sh rustfmt cargo fmt --all -- --check
 
   regression:
     name: ${{ matrix.label }}
@@ -79,11 +80,14 @@ jobs:
         run: command -v tmux >/dev/null || brew install tmux
 
       - name: Build all targets
-        run: cargo build --locked --all-targets
+        shell: bash
+        run: bash .github/gate.sh "${{ matrix.label }} build" cargo build --locked --all-targets
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        shell: bash
+        run: bash .github/gate.sh "${{ matrix.label }} clippy" cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run regression suite
         timeout-minutes: 12
-        run: cargo test --locked --all-targets -- --test-threads=1 --nocapture
+        shell: bash
+        run: bash .github/gate.sh "${{ matrix.label }} tests" cargo test --locked --all-targets -- --test-threads=1 --nocapture
