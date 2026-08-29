@@ -23,7 +23,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::http;
@@ -305,7 +305,7 @@ pub fn send_text(
                 .unwrap_or_default()
         ),
     );
-    complain(&answer)?;
+    refused_send(&answer)?;
     Ok((id, verdict))
 }
 
@@ -577,6 +577,42 @@ fn complain(answer: &Value) -> Result<()> {
     }
 }
 
+/// The same refusal, read as a send.
+///
+/// [`complain`] answers for every call this protocol makes, so it can only
+/// repeat what the platform said. Two things are known here that are not known
+/// there, and both are what somebody staring at `ret -2` actually wants.
+///
+/// The first is that WeChat is up. A refusal is read off a 2xx body, so having
+/// one in hand means the request arrived and was answered; an outage never gets
+/// this far — it ends in the transport, with a sentence about the host. So
+/// whatever is wrong is wrong about this bot rather than about WeChat, and a
+/// caller reading the platform's own terse complaint as "the service is down"
+/// is reading it backwards.
+///
+/// The second is that a send is the one call standing on a context token, and a
+/// token gone stale looks from here exactly like the platform being unhappy for
+/// some other reason: the same 200, the same shape of body. The repair is the
+/// same either way, and it is the only repair this side has, so the refusal
+/// carries it — rather than leaving the caller to send again, and again, into a
+/// refusal that no amount of sending clears.
+fn refused_send(answer: &Value) -> Result<()> {
+    match code_of(answer) {
+        // One is not a refusal at all, and the other already says the only
+        // thing worth saying about itself.
+        0 | ASLEEP => complain(answer),
+        _ => complain(answer).map_err(|refusal| {
+            anyhow!(
+                "{refusal}. WeChat answered, so this is not an outage — it is this bot the \
+                 platform is unhappy with. Suspect the conversation token first: every message \
+                 out carries the token off the last message in, only an inbound message renews \
+                 one, and a stale one is the same dead end as a bot nobody has greeted. The \
+                 person saying anything at all to it clears that; sending again does not."
+            )
+        }),
+    }
+}
+
 /// The complaint code, under either of the two names the protocol uses for it.
 fn code_of(answer: &Value) -> i64 {
     answer
@@ -660,6 +696,26 @@ mod tests {
             format!("{asleep:#}").contains("say anything to the bot"),
             "{asleep:#}"
         );
+    }
+
+    /// A refused send is the one refusal a caller can act on, so it has to say
+    /// which way to act: not at WeChat, and not by trying again.
+    #[test]
+    fn a_refused_send_rules_out_an_outage_and_names_the_repair() {
+        let refused = refused_send(&json!({ "ret": -2, "errmsg": "prepare failed" })).unwrap_err();
+        let refused = format!("{refused:#}");
+        // The platform's own words survive; what is added is what this side
+        // knows and the body never says.
+        assert!(refused.contains("prepare failed (ret -2)"), "{refused}");
+        assert!(refused.contains("not an outage"), "{refused}");
+        assert!(refused.contains("conversation token"), "{refused}");
+        // A send that went through is not a refusal, and a sleeping
+        // conversation already reads correctly on its own.
+        assert!(refused_send(&json!({ "ret": 0 })).is_ok());
+        let asleep = refused_send(&json!({ "errcode": ASLEEP })).unwrap_err();
+        let asleep = format!("{asleep:#}");
+        assert!(asleep.contains("say anything to the bot"), "{asleep}");
+        assert!(!asleep.contains("not an outage"), "{asleep}");
     }
 
     #[test]
