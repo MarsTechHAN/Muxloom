@@ -127,6 +127,10 @@ struct ConnectionState {
     capabilities: Mutex<HashSet<String>>,
     /// The running daemon's version from its Hello, for the update indicator.
     daemon_version: Mutex<Option<String>>,
+    /// The running daemon's full generation stamp from the same Hello, which
+    /// tells two builds of one version apart. Empty from a daemon too old to
+    /// send one; the indicator falls back to the version there.
+    daemon_generation: Mutex<Option<String>>,
 }
 
 /// Outbound side of one bridge connection. Frames are queued here and written
@@ -505,6 +509,7 @@ impl BridgeConnection {
                         protocol_version,
                         capabilities,
                         daemon_version,
+                        daemon_generation,
                         ..
                     },
                 ..
@@ -520,6 +525,11 @@ impl BridgeConnection {
                     .daemon_version
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(daemon_version);
+                *connection
+                    .state
+                    .daemon_generation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(daemon_generation);
                 debug::log(
                     "bridge",
                     format!("connected target={target} via one persistent bridge"),
@@ -554,6 +564,7 @@ impl BridgeConnection {
             alive: AtomicBool::new(true),
             capabilities: Mutex::new(HashSet::new()),
             daemon_version: Mutex::new(None),
+            daemon_generation: Mutex::new(None),
         });
         spawn_writer(frames, Arc::downgrade(&state), writer);
         spawn_reader(Arc::clone(&state), reader);
@@ -2633,6 +2644,18 @@ impl BridgePool {
             .clone()
     }
 
+    /// The generation stamp of that same daemon, which names the build and not
+    /// only the version. `None` for no live bridge; empty for a daemon from
+    /// before the stamp travelled in the handshake.
+    pub fn daemon_generation(&self, target_id: &str) -> Option<String> {
+        self.live_connection(target_id)?
+            .state
+            .daemon_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// The target's established bridge, if it has one. Unlike
     /// [`Self::connection_for_target`] this never connects and never waits on
     /// the per-target connect lock, so callers on the render loop stay
@@ -2768,6 +2791,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     pid: 1,
                     capabilities: vec!["pty-v1".into()],
+                    daemon_generation: "0.3.0:protocol-1:abc:7:1-1".into(),
                 },
             )
             .unwrap()

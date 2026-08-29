@@ -1,5 +1,70 @@
+use std::{fs, path::Path, time::UNIX_EPOCH};
+
+use crate::daemon_protocol::PROTOCOL_VERSION;
+
+/// What this build stamps into the state directory while it is serving, so the
+/// next client can tell whether it is talking to its own build.
+///
+/// The fourth field is what orders two of them. CI stamps in the number of
+/// commits behind the build, which is the only thing that tells two nightlies
+/// carrying the same package version apart; a build made by hand says `local`
+/// and ranks above every numbered build of its version, because somebody made
+/// it deliberately and means it to be in front.
+///
+/// Ordering is not identity, though, and only CI fills those fields in. Every
+/// `cargo build` of one version stamped the same `local:local`, so a daemon
+/// compiled from yesterday's source read as this build's own and went on
+/// serving: the fix was in the binary, the running code was the old one, and
+/// nothing short of stopping the daemon by hand changed that. So the file
+/// itself ends the stamp — the same size and write time [`stash_executable`]
+/// has always used to tell one build's copy from another's.
+///
+/// Outside the Unix-only module because the controller asks it too, to see
+/// whether the daemon on a machine it is watching is behind this build. The
+/// controller and the daemon are two files, so that comparison reads the rank
+/// and never the whole stamp.
+pub fn current_generation() -> String {
+    format!(
+        "{}:protocol-{}:{}:{}:{}",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION,
+        option_env!("MUXLOOM_BUILD_ID").unwrap_or("local"),
+        option_env!("MUXLOOM_BUILD_HEIGHT").unwrap_or("local"),
+        running_executable_identity(),
+    )
+}
+
+/// Which file this process is running, as the stamp spells it.
+///
+/// `unknown` when the executable cannot be read at all — a package manager that
+/// replaced it mid-life is the ordinary reason. Two builds that both say
+/// `unknown` compare equal, which is exactly how the stamp behaved before this
+/// field existed: no worse than it was, and it settles instead of handing over
+/// on every connection.
+fn running_executable_identity() -> String {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(file_identity)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// What tells one file apart from another that has taken its place: how big it
+/// is and when it was written.
+fn file_identity(path: &Path) -> Option<String> {
+    let file = fs::metadata(path).ok()?;
+    let written = file
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some(format!("{}-{written}", file.len()))
+}
+
 #[cfg(unix)]
 mod platform {
+    use super::current_generation;
     use std::{
         collections::{BTreeSet, HashMap},
         fs::{self, File, OpenOptions},
@@ -33,7 +98,7 @@ mod platform {
         keeper,
         model::{
             AgentKind, Composer, DirectoryListing, FileEntry, FileEntryKind, FileListing,
-            FilePreview, FilePreviewKind,
+            FilePreview, FilePreviewKind, generation_rank,
         },
         native_history::SessionFacts as NativeFacts,
         recap::extract_recap,
@@ -2352,6 +2417,7 @@ mod platform {
                         daemon_version: env!("CARGO_PKG_VERSION").into(),
                         protocol_version: PROTOCOL_VERSION,
                         pid: std::process::id(),
+                        daemon_generation: current_generation(),
                         capabilities: vec![
                             "multiplex-v1".into(),
                             "compression-lz4-v1".into(),
@@ -5995,6 +6061,7 @@ mod platform {
             protocol_version,
             pid,
             mut capabilities,
+            daemon_generation,
         }) = frame.decode_json::<DaemonResponse>()
         else {
             return frame;
@@ -6016,6 +6083,7 @@ mod platform {
                 protocol_version,
                 pid,
                 capabilities,
+                daemon_generation,
             },
         );
         match supplemented {
@@ -6342,95 +6410,6 @@ mod platform {
         };
         let result = unsafe { libc::kill(pid, 0) };
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-
-    /// What this build stamps into the state directory while it is serving, so
-    /// the next client can tell whether it is talking to its own build.
-    ///
-    /// The fourth field is what orders two of them. CI stamps in the number of
-    /// commits behind the build, which is the only thing that tells two
-    /// nightlies carrying the same package version apart; a build made by hand
-    /// says `local` and ranks above every numbered build of its version,
-    /// because somebody made it deliberately and means it to be in front.
-    ///
-    /// Ordering is not identity, though, and only CI fills those fields in.
-    /// Every `cargo build` of one version stamped the same `local:local`, so a
-    /// daemon compiled from yesterday's source read as this build's own and
-    /// went on serving: the fix was in the binary, the running code was the old
-    /// one, and nothing short of stopping the daemon by hand changed that. So
-    /// the file itself ends the stamp — the same size and write time
-    /// [`stash_executable`] has always used to tell one build's copy from
-    /// another's.
-    fn current_generation() -> String {
-        format!(
-            "{}:protocol-{}:{}:{}:{}",
-            env!("CARGO_PKG_VERSION"),
-            PROTOCOL_VERSION,
-            option_env!("MUXLOOM_BUILD_ID").unwrap_or("local"),
-            option_env!("MUXLOOM_BUILD_HEIGHT").unwrap_or("local"),
-            running_executable_identity(),
-        )
-    }
-
-    /// Which file this process is running, as the stamp spells it.
-    ///
-    /// `unknown` when the executable cannot be read at all — a package manager
-    /// that replaced it mid-life is the ordinary reason. Two builds that both
-    /// say `unknown` compare equal, which is exactly how the stamp behaved
-    /// before this field existed: no worse than it was, and it settles instead
-    /// of handing over on every connection.
-    fn running_executable_identity() -> String {
-        std::env::current_exe()
-            .ok()
-            .as_deref()
-            .and_then(file_identity)
-            .unwrap_or_else(|| "unknown".into())
-    }
-
-    /// What tells one file apart from another that has taken its place: how big
-    /// it is and when it was written.
-    fn file_identity(path: &Path) -> Option<String> {
-        let file = fs::metadata(path).ok()?;
-        let written = file
-            .modified()
-            .ok()?
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_millis();
-        Some(format!("{}-{written}", file.len()))
-    }
-
-    /// A generation broken down into what two of them can be compared by.
-    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct GenerationRank {
-        version: (u64, u64, u64),
-        /// How many commits are behind the build. `u64::MAX` for one made by
-        /// hand, `0` for a build old enough not to say — which is every build
-        /// from before this field existed, and which must therefore rank below
-        /// the one asking to replace it.
-        height: u64,
-    }
-
-    fn generation_rank(stamp: &str) -> Option<GenerationRank> {
-        let mut fields = stamp.trim().split(':');
-        let mut numbers = fields.next()?.split('.').map(|part| {
-            part.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        });
-        let version = (
-            numbers.next()?,
-            numbers.next().unwrap_or(0),
-            numbers.next().unwrap_or(0),
-        );
-        // Past the version come the protocol version and the commit, then the
-        // height. An absent field is a stamp from before there was one.
-        let height = fields
-            .nth(2)
-            .map_or(0, |height| height.trim().parse().unwrap_or(u64::MAX));
-        Some(GenerationRank { version, height })
     }
 
     /// Whether to ask the daemon already running to make way for this build.
@@ -7728,7 +7707,7 @@ mod platform {
             let running = std::env::current_exe().expect("this test is a file somewhere");
             assert_eq!(
                 Some(fields[4].to_string()),
-                file_identity(&running),
+                crate::daemon::file_identity(&running),
                 "the last field is the running executable"
             );
 
@@ -10976,6 +10955,7 @@ mod platform {
                     protocol_version: PROTOCOL_VERSION,
                     pid: 4321,
                     capabilities: capabilities.iter().map(|it| (*it).to_string()).collect(),
+                    daemon_generation: "0.3.0:protocol-1:abc:7:1-1".into(),
                 },
             )
             .unwrap()

@@ -640,7 +640,9 @@ Bootstrap 由 Rust binary 自己计算 SHA-256 Fingerprint。缺失或过期的 
 搜索与元数据。daemon 升级不再等待空闲：换代时会话由各自的 keeper 原地带过去，新
 daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
 运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
-终端未 attach 时自动重连完成升级。pre-keeper 旧会话会无限期推迟接管；在 Machines 面板
+终端未 attach 时自动重连完成升级。是否落后按 daemon 在握手里回报的完整 generation 标记
+判断——先比版本，再比构建落后的 commit 数——因此包版本号相同的两个 nightly 也能分辨；
+手工构建的 Controller 不会把整个机群判为落后于自己。pre-keeper 旧会话会无限期推迟接管；在 Machines 面板
 选中该机按 `,` 打开设置面板，其中会显示该机 `muxloomd` 的运行版本，并提供 **Force update**
 动作一次性强制更新——先弹窗列出将被打断的 working agent 与将被终结的终端（终端无法恢复），
 确认后归档、完成接管、再从各 agent 自身的转录自动 resume。History

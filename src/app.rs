@@ -1953,9 +1953,24 @@ impl App {
     /// The running daemon version behind a machine's live bridge, when it is
     /// older than this controller build. `None` while no bridge is connected,
     /// so a machine only reads as outdated when that is actually observable.
+    ///
+    /// Generation first, version only as the fallback. A fleet on nightlies is
+    /// a fleet where every machine reports the same package version however far
+    /// apart the builds are, so comparing versions alone left machines stuck on
+    /// month-old binaries reading as current and never offered the reconnect
+    /// that would have brought them forward.
     pub fn daemon_lag_version(&self, target_id: &str) -> Option<String> {
         let version = self.worker.bridges.daemon_version(target_id)?;
-        crate::model::version_is_newer(env!("CARGO_PKG_VERSION"), &version).then_some(version)
+        let generation = self.worker.bridges.daemon_generation(target_id);
+        let behind = match generation.as_deref().filter(|it| !it.trim().is_empty()) {
+            Some(running) => {
+                crate::model::generation_is_behind(running, &crate::daemon::current_generation())
+            }
+            // A daemon too old to send a stamp: all there is to compare is the
+            // version it did send.
+            None => crate::model::version_is_newer(env!("CARGO_PKG_VERSION"), &version),
+        };
+        behind.then_some(version)
     }
 
     /// Ids and running versions of every enabled machine whose daemon lags
@@ -9100,8 +9115,16 @@ impl App {
     fn daemon_version_note(&self, target_id: &str) -> String {
         let build = env!("CARGO_PKG_VERSION");
         match self.worker.bridges.daemon_version(target_id) {
-            Some(running) if crate::model::version_is_newer(build, &running) => {
-                format!("muxloomd {running} running · {build} available")
+            // Through the same test as the footer chip, so the section a user
+            // opens to check never disagrees with the indicator that sent them
+            // there — including the case the version alone cannot show, where
+            // both sides read the same number and the builds are months apart.
+            Some(running) if self.daemon_lag_version(target_id).is_some() => {
+                if crate::model::version_is_newer(build, &running) {
+                    format!("muxloomd {running} running · {build} available")
+                } else {
+                    format!("muxloomd {running} running · a newer build of {build} available")
+                }
             }
             Some(running) => format!("muxloomd {running} running · current"),
             None => "not connected".to_string(),

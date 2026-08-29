@@ -24,6 +24,73 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// A daemon generation broken down into what two of them can be compared by.
+///
+/// The stamp itself is `<version>:protocol-<n>:<commit>:<height>:<file>`, and
+/// only the first and fourth fields order anything. The commit names the build
+/// without ranking it, and the file identifies the very copy that is running —
+/// which differs between a controller and the companion beside it, so nothing
+/// that compares two machines may look at it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GenerationRank {
+    pub version: (u64, u64, u64),
+    /// How many commits are behind the build. `u64::MAX` for one made by hand,
+    /// `0` for a build old enough not to say — which is every build from before
+    /// this field existed, and which must therefore rank below the one asking
+    /// to replace it.
+    pub height: u64,
+}
+
+pub fn generation_rank(stamp: &str) -> Option<GenerationRank> {
+    if stamp.trim().is_empty() {
+        return None;
+    }
+    let mut fields = stamp.trim().split(':');
+    let mut numbers = fields.next()?.split('.').map(|part| {
+        part.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    });
+    let version = (
+        numbers.next()?,
+        numbers.next().unwrap_or(0),
+        numbers.next().unwrap_or(0),
+    );
+    // Past the version come the protocol version and the commit, then the
+    // height. An absent field is a stamp from before there was one.
+    let height = fields
+        .nth(2)
+        .map_or(0, |height| height.trim().parse().unwrap_or(u64::MAX));
+    Some(GenerationRank { version, height })
+}
+
+/// Whether a daemon stamped `running` is behind a build stamped `current`.
+///
+/// Rank only, never the whole stamp: this compares a machine's daemon with the
+/// controller watching it, and those are two different files even when they
+/// were cut from the same commit. Two builds of one version are told apart by
+/// their height, which is the only thing that separates the nightlies a fleet
+/// actually runs — comparing package versions alone left every machine between
+/// two releases reading as current, however far behind it had fallen, and so
+/// never offered the update that would have brought it forward.
+///
+/// A hand-made build is deliberately not counted as ahead. On one machine it
+/// claims the top of the order, so that an installed release never retires the
+/// daemon a developer is working on; across two machines that same claim would
+/// have a working tree deployed over the entire fleet every half hour.
+pub fn generation_is_behind(running: &str, current: &str) -> bool {
+    let (Some(running), Some(current)) = (generation_rank(running), generation_rank(current))
+    else {
+        return false;
+    };
+    if running.version != current.version {
+        return running.version < current.version;
+    }
+    current.height != u64::MAX && running.height < current.height
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
@@ -544,5 +611,65 @@ impl HistoryPage {
     /// is still expected and no limit is known yet.
     pub fn oldest_offset(&self) -> Option<usize> {
         (!self.more_history).then_some(self.history_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of carrying the stamp across the wire. A fleet on
+    /// nightlies reads the same package version everywhere, so before this the
+    /// controller had nothing to notice a month-old machine by.
+    #[test]
+    fn a_daemon_from_an_older_commit_of_one_version_reads_as_behind() {
+        let old = "0.5.5:protocol-1:aaac2e0:265:100-1";
+        let new = "0.5.5:protocol-1:3af6b11:287:200-2";
+        assert!(generation_is_behind(old, new));
+        assert!(!generation_is_behind(new, old));
+        assert!(!generation_is_behind(new, new));
+    }
+
+    /// The file each build is differs between the controller and the daemon it
+    /// watches even when both were cut from one commit, so it must not count.
+    #[test]
+    fn the_same_build_on_two_machines_is_not_behind_itself() {
+        let daemon = "0.5.5:protocol-1:3af6b11:287:9000-5";
+        let controller = "0.5.5:protocol-1:3af6b11:287:4200-9";
+        assert!(!generation_is_behind(daemon, controller));
+        assert!(!generation_is_behind(controller, daemon));
+    }
+
+    /// A version is still a version. A daemon left behind by a release is
+    /// behind whatever the commits say.
+    #[test]
+    fn an_older_version_is_behind_however_far_along_its_commits_are() {
+        let old = "0.5.4:protocol-1:aaac2e0:9999:1-1";
+        let new = "0.5.5:protocol-1:3af6b11:2:1-1";
+        assert!(generation_is_behind(old, new));
+        assert!(!generation_is_behind(new, old));
+    }
+
+    /// A build made by hand ranks above every numbered one of its version, so
+    /// that an installed release never retires the daemon a developer is
+    /// working on. Across two machines that claim would have a working tree
+    /// deployed over the whole fleet every half hour, so it stops at the edge.
+    #[test]
+    fn a_hand_made_controller_does_not_call_the_fleet_outdated() {
+        let fleet = "0.5.5:protocol-1:3af6b11:287:1-1";
+        let working_tree = "0.5.5:protocol-1:local:local:1-1";
+        assert!(!generation_is_behind(fleet, working_tree));
+        // Nor the other way about: nothing numbered outranks a build somebody
+        // made deliberately.
+        assert!(!generation_is_behind(working_tree, fleet));
+    }
+
+    /// A daemon old enough not to send a stamp at all sends an empty string,
+    /// which orders nothing. The caller falls back to the version there.
+    #[test]
+    fn a_stamp_that_says_nothing_orders_nothing() {
+        let new = "0.5.5:protocol-1:3af6b11:287:1-1";
+        assert!(!generation_is_behind("", new));
+        assert!(!generation_is_behind(new, ""));
     }
 }

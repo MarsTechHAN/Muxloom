@@ -901,7 +901,11 @@ idle: running sessions ride their keepers across the generation change, and
 the next daemon adopts them with the same processes and transcripts. The
 footer shows a `⟳` chip while any machine's running daemon lags this build,
 and the controller quietly cycles such a machine's bridge (never while its
-terminal is attached) to complete the update. Pre-keeper sessions defer that
+terminal is attached) to complete the update. Lag is measured on the full
+generation stamp the daemon returns in its handshake — version, then commits
+behind the build — so two nightlies carrying the same package version are
+still told apart; a controller built by hand never counts the fleet as behind
+it. Pre-keeper sessions defer that
 handover indefinitely; the settings panel (`,`) reports the machine's running
 `muxloomd` version and carries a **Force update** action that breaks the
 deadlock once — after an on-screen summary of what will happen, the

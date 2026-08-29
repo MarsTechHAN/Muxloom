@@ -481,6 +481,12 @@ pub enum DaemonResponse {
         protocol_version: u16,
         pid: u32,
         capabilities: Vec<String>,
+        /// The full generation stamp of the running daemon, which says which
+        /// build it is and not merely which version. Empty from a daemon old
+        /// enough not to send one — and one of those is exactly what a fleet
+        /// stuck between two releases is made of, so the reader must cope.
+        #[serde(default)]
+        daemon_generation: String,
     },
     Pong {
         unix_time_ms: u64,
