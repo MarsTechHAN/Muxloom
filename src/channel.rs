@@ -2722,13 +2722,25 @@ fn handle(
     );
     match decision {
         Route::Who => {
-            let mut lines: Vec<String> = desk
-                .sessions()
+            // The ones still running, which are the ones there is any point
+            // aiming at. A machine that has been up for days carries dozens of
+            // finished sessions, and a roster where the agents you can still
+            // talk to are outnumbered several times over by the ones you
+            // cannot is a roster nobody reads to the end on a phone. Dropping
+            // them without a word would be its own kind of lie, so the count
+            // stays.
+            let (live, finished): (Vec<&Correspondent>, Vec<&Correspondent>) =
+                desk.sessions().iter().partition(|who| who.alive);
+            let finished = finished.len();
+            let mut lines: Vec<String> = live
                 .iter()
                 .map(|who| format!("- {} · {}", who.name(), who.state()))
                 .collect();
             if lines.is_empty() {
                 lines.push("- nobody is running".into());
+            }
+            if finished > 0 {
+                lines.push(format!("- ({finished} finished, not listed)"));
             }
             lines.push(String::new());
             lines.push(match binding.kind.solo() {
@@ -3017,13 +3029,26 @@ fn handle(
                 inbox.aim(&binding.id, only.clone());
                 return format!("· aimed at {name}");
             }
-            let found: Vec<Correspondent> = desk
+            // A name is matched against the running agents, the same ones
+            // `/list` numbers and `/who` prints. The dead outnumber them many
+            // times over on a machine that has been up a while, and a name
+            // that fits both a finished session and the live one that took its
+            // place must not land on the corpse - nor read as ambiguous
+            // because of it.
+            let (live, finished): (Vec<Correspondent>, Vec<Correspondent>) = desk
                 .sessions()
                 .iter()
                 .filter(|who| who.answers_to(&words))
                 .cloned()
-                .collect();
-            match found.as_slice() {
+                .partition(|who| who.alive);
+            match live.as_slice() {
+                // Saying which finished session it was is the whole answer
+                // here: the human typed a name they remember, and what they
+                // need to hear is that it is over, not that it never existed.
+                [] if !finished.is_empty() => format!(
+                    "· {} has finished, so there is nobody to aim at — `/who` lists what is running",
+                    finished[0].name()
+                ),
                 [] => format!("· nothing here answers to `{words}` — `/who` lists what does"),
                 [only] => {
                     let name = only.name();
@@ -4031,6 +4056,81 @@ mod tests {
             ..named.clone()
         };
         assert_eq!(silent.name(), "2");
+    }
+
+    /// `/select <name>` and `/who` ran over every session the machines
+    /// remembered, the finished ones included, while `/list` and
+    /// `/select <machine>-<n>` showed and counted only the live ones. So a
+    /// name that fitted an agent still working *and* the conversation it
+    /// replaced came back as ambiguous, or aimed the chat at the dead one -
+    /// and `/who`, the very list that is supposed to say who there is to talk
+    /// to, was mostly sessions there is no talking to.
+    #[test]
+    fn a_name_aims_at_a_running_agent_and_a_finished_one_says_so() {
+        let config = crate::config::Config::default();
+        let runtime = Runtime::new(&config);
+        let mut desk = Desk::new(&runtime, &[], &config);
+        let session = |id: &str, label: &str, alive: bool| Correspondent {
+            machine: "local".into(),
+            session_id: id.into(),
+            label: label.into(),
+            path: "/works/arena".into(),
+            alive,
+            working: alive,
+            needs_attention: false,
+            recap: None,
+        };
+        desk.sessions = Some(vec![
+            session("s-old", "arena", false),
+            session("s-live", "arena runner", true),
+            session("s-gone", "seo", false),
+        ]);
+        let binding = ChannelBinding {
+            id: "wechat-1".into(),
+            kind: ChannelKind::WeChat,
+            ..Default::default()
+        };
+        let mut inbox = Inbox::default();
+        let said = |text: &str| Incoming {
+            text: text.into(),
+            ..Default::default()
+        };
+
+        // `arena` fits both the live agent and the finished one it followed.
+        // There is only one of them to aim at, so it is not a choice to put
+        // back to the human.
+        let answer = handle(&mut desk, &binding, &said("/select arena"), &mut inbox);
+        assert_eq!(answer, "· aimed at arena runner · local");
+        assert_eq!(
+            inbox
+                .aimed
+                .get("wechat-1")
+                .map(|who| who.session_id.clone()),
+            Some("s-live".into())
+        );
+
+        // A name only a finished session answers to is told plainly, rather
+        // than aiming the chat at something that will never answer.
+        let answer = handle(&mut desk, &binding, &said("/select seo"), &mut inbox);
+        assert!(answer.contains("has finished"), "{answer}");
+        assert_eq!(
+            inbox
+                .aimed
+                .get("wechat-1")
+                .map(|who| who.session_id.clone()),
+            Some("s-live".into()),
+            "a name that fits nobody live leaves the aim where it was"
+        );
+
+        // And `/who` is the running agents with what each is doing, plus a
+        // count of the rest so nothing is dropped in silence.
+        let roster = handle(&mut desk, &binding, &said("/who"), &mut inbox);
+        assert!(
+            roster.contains("- arena runner · local · working"),
+            "{roster}"
+        );
+        assert!(!roster.contains("seo"), "{roster}");
+        assert!(roster.contains("(2 finished, not listed)"), "{roster}");
     }
 
     /// The number `/list` prints and the number `/select` counts along were
