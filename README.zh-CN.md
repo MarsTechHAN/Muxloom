@@ -436,8 +436,8 @@ Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）�
 行，也要像其他会话一样归档或删除。未启用的机器不会被触碰——指向它的调用会被拒绝。
 
 Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能超过它自己持有的权限。
-`may_message` 决定新会话能写到多远——`parent` 只能回复起它的 Agent，`task` 是同一件工
-作上的所有人，`fleet` 是任意机器上的任意 Agent——默认是 `task`。`may_launch` 是它能起
+`may_message` 决定新会话能写到多远——`parent` 只能回复起它的 Agent、以及它自己起的会
+话，`task` 是同一件工作上的所有人，`fleet` 是任意机器上的任意 Agent——默认是 `task`。`may_launch` 是它能起
 哪些运行时的会话，默认与起它的 Agent 同类，让一支队伍保持同一种 Agent；空列表表示它谁
 也起不了。`may_reach_person` 决定它能否用 `send_channel_message` 写到聊天软件，不明确
 要求就是关的，这样人只会被通知一次，而不是每个干活的会话各说一遍。人自己起的会话则是完
@@ -447,7 +447,8 @@ Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能
 
 这几个开关在"真正落笔"的地方生效。`message_agent` 会沿目标会话的 parent 链上溯：
 `task` 会话能够到自己这件工作下面的任何会话——包括它在另一台机器上起的子 Agent，跨机
-消息会先取回那台机器的会话列表再走这条链——`parent` 会话则只能够到起它的那一个。
+消息会先取回那台机器的会话列表再走这条链——`parent` 会话则只能够到起它的那一个，外加
+它自己起出来的那一支：可以起帮手却不能对帮手说一句话，等于拿到了一件用不了的东西。
 `talk_post` 受同一个 reach 约束，因为 board 是一组房间，往更宽的房间里发帖同样是"被更
 多人听到"：`task` 永远可用，`path` 在会话可以和同目录的其他人说话之后可用，`machine`
 与 `global` 需要完整 reach。`send_channel_message` 对没有拿到"联系人"权限的会话直接拒

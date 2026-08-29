@@ -738,8 +738,9 @@ it are refused.
 
 An agent launching a subagent also says what that subagent may do, and cannot
 say more than it holds itself. `may_message` is how far the new session may
-write — `parent` back to the agent that started it, `task` to everyone on the
-same piece of work, `fleet` to any agent anywhere — and defaults to `task`.
+write — `parent` back to the agent that started it and down to whatever it
+starts itself, `task` to everyone on the same piece of work, `fleet` to any
+agent anywhere — and defaults to `task`.
 `may_launch` is which runtimes it may start sessions of, defaulting to the
 launcher's own kind, so a team stays one kind of agent; an empty list means it
 starts none. `may_reach_person` is whether it may write to the chat app with
@@ -754,7 +755,9 @@ The dials are enforced where the writing happens. `message_agent` walks the
 chain of parents above the session it is aimed at: a `task` session reaches
 anything under its own task — including a subagent it started on another
 machine, which a cross-machine message resolves by fetching that machine's
-list first — and a `parent` session reaches the one agent that started it.
+list first — and a `parent` session reaches the one agent that started it plus
+its own subtree, since an agent that may start a helper and may not speak to it
+is holding something it cannot use.
 `talk_post` is held to the same reach, because the board is a set of rooms and
 posting to the wider ones is another way of being heard: `task` scope is always
 open, `path` opens once the session may talk to the others working in that

@@ -186,8 +186,9 @@ impl std::str::FromStr for AgentKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Reach {
-    /// Only back to the agent that started it. A pair of hands, reporting to
-    /// the one pair of eyes that asked for the work.
+    /// Back to the agent that started it, and down to whatever it starts
+    /// itself. A pair of hands, reporting to the one pair of eyes that asked
+    /// for the work — and the rest of the fleet is none of its business.
     Parent,
     /// Anyone on the same piece of work: the agent that started it, the ones
     /// started alongside it, and the ones it starts itself. Coordination

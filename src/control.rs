@@ -1519,6 +1519,34 @@ fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
     if mine.is_empty() {
         return true;
     }
+    descends_from(lineage, target, &mine)
+}
+
+/// Whether `target` is one of the sessions this one started, however far down.
+///
+/// A session's own subtree is its own hands rather than somebody else's
+/// attention, and the narrowest reach is about the second: an agent handed
+/// `parent` is one that reports to whoever asked and does not go bothering the
+/// rest of the fleet. If it may start a helper at all, being unable to say a
+/// word to the helper leaves it holding something it cannot use — and the
+/// helper, which reaches its parent by definition, asking questions upward that
+/// can never be answered.
+#[cfg(unix)]
+fn started_here(lineage: &[(String, Option<String>)], target: &str) -> bool {
+    match launching_session() {
+        Some(mine) => descends_from(lineage, target, &[mine]),
+        None => false,
+    }
+}
+
+/// Walk the chain of parents above `target` until it reaches one of `mine`.
+///
+/// A chain that runs out unrecognised, or runs longer than a team plausibly is,
+/// belongs to somebody else. `mine` is never empty here: a caller with nothing
+/// to compare against has already decided what that means, and the two callers
+/// decide it differently.
+#[cfg(unix)]
+fn descends_from(lineage: &[(String, Option<String>)], target: &str, mine: &[String]) -> bool {
     let mut at = target.trim().to_string();
     for _ in 0..TASK_WALK_MAX {
         if mine.contains(&at) {
@@ -1580,14 +1608,19 @@ fn check_may_message(
              agent that started it set that. Tell that agent what needs saying, and let it carry \
              the message."
         ),
+        // Upward to the one agent that asked, and downward into whatever this
+        // session started to answer it with. Everything else on the machine is
+        // somebody else's, which is the whole of what this dial says.
         Reach::Parent
-            if session_env("MUXLOOM_SESSION_PARENT").as_deref() == Some(target.trim()) =>
+            if session_env("MUXLOOM_SESSION_PARENT").as_deref() == Some(target.trim())
+                || started_here(lineage, target) =>
         {
             Ok(())
         }
         Reach::Parent => bail!(
-            "this session answers to the agent that started it and to nobody else, which is what \
-             that agent asked for. Report to it, and it can pass anything on."
+            "this session answers to the agent that started it, and to the sessions it started \
+             itself, and to nobody else — which is what that agent asked for. Report to it, and \
+             it can pass anything on."
         ),
     }
 }
@@ -6071,15 +6104,24 @@ mod tests {
         let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("fleet"));
         check_may_message(&own_powers(), "muxloomd-claude-someone-elses", &[]).unwrap();
 
-        // The narrowest answers to one session and no other, wherever it runs.
+        // The narrowest answers to the one session that asked, and to whatever
+        // it started to answer with, and to nothing else.
         let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
         let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", Some("muxloomd-claude-boss"));
         check_may_message(&own_powers(), "muxloomd-claude-boss", &here).unwrap();
-        let error = check_may_message(&own_powers(), "muxloomd-claude-hand", &here)
+        let error = check_may_message(&own_powers(), "muxloomd-claude-stranger", &here)
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("and to nobody else"), "{error}");
+        // Its own subtree, however far down: an agent that may start a helper
+        // and may not speak to it is holding something it cannot use, and the
+        // helper's questions upward would never be answerable.
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-hand"));
+        for mine in ["muxloomd-claude-grandchild", "muxloomd-claude-boss"] {
+            check_may_message(&own_powers(), mine, &here).unwrap();
+        }
+        assert!(check_may_message(&own_powers(), "muxloomd-claude-lead", &here).is_err());
     }
 
     /// The person hears about a piece of work from the agent they asked, not
