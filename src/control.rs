@@ -3843,13 +3843,18 @@ mod daemon_surface {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
     /// The most preview bytes a tool answer carries.
     const PREVIEW_LIMIT: usize = 256 * 1024;
-    /// How long a call the controller runs for us may take, and how often we
-    /// look for its answer. A controller comes round for work every couple of
-    /// seconds and the call itself takes as long as it takes; a minute covers
-    /// a search across a slow link, and failing after it is better than being
-    /// dropped by the client mid-call.
+    /// How long a call the controller runs for us may take. The call itself
+    /// takes as long as it takes; a minute covers a search across a slow link,
+    /// and failing after it is better than being dropped by the client
+    /// mid-call.
     const RELAY_WAIT: Duration = Duration::from_secs(60);
-    const RELAY_POLL: Duration = Duration::from_millis(250);
+    /// How soon after submitting we look for an answer, and how much longer we
+    /// wait each time none has come. A controller on the same machine can be
+    /// done in a few milliseconds, so the first look is nearly free and the
+    /// gaps grow only for a call that is genuinely still running — a fixed
+    /// quarter-second would have charged every quick answer the full quarter.
+    const RELAY_POLL_FIRST: Duration = Duration::from_millis(15);
+    const RELAY_POLL_MAX: Duration = Duration::from_millis(250);
 
     /// The folder the caller works in. muxloom put it in the session's
     /// environment when it started it; a process driving the surface by hand
@@ -4161,8 +4166,8 @@ mod daemon_surface {
                 response => bail!("unexpected relay response: {response:?}"),
             };
             let deadline = Instant::now() + RELAY_WAIT;
+            let mut gap = RELAY_POLL_FIRST;
             loop {
-                std::thread::sleep(RELAY_POLL);
                 let answer = match self
                     .transact(&DaemonRequest::RelayResult { id: id.clone() })?
                     .0
@@ -4184,6 +4189,8 @@ mod daemon_surface {
                         RELAY_WAIT.as_secs()
                     );
                 }
+                std::thread::sleep(gap);
+                gap = (gap * 2).min(RELAY_POLL_MAX);
             }
         }
 
