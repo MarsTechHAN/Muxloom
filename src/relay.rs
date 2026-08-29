@@ -217,17 +217,64 @@ fn job_machine(job: &RelayJob) -> String {
         .unwrap_or_default()
 }
 
-/// Ask the person over the bound chat, when a chat is bound and reachable.
-/// Not reachable is fine: the job is refused with the same "needs approval"
-/// answer, and the refusal itself tells the agent what to type back.
-fn try_chat_ask(surface: &mut Option<ControllerControl>, ask: &str) {
-    let Some(surface) = surface else {
-        return;
+/// What the person is shown when a cross-machine write is waiting on them,
+/// and the words they answer it with.
+///
+/// The words carry the bare number, not the ledger's key. The ledger files the
+/// ask under `approve-7` and the person types `approve-7`, so quoting the key
+/// would ask them for `approve-approve-7` — which the chat side will not parse
+/// at all, leaving every gated write unanswerable and the agent stuck being
+/// told to wait for an answer nobody could give.
+fn approval_ask(tool: &str, machine: &str, number: u64) -> String {
+    let at = match machine.is_empty() {
+        true => "another machine".to_string(),
+        false => format!("{machine} (cross-machine)"),
     };
-    let _ = surface.call(
-        "send_channel_message",
-        &serde_json::json!({ "text": ask, "title": "approval needed" }),
-    );
+    format!(
+        "An agent wants to run `{tool}` on {at}.\nReply `approve-{number}` to allow it once, \
+         `always-{number}` for the rest of that agent's conversation, or `reject-{number}` to \
+         refuse."
+    )
+}
+
+/// The controller surface this round runs calls through, built the first time
+/// one is wanted and kept for the rest of the round.
+fn surface_for<'a>(
+    surface: &'a mut Option<ControllerControl>,
+    config: &Config,
+    runtime: &Runtime,
+) -> Result<&'a mut ControllerControl> {
+    match surface {
+        Some(surface) => Ok(surface),
+        none => Ok(none.insert(ControllerControl::with_runtime(
+            config.clone(),
+            runtime.clone(),
+        )?)),
+    }
+}
+
+/// Ask the person over the bound chat, and say whether the ask went out.
+///
+/// It has to build the surface rather than use one that happens to be there:
+/// a round whose only job is the gated one had never made a surface, so the
+/// ask fell out of a `let Some(..) else { return }` and nobody was ever asked
+/// while the agent was told they had been. When there is no chat bound the
+/// answer is false, and the agent is told plainly that nobody heard.
+fn try_chat_ask(
+    surface: &mut Option<ControllerControl>,
+    config: &Config,
+    runtime: &Runtime,
+    ask: &str,
+) -> bool {
+    let Ok(surface) = surface_for(surface, config, runtime) else {
+        return false;
+    };
+    surface
+        .call(
+            "send_channel_message",
+            &serde_json::json!({ "text": ask, "title": "approval needed" }),
+        )
+        .is_ok()
 }
 
 #[derive(Debug)]
@@ -524,68 +571,70 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
         for job in jobs {
             // A WRITE tool held behind the approval gate runs only after the
             // person has said so — remembered for the session, or asked now.
-            if approve_gated(&job.tool)
-                && !approvals.remembered(&job.session, &job_machine(&job), &job.tool)
+            let machine = job_machine(&job);
+            if approve_gated(&job.tool) && !approvals.remembered(&job.session, &machine, &job.tool)
             {
-                let id = format!("approve-{next}");
-                next += 1;
-                let machine = job_machine(&job);
-                let ask = format!(
-                    "An agent wants to run `{}`{} on {}...
-Reply `approve-{id}` to allow once, `always-{id}` for the whole conversation, or `reject-{id}` to deny.",
-                    job.tool,
-                    if machine.is_empty() {
-                        ""
-                    } else {
-                        " (cross-machine)"
-                    },
-                    if machine.is_empty() {
-                        "a remote machine".to_string()
-                    } else {
-                        machine.clone()
-                    }
-                );
-                approvals.park(
-                    id.clone(),
-                    ApprovalsPending {
-                        session: job.session.clone(),
-                        machine: machine.clone(),
-                        tool: job.tool.clone(),
-                        ask: ask.clone(),
-                        at_ms: now_ms(),
-                        open: true,
-                    },
-                );
-                approval_dirty = true;
-                let (ok, output) = (
-                    false,
-                    format!(
-                        "{tool} needs human approval — the person has been asked via chat; reply `approve-{id}` / `always-{id}` / `reject-{id}`",
-                        tool = job.tool
+                let tool = job.tool.clone();
+                // An agent asks again while the person is still deciding, and
+                // every retry has to land on the ask already in front of them
+                // rather than put another copy of it on their phone.
+                let output = match approvals.open_ask(&job.session, &machine, &tool) {
+                    Some(id) => format!(
+                        "{tool} is waiting on the person: they were asked as {id} and have not \
+                         answered yet. Make this call again once they have."
                     ),
-                );
-                let _ = pool.relay_complete(target, job.id.clone(), ok, output);
-                try_chat_ask(&mut surface, &ask);
+                    None => {
+                        let number = next;
+                        next += 1;
+                        let id = format!("approve-{number}");
+                        let ask = approval_ask(&tool, &machine, number);
+                        // Parked only once it has actually gone out. An entry
+                        // nobody was shown is an ask nobody can answer, and
+                        // leaving one behind would tell every later attempt it
+                        // is waiting on a person who never heard.
+                        match try_chat_ask(&mut surface, config, runtime, &ask) {
+                            true => {
+                                approvals.park(
+                                    id,
+                                    ApprovalsPending {
+                                        session: job.session.clone(),
+                                        machine: machine.clone(),
+                                        tool: tool.clone(),
+                                        ask,
+                                        at_ms: now_ms(),
+                                        open: true,
+                                    },
+                                );
+                                approval_dirty = true;
+                                format!(
+                                    "{tool} needs the person's approval and they have been asked \
+                                     in chat. They answer `approve-{number}`, `always-{number}` \
+                                     or `reject-{number}`; make this call again once they have."
+                                )
+                            }
+                            false => format!(
+                                "{tool} needs the person's approval, and muxloom has no chat \
+                                 bound to ask on — nobody has been asked. Ask them yourself, or \
+                                 have an agent on that machine do the work instead."
+                            ),
+                        }
+                    }
+                };
+                let _ = pool.relay_complete(target, job.id.clone(), false, output);
                 continue;
             }
             let (ok, output) = if relayed(&job.tool) || approve_gated(&job.tool) {
-                let surface = match &mut surface {
-                    Some(surface) => surface,
-                    none => none.insert(ControllerControl::with_runtime(
-                        config.clone(),
-                        runtime.clone(),
-                    )?),
-                };
+                let surface = surface_for(&mut surface, config, runtime)?;
                 match run(surface, &job.tool, &job.arguments, &job.session) {
                     Ok(output) => {
                         round.ran += 1;
                         // A one-shot grant is spent by the run it let through.
                         if approve_gated(&job.tool)
                             && approvals.once.iter().any(|(s, m, t)| {
-                                s == &job.session && m == &job_machine(&job) && t == &job.tool
+                                s == &job.session && m == &machine && t == &job.tool
                             })
                         {
-                            approvals.spend_once(&job.session, &job_machine(&job), &job.tool);
+                            approvals.spend_once(&job.session, &machine, &job.tool);
                             approval_dirty = true;
                         }
                         (true, output)
@@ -682,6 +731,41 @@ fn bounded(mut arguments: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ask and the reply are written on two sides of the fleet — the
+    /// controller composes the words, the chat adapter parses them back — and
+    /// nothing but this test makes them the same words. They were not: the ask
+    /// quoted the ledger's key inside `approve-{}`, so it told the person to
+    /// type `approve-approve-7`, which the parser refuses. Every cross-machine
+    /// write was unanswerable, and the agent was told to wait for an answer
+    /// nobody could give.
+    #[test]
+    fn the_words_an_ask_offers_are_words_the_chat_side_answers_with() {
+        let ask = approval_ask("launch_session", "seed", 7);
+        assert!(ask.contains("launch_session"), "{ask}");
+        assert!(ask.contains("seed"), "{ask}");
+        for (reply, verdict) in [
+            ("approve-7", crate::approvals::Verdict::Yes),
+            ("always-7", crate::approvals::Verdict::Always),
+            ("reject-7", crate::approvals::Verdict::No),
+        ] {
+            assert!(ask.contains(reply), "{reply} is not offered by: {ask}");
+            match crate::channel::approval_route(reply) {
+                // And it resolves to the key the ledger parked it under, which
+                // is what makes the person's yes find this ask.
+                Some(crate::channel::Route::Approval { id, verdict: said }) => {
+                    assert_eq!(id, "approve-7");
+                    assert_eq!(said, verdict);
+                }
+                other => panic!("{reply} did not read as an approval: {other:?}"),
+            }
+        }
+        // A job whose arguments named no machine still has to say something a
+        // person can act on.
+        let vague = approval_ask("run_shell", "", 12);
+        assert!(vague.contains("another machine"), "{vague}");
+        assert!(vague.contains("approve-12"), "{vague}");
+    }
 
     #[test]
     fn a_job_only_travels_while_a_controller_is_asking_for_work() {

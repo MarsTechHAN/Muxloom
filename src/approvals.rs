@@ -123,6 +123,26 @@ impl Approvals {
                 .is_some_and(|list| list.iter().any(|(m, t, _)| m == machine && t == tool))
     }
 
+    /// The ask this session already has open for the same write on the same
+    /// machine, if there is one.
+    ///
+    /// A person answers in their own time, and the agent will try the call
+    /// again while they are deciding. Every one of those retries has to land
+    /// on the ask already in front of them: without this each attempt mints
+    /// another id and puts another copy on their phone, and a person answering
+    /// the first one leaves all the others open forever.
+    pub fn open_ask(&self, session: &str, machine: &str, tool: &str) -> Option<&str> {
+        self.pending
+            .iter()
+            .filter(|(_, p)| {
+                p.open && p.session == session && p.machine == machine && p.tool == tool
+            })
+            // Oldest first, so a person looking at two asks is told about the
+            // one they have been looking at longest. Map order is arbitrary.
+            .min_by_key(|(id, p)| (p.at_ms, id.as_str()))
+            .map(|(id, _)| id.as_str())
+    }
+
     /// Park a new ask under a fresh id and return it. Caller writes the file.
     pub fn park(&mut self, id: String, pending: Pending) {
         self.pending.insert(id, pending);
@@ -234,6 +254,46 @@ mod tests {
         // Ending a session forgets what it remembered, including oneshots.
         a.end_session("s1");
         assert!(!a.remembered("s1", "seed", "launch_session"));
+    }
+
+    /// The agent calls again while the person is still deciding. Without a
+    /// look for the ask already open, every retry mints another id and puts
+    /// another copy on their phone — and the one they answer leaves all the
+    /// rest of them open forever.
+    #[test]
+    fn a_second_try_finds_the_ask_the_person_is_already_looking_at() {
+        let mut a = Approvals::default();
+        let ask = |session: &str, machine: &str, tool: &str, at_ms: u64| Pending {
+            session: session.into(),
+            machine: machine.into(),
+            tool: tool.into(),
+            ask: String::new(),
+            at_ms,
+            open: true,
+        };
+        assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
+        a.park("approve-1".into(), ask("s1", "seed", "launch_session", 10));
+        assert_eq!(
+            a.open_ask("s1", "seed", "launch_session"),
+            Some("approve-1")
+        );
+        // Scoped to all three: another session, another machine, or another
+        // tool is a different question and gets asked on its own.
+        assert_eq!(a.open_ask("s2", "seed", "launch_session"), None);
+        assert_eq!(a.open_ask("s1", "laptop", "launch_session"), None);
+        assert_eq!(a.open_ask("s1", "seed", "run_shell"), None);
+        // The oldest one is the one they have been looking at longest, and a
+        // HashMap has no order of its own to fall back on.
+        a.park("approve-2".into(), ask("s1", "seed", "launch_session", 5));
+        assert_eq!(
+            a.open_ask("s1", "seed", "launch_session"),
+            Some("approve-2")
+        );
+        // Answered is not open: the next call asks again rather than waiting
+        // on a question that is already settled.
+        a.take("approve-2");
+        a.take("approve-1");
+        assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
     }
 
     #[test]
