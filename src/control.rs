@@ -229,6 +229,10 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
           shows up in the dashboard and on the task board where you and the person watching can \
           both follow it. Do not reach for your harness's built-in subagent or task tool: those \
           are invisible, untracked, and die with your process.\n\
+          - Being handed more than one task is the signal to fan out. Split the list before you \
+          start, give each session a brief specific enough to need no follow-up question, and \
+          keep the coordinating and the aggregating for yourself. Work them one after another \
+          only when they genuinely depend on each other.\n\
           - A message lands in the session's prompt box and is read when its turn ends. For pi and \
          OpenCode the box is read off their screen like the others: if it already holds an \
          unsent sentence your message is held until it clears, and if a model or effort picker is \
@@ -5106,6 +5110,20 @@ mod tests {
         for flavor in [Flavor::Controller, Flavor::Daemon] {
             let text = instructions(flavor, &McpConfig::default());
             assert!(text.contains("answer before you start the work"), "{text}");
+        }
+    }
+
+    /// A list of tasks is a list of sessions. An agent that works them in a
+    /// row spends four times the wall clock and gives the person watching one
+    /// row that says whichever task it happens to be on.
+    #[test]
+    fn an_agent_holding_several_tasks_is_told_to_hand_them_out() {
+        for flavor in [Flavor::Controller, Flavor::Daemon] {
+            let text = instructions(flavor, &McpConfig::default());
+            assert!(
+                text.contains("more than one task is the signal to fan out"),
+                "{text}"
+            );
         }
     }
 

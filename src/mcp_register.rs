@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 9;
+const SKILL_REVISION: u32 = 10;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -390,6 +390,25 @@ is a colleague you can watch, message, and hand off to: the person at the
 dashboard sees it running and knows when it is done. Give each one a clear
 label and a specific brief, then follow it with `wait_for`, `read_screen`,
 and `message_agent` exactly like any other session.
+
+Being handed more than one task is the signal to do this. Four tasks worked
+one after another take four times as long, hold four times as much in your
+context, and give the person watching nothing to look at but whichever one you
+happen to be on; four sessions do them at once, each with a row of its own.
+So when a message arrives carrying several things — a list, a numbered set of
+fixes, \"and also\" — split it before you start:
+
+```
+launch_session { kind: \"claude\", label: \"review: relay latency\", initial_prompt: \"...\" }
+launch_session { kind: \"claude\", label: \"review: approval gate\", initial_prompt: \"...\" }
+talk_post { text: \"Split the review four ways; I am aggregating\", scope: \"task\" }
+```
+
+Write each brief so it needs no follow-up question — what to look at, what to
+report, and what not to touch — and keep the coordinating, the aggregating,
+and the commit for yourself. Doing it all in your own context is the right
+choice only when the tasks genuinely depend on each other, or when there is
+one of them.
 
 ## Ask the human first
 
@@ -1194,6 +1213,21 @@ mod tests {
             !text.contains(&format!("{SKILL_MARKER}8 ")),
             "the body changed under the stamp it shipped with"
         );
+    }
+
+    /// Several tasks in one message are several sessions, and the skill has to
+    /// say so where an agent reading it is deciding what to do first. Worked
+    /// in a row they cost the wall clock of all of them, and the person
+    /// watching sees one row saying whichever one is in hand.
+    #[test]
+    fn the_skill_tells_an_agent_holding_several_tasks_to_hand_them_out() {
+        let text = skill_document();
+        assert!(
+            text.contains("Being handed more than one task is the signal to do this"),
+            "{text}"
+        );
+        assert!(text.contains("launch_session"), "{text}");
+        assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
     }
 
     /// One machine, one entry. The controller's surface reaches the whole
