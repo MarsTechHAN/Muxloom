@@ -6272,11 +6272,35 @@ mod platform {
                 forget_handover_ask(paths);
                 return Ok(stream);
             }
-            match prepare_atomic_handover(&mut stream)? {
+            match prepare_atomic_handover(&mut stream) {
+                // The ask itself broke, rather than being answered. The daemon
+                // hung up mid-request because it is already draining, or it
+                // could not read the frame at all — which is what a protocol
+                // version this build does not share looks like from the far
+                // side. Both were fatal here, so the error went back to the
+                // caller and the lines below never ran: the machine kept a
+                // daemon nobody could finish a sentence with, and the build
+                // that would have replaced it never started. Neither case is
+                // a reason to fail. Ask for a fresh connection — one that
+                // comes back is a daemon still serving, and one that does not
+                // is a daemon nobody can use — and where nothing comes back,
+                // clear what is left of it and start.
+                Err(error) => {
+                    crate::debug::log(
+                        "daemon",
+                        format!("the running daemon could not be asked to hand over: {error:#}"),
+                    );
+                    drop(stream);
+                    if let Ok(stream) = UnixStream::connect(&paths.socket) {
+                        return Ok(stream);
+                    }
+                    let _ = stop_running_daemon(paths);
+                    forget_handover_ask(paths);
+                }
                 // Deferred: a daemon that knows the request means to stand
                 // down as soon as nothing would be lost. Give it that time,
                 // and take its place if it never does.
-                Some(false) => {
+                Ok(Some(false)) => {
                     if !handover_is_overdue(paths) {
                         return Ok(stream);
                     }
@@ -6287,7 +6311,7 @@ mod platform {
                         return Ok(stream);
                     }
                 }
-                Some(true) => {
+                Ok(Some(true)) => {
                     drop(stream);
                     wait_for_daemon_stop(paths)?;
                     forget_handover_ask(paths);
@@ -6295,7 +6319,7 @@ mod platform {
                 // Too old to know the request at all. Handing over used to
                 // want an idle daemon, which a machine with agents on it never
                 // is, so the same patience decides the rest.
-                None => {
+                Ok(None) => {
                     if daemon_is_idle_for_handover(&mut stream).unwrap_or(false) {
                         drop(stream);
                         stop_running_daemon(paths)?;

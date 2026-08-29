@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -191,4 +192,56 @@ fn a_daemon_that_keeps_deferring_is_replaced_once_the_ask_is_overdue() {
 
     stop(bridge);
     let _ = serve.wait_with_output();
+}
+
+/// A handover nobody can even be asked about must not be the end of the road.
+/// The ask breaking is not the same as the ask being refused: a daemon already
+/// draining hangs up mid-request, and one whose protocol this build does not
+/// share cannot read the frame at all. Both used to come back as an error from
+/// the connect, so the machine kept a daemon nobody could finish a sentence
+/// with and the build that would have replaced it never started. Now the
+/// answer is a second connection — one that comes back is a daemon still
+/// serving — and where nothing comes back, what is left of it is cleared away
+/// and this build starts in its place.
+#[test]
+fn a_daemon_that_cannot_answer_the_ask_is_replaced_instead_of_failing_the_call() {
+    let state = TestState::new();
+
+    // Something alive to hold the pid file, so this reads as a daemon running
+    // rather than as wreckage left by one that died. Started at arm's length
+    // through a shell that exits at once, so it belongs to init and not to
+    // this test: a child of the test process would linger as a zombie after
+    // being stopped, and a zombie still answers kill(pid, 0), which is how a
+    // daemon is told apart from a pid file left behind.
+    let spawned = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30 & echo $!")
+        .output()
+        .unwrap();
+    let standing_in: u32 = String::from_utf8_lossy(&spawned.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    fs::write(state.root.join("muxloomd.pid"), format!("{standing_in}\n")).unwrap();
+    fs::write(state.root.join("muxloomd.generation"), "stale\n").unwrap();
+
+    // A socket that takes the connection and then goes silent for good. The
+    // listener is dropped as soon as it has accepted once, so the second
+    // connection — the one that decides whether this daemon is still usable —
+    // finds nothing listening.
+    let listener = UnixListener::bind(state.root.join("muxloomd.sock")).unwrap();
+    let hangup = thread::spawn(move || {
+        let _ = listener.accept();
+    });
+
+    let new_pid = status_pid(&status(&state));
+    assert_ne!(
+        new_pid, standing_in,
+        "a daemon that cannot be asked must be replaced, not served from"
+    );
+
+    hangup.join().unwrap();
+    unsafe {
+        libc::kill(standing_in as i32, libc::SIGKILL);
+    }
 }
