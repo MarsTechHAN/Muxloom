@@ -549,6 +549,53 @@ const LARK_HOST: &str = "https://open.feishu.cn";
 const LARK_LIMIT: usize = 20 * 1024;
 const WECHAT_LIMIT: usize = 4 * 1024;
 
+/// How long a message to a person may be, in characters.
+///
+/// Not a platform limit — [`LARK_LIMIT`] and [`WECHAT_LIMIT`] are those, in
+/// bytes, because bytes are what the two APIs count. This one is about the
+/// person: a card arrives on a phone and is read standing up, between other
+/// things, and past a few paragraphs it stops being read at all. Characters
+/// rather than bytes, so a message written in Chinese is not held to a third of
+/// the length of one written in English.
+pub const READABLE_LIMIT: usize = 1200;
+
+/// How long the card's header may be. It is a few words saying what this is
+/// about, and a header that needs a second line is a first line.
+pub const TITLE_LIMIT: usize = 48;
+
+/// Refuse an over-long message instead of trimming it.
+///
+/// Trimming is the tempting thing and the wrong one. An agent writing to a
+/// person puts the conclusion at the top and the ask at the bottom, so a cut
+/// takes the ask — the person is left with a card that stops mid-sentence and
+/// no way to reach the rest, and the agent is never told it happened. Handing
+/// it back is the only thing that gets a shorter message written, and a shorter
+/// message is what was wanted. The platform limits below still clip, because
+/// there a refusal would only lose a message the API would have carried.
+pub fn refuse_if_too_long(message: &Outgoing) -> Result<()> {
+    let title = message.title.trim().chars().count();
+    if title > TITLE_LIMIT {
+        bail!(
+            "the title is {title} characters and the limit is {TITLE_LIMIT}. It is the card's \
+             header — a few words saying what this is about, not a summary of it. Nothing was \
+             sent: shorten the title and send again."
+        );
+    }
+    let text = message.text.trim().chars().count();
+    if text > READABLE_LIMIT {
+        bail!(
+            "the message is {text} characters and the limit is {READABLE_LIMIT}. This lands on \
+             somebody's phone, so it has to be readable standing up: the conclusion, the numbers \
+             that actually matter, and what you need from them. Everything else already exists \
+             somewhere — the talk board, your session, the diff — so say where it is instead of \
+             repeating it. Nothing was sent, and it was deliberately not cut down for you, \
+             because what a cut removes is whatever you put last, which is usually the ask. \
+             Rewrite it shorter and send again."
+        );
+    }
+    Ok(())
+}
+
 /// How long before its stated expiry a tenant token is treated as spent. The
 /// token is good for two hours; a minute covers a slow request and a clock that
 /// is not quite right.
@@ -3422,6 +3469,51 @@ mod tests {
         // A cut that landed inside one of those three-byte characters would
         // have panicked on the way out of `clip`.
         assert!(body.contains('あ'));
+    }
+
+    /// The platform cut above is the last resort, for a message that got this
+    /// far. An agent's message never should: it is handed back instead, with
+    /// enough of a reason to write a shorter one.
+    #[test]
+    fn a_message_too_long_to_read_on_a_phone_is_refused_rather_than_trimmed() {
+        let message = Outgoing {
+            title: "Report".into(),
+            text: "あ".repeat(READABLE_LIMIT + 1),
+            signature: "*— gpu-1*".into(),
+        };
+        let refusal = format!("{:#}", refuse_if_too_long(&message).unwrap_err());
+        assert!(
+            refusal.contains(&(READABLE_LIMIT + 1).to_string()),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&READABLE_LIMIT.to_string()), "{refusal}");
+        assert!(refusal.contains("Nothing was sent"), "{refusal}");
+    }
+
+    /// Characters, not bytes. A message in Chinese is three times the bytes of
+    /// the same message in English and is not three times as long to read, so
+    /// counting bytes would hold half the fleet's users to a third of the cap.
+    #[test]
+    fn the_cap_counts_characters_so_chinese_is_not_charged_three_times() {
+        let message = Outgoing {
+            title: "报告".into(),
+            text: "字".repeat(READABLE_LIMIT),
+            signature: "*— gpu-1*".into(),
+        };
+        assert!(message.text.len() > READABLE_LIMIT, "three bytes each");
+        refuse_if_too_long(&message).expect("as many characters as the cap allows");
+    }
+
+    /// A header is a few words. One that needs a second line is a first line.
+    #[test]
+    fn a_title_longer_than_a_header_is_refused_too() {
+        let message = Outgoing {
+            title: "x".repeat(TITLE_LIMIT + 1),
+            text: "short".into(),
+            signature: "*— gpu-1*".into(),
+        };
+        let refusal = format!("{:#}", refuse_if_too_long(&message).unwrap_err());
+        assert!(refusal.contains("title"), "{refusal}");
     }
 
     #[test]

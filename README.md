@@ -791,7 +791,11 @@ also carries the way back — the `send_channel_message` call for the channel th
 wrote from, quoting whichever of the agent's own messages they replied to — for
 the same reason the agent-to-agent envelope carries a reply address. A person on
 a phone is not reading the board, so an answer left there is an answer nobody
-receives.
+receives. What goes to a phone is capped — 1200 characters of text, 48 of
+title — and a message over either is refused rather than trimmed: a trim takes
+whatever the agent put last, which is usually the ask, and tells it nothing.
+The refusal says what to send instead, which is the only thing that gets a
+shorter message written.
 
 **Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
 a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.

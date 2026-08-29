@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 10;
+const SKILL_REVISION: u32 = 11;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -314,9 +314,25 @@ progress log: if two messages could be one, make them one.
 Write it as something they can act on without opening a laptop. Lead with the
 conclusion, then the numbers, then what you need from them and exactly how to
 answer (\"回 1 / 2 / 3\", \"yes/no\"); an open question costs them more than the
-whole message saves. Keep it to a screen or two. muxloom signs every message
-with your machine and session, so do not introduce yourself, and never put a
-token, a key, or an absolute home path in one.
+whole message saves. muxloom signs every message with your machine and session,
+so do not introduce yourself, and never put a token, a key, or an absolute home
+path in one.
+
+Be brief, and know that this one is enforced: `text` is capped at 1200
+characters and `title` at 48, and a message over either is **refused, not
+trimmed**. Trimming would take whatever you put last, which is almost always
+the ask, and you would never be told. So if it does not fit, the message is too
+long rather than the cap too small. Cut it the way you would cut it for
+somebody standing at a bus stop:
+
+- the conclusion, in one line;
+- the two or three numbers that would change what they do;
+- the ask, and how to answer it.
+
+Everything else already exists somewhere — the talk board, your session, the
+diff, the CI run. Say where it is instead of repeating it. A report belongs on
+the board; what goes to a phone is the sentence that made you send anything at
+all.
 
 Write `text` as markdown either way, but know that only some of it survives.
 Lark renders the lot — headings, lists, tables, code fences, links. WeChat
@@ -1227,6 +1243,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("launch_session"), "{text}");
+        assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
+    }
+
+    /// The skill spells the caps out as numbers, because an agent reading
+    /// \"keep it short\" writes whatever it thinks short is. Numbers in prose
+    /// drift away from the constant that enforces them, and a skill promising
+    /// one length while the tool refuses at another is worse than no number at
+    /// all — so the two are checked against each other here.
+    #[test]
+    fn the_skill_quotes_the_caps_the_tool_actually_enforces() {
+        let text = skill_document();
+        assert!(
+            text.contains(&crate::channel::READABLE_LIMIT.to_string()),
+            "the skill must name the cap it is teaching: {text}"
+        );
+        assert!(
+            text.contains(&crate::channel::TITLE_LIMIT.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("refused, not\ntrimmed"), "{text}");
         assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
     }
 

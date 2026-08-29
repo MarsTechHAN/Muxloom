@@ -215,6 +215,7 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
         }
         Flavor::Controller => "",
     };
+    let channel_limit = crate::channel::READABLE_LIMIT;
     let mut text = format!(
         "muxloom manages long-lived terminal sessions — Codex, Claude Code, pi, OpenCode, and \
          plain shells — \
@@ -264,11 +265,14 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          say why, and leave the other agent to judge it against what it is already doing.\n\
          - send_channel_message reaches the human themselves, on their phone, through the chat \
          app they bound to muxloom. It is for the end of something they are waiting on and for a \
-         decision only they can make — one summary they can act on, never a progress log. Their \
-         answer comes back to you as a direct message. This and the talk board are independent \
-         surfaces: a channel message posts nothing to the board, and a talk_post tells the \
-         person on their phone nothing. Reply to a person on the surface they wrote to — over \
-         the channel, not the board.\n\
+         decision only they can make — one summary they can act on, never a progress log. Keep \
+         it short: the text is capped at {channel_limit} characters and a longer one is refused \
+         rather than trimmed, because a trim would silently take whatever you put last. Send the \
+         conclusion, the numbers that matter, and the ask; say where the rest already is instead \
+         of repeating it. Their answer comes back to you as a direct message. This and the talk \
+         board are independent surfaces: a channel message posts nothing to the board, and a \
+         talk_post tells the person on their phone nothing. Reply to a person on the surface \
+         they wrote to — over the channel, not the board.\n\
          - When the person writes to you, answer before you start the work. They are on a phone \
          and cannot see your screen, so what you understood and roughly how long it will take is \
          worth a line straight away; the result follows when it is done. Silence for twenty \
@@ -612,32 +616,38 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         // No `machine` argument, on either surface: this does not reach a
         // machine, it reaches a person. Which machine dials the chat app is
         // muxloom's business, and the message says where it came from anyway.
-        description: "Reach the human who is not at a dashboard, through the chat app they bound \
-                      to muxloom (WeChat, or Lark). Use it when something they are waiting on is \
-                      finished, when you are blocked on a decision only they can make, or when a \
-                      long run ends while nobody is watching — and not otherwise: this arrives on \
-                      somebody's phone. One message per milestone, never a progress log. Write it \
-                      as a summary they can act on: `title` says what happened, and `text` opens \
-                      with the conclusion, then the numbers, then what you need from them and \
-                      exactly how to answer. Write `text` as markdown, but keep to short lines \
-                      and plain lists: Lark renders headings, tables and code fences, WeChat \
-                      renders none of them and gets a flattened version where the words and line \
-                      breaks survive and the marks do not. muxloom signs it with the machine and \
-                       session you are in, so do not write that yourself, and never put a token, a \
-                       key, or an absolute home path in it. The receipt reports what you sent as \
-                       `message_id`; when a reply reaches you quoting one of your messages it \
-                       names the quoted id, and answering with that id as `reply_to` draws \
-                       WeChat's quote on the same message. Their reply comes back to you as a \
-                      direct message: watch for it with talk_read { scope: \"direct\", \
-                      wait_seconds }. This is a second surface, independent of the talk board: it \
-                      posts nothing there and reads nothing from it, so do not use talk_post to \
-                      reply to a person — answer them here, on the surface they wrote to."
-            .into(),
+        description: format!(
+            "Reach the human who is not at a dashboard, through the chat app they bound to \
+             muxloom (WeChat, or Lark). Use it when something they are waiting on is finished, \
+             when you are blocked on a decision only they can make, or when a long run ends \
+             while nobody is watching — and not otherwise: this arrives on somebody's phone. \
+             One message per milestone, never a progress log. Write it as a summary they can \
+             act on: `title` says what happened, and `text` opens with the conclusion, then the \
+             numbers, then what you need from them and exactly how to answer. Keep it short: \
+             `text` is capped at {text} characters and `title` at {title}, and a message over \
+             either is refused rather than trimmed, because what a trim removes is whatever you \
+             put last — usually the ask. If it will not fit, that is the message being too long \
+             and not the cap being too small: say the conclusion and where the detail already \
+             is (the board, your session, the diff). Write `text` as markdown, but keep to short \
+             lines and plain lists: Lark renders headings, tables and code fences, WeChat \
+             renders none of them and gets a flattened version where the words and line breaks \
+             survive and the marks do not. muxloom signs it with the machine and session you \
+             are in, so do not write that yourself, and never put a token, a key, or an absolute \
+             home path in it. The receipt reports what you sent as `message_id`; when a reply \
+             reaches you quoting one of your messages it names the quoted id, and answering with \
+             that id as `reply_to` draws WeChat's quote on the same message. Their reply comes \
+             back to you as a direct message: watch for it with talk_read {{ scope: \"direct\", \
+             wait_seconds }}. This is a second surface, independent of the talk board: it posts \
+             nothing there and reads nothing from it, so do not use talk_post to reply to a \
+             person — answer them here, on the surface they wrote to.",
+            text = crate::channel::READABLE_LIMIT,
+            title = crate::channel::TITLE_LIMIT,
+        ),
         input_schema: schema(
             false,
             json!({
-                "text": { "type": "string", "description": "The message, as markdown." },
-                "title": { "type": "string", "description": "A few words saying what this is about. Shown as the card's title; taken from a leading \"# \" line if you leave it out." },
+                "text": { "type": "string", "description": format!("The message, as markdown. At most {} characters — a longer one is refused, not trimmed.", crate::channel::READABLE_LIMIT) },
+                "title": { "type": "string", "description": format!("A few words saying what this is about, at most {} characters. Shown as the card's title; taken from a leading \"# \" line if you leave it out.", crate::channel::TITLE_LIMIT) },
                 "channel": { "type": "string", "description": "Which bound channel, by id. Defaults to the one marked default, or to the only one there is." },
                 "reply_to": { "type": "string", "description": "Optional platform id of a message this one answers — the message_id from an earlier send_channel_message receipt, or the id a quote-relayed message named. WeChat draws the answer as a quote of that message; other kinds ignore it." },
             }),
@@ -1763,6 +1773,9 @@ fn send_channel(
         text: required_str(arguments, "text")?.into(),
         signature: speaker(now.clone()),
     };
+    // Before anything is dialled, so a refused message costs nothing and the
+    // agent gets the error while it still has the text in hand.
+    crate::channel::refuse_if_too_long(&message)?;
     let sent =
         crate::channel::send_reply(binding, &message, channel_reply_to(arguments), environment)?;
     // A receipt is what turns the human's reply into an answer: without one it
