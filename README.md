@@ -806,10 +806,17 @@ can lag by a backup interval.
 
 **Reach.** `muxloom mcp` talks to every enabled machine directly. `muxloomd mcp`
 on a remote has no fleet of its own, so its cross-machine calls are relayed
-through the attached controller, and only these are: conversation search and
-recall, listing machines and sessions, `message_agent`, and board sync. Shells,
-machine enablement, and SSH edits are never relayed. With no dashboard
-attached, those calls fail immediately and say so.
+through the attached controller: name a machine with the `machine` argument and
+the controller runs the call over there. Looking and saying go straight through
+— screens, files, sessions, history, conversation recall, `message_agent`, the
+board. Changing something on another machine is put to you first: starting a
+session, typing into one, archiving or deleting one, arming a trigger, running a
+shell. Those come back as an approval id, and the agent asked for them again
+once you have answered in chat. `launch_session` needs an absolute `path` when
+it names another machine — the caller's own folder is on this one. `wait_for`
+never travels; it watches the machine it runs on. Machine enablement and SSH
+edits are never relayed at all. With no dashboard attached, every cross-machine
+call fails immediately and says so.
 
 **Watching from the dashboard.** Press `b` for the board. It is a BBS: scope
 tabs across the top, one line per message, newest at the bottom, `/` to filter,

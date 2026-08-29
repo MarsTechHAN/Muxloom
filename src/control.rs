@@ -178,11 +178,12 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
         }
         Flavor::Daemon => {
             "on this machine, which a muxloom controller may be watching along with others. \
-             list_machines shows the others as `remote`: while the controller is attached you can \
-             look at them and speak to the agents on them — every tool that reads, plus \
-             message_agent and the talk board, takes a `machine` argument and the controller runs \
-             it for you. Changing one of those machines is not yours to do; that is what the \
-             agents living there are for. Everything else happens here"
+             list_machines shows the others as `remote`: while the controller is attached the \
+             whole fleet is yours to work in — name one with the `machine` argument and the \
+             controller runs the call over there. Looking and saying go straight through; \
+             starting a session, typing into one, ending one, or running a shell command is put \
+             to the person first and runs once they say so. Only wait_for stays here, watching \
+             this machine"
         }
     };
     // Which machines exist, and how to reach them, is only the controller's to
@@ -195,10 +196,12 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              when the human asked for that change.\n"
         }
         Flavor::Daemon => {
-            "- A remote machine is only ever reached through the controller, and only to look or \
-             to say something. If it is not attached you are told so immediately — that is the \
-             whole answer, not a reason to retry. Nothing that changes a machine travels: to have \
-             something done over there, ask an agent on that machine with message_agent.\n"
+            "- A remote machine is only ever reached through the controller. If it is not \
+             attached you are told so immediately — that is the whole answer, not a reason to \
+             retry. A change over there waits on the person: you get back an approval id rather \
+             than a result, and the call runs when they answer, so make it again after they do. \
+             When there is already an agent living over there, saying what you want with \
+             message_agent is quicker than driving its machine from here.\n"
         }
     };
     // Only a session has a head name of its own: the daemon flavor runs inside one,
@@ -392,8 +395,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              `raw: true` for the raw vt100 grid (ANSI stripped, column positions \
              intact) when you need the exact layout."
         ),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
                 "lines": { "type": "integer", "description": "Rows to return." },
@@ -414,8 +417,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       `needs_attention` first. Prompts take effect asynchronously: poll \
                       list_sessions or read_screen to watch the result."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
                 "text": { "type": "string", "description": "Bytes to type verbatim." },
@@ -467,7 +470,15 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              happens, or with outcome \"timeout\" after `timeout_seconds` (default \
              {WAIT_DEFAULT_TIMEOUT_SECONDS}, max {WAIT_MAX_TIMEOUT_SECONDS}) — a timeout is not a \
              failure, call it again to keep waiting. This is the tool to reach for after \
-             send_input; to be told about something you will not be here for, use trigger."
+             send_input; to be told about something you will not be here for, use trigger.{}",
+            match flavor {
+                Flavor::Controller => "",
+                // The one watcher that cannot travel: it would sit here
+                // waiting on a session that is somewhere else.
+                Flavor::Daemon =>
+                    " It watches this machine only. For a session on another one, look with \
+                     read_screen { machine } or list_sessions { machine } instead.",
+            }
         ),
         input_schema: schema(
             multi,
@@ -500,8 +511,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       took them and are dropped when their session dies. Use wait_for instead \
                       when you are going to sit and wait for it yourself."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "action": { "type": "string", "enum": ["set", "list", "delete"] },
                 "session_id": { "type": "string", "description": "Session to watch (set), or to list watches for." },
@@ -643,15 +654,20 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             match flavor {
                 Flavor::Controller => "",
                 // The daemon surface starts subagents of the agent calling it,
-                // which is why `path` can be left out entirely.
+                // which is why `path` can be left out entirely. On another
+                // machine there is no such folder to fall back to, and no
+                // environment to read the caller out of either, so the path is
+                // asked for and the person is asked to approve.
                 Flavor::Daemon =>
-                    " Your own working directory is the only place you can start one: leave \
-                     `path` out for it, or name somewhere inside it. To get work done elsewhere, \
-                     or on another machine, ask the agent that lives there with message_agent.",
+                    " On this machine your own working directory is the only place you can start \
+                     one: leave `path` out for it, or name somewhere inside it. On another \
+                     machine, name it with `machine` and give an absolute `path` over there — the \
+                     controller runs the launch once the person approves it, and the session comes \
+                     back recorded as yours.",
             }
         ),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "kind": { "type": "string", "enum": ["codex", "claude", "pi", "opencode", "terminal"] },
                 "path": {
@@ -659,7 +675,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                     "description": match flavor {
                         Flavor::Controller => "Absolute working directory on the machine.",
                         Flavor::Daemon => "Absolute working directory: your own folder, or one \
-                                           inside it. Defaults to your own.",
+                                           inside it. Defaults to your own. Required when \
+                                           `machine` names another one, where you have no folder.",
                     },
                 },
                 "label": { "type": "string", "description": "Display name shown in the dashboard." },
@@ -696,8 +713,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         description: "Retire a live session but keep its history searchable and resumable. \
                       Temporary sessions cannot be archived — delete them instead."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
             }),
@@ -711,8 +728,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       you launched yourself, or ones the human named; archive_session keeps the \
                       history instead."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
             }),
@@ -724,8 +741,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         description: "Full-text search over session terminal histories, live and archived. \
                       Searches one session when session_id is given, otherwise every session."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "query": { "type": "string" },
                 "session_id": { "type": "string", "description": "Limit the search to one session." },
@@ -787,8 +804,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "list_directory",
         description: "List the subdirectories of a directory on the machine.".into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "path": { "type": "string", "description": "Absolute directory path." },
             }),
@@ -798,8 +815,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "list_files",
         description: "List a directory's entries with kind, size, and mtime.".into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "path": { "type": "string", "description": "Absolute directory path." },
             }),
@@ -827,8 +844,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         description: "Read a text or Markdown file from the machine. Binary and media files \
                       answer with their type and size instead of content."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "path": { "type": "string", "description": "Absolute file path." },
             }),
@@ -845,8 +862,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       preview_file, and search_history; work another agent could do belongs in a \
                       message to its session."
             .into(),
-        input_schema: schema(
-            multi,
+        input_schema: schema_across(
+            flavor,
             json!({
                 "script": { "type": "string" },
             }),
@@ -899,6 +916,11 @@ fn schema(multi_machine: bool, properties: Value, required: &[&str]) -> Value {
 /// The schema of a tool that addresses any machine from either surface. The
 /// daemon reaches the others by asking an attached controller to run the call,
 /// so the argument is the same and only what it costs differs.
+///
+/// A tool only belongs here if the controller will actually carry it —
+/// `relay::relayed` for a look, `relay::approve_gated` for a change the person
+/// signs off on first. Offering the argument on anything else would be an
+/// invitation to name a machine and be answered by this one.
 fn schema_across(flavor: Flavor, properties: Value, required: &[&str]) -> Value {
     let mut schema = schema(true, properties, required);
     if flavor == Flavor::Daemon {
@@ -906,7 +928,9 @@ fn schema_across(flavor: Flavor, properties: Value, required: &[&str]) -> Value 
             "type": "string",
             "description": "Machine id from list_machines. Defaults to this machine; another one \
                             is reached through the muxloom controller watching this machine, \
-                            which has to be running.",
+                            which has to be running. Naming another machine on a tool that \
+                            changes something there puts the call to the person first, and it \
+                            runs once they say so.",
         });
     }
     schema
@@ -4242,10 +4266,24 @@ mod daemon_surface {
             // the rest go out only when they name one. A cross-machine WRITE
             // goes out too — the controller enforces the person's approval on
             // the far side — so it is offered here rather than refused.
+            let elsewhere = self.elsewhere(arguments);
             if matches!(name, "search_conversations" | "read_conversation")
                 || ((crate::relay::relayed(name) || crate::relay::approve_gated(name))
-                    && self.elsewhere(arguments).is_some())
+                    && elsewhere.is_some())
             {
+                // The one argument that cannot be defaulted across the wire:
+                // a launch here falls back to the caller's own folder, and
+                // over there that folder is somebody else's or nobody's. Said
+                // now rather than after a round trip and a person's approval.
+                if name == "launch_session" && optional_str(arguments, "path").is_none() {
+                    let machine = elsewhere.unwrap_or_default();
+                    bail!(
+                        "launch_session on {machine} needs an absolute `path` on that machine: \
+                         the folder you are in is on this one. list_sessions {{ machine: \
+                         \"{machine}\" }} shows where its agents already work, and list_directory \
+                         {{ machine: \"{machine}\", path: \"...\" }} looks around."
+                    );
+                }
                 return self.relay(name, arguments);
             }
             match name {
@@ -4755,6 +4793,10 @@ mod tests {
             if tool.name == "launch_session" {
                 assert_eq!(tool.input_schema["required"], json!(["kind"]));
                 assert_eq!(twin.input_schema["required"], json!(["kind", "path"]));
+                // Optional here only because the caller's own folder answers
+                // for it, which is a local answer: naming another machine
+                // takes the folder back off the surface's hands.
+                assert!(tool.input_schema["properties"]["machine"].is_object());
                 continue;
             }
             // Machine addressing is the difference between the surfaces: the
@@ -4773,7 +4815,7 @@ mod tests {
                 .is_some()
             {
                 assert!(
-                    crate::relay::relayed(tool.name),
+                    crate::relay::relayed(tool.name) || crate::relay::approve_gated(tool.name),
                     "{} takes a machine the controller will not relay",
                     tool.name
                 );
@@ -4795,6 +4837,57 @@ mod tests {
         // surface, which lives inside a session, can set one.
         assert!(daemon.iter().any(|tool| tool.name == "set_head_name"));
         assert!(!controller.iter().any(|tool| tool.name == "set_head_name"));
+    }
+
+    /// Seeing a machine and being unable to work on it is the failure this
+    /// guards: the daemon runs every relayable call already, and the only
+    /// thing that ever stopped one was a schema with nowhere to write the
+    /// machine's name down. So the rule is the allowlists', not a list kept
+    /// by hand here — anything the controller will carry is addressable, and
+    /// anything it will not must not look as though it is.
+    #[test]
+    fn a_daemon_can_name_a_machine_for_every_call_the_controller_will_carry() {
+        let daemon = specs(Flavor::Daemon);
+        for tool in &daemon {
+            if !tool.input_schema["properties"]["machine"].is_object() {
+                continue;
+            }
+            assert!(
+                crate::relay::relayed(tool.name) || crate::relay::approve_gated(tool.name),
+                "{} invites a machine the controller will not carry",
+                tool.name
+            );
+        }
+        // The exception on purpose: a watch that travelled would sit on this
+        // machine waiting for something happening on another. It says so in
+        // its own description instead of taking the argument.
+        let wait_for = daemon.iter().find(|tool| tool.name == "wait_for").unwrap();
+        assert!(!wait_for.input_schema["properties"]["machine"].is_object());
+        assert!(wait_for.description.contains("watches this machine only"));
+        // The whole point, spelled out: looking at another machine, and the
+        // writes a person signs off on, are all reachable from inside a
+        // session now.
+        for name in [
+            "read_screen",
+            "send_input",
+            "launch_session",
+            "archive_session",
+            "delete_session",
+            "run_shell",
+            "trigger",
+            "list_files",
+            "preview_file",
+            "search_history",
+        ] {
+            let tool = daemon
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the daemon surface"));
+            assert!(
+                tool.input_schema["properties"]["machine"].is_object(),
+                "{name} cannot be aimed at another machine"
+            );
+        }
     }
 
     #[test]
@@ -4987,15 +5080,15 @@ mod tests {
         assert!(text.contains("not enabled") || text.contains("has not enabled"));
         assert!(!text.contains("disabled these tools"));
         // The daemon surface reaches other machines only through the
-        // controller, and only for the errands it will run. The list of those
-        // is too long to recite now, so the instructions state the rule
-        // instead: look and speak, but do not change.
+        // controller. The list of errands is too long to recite now, so the
+        // instructions state the rule instead: look and speak freely, and a
+        // change over there waits on the person who owns the fleet.
         let daemon = instructions(Flavor::Daemon, &McpConfig::default());
         assert!(daemon.contains("`machine` argument"));
         assert!(daemon.contains("remote"));
-        assert!(daemon.contains("every tool that reads"));
+        assert!(daemon.contains("the whole fleet is yours to work in"));
+        assert!(daemon.contains("put to the person first"));
         assert!(daemon.contains("message_agent"));
-        assert!(daemon.contains("not yours to do"));
         assert!(daemon.contains("not a reason to retry"));
     }
 
@@ -6054,6 +6147,74 @@ mod tests {
             );
             assert_eq!(answer, "[]");
             round.join().unwrap();
+        }
+
+        /// Seeing a machine and being unable to work on it was the whole
+        /// complaint. A call that names another machine has to leave this one
+        /// — including the ones that change something over there, which the
+        /// person approves on the far side rather than this end refusing.
+        #[test]
+        fn a_call_aimed_at_another_machine_leaves_this_one() {
+            let surface = surface("aimed");
+            let away = json!({ "machine": "somewhere-else" });
+            let aimed = |extra: Value| {
+                let mut arguments = away.clone();
+                for (key, value) in extra.as_object().unwrap() {
+                    arguments[key] = value.clone();
+                }
+                arguments
+            };
+            // Nothing is watching, so "there is no controller" is the answer
+            // to every one of these — and it is the answer only because the
+            // call went looking for one instead of being served from here.
+            for (tool, arguments) in [
+                (
+                    "read_screen",
+                    aimed(json!({ "session_id": "muxloomd-x-1-1" })),
+                ),
+                (
+                    "send_input",
+                    aimed(json!({ "session_id": "muxloomd-x-1-1", "text": "hello" })),
+                ),
+                (
+                    "launch_session",
+                    aimed(json!({ "kind": "claude", "path": "/srv/work" })),
+                ),
+                (
+                    "archive_session",
+                    aimed(json!({ "session_id": "muxloomd-x-1-1" })),
+                ),
+                ("run_shell", aimed(json!({ "script": "uptime" }))),
+                ("list_files", aimed(json!({ "path": "/srv" }))),
+            ] {
+                let error = surface.call(tool, &arguments).unwrap_err().to_string();
+                assert!(
+                    error.contains("attached muxloom controller"),
+                    "{tool} was answered here: {error}"
+                );
+            }
+
+            // A launch is the one call whose missing argument this machine
+            // used to fill in, and its folder means nothing over there. Said
+            // before the errand goes out, not after a person has approved it.
+            let error = surface
+                .call("launch_session", &aimed(json!({ "kind": "claude" })))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("needs an absolute `path`"), "{error}");
+            assert!(error.contains("somewhere-else"), "{error}");
+
+            // Aimed at this machine, nothing has changed: the call is served
+            // here, and fails on its own merits rather than for want of a
+            // controller.
+            let error = surface
+                .call(
+                    "read_screen",
+                    &json!({ "machine": "local", "session_id": "muxloomd-x-1-1" }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("attached muxloom controller"), "{error}");
         }
 
         #[test]
