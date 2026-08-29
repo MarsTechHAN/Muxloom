@@ -3748,7 +3748,14 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
     tail.lines().any(spinner_status_line)
 }
 
-/// Whether the sign that a turn is running is one the CLI keeps redrawing.
+/// How far up from the bottom of what is drawn a status bar reaches. Claude
+/// Code's hint is the line under its composer, OpenCode's is its bottom bar;
+/// three lines covers both, and is tight enough that the same words sitting in
+/// the transcript are outside it.
+const STATUS_BAR_LINES: usize = 3;
+
+/// Whether the sign that a turn is running is one the CLI painted once and
+/// then left alone.
 ///
 /// A spinner and the counter beside it tick about once a second for as long as
 /// the turn lasts, so the same frame still on screen much later means the
@@ -3759,10 +3766,27 @@ pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
 /// holds that hint for minutes without a byte crossing the PTY — so how long a
 /// quiet session may go on being read as working depends on which of the two
 /// its screen is showing.
-pub(crate) fn working_marker_ticks(screen: &str) -> bool {
+///
+/// The hint has to be where a status bar is drawn to count as one. `esc to
+/// interrupt` is ordinary enough to turn up in what an agent is reading or
+/// writing — a grep hit, a diff, the tests in this very file — and a transcript
+/// that happens to quote it must not buy a session that stopped talking ten
+/// minutes of looking busy.
+pub(crate) fn working_marker_is_held(screen: &str) -> bool {
     let tail = attention_tail(screen);
-    tail.lines()
+    if tail
+        .lines()
         .any(|line| spinner_status_line(line) || opencode_turn_counter(line))
+    {
+        return false;
+    }
+    let lines: Vec<&str> = tail.lines().collect();
+    lines[lines.len().saturating_sub(STATUS_BAR_LINES)..]
+        .iter()
+        .any(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("esc to interrupt") || lower.contains("esc interrupt")
+        })
 }
 
 /// The frames Claude Code and Pi cycle at the head of their status line.
@@ -6556,18 +6580,41 @@ mod tests {
             "   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                    211.7K (81%)  ctrl+p commands\n",
         );
         assert!(agent_is_working(AgentKind::OpenCode, held));
-        assert!(!working_marker_ticks(held));
+        assert!(working_marker_is_held(held));
 
-        // The counters both CLIs redraw about once a second.
-        assert!(working_marker_ticks(
+        // The counters both CLIs redraw about once a second. Silence with one
+        // of those on screen is the painting having stopped.
+        assert!(!working_marker_is_held(
             "✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)\n"
         ));
-        assert!(working_marker_ticks(
+        assert!(!working_marker_is_held(
             "▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n"
         ));
+        // Claude Code draws both at once: the spinner above the composer, the
+        // hint on the bar below it. The one that ticks is the one to go by.
+        assert!(!working_marker_is_held(concat!(
+            "✶ Garnishing… (14m 20s · ↓ 32.4k tokens)\n",
+            "\n",
+            "──────────────────────────────────────\n",
+            "❯\n",
+            "──────────────────────────────────────\n",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents\n",
+        )));
 
-        // Nothing on a screen at rest ticks.
-        assert!(!working_marker_ticks("❯ \nCtrl+N new session\n"));
+        // Nothing on a screen at rest is held either.
+        assert!(!working_marker_is_held("❯ \nCtrl+N new session\n"));
+
+        // The words in the transcript rather than on the bar: an agent reading
+        // this very file, or grepping for the marker. Whatever that session is
+        // doing, this is not the evidence for it, and it buys no patience.
+        assert!(!working_marker_is_held(concat!(
+            "  ⎿  src/runtime.rs:3714:    if lower.contains(\"esc to interrupt\")\n",
+            "\n",
+            "──────────────────────────────────────\n",
+            "❯ \n",
+            "──────────────────────────────────────\n",
+            "  ⏵⏵ accepts edits on\n",
+        )));
     }
 
     #[test]

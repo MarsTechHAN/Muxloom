@@ -178,7 +178,9 @@ daemon has heard the session speak. How long such a screen outlives the last
 byte off the PTY depends on which marker it is: seconds for a spinner, which
 stops turning the moment the CLI stops painting, but minutes for an interrupt
 hint held on a status bar, because a turn that shells out to a build holds one
-the whole time it says nothing at all. A session a new daemon adopted has its
+the whole time it says nothing at all. The hint has to be down on the bar to
+earn that: the same words quoted in a transcript — a grep hit, a diff — buy a
+quiet session nothing. A session a new daemon adopted has its
 screen replayed out of the capture, which may be drawing a turn that ended an
 hour ago, so it counts as working only once this daemon has heard it — a
 rebuild no longer lights up every untouched agent on the machine at once. Codex

@@ -40,7 +40,7 @@ mod platform {
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
             DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer, composer_text,
-            is_temporary_session_id, working_marker_ticks,
+            is_temporary_session_id, working_marker_is_held,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
@@ -5046,9 +5046,9 @@ mod platform {
                     // once: a screen replayed into an adopted session is a
                     // record of what it was doing, not of what it is doing.
                     let heard = self.last_output.load(Ordering::Relaxed);
-                    let patience = match working_marker_ticks(&visible_screen) {
-                        true => WORKING_TICKING_QUIET_MS,
-                        false => WORKING_HELD_QUIET_MS,
+                    let patience = match working_marker_is_held(&visible_screen) {
+                        true => WORKING_HELD_QUIET_MS,
+                        false => WORKING_TICKING_QUIET_MS,
                     };
                     let fresh = heard != 0 && now_ms().saturating_sub(heard) < patience;
                     let working_hint = self
