@@ -57,6 +57,66 @@ const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
 const CODEX_NO_HISTORY_CONFIG: &str = "history.persistence=\"none\"";
 
+/// How a runtime is asked to run its own turn without stopping to ask.
+///
+/// A muxloom session is started by somebody who is not sitting in front of it:
+/// a chat message, a parent agent, a launch form on another machine. A runtime
+/// that halts on its first permission dialog spends that whole distance on one
+/// keypress nobody is there to give, so every runtime that has an unattended
+/// mode is started in it. Each of these is the runtime's own sanctioned
+/// setting, not a bypass: Claude's `auto` permission mode, Codex's workspace
+/// sandbox with approvals off, OpenCode's `--auto`. Pi asks for nothing to
+/// begin with and so needs none.
+///
+/// `conflicts` are the arguments that mean the user has already said what mode
+/// they want. Configured arguments win: an explicit `--permission-mode plan`
+/// or a `--sandbox read-only` is a decision, and a default must never overrule
+/// one.
+struct UnattendedMode {
+    args: &'static [&'static str],
+    conflicts: &'static [&'static str],
+}
+
+fn unattended_mode(kind: AgentKind) -> Option<UnattendedMode> {
+    match kind {
+        AgentKind::Claude => Some(UnattendedMode {
+            args: &["--permission-mode", "auto"],
+            conflicts: &[
+                "--permission-mode",
+                "--dangerously-skip-permissions",
+                "--permission-prompt-tool",
+            ],
+        }),
+        // Codex spells the same thing as a pair: where it may write, and
+        // whether it stops to ask. `--full-auto` was the shorthand for exactly
+        // this pair and no longer parses on current builds, so the pair is
+        // what gets sent — and a config still carrying the shorthand is left
+        // to mean what its own runtime makes of it.
+        AgentKind::Codex => Some(UnattendedMode {
+            args: &[
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+            ],
+            conflicts: &[
+                "--sandbox",
+                "-s",
+                "--ask-for-approval",
+                "-a",
+                "--full-auto",
+                "--approve-for-me",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+        }),
+        AgentKind::OpenCode => Some(UnattendedMode {
+            args: &["--auto"],
+            conflicts: &["--auto"],
+        }),
+        AgentKind::Pi | AgentKind::Terminal => None,
+    }
+}
+
 /// The most of a text file a preview will pull across. A preview is something
 /// to glance through, and reading a log of any size whole — over SSH, into
 /// memory, behind a spinner that cannot say how long it will take — is not that.
@@ -4763,6 +4823,18 @@ pub(crate) fn launch_arguments(
     initial_prompt: Option<&str>,
 ) -> Vec<String> {
     let mut args = command.args.clone();
+    // Nobody is sitting in front of a session muxloom starts, so the runtime is
+    // asked to run unattended unless the configured arguments already choose a
+    // mode. Like the flags below, this must precede Codex's `resume`
+    // subcommand, so it goes on first.
+    if let Some(mode) = unattended_mode(kind)
+        && !mode
+            .conflicts
+            .iter()
+            .any(|flag| args.iter().any(|argument| argument_is(argument, flag)))
+    {
+        args.extend(mode.args.iter().map(|argument| (*argument).to_string()));
+    }
     // Keep this session-local instead of changing the user's global Codex
     // configuration. The flag must precede the `resume` subcommand.
     if kind == AgentKind::Codex
@@ -4806,6 +4878,16 @@ pub(crate) fn launch_arguments(
         args.push(prompt.into());
     }
     args
+}
+
+/// Whether a configured argument is the named flag, written either way round:
+/// `--sandbox read-only` and `--sandbox=read-only` are the same decision, and
+/// a default that only recognised one of them would quietly override the other.
+fn argument_is(argument: &str, flag: &str) -> bool {
+    argument == flag
+        || argument
+            .split_once('=')
+            .is_some_and(|(name, _)| name == flag)
 }
 
 /// The prompt a launch wants typed into the session once it is ready, rather
@@ -6677,7 +6759,7 @@ mod tests {
         };
         assert_eq!(
             command_line(&command, AgentKind::Claude, false, Some("abc"), None),
-            "claude --resume abc"
+            "claude --permission-mode auto --resume abc"
         );
         assert_eq!(
             command_line(
@@ -6687,7 +6769,7 @@ mod tests {
                 None,
                 Some("Read /tmp/source history.jsonl")
             ),
-            "claude 'Read /tmp/source history.jsonl'"
+            "claude --permission-mode auto 'Read /tmp/source history.jsonl'"
         );
         let command = CommandConfig {
             command: "pi".into(),
@@ -6697,6 +6779,85 @@ mod tests {
         assert_eq!(
             command_line(&command, AgentKind::Pi, false, Some("abc"), None),
             "pi --session abc"
+        );
+    }
+
+    /// A session muxloom starts has nobody in front of it, so each runtime is
+    /// asked for its own unattended mode. Pi has none to ask for.
+    #[test]
+    fn a_session_nobody_is_watching_starts_in_the_runtime_unattended_mode() {
+        let bare = |command: &str| CommandConfig {
+            command: command.into(),
+            args: Vec::new(),
+            ..CommandConfig::default()
+        };
+
+        assert_eq!(
+            launch_arguments(&bare("claude"), AgentKind::Claude, false, None, None),
+            ["--permission-mode", "auto"]
+        );
+        assert_eq!(
+            launch_arguments(&bare("codex"), AgentKind::Codex, false, None, None),
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "--no-alt-screen"
+            ]
+        );
+        assert_eq!(
+            launch_arguments(&bare("opencode"), AgentKind::OpenCode, false, None, None),
+            ["--auto"]
+        );
+        assert!(launch_arguments(&bare("pi"), AgentKind::Pi, false, None, None).is_empty());
+    }
+
+    /// A mode written into the config is a decision somebody made on purpose,
+    /// including the deliberately narrower ones, so the default stands aside —
+    /// however the flag is spelled, and whichever half of Codex's pair is set.
+    #[test]
+    fn a_mode_chosen_in_the_config_is_never_overruled_by_the_default() {
+        let with = |command: &str, args: &[&str]| CommandConfig {
+            command: command.into(),
+            args: args
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect(),
+            ..CommandConfig::default()
+        };
+
+        assert_eq!(
+            launch_arguments(
+                &with("claude", &["--permission-mode=plan"]),
+                AgentKind::Claude,
+                false,
+                None,
+                None
+            ),
+            ["--permission-mode=plan"]
+        );
+        // Half the pair is enough: somebody who pinned the sandbox to read-only
+        // did not ask for approvals to be turned off underneath it.
+        assert_eq!(
+            launch_arguments(
+                &with("codex", &["--sandbox", "read-only"]),
+                AgentKind::Codex,
+                false,
+                None,
+                None
+            ),
+            ["--sandbox", "read-only", "--no-alt-screen"]
+        );
+        assert_eq!(
+            launch_arguments(
+                &with("opencode", &["--auto"]),
+                AgentKind::OpenCode,
+                false,
+                None,
+                None
+            ),
+            ["--auto"]
         );
     }
 

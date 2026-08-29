@@ -609,6 +609,10 @@ read_only = false
 # state instead. Bind one in the dashboard: focus the machines panel and press
 # c. WeChat takes a scan and about ten seconds.
 
+# Nobody is sitting in front of a session muxloom starts, so each runtime is
+# launched in its own unattended mode: Claude `--permission-mode auto`, Codex
+# `--sandbox workspace-write --ask-for-approval never`, OpenCode `--auto`. Name
+# a mode in `args` and that one is used instead — including a narrower one.
 [agents.codex]
 command = "codex"
 args = []

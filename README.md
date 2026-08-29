@@ -605,11 +605,16 @@ attention_patterns = ["gpu approval", "do you want to proceed"]
 
 [hosts.gpu-box.codex]
 command = "/opt/codex/bin/codex"
-args = ["--full-auto"]
+args = ["--sandbox", "read-only"]
 ```
 
 - `command` is one executable name or path; `args` are structured values, not a
   shell string. Use a wrapper executable for pipes or redirects.
+- Nobody is sitting in front of a session muxloom starts, so each runtime is
+  launched in its own unattended mode: Claude `--permission-mode auto`, Codex
+  `--sandbox workspace-write --ask-for-approval never`, OpenCode `--auto` (pi
+  asks for nothing). Naming a mode in `args` — including a narrower one, as
+  above — uses that one instead.
 - `environment` uses shell-style assignments
   (`HTTP_PROXY=http://proxy:8118 TOKEN='two words'`). Global values merge with
   the selected machine's overrides.
