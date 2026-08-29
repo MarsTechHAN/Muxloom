@@ -747,6 +747,10 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let archived_count = app.archived_count();
     let mut items = Vec::new();
     let mut row_ids = Vec::new();
+    // Which folder band each row sits under, so a row left at the top of the
+    // pane can still be told which one it fell out of. Empty for the rows that
+    // belong to no folder — the bands themselves, the watches, the archive.
+    let mut row_groups: Vec<String> = Vec::new();
     let mut selected_row = None;
     let mut previous_group = String::new();
     let mut archive_header_added = false;
@@ -777,6 +781,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .style(Style::default().fg(Color::Cyan)),
         );
         row_ids.push((Some(watch.id.clone()), 1));
+        row_groups.push(String::new());
     }
 
     for (index, (session, shape)) in sessions.iter().enumerate() {
@@ -786,6 +791,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.archive_row = Some(items.len());
             items.push(archive_item(archived_count, true));
             row_ids.push((None, 1));
+            row_groups.push(String::new());
             previous_group.clear();
             archive_header_added = true;
         }
@@ -819,6 +825,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             // from the next; the rows between them carry no background.
             items.push(ListItem::new(Line::from(spans)).style(Style::default().bg(GROUP_BAND)));
             row_ids.push((None, 1));
+            row_groups.push(String::new());
             previous_group = group;
         }
 
@@ -969,11 +976,15 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Style::default()
         }));
         row_ids.push((Some(session.id), height));
+        // A subagent keeps the band its parent opened even when it runs
+        // somewhere else, so the band in effect is the answer, not the path.
+        row_groups.push(previous_group.clone());
     }
     if archived_count > 0 && !app.state.show_archived {
         app.archive_row = Some(items.len());
         items.push(archive_item(archived_count, false));
         row_ids.push((None, 1));
+        row_groups.push(String::new());
     }
     if items.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -981,6 +992,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Style::default().fg(MUTED),
         )));
         row_ids.push((None, 1));
+        row_groups.push(String::new());
     }
 
     app.agent_rows = row_ids;
@@ -1001,6 +1013,44 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             "  "
         });
     frame.render_stateful_widget(list, area, &mut app.agent_list_state);
+
+    // A folder band scrolls away with the rows above it, and the agent left at
+    // the top of the pane is then in no folder at all — the one row on screen
+    // that cannot say where it is. Repeat the band it fell out of along the
+    // pane's own edge, which costs no row and reads in the same colour.
+    let offset = app.agent_list_state.offset();
+    let scrolled_out_of = row_groups
+        .get(offset)
+        .filter(|group| !group.is_empty())
+        .filter(|_| {
+            offset > 0
+                && app
+                    .agent_rows
+                    .get(offset)
+                    .is_some_and(|(id, _)| id.is_some())
+        });
+    if let Some(group) = scrolled_out_of {
+        let room = (area.width as usize).saturating_sub(UnicodeWidthStr::width(title) + 5);
+        if room >= 4 {
+            let (attention, working) = state_by_group.get(group).copied().unwrap_or_default();
+            let text = format!(" {} ", truncate(group, room));
+            let width = UnicodeWidthStr::width(text.as_str()) as u16;
+            frame.buffer_mut().set_string(
+                area.x + area.width.saturating_sub(width + 1),
+                area.y,
+                text,
+                Style::default()
+                    .fg(if attention {
+                        Color::Yellow
+                    } else if working {
+                        Color::Green
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+    }
 }
 
 fn archive_item(count: usize, expanded: bool) -> ListItem<'static> {
@@ -6272,6 +6322,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_agent_at_the_top_of_a_scrolled_list_still_says_which_folder_it_is_in() {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        for folder in ["/work/alpha", "/work/beta"] {
+            for index in 0..4 {
+                app.sessions.push(AgentSession {
+                    id: format!("muxloomd-codex{}-{index}", folder.replace('/', "-")),
+                    target_id: "local".into(),
+                    kind: AgentKind::Codex,
+                    path: folder.into(),
+                    label: format!("{folder} agent {index}"),
+                    created_at: index,
+                    dead: false,
+                    pid: Some(1),
+                    working: false,
+                    needs_attention: false,
+                    attention_reason: None,
+                    recap: None,
+                    title: None,
+                    thread: None,
+                    parent: None,
+                });
+            }
+        }
+        // The last agent of the second folder: reaching it scrolls the first
+        // folder's band, and every one of its rows, off the top.
+        app.selected_session_id = Some("muxloomd-codex-work-beta-0".into());
+
+        let border = |terminal: &Terminal<TestBackend>| -> String {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(app.agent_list_state.offset() > 0, "the list has to scroll");
+        let scrolled = border(&terminal);
+        assert!(
+            scrolled.contains("/work/alpha"),
+            "the top row's folder belongs on the pane edge: {scrolled:?}"
+        );
+
+        // Climbing back up to the first agent of a folder is the case that
+        // stung: the list stops with that agent's own band one row too high.
+        app.selected_session_id = Some("muxloomd-codex-work-alpha-3".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        assert_eq!(app.agent_list_state.offset(), 1);
+        assert!(border(&terminal).contains("/work/alpha"));
+
+        // Nothing scrolled off: the bands are all on screen and the edge says
+        // nothing they do not already say.
+        app.agent_list_state = Default::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .unwrap();
+        assert_eq!(app.agent_list_state.offset(), 0);
+        let whole = border(&terminal);
+        assert!(!whole.contains("/work/"), "nothing scrolled off: {whole:?}");
     }
 
     #[test]
