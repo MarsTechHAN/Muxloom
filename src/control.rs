@@ -1626,28 +1626,53 @@ fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
     )
 }
 
-/// Who a channel message says it is from, as the human should read it: the
-/// assigned name when the session has one, and the folder it runs in when it
-/// does not — a session renamed is somebody, a session left at its defaults is
+/// What the calling session is called *now*, asked of whoever can see the
+/// session table.
+///
+/// `MUXLOOM_SESSION_LABEL` is stamped into the keeper's environment once, when
+/// the session is launched, and no one can change a running process's mind
+/// about it afterwards. Every name the session has acquired since is invisible
+/// from in here: the one it gave itself with `set_head_name`, the one a person
+/// typed over it in the dashboard, the title its runtime wrote for the
+/// conversation. So a name read off the environment is what the session was
+/// called at birth — which, for the many launched with no name at all, is
+/// nothing — and that is the name a person was reading on their phone.
+///
+/// Asked rather than inferred, and only of the session's own record: an agent
+/// naming itself in an argument could only get it wrong.
+fn session_name_now(sessions: impl FnOnce() -> Result<Vec<DaemonSession>>) -> Option<String> {
+    let id = session_env("MUXLOOM_SESSION_ID")?;
+    let session = sessions().ok()?.into_iter().find(|it| it.id == id)?;
+    let named = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    named(&session.label).or_else(|| session.title.as_deref().and_then(named))
+}
+
+/// Who a channel message says it is from, as the human should read it: what the
+/// session is called if it is called anything, and the folder it runs in if it
+/// is not — a session named is somebody, a session left at its defaults is
 /// where the work is. A machine label is added when there is one, so two
 /// machines talking into the same chat stay tellable apart.
 ///
-/// Read from the environment muxloom put the session in rather than asked for
-/// as an argument, for the same reason a parent session is: an agent naming
-/// itself could only get it wrong, and a person reading this on their phone has
-/// nothing else to tell one agent from another by. A process driving the
-/// surface from outside a session says only that it is the default, which is
-/// true.
-fn speaker() -> String {
-    let name = session_env("MUXLOOM_SESSION_LABEL")
-        .filter(|label| !label.trim().is_empty())
+/// `now` is what the session table says it is called this minute, from
+/// `session_name_now`; the environment is the fallback for a lookup that could
+/// not be made. The session id is never one of the answers. It identifies the
+/// session perfectly and names it not at all, and a person reading their phone
+/// cannot do anything with `muxloomd-claude-1787996682-39374-2` except squint
+/// at it — the runtime and the machine at least say which agent this is.
+fn speaker(now: Option<String>) -> String {
+    let name = now
+        .or_else(|| session_env("MUXLOOM_SESSION_LABEL"))
         .or_else(|| {
             session_env("MUXLOOM_SESSION_PATH")
                 .filter(|path| !path.trim().is_empty())
                 .as_deref()
                 .and_then(folder_name)
         })
-        .unwrap_or_else(|| session_env("MUXLOOM_SESSION_ID").unwrap_or_default());
+        .or_else(|| session_env("MUXLOOM_SESSION_KIND"))
+        .unwrap_or_default();
     let mut parts = vec![name];
     if let Some(machine) = session_env("MUXLOOM_MACHINE_LABEL")
         .or_else(|| session_env("MUXLOOM_MACHINE"))
@@ -1692,12 +1717,13 @@ fn send_channel(
     binding: &crate::channel::ChannelBinding,
     arguments: &Value,
     environment: &[(String, String)],
+    now: Option<String>,
     leave: impl FnOnce(crate::channel::ChannelReceipt),
 ) -> Result<String> {
     let message = crate::channel::Outgoing {
         title: optional_str(arguments, "title").unwrap_or_default().into(),
         text: required_str(arguments, "text")?.into(),
-        signature: speaker(),
+        signature: speaker(now.clone()),
     };
     let sent =
         crate::channel::send_reply(binding, &message, channel_reply_to(arguments), environment)?;
@@ -1713,7 +1739,12 @@ fn send_channel(
             message_id: sent.message_id.clone(),
             machine: session_env("MUXLOOM_MACHINE").unwrap_or_else(|| "local".into()),
             session_id,
-            label: session_env("MUXLOOM_SESSION_LABEL").unwrap_or_default(),
+            // The name the chat will show against their reply, and the one
+            // `/list` reads back: the live one, for the same reason the
+            // signature is.
+            label: now
+                .or_else(|| session_env("MUXLOOM_SESSION_LABEL"))
+                .unwrap_or_default(),
         });
     }
     let wechat_json = sent.wechat.as_ref().map(|v| {
@@ -1734,10 +1765,14 @@ fn send_channel(
     })))
 }
 
-fn session_voice() -> TalkVoice {
+fn session_voice(now: Option<String>) -> TalkVoice {
     TalkVoice {
         session_id: session_env("MUXLOOM_SESSION_ID"),
-        label: session_env("MUXLOOM_SESSION_LABEL"),
+        // What this session is called now, not what it was named at launch:
+        // this is how every other agent reads who just spoke to them, and a
+        // board full of agents under their birth names is a board nobody can
+        // navigate. See `session_name_now`.
+        label: now.or_else(|| session_env("MUXLOOM_SESSION_LABEL")),
         kind: session_env("MUXLOOM_SESSION_KIND"),
         // Speaking as a person is the dashboard's privilege; anything reaching
         // the board through a tool call is an agent, whoever asked for it.
@@ -1749,7 +1784,12 @@ fn session_voice() -> TalkVoice {
 /// purpose: the daemon that mints the message is the one that knows its own
 /// origin key, and a caller naming someone else's machine would be filing
 /// under a board it does not own.
-fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
+///
+/// The author is passed in rather than defaulted. `Talk::post` fills in the
+/// machine and nothing else, so a draft that named nobody was filed as nobody —
+/// every board post read back as `"name": "someone"` with no session and no
+/// kind, which is a board you cannot tell two agents apart on.
+fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
     let text = required_str(arguments, "text")?;
     if text.len() > MAX_TEXT {
         bail!(
@@ -1790,7 +1830,7 @@ fn talk_draft(arguments: &Value) -> Result<TalkDraft> {
     };
     Ok(TalkDraft {
         scope,
-        author: TalkAuthor::default(),
+        author,
         kind,
         to: None,
         reply_to: optional_str(arguments, "reply_to").map(Into::into),
@@ -1808,17 +1848,18 @@ fn task_root() -> Option<String> {
     session_env("MUXLOOM_TASK_ROOT").or_else(|| session_env("MUXLOOM_SESSION_ID"))
 }
 
-/// Who a direct message is from.
+/// Who a message is from, board post or direct alike.
 ///
-/// A board post can leave this out — the machine that files it is the machine
-/// it was said on. A direct message is filed on the *target's* board, so a
-/// sender that says nothing about where it is would be recorded as speaking
-/// from the machine it reached.
-fn direct_author(local: impl FnOnce() -> Result<TalkState>) -> TalkAuthor {
+/// The machine matters most for a direct message, which is filed on the
+/// *target's* board: a sender that says nothing about where it is would be
+/// recorded as speaking from the machine it reached. A board post crossing to
+/// another machine's board has the same problem, and one filed here would have
+/// been backfilled correctly anyway — so both ask.
+fn message_author(now: Option<String>, local: impl FnOnce() -> Result<TalkState>) -> TalkAuthor {
     let mut author = TalkAuthor {
         machine: session_env("MUXLOOM_MACHINE").unwrap_or_default(),
         machine_label: session_env("MUXLOOM_MACHINE_LABEL").unwrap_or_default(),
-        voice: session_voice(),
+        voice: session_voice(now),
     };
     if author.machine.is_empty() {
         // Not running inside a muxloom session: ask the board here what this
@@ -2857,10 +2898,10 @@ impl ControllerControl {
 
     fn talk_post(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
-        let message = self
-            .runtime
-            .bridge_pool()
-            .talk_post(&target, talk_draft(arguments)?)?;
+        let pool = self.runtime.bridge_pool();
+        let now = session_name_now(|| pool.list_sessions(&Target::local()));
+        let author = message_author(now, || pool.talk_status(&Target::local(), None));
+        let message = pool.talk_post(&target, talk_draft(arguments, author)?)?;
         Ok(pretty(&talk_json(&message)))
     }
 
@@ -2891,7 +2932,8 @@ impl ControllerControl {
         // Left with the daemon on this machine rather than kept here: this
         // process ends when the tool call does, and the dashboard that reads
         // the chat is somewhere else entirely.
-        send_channel(binding, arguments, &environment, |receipt| {
+        let now = session_name_now(|| self.runtime.bridge_pool().list_sessions(&Target::local()));
+        send_channel(binding, arguments, &environment, now, |receipt| {
             let _ = self
                 .runtime
                 .bridge_pool()
@@ -2902,7 +2944,8 @@ impl ControllerControl {
     fn message_agent(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        let author = direct_author(|| pool.talk_status(&Target::local(), None));
+        let now = session_name_now(|| pool.list_sessions(&Target::local()));
+        let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let (draft, deliver, reply_expected) = direct_draft(arguments, author)?;
         let (message, delivery, reason) =
             pool.talk_deliver(&target, draft, deliver, reply_expected)?;
@@ -3423,13 +3466,13 @@ mod daemon_surface {
 
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
-        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, delivery_json, direct_author,
-        direct_draft, enforce_policy, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
-        fleet_resume_target, instructions, launch_path_within, launching_session, native_resume_id,
-        optional_bool, optional_str, optional_usize, plain_screen, pretty, preview_text,
-        required_str, screen_page, send_channel, session_env, session_json, session_kind,
-        shell_report, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
-        trigger_json, trigger_spec, wait_loop,
+        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, delivery_json, direct_draft,
+        enforce_policy, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
+        fleet_resume_target, instructions, launch_path_within, launching_session, message_author,
+        native_resume_id, optional_bool, optional_str, optional_usize, plain_screen, pretty,
+        preview_text, required_str, screen_page, send_channel, session_env, session_json,
+        session_kind, session_name_now, shell_report, synthetic_child_prompt, talk_draft,
+        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         channel::ChannelSet,
@@ -3656,7 +3699,14 @@ mod daemon_surface {
         }
 
         fn talk_post(&self, arguments: &Value) -> Result<String> {
-            let draft = talk_draft(arguments)?;
+            let now = session_name_now(|| self.sessions());
+            let author = message_author(now, || {
+                match self.transact(&DaemonRequest::TalkStatus { label: None })?.0 {
+                    DaemonResponse::TalkBoard { state } => Ok(state),
+                    response => bail!("unexpected talk response: {response:?}"),
+                }
+            });
+            let draft = talk_draft(arguments, author)?;
             match self.transact(&DaemonRequest::TalkPost { draft })?.0 {
                 DaemonResponse::Talk { page } => {
                     let message = page
@@ -3707,9 +3757,12 @@ mod daemon_surface {
             let channels = ChannelSet::read(&self.paths.channels);
             let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
             match channels.pick(optional_str(arguments, "channel")) {
-                Ok(binding) => send_channel(binding, arguments, &environment, |receipt| {
-                    let _ = self.transact(&DaemonRequest::ChannelSent { receipt });
-                }),
+                Ok(binding) => {
+                    let now = session_name_now(|| self.sessions());
+                    send_channel(binding, arguments, &environment, now, |receipt| {
+                        let _ = self.transact(&DaemonRequest::ChannelSent { receipt });
+                    })
+                }
                 Err(unbound) => self
                     .relay("send_channel_message", arguments)
                     // The controller could not help either. What a human can
@@ -3826,7 +3879,8 @@ mod daemon_surface {
             // The board here is the one the message will be filed on, so an
             // author with no machine on it would be right anyway; asking keeps
             // the record the same shape as one that crossed a machine.
-            let author = direct_author(|| {
+            let now = session_name_now(|| self.sessions());
+            let author = message_author(now, || {
                 match self.transact(&DaemonRequest::TalkStatus { label: None })?.0 {
                     DaemonResponse::TalkBoard { state } => Ok(state),
                     response => bail!("unexpected talk response: {response:?}"),
@@ -5334,6 +5388,50 @@ mod tests {
             relayed_caller(&json!({ "_muxloom_caller": "muxloomd-claude-3-1-0" })).as_deref(),
             Some("muxloomd-claude-4-1-0")
         );
+    }
+
+    /// A session is signed with what it is called now, not what it was named
+    /// at launch — and never with its id.
+    ///
+    /// `MUXLOOM_SESSION_LABEL` is written into the keeper's environment once
+    /// and never again, so every name acquired since — `set_head_name`, a
+    /// person typing over it in the dashboard, the runtime's own title — was
+    /// invisible to chat cards, board posts, and agent-to-agent envelopes.
+    #[test]
+    fn a_session_signs_with_the_name_it_answers_to_this_minute() {
+        let _lock = daemon_env_lock();
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-9-1-0"));
+        let _label = EnvScope::set("MUXLOOM_SESSION_LABEL", Some("agent 3"));
+        let _kind = EnvScope::set("MUXLOOM_SESSION_KIND", Some("claude"));
+        let _path = EnvScope::set("MUXLOOM_SESSION_PATH", Some("/works/Terminal"));
+        let _machine = EnvScope::set("MUXLOOM_MACHINE", Some("seed"));
+        let _machine_label = EnvScope::set("MUXLOOM_MACHINE_LABEL", None);
+
+        let mut renamed = fleet_row("muxloomd-claude-9-1-0", None);
+        renamed.label = "channel routing".into();
+        let table = vec![fleet_row("muxloomd-claude-8-1-0", None), renamed.clone()];
+
+        let now = session_name_now(|| Ok(table.clone()));
+        assert_eq!(now.as_deref(), Some("channel routing"));
+        assert_eq!(speaker(now), "channel routing · seed");
+
+        // Nobody named it, but its runtime titled the conversation: that is
+        // what the dashboard shows, so that is what the human should read.
+        let mut titled = renamed.clone();
+        titled.label = String::new();
+        titled.title = Some("tracking down the resume leak".into());
+        assert_eq!(
+            session_name_now(|| Ok(vec![titled])).as_deref(),
+            Some("tracking down the resume leak")
+        );
+
+        // No lookup to be had: the launch-time name, then the folder. The id
+        // is never one of the answers.
+        assert_eq!(speaker(None), "agent 3 · seed");
+        let _unnamed = EnvScope::set("MUXLOOM_SESSION_LABEL", None);
+        assert_eq!(speaker(None), "Terminal · seed");
+        let _nowhere = EnvScope::set("MUXLOOM_SESSION_PATH", None);
+        assert_eq!(speaker(None), "claude · seed");
     }
 
     /// The same process-global the daemon-surface tests rewrite; the gate
