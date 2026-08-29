@@ -5641,6 +5641,11 @@ mod platform {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        // Whether every line has to be case folded properly to answer this
+        // query, or whether the bytes can be read as they lie. Folding is a
+        // fresh allocation per line, and a capture runs to hundreds of
+        // megabytes: it costs about ten times what the byte scan does.
+        let folding = query_needs_unicode_folding(&query);
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
@@ -5652,10 +5657,17 @@ mod platform {
                 break;
             }
             line_number += 1;
-            let text = String::from_utf8_lossy(&buffer);
-            if !text.to_lowercase().contains(&query) {
+            let hit = if folding {
+                String::from_utf8_lossy(&buffer)
+                    .to_lowercase()
+                    .contains(&query)
+            } else {
+                line_contains_folded(&buffer, query.as_bytes())
+            };
+            if !hit {
                 continue;
             }
+            let text = String::from_utf8_lossy(&buffer);
             let text = text
                 .trim()
                 .chars()
@@ -5678,6 +5690,51 @@ mod platform {
             }
         }
         Ok(matches)
+    }
+
+    /// Whether a query can only be answered by case folding the text it is
+    /// matched against: it holds a letter outside ASCII whose shape changes
+    /// with its case. A query written in ASCII folds byte for byte, and one
+    /// written in a script that has no case - CJK, digits, punctuation, which
+    /// lowercase to themselves - needs no folding at all. Those are the queries
+    /// people type; the accented remainder keeps the slow, exact path.
+    ///
+    /// `query` is already lowercased.
+    fn query_needs_unicode_folding(query: &str) -> bool {
+        query.chars().any(|character| {
+            !character.is_ascii() && character.to_uppercase().next() != Some(character)
+        })
+    }
+
+    /// Whether `line` holds `needle`, matched byte for byte with ASCII letters
+    /// folded. `needle` is already lowercased; see
+    /// [`query_needs_unicode_folding`] for when this is the whole answer.
+    fn line_contains_folded(line: &[u8], needle: &[u8]) -> bool {
+        let Some(first) = needle.first().copied() else {
+            return true;
+        };
+        let mut rest = line;
+        while rest.len() >= needle.len() {
+            let Some(offset) = rest
+                .iter()
+                .position(|byte| byte.eq_ignore_ascii_case(&first))
+            else {
+                return false;
+            };
+            rest = &rest[offset..];
+            if rest.len() < needle.len() {
+                return false;
+            }
+            if rest[..needle.len()]
+                .iter()
+                .zip(needle)
+                .all(|(byte, wanted)| byte.eq_ignore_ascii_case(wanted))
+            {
+                return true;
+            }
+            rest = &rest[1..];
+        }
+        false
     }
 
     fn write_chunks(
@@ -8818,6 +8875,57 @@ mod platform {
             let tail = keeper_log_tail(&paths, session_id).unwrap();
             assert!(tail.chars().count() <= 301, "{}", tail.chars().count());
             assert!(tail.ends_with('…'), "{tail}");
+
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        /// Searching a fleet means reading every capture it has ever written,
+        /// and those run to gigabytes, so the line matcher is where the time
+        /// goes. It reads the bytes as they lie for the queries people type and
+        /// still answers them the way case folding would.
+        #[test]
+        fn history_is_searched_case_insensitively_whatever_the_query_is_written_in() {
+            let paths = DaemonPaths::under(PathBuf::from("/tmp").join(format!(
+                "mxl-search-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+            )));
+            paths.prepare().unwrap();
+            let history = paths.history.join("search.ansi");
+            fs::write(
+                &history,
+                "Cargo Test all green\n\
+                 ※ recap: 改好了分页器\n\
+                 rien à signaler\n\
+                 RIEN À SIGNALER\n",
+            )
+            .unwrap();
+
+            let matched = |query: &str| {
+                search_history_file(&history, query, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|found| (found.line_number, found.recap))
+                    .collect::<Vec<_>>()
+            };
+            // ASCII folds byte for byte, in either direction.
+            assert_eq!(matched("cargo test"), [(1, false)]);
+            assert_eq!(matched("CARGO TEST"), [(1, false)]);
+            // A script with no case is matched exactly, and a recap still reads
+            // as one.
+            assert_eq!(matched("分页器"), [(2, true)]);
+            // An accented query is the one case that still needs folding, and
+            // it must not have been lost with the fast path.
+            assert_eq!(matched("rien à"), [(3, false), (4, false)]);
+            assert_eq!(matched("RIEN À"), [(3, false), (4, false)]);
+            assert!(matched("nothing of the sort").is_empty());
+            // The query is what decides which path is taken.
+            assert!(!query_needs_unicode_folding("cargo test"));
+            assert!(!query_needs_unicode_folding("改好了分页器"));
+            assert!(query_needs_unicode_folding("rien à"));
 
             fs::remove_dir_all(paths.root).unwrap();
         }
