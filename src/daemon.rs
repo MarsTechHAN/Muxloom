@@ -5438,8 +5438,10 @@ mod platform {
         /// while the *same* question sits there the tells run out along
         /// `PARENT_ALERT_REMINDERS_MS` and then stop, because a stuck screen,
         /// most of all a wrongly-classified one, must not become a
-        /// minute-ticker at its parent. A different reason or different last
-        /// words is a different question and is told about at once.
+        /// minute-ticker at its parent. A different reason, or different last
+        /// words where both readings exist, is a different question and is told
+        /// about at once; last words merely going missing and coming back are
+        /// the reading blinking, not the child moving.
         ///
         /// An attention pass that reads *not* attention does not reset the
         /// schedule either: a classifier blinking off and back onto the same
@@ -5473,7 +5475,22 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let replace = match guard.as_ref() {
-                Some(edge) => edge.reason_key != reason_key || edge.recap_key != recap_key,
+                // The last words are a *reading*, and a reading can be missing
+                // where the question behind it is not. The runtime drops and
+                // retakes its transcript claim, and a screen sitting behind a
+                // modal has no last word to scrape; either one blinks the recap
+                // to nothing and back while the child sits on the very same
+                // question. An edge replaced on that blink is the ceiling
+                // coming off - the count starts at zero, the first tell is due
+                // at once, and the parent gets exactly the minute-ticker this
+                // schedule exists to prevent. So only a change between two
+                // readings is news. The absence of one is not.
+                Some(edge) => {
+                    edge.reason_key != reason_key
+                        || (!recap_key.is_empty()
+                            && !edge.recap_key.is_empty()
+                            && edge.recap_key != recap_key)
+                }
                 None => true,
             };
             if replace {
@@ -5484,6 +5501,14 @@ mod platform {
                     told: 0,
                     last_claimed_at: 0,
                 });
+            } else if let Some(edge) = guard.as_mut()
+                && edge.recap_key.is_empty()
+            {
+                // The reading that was missing when this edge was installed,
+                // arriving late. Learning it costs nothing, changes nothing
+                // owed, and is what lets the next *real* change be seen as one
+                // rather than measured against a blank.
+                edge.recap_key = recap_key;
             }
             let edge = guard.as_mut().expect("an edge was just installed");
             // `told` counts what has been claimed for this pair, first tell
@@ -8622,7 +8647,16 @@ mod platform {
             // Silence means *until the question changes*: different last
             // words is a new question, and so is a different reason - both
             // are told about at once, schedule and all.
+            // Last words the child never had are not a change, so give it
+            // some to change *from* first - which is quiet, and is its own
+            // assertion.
             let mut moved = child.snapshot();
+            moved.recap = Some("waiting on the gpu quota".into());
+            child.note_parent_alert(&moved);
+            assert!(
+                child.take_parent_alert().is_none(),
+                "last words merely turning up are not a new question"
+            );
             moved.recap = Some("but this line is new".into());
             child.note_parent_alert(&moved);
             assert!(
@@ -8648,7 +8682,81 @@ mod platform {
 
             child.archive().unwrap();
             orphan.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
+        }
+
+        /// The leash holds through a *missing* reading, which is the way it
+        /// actually gets tested. Last words are scraped, and scraping fails
+        /// where the question does not: the runtime drops and retakes its
+        /// transcript claim, a modal covers the last thing said. Counting
+        /// either blink as a new question restarts the schedule at zero with
+        /// the first tell due at once, and a child parked on one dialog for an
+        /// afternoon becomes a nag a minute at its parent - the exact failure
+        /// the widening reminders exist to prevent, arriving through the door
+        /// marked "told about at once".
+        #[test]
+        fn last_words_going_missing_and_coming_back_is_not_a_new_question() {
+            let state = test_state("parent-edge-blink");
+            let root = state.paths.root.clone();
+            *state
+                .attention_patterns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                vec!["gpu quota approval".into()];
+            let told = |child: &ManagedSession, recap: Option<&str>| {
+                let mut snapshot = child.snapshot();
+                snapshot.recap = recap.map(str::to_string);
+                child.note_parent_alert(&snapshot);
+                child.take_parent_alert().is_some()
+            };
+
+            // A question that arrives with its last words attached, and a
+            // reading that then blinks out and back while nothing moves.
+            let child = launch_child_with_parent(&state, "parent-edge-blink", Some("the-parent"));
+            child.record_output(&approval_screen("gpu quota approval"));
+            assert!(told(&child, Some("waiting on the gpu quota")), "first tell");
+            assert!(!told(&child, None), "last words going missing is not news");
+            assert!(
+                !told(&child, Some("waiting on the gpu quota")),
+                "nor is them coming back"
+            );
+
+            // And the blinking has not refilled the tank behind itself: the
+            // reminders come due where they always would have, and the fourth
+            // tell is still the last one.
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[0] + 1);
+            assert!(told(&child, None), "first reminder, on the same schedule");
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[1] + 1);
+            assert!(told(&child, Some("waiting on the gpu quota")), "second");
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[2] + 1);
+            assert!(told(&child, None), "third");
+            age_parent_alert(&child, 3_600_000);
+            assert!(
+                !told(&child, Some("waiting on the gpu quota")),
+                "four tells is still the leash"
+            );
+
+            // The other direction: an edge installed while the reading was
+            // missing learns it when it turns up - quietly, owing nothing for
+            // the arrival - and that is what lets a real change afterwards be
+            // measured against real last words instead of against a blank.
+            let late = launch_child_with_parent(&state, "parent-edge-late", Some("the-parent"));
+            late.record_output(&approval_screen("gpu quota approval"));
+            assert!(told(&late, None), "the first tell, last words or not");
+            assert!(
+                !told(&late, Some("waiting on the gpu quota")),
+                "the reading turning up is not a new question"
+            );
+            age_parent_alert(&late, PARENT_ALERT_REMINDERS_MS[0] + 1);
+            assert!(told(&late, Some("waiting on the gpu quota")), "reminder");
+            assert!(
+                told(&late, Some("now waiting on a second opinion")),
+                "a real change is still told about at once"
+            );
+
+            child.archive().unwrap();
+            late.archive().unwrap();
+            discard_root(root);
         }
 
         /// The other half of one round: whoever lists the sessions runs the
