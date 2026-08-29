@@ -1531,11 +1531,16 @@ pub enum Route {
     Who,
     /// Explain the commands this chat understands.
     Help,
-    /// Stop pointing anywhere; plain messages go back to the board.
+    /// Stop pointing anywhere; plain messages then have nowhere to go until
+    /// the chat is aimed again.
     Clear,
     /// Put it on the machine board, where any agent can find it. `asked` is
     /// whether the human meant to — `/all` — or whether it simply had nowhere
-    /// better to go. Nothing a person says is dropped.
+    /// better to go, which is not the same thing and is not treated as one: a
+    /// sentence with nobody's name on it is this person talking, and a
+    /// broadcast every agent on the machine reads past is not where talking
+    /// goes. Unasked, they are told it went nowhere while the words are still
+    /// on their screen to send again.
     Board { asked: bool },
     /// A word that was meant as a command and is not one. Answered rather than
     /// sent: somebody who mistypes `/select` and has it delivered to an agent
@@ -1554,7 +1559,7 @@ pub enum Route {
 /// person in it, a sentence with no address on it can only mean whoever they
 /// were last talking to, and making them say `/select` first to hear that back
 /// is the kind of ceremony that gets a feature abandoned. In a group it means
-/// nothing of the sort, so there it goes to the board where anyone can find it.
+/// nothing of the sort, so there it is nobody's until they say whose.
 pub fn route(
     text: &str,
     reply_to: Option<&str>,
@@ -2947,7 +2952,7 @@ fn handle(
                 "  /select <num>-<n>  aim this chat at one agent, until another writes or /clear".into(),
                 "  /select <name>     aim at an agent by name".into(),
                 "  /who               every running agent everywhere, in one flat list".into(),
-                "  /clear             stop aiming; plain messages go to the board".into(),
+                "  /clear             stop aiming; plain messages then go nowhere until you aim again".into(),
                 "  /all <text>        put something on the board every agent reads".into(),
                 "  /new <machine>     start a fresh agent there, in a scratch folder, aimed at this chat".into(),
                 "  /help              this list".into(),
@@ -2955,7 +2960,7 @@ fn handle(
             lines.push(String::new());
             lines.push(match binding.kind.solo() {
                 true => "Just type a plain sentence and it goes to whoever you last talked to — /select picks that up front, and reply to a card to answer that agent instead.".into(),
-                false => "Just type a plain sentence and it goes where this chat is aimed, or to the board if nothing is. A reply to a card always reaches the agent who sent it.".into(),
+                false => "Just type a plain sentence and it goes where this chat is aimed — aim with /select, or use /all to put something on the board. A reply to a card always reaches the agent who sent it.".into(),
             });
             lines.join("\n")
         }
@@ -3141,7 +3146,10 @@ fn handle(
             out
         }
         Route::Clear => match inbox.unaim(&binding.id) {
-            Some(who) => format!("· no longer aimed at {}", who.name()),
+            Some(who) => format!(
+                "· no longer aimed at {} — plain messages go nowhere until you `/select` again",
+                who.name()
+            ),
             None => "· nothing was aimed".into(),
         },
         Route::Unknown(word) => format!(
@@ -3254,7 +3262,19 @@ fn handle(
                 Err(error) => format!("· {} did not get that: {error:#}", who.name()),
             }
         }
-        Route::Board { asked } => {
+        // Nothing is aimed and nobody has written, so there is no one this was
+        // for. It does not go on the board: the board is a broadcast, read by
+        // every agent on the machine and owed an answer by none of them, and a
+        // person's sentence sitting in it is both unanswered and in everybody's
+        // way. Far better to say so straight back — they are holding the phone
+        // they typed it on, and one `/select` makes the next one land.
+        Route::Board { asked: false } => {
+            "· nothing is aimed, so that went nowhere. `/who` lists who is here and `/select` \
+             points this chat at one of them — or `/all <text>` to put something on the board for \
+             whoever picks it up."
+                .into()
+        }
+        Route::Board { asked: true } => {
             let draft = crate::talk::TalkDraft {
                 scope: crate::talk::TalkScope::Machine {
                     machine: String::new(),
@@ -3270,8 +3290,9 @@ fn handle(
                 .bridge_pool()
                 .talk_post(&Target::local(), draft)
             {
-                Ok(_) if asked => "· on the board, where every agent reads it".into(),
-                Ok(_) => "· on the board — nothing is aimed yet. `/who` lists who is here.".into(),
+                Ok(_) => "· on the board, where every agent reads it. Nobody owes it an answer — \
+                          `/select` if you want one."
+                    .into(),
                 Err(error) => format!("· the board did not take that: {error:#}"),
             }
         }
@@ -4305,6 +4326,42 @@ mod tests {
         );
         assert!(!roster.contains("seo"), "{roster}");
         assert!(roster.contains("(2 finished, not listed)"), "{roster}");
+    }
+
+    /// A sentence with nobody's name on it used to be posted to the machine
+    /// board, and the person told it had gone "on the board". It had: a
+    /// broadcast every agent on the machine reads past and none of them owes
+    /// an answer. So the person was told their message had arrived somewhere
+    /// while in fact nobody had it, which is the worst of both — the board
+    /// carrying chat, and the chat waiting on a board.
+    #[test]
+    fn a_message_aimed_at_nobody_is_answered_rather_than_dropped_on_the_board() {
+        let config = crate::config::Config::default();
+        let runtime = Runtime::new(&config);
+        let mut desk = Desk::new(&runtime, &[], &config);
+        desk.sessions = Some(Vec::new());
+        let binding = ChannelBinding {
+            id: "wechat-1".into(),
+            kind: ChannelKind::WeChat,
+            ..Default::default()
+        };
+        let mut inbox = Inbox::default();
+
+        let answer = handle(
+            &mut desk,
+            &binding,
+            &Incoming {
+                text: "how is the parser coming along?".into(),
+                ..Default::default()
+            },
+            &mut inbox,
+        );
+        // Said straight back, while the words are still on the phone that typed
+        // them, with the one command that makes the next one land.
+        assert!(answer.contains("went nowhere"), "{answer}");
+        assert!(answer.contains("/select"), "{answer}");
+        // And `/all` is still there for somebody who did mean everyone.
+        assert!(answer.contains("/all"), "{answer}");
     }
 
     /// The number `/list` prints and the number `/select` counts along were
