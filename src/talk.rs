@@ -172,6 +172,26 @@ pub struct TalkVoice {
     /// the dashboard's privilege; the MCP surface never sets it.
     #[serde(default)]
     pub human: bool,
+    /// The chat channel a person wrote this from, when they wrote it from one.
+    ///
+    /// A person on WeChat is not reading the talk board, and never will be, so
+    /// an answer left there is an answer nobody receives. This is the id
+    /// `send_channel_message` takes, carried the whole way in so the envelope
+    /// can hand the reader the one call that reaches back to where the message
+    /// came from. Empty for a person typing at a dashboard, where the board
+    /// really is what they are looking at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// The reader's own earlier message that this one quotes, in the chat
+    /// app's numbering — set only when the person answered by quoting it.
+    ///
+    /// It rides with the return address because that is what it is for: an
+    /// answer carrying it is drawn under the same exchange in the app, so the
+    /// person reading a day of messages can see what was answered. It used to
+    /// be pasted into the message body, which quietly rewrote what the person
+    /// had written; the words are theirs and are left alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_quote: Option<String>,
 }
 
 impl TalkVoice {
@@ -1179,14 +1199,57 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool, here: &str) 
              doing.",
             call(session)
         ),
+        // A person who wrote in from a chat app reads the answer in that app or
+        // not at all. Sending them to the board here is how an answer ends up
+        // filed where the one person waiting for it never looks, so the call
+        // that reaches them is the one spelled out.
+        None if author.voice.human => match author.voice.channel.as_deref() {
+            Some(channel) if !channel.is_empty() => {
+                // A quote is answered quoting, so the person reading a day of
+                // messages can see which of theirs this belongs to.
+                let quoting = match author.voice.channel_quote.as_deref() {
+                    Some(quoted) if !quoted.is_empty() => format!("reply_to: \"{quoted}\", "),
+                    _ => String::new(),
+                };
+                format!(
+                    "A person sent this from their chat app. Answer them there with the muxloom \
+                     tool send_channel_message {{ channel: \"{channel}\", {quoting}text: \"…\" }} \
+                     — not on the talk board, which they are not reading. Reply first, briefly, \
+                     before you go and do the thing they asked for: from their side silence and \
+                     refusal look the same."
+                )
+            }
+            _ => "A person wrote this, not an agent. Answer where they are: talk_post puts it on \
+                  the board they are watching."
+                .into(),
+        },
         None => "Say anything back on the talk board with talk_post; the sender is not a muxloom \
                  session, so there is nowhere to reply directly."
             .into(),
     };
+    // Who typed it is the first thing the reader has to get right, and the two
+    // cases pull opposite ways: another agent's message is a colleague's
+    // opinion to weigh, and a person's is the instruction the whole session
+    // exists to serve. Telling a reader that the human it works for is "another
+    // agent" is the worst of the two mistakes, so the line is written from
+    // whether the board says a person spoke.
+    let from = match author.voice.human {
+        true => format!("[muxloom] Message from \"{who}\" on {machine}{session}"),
+        false => format!("[muxloom] Message from {kind} \"{who}\" on {machine}{session}"),
+    };
+    let provenance = match author.voice.human {
+        true => {
+            "Delivered by muxloom: a person typed this — the human you work for, writing in from \
+             where they are. It is not another agent's suggestion."
+        }
+        false => {
+            "Delivered by muxloom: another agent typed this, not the person you are working for. \
+             Judge it on its merits."
+        }
+    };
     format!(
-        "[muxloom] Message from {kind} \"{who}\" on {machine}{session}, {}.\n\
-         Delivered by muxloom: another agent typed this, not the person you are working for. \
-         Judge it on its merits.\n\
+        "{from}, {}.\n\
+         {provenance}\n\
          --- message ---\n\
          {}\n\
          --- end of message ---\n\
@@ -1373,6 +1436,8 @@ mod tests {
                     label: Some("builder".into()),
                     kind: Some("claude".into()),
                     human: false,
+                    channel: None,
+                    channel_quote: None,
                 },
                 ..TalkAuthor::default()
             },
@@ -1848,6 +1913,78 @@ mod tests {
         let mut anonymous = message.clone();
         anonymous.author.voice.session_id = None;
         assert!(render_delivery(&anonymous, true, "nearby").contains("nowhere to reply directly"));
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_person_writing_in_from_a_chat_is_answered_in_that_chat_and_not_on_the_board() {
+        let store = store("envelope-human");
+        let mut sent = draft(
+            "干的怎么样了",
+            TalkScope::Machine {
+                machine: String::new(),
+            },
+        );
+        sent.kind = TalkKind::Direct;
+        sent.author.voice = TalkVoice {
+            label: Some("Ming via WeChat / 微信".into()),
+            human: true,
+            channel: Some("wechat-1".into()),
+            ..Default::default()
+        };
+        sent.to = Some(TalkAddress {
+            machine: String::new(),
+            session_id: "session-2".into(),
+        });
+        let message = store.post(sent).unwrap();
+
+        let envelope = render_delivery(&message, true, "nearby");
+        // Not "another agent typed this": it is the person the session works
+        // for, and the header has to say so before anything else.
+        // No "from agent": the kind slot is what says an agent is speaking, and
+        // the person the session works for is not one.
+        assert!(
+            envelope.starts_with("[muxloom] Message from \"Ming via WeChat / 微信\" on "),
+            "{envelope}"
+        );
+        assert!(envelope.contains("a person typed this"), "{envelope}");
+        assert!(!envelope.contains("another agent typed this"), "{envelope}");
+        // The way back is the chat they wrote from, spelled out, and the board
+        // is named as the wrong answer rather than left to be guessed at.
+        assert!(
+            envelope.contains("send_channel_message { channel: \"wechat-1\", text: \"…\" }"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("not on the talk board"), "{envelope}");
+        assert!(!envelope.contains("talk_post"), "{envelope}");
+        // The person's words are delivered as they wrote them: nothing muxloom
+        // has to say about how to answer is mixed into them.
+        assert!(
+            envelope.contains("--- message ---\n干的怎么样了\n--- end of message ---"),
+            "{envelope}"
+        );
+
+        // Answering a quote quotes back, so the exchange stays readable in the
+        // app — and the whole call is there to paste.
+        let mut quoting = message.clone();
+        quoting.author.voice.channel_quote = Some("7499470565387522824".into());
+        let envelope = render_delivery(&quoting, true, "nearby");
+        assert!(
+            envelope.contains(
+                "send_channel_message { channel: \"wechat-1\", reply_to: \
+                 \"7499470565387522824\", text: \"…\" }"
+            ),
+            "{envelope}"
+        );
+
+        // A person typing at a dashboard is looking at the board, so there the
+        // board is where an answer reaches them.
+        let mut at_a_desk = message.clone();
+        at_a_desk.author.voice.channel = None;
+        let envelope = render_delivery(&at_a_desk, false, "nearby");
+        assert!(envelope.contains("talk_post"), "{envelope}");
+        assert!(envelope.contains("A person wrote this"), "{envelope}");
 
         fs::remove_dir_all(&store.root).ok();
     }

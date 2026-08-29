@@ -781,7 +781,17 @@ knows it is hearing from a colleague rather than from its user. Delivery waits
 for a busy session by default (`deliver: "when_idle"` waits indefinitely,
 `"now"` interrupts). Every direct message is also filed on the board, so both
 what was said and whether it arrived are auditable, and replies come back
-through `talk_read { scope: "direct" }`.
+through `talk_read { scope: "direct" }` — and are answered with `message_agent`
+again, not with a board post, which would put a two-agent exchange in front of
+every agent on every machine.
+
+The same envelope carries a person writing in from a chat app, and then it says
+the opposite: a human typed this, and it is not a colleague's suggestion. It
+also carries the way back — the `send_channel_message` call for the channel they
+wrote from, quoting whichever of the agent's own messages they replied to — for
+the same reason the agent-to-agent envelope carries a reply address. A person on
+a phone is not reading the board, so an answer left there is an answer nobody
+receives.
 
 **Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
 a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.

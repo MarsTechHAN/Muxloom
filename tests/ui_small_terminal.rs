@@ -478,6 +478,8 @@ fn board_messages() -> Vec<TalkMessage> {
                     label: Some("review-bot".into()),
                     kind: Some("claude".into()),
                     human: false,
+                    channel: None,
+                    channel_quote: None,
                 },
             },
             kind,

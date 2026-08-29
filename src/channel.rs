@@ -2605,7 +2605,11 @@ impl<'a> Desk<'a> {
 
     /// A human speaking, as the board records them. Asked of the local board
     /// once, because what this machine is called is not something a chat knows.
-    fn author(&mut self, called: &str) -> crate::talk::TalkAuthor {
+    ///
+    /// `channel` is the binding they wrote from, and it travels with the words:
+    /// a person on a phone reads the answer in the app they typed into, so an
+    /// agent that is handed this message has to be handed the way back to it.
+    fn author(&mut self, called: &str, channel: &str) -> crate::talk::TalkAuthor {
         let base = self.author.get_or_insert_with(|| {
             let (machine, machine_label) = self
                 .runtime
@@ -2625,6 +2629,7 @@ impl<'a> Desk<'a> {
                 // The one thing an agent reading this has to know: a person
                 // wrote it, so it is not another agent's suggestion.
                 human: true,
+                channel: Some(channel.to_string()),
                 ..Default::default()
             },
             ..base.clone()
@@ -3079,31 +3084,26 @@ fn handle(
                 return format!("· {} is on a machine muxloom cannot reach", who.name());
             };
             // When they replied by quoting one of this agent's own messages,
-            // the quoted platform id is the one thing the agent needs to
-            // answer quoting the same exchange, and nothing else carries it
-            // across the delivery: name it in the words they receive. Only a
-            // quote that matches this agent's receipt gets the note — a quote
-            // of somebody else's message is not theirs to answer quoting.
-            let text = match message.reply_to.as_deref() {
-                Some(quoted)
-                    if binding.kind == ChannelKind::WeChat
-                        && inbox
-                            .sender_of(quoted)
-                            .is_some_and(|from| from.session_id == who.session_id) =>
-                {
-                    format!(
-                        "{text}\n\n(muxloom: this quotes your message {quoted} — \
-                         answer with send_channel_message reply_to \"{quoted}\" \
-                         and it quotes the exchange back)"
-                    )
-                }
-                _ => text,
-            };
+            // the quoted platform id is the one thing the agent needs to answer
+            // quoting the same exchange, and nothing else carries it across the
+            // delivery. It travels on the author's return address rather than
+            // pasted into the message: the words in the body are the person's,
+            // and muxloom adding a line to them is muxloom putting words in
+            // their mouth. Only a quote that matches this agent's own receipt
+            // counts — a quote of somebody else's message is not theirs to
+            // answer quoting.
+            let quoted = message.reply_to.as_deref().filter(|quoted| {
+                inbox
+                    .sender_of(quoted)
+                    .is_some_and(|from| from.session_id == who.session_id)
+            });
+            let mut author = desk.author(&called, &binding.id);
+            author.voice.channel_quote = quoted.map(str::to_string);
             let draft = crate::talk::TalkDraft {
                 scope: crate::talk::TalkScope::Machine {
                     machine: String::new(),
                 },
-                author: desk.author(&called),
+                author,
                 kind: crate::talk::TalkKind::Direct,
                 to: Some(crate::talk::TalkAddress {
                     machine: String::new(),
@@ -3131,7 +3131,7 @@ fn handle(
                 scope: crate::talk::TalkScope::Machine {
                     machine: String::new(),
                 },
-                author: desk.author(&called),
+                author: desk.author(&called, &binding.id),
                 kind: crate::talk::TalkKind::Message,
                 to: None,
                 reply_to: None,

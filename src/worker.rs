@@ -1515,6 +1515,8 @@ fn drain_parent_alerts(runtime: &Runtime, targets: &[Target], config: &Config) {
                         label: Some("muxloom".into()),
                         kind: None,
                         human: false,
+                        channel: None,
+                        channel_quote: None,
                     },
                 },
                 kind: TalkKind::Direct,

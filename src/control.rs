@@ -433,9 +433,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       something over, answer a question you were asked, or warn someone off a file \
                       you are changing — and use send_input instead only when you need raw \
                       keystrokes rather than a message. The target must be a codex, claude, \
-                      session; a terminal has nobody in it to read. Every message is also filed on \
-                      the talk board, so read your own with talk_read { scope: \"direct\" } — that \
-                      is where replies arrive if the other agent is not sure how to reach you. \
+                      session; a terminal has nobody in it to read. Replies come back the same \
+                      way, as direct messages: read yours with talk_read { scope: \"direct\" }, \
+                      and answer with message_agent again. Never answer one of these with \
+                      talk_post — that puts a private exchange on a board every agent on every \
+                      machine has to read past. \
                       A message lands whole even while that agent is mid-turn; it is read when \
                       the turn ends, so one message should say everything you have to say. There \
                       is a rate limit per session and it will tell you. \"auto\" is almost always \
@@ -565,7 +567,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       front of everyone else on the machine. kind \"note\" is the same thing meant \
                       to be kept and found later: decisions, gotchas, where a thing lives. \
                       Posting does not interrupt anyone; to put a message in front of one agent, \
-                      use message_agent. This writes only to the talk board: it never reaches a \
+                      use message_agent. It is a broadcast, not a chat: say the thing once, for \
+                      everyone, and take a back-and-forth to message_agent, where it belongs and \
+                      where the one agent it concerns will actually read it. A board carrying two \
+                      agents' conversation is a board the rest stop reading. This writes only to \
+                      the talk board: it never reaches a \
                       person's chat app, and nobody on their phone is told. To reach a person \
                       where they are, use send_channel_message instead — the board and the chat \
                       app are independent surfaces and nothing routes between them."
@@ -577,7 +583,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "scope": { "type": "string", "enum": ["path", "machine", "task", "global"], "description": "Who it is for. Default path." },
                 "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
                 "kind": { "type": "string", "enum": ["message", "note"], "description": "\"note\" is meant to be kept and searched later. Default message." },
-                "reply_to": { "type": "string", "description": "Message id this answers." },
+                "reply_to": { "type": "string", "description": "Message id this answers. One hop: correct or add to a post everyone should see. If it is turning into a conversation, carry on with message_agent instead." },
             }),
             &["text"],
         ),
@@ -1777,6 +1783,8 @@ fn session_voice(now: Option<String>) -> TalkVoice {
         // Speaking as a person is the dashboard's privilege; anything reaching
         // the board through a tool call is an agent, whoever asked for it.
         human: false,
+        channel: None,
+        channel_quote: None,
     }
 }
 
@@ -2019,6 +2027,12 @@ fn talk_json(message: &TalkMessage) -> Value {
             "session_id": &message.author.voice.session_id,
             "kind": &message.author.voice.kind,
             "human": message.author.voice.human,
+            // The way back to a person who wrote in from a chat app. An agent
+            // reading its own board afterwards — catching up on what it was
+            // asked while it was busy — needs the same return address the
+            // delivered envelope carried, or the answer to a question read
+            // here has nowhere to go.
+            "channel": &message.author.voice.channel,
         },
         "to": message.to.as_ref().map(|to| json!({
             "machine": to.machine,
@@ -4371,6 +4385,8 @@ mod tests {
                     label: Some(from.into()),
                     kind: Some("claude".into()),
                     human: false,
+                    channel: None,
+                    channel_quote: None,
                 },
             },
             kind: TalkKind::Direct,
@@ -4398,6 +4414,8 @@ mod tests {
             label: Some("muxloom".into()),
             kind: None,
             human: false,
+            channel: None,
+            channel_quote: None,
         };
         message.reply_to = Some(about.into());
         message

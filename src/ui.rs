@@ -6240,6 +6240,8 @@ mod tests {
                     label: Some(who.into()),
                     kind: Some("claude".into()),
                     human: false,
+                    channel: None,
+                    channel_quote: None,
                 },
             },
             kind: TalkKind::Message,

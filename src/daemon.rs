@@ -1199,6 +1199,8 @@ mod platform {
                         label: Some("muxloom".into()),
                         kind: None,
                         human: false,
+                        channel: None,
+                        channel_quote: None,
                     },
                 },
                 kind: TalkKind::Direct,

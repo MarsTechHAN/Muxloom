@@ -1066,6 +1066,8 @@ fn human_voice() -> TalkVoice {
         label: Some(name),
         kind: None,
         human: true,
+        channel: None,
+        channel_quote: None,
     }
 }
 
@@ -19409,6 +19411,8 @@ mod tests {
                     label: Some("review-bot".into()),
                     kind: Some("claude".into()),
                     human: false,
+                    channel: None,
+                    channel_quote: None,
                 },
             },
             kind,
