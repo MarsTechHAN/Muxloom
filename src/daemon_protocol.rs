@@ -631,6 +631,14 @@ pub struct DaemonSession {
     #[serde(default)]
     pub temporary: bool,
     pub created_at: u64,
+    /// When this session stopped being live, in seconds, whether it was
+    /// archived by hand or its process ended on its own. An archive is read
+    /// newest-put-down first — the conversation somebody just closed is the
+    /// one they come back for — and that is a different order from when each
+    /// of them began. `None` on a record archived before this was written
+    /// down, and on every live session.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
     pub pid: Option<u32>,
     pub dead: bool,
     pub archived: bool,

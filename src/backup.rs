@@ -75,6 +75,10 @@ pub struct BackupRecord {
     pub title: String,
     pub dead: bool,
     pub archived: bool,
+    /// Unix seconds the session was archived, when the daemon recorded one.
+    /// A backup listed alongside live records sits in the same archive order
+    /// as everything else, and that order is when each was put down.
+    pub archived_at: Option<u64>,
     /// Native agent transcript id + path, once resolved (empty until then).
     pub native_id: String,
     pub native_path: String,
@@ -771,6 +775,7 @@ pub fn sync_target(
         record.recap = session.recap.clone().unwrap_or_default();
         record.dead = session.dead;
         record.archived = session.archived;
+        record.archived_at = session.archived_at.or(record.archived_at);
 
         if include_ansi {
             if let Err(error) = sync_capture(
@@ -2503,6 +2508,7 @@ mod tests {
             label: id.into(),
             temporary: false,
             created_at: 0,
+            archived_at: None,
             pid: None,
             dead: false,
             archived: false,

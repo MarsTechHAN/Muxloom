@@ -5119,6 +5119,7 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
         path: session.path,
         label: session.label,
         created_at: session.created_at,
+        archived_at: session.archived_at,
         dead: session.dead || session.archived,
         pid: session.pid,
         working: session.working,
@@ -5183,6 +5184,8 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     path: sanitize_field(metadata.0[1]),
                     label: sanitize_field(metadata.0[2]),
                     created_at: metadata.0[3].parse().unwrap_or(0),
+                    // A tmux pane keeps no account of when it ended.
+                    archived_at: None,
                     dead: fields[metadata.1] == "1",
                     pid: fields[metadata.2].parse().ok(),
                     working: false,

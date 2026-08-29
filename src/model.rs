@@ -334,6 +334,11 @@ pub struct AgentSession {
     pub path: String,
     pub label: String,
     pub created_at: u64,
+    /// When this session was archived, in seconds. An archive is read
+    /// newest-put-down first, which is a different order from when each
+    /// conversation began. `None` on a live session, and on a record archived
+    /// by a daemon too old to write it down.
+    pub archived_at: Option<u64>,
     pub dead: bool,
     pub pid: Option<u32>,
     pub working: bool,

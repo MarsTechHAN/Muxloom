@@ -42,6 +42,7 @@ fn make_app() -> App {
         path: "/work/terminal".into(),
         label: "build".into(),
         created_at: 1,
+        archived_at: None,
         dead: false,
         pid: Some(100),
         working: false,

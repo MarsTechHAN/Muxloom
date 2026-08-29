@@ -615,6 +615,9 @@ struct RecoverableSession {
     title: String,
     recap: String,
     created_at: u64,
+    /// When the machine archived it, if the record caught that before the
+    /// session was lost. The archive is ordered by it like everything else.
+    archived_at: Option<u64>,
     machine_key: String,
     restorable: bool,
     /// The conversation the record mirrors, so a restore reopens the one this
@@ -3829,7 +3832,22 @@ impl App {
                 })
                 .then_with(|| left.target_id.cmp(&right.target_id))
                 .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| right.created_at.cmp(&left.created_at))
+                // Inside a folder: live sessions by when they started, and
+                // archived ones by when they were put down. What sends anybody
+                // into the archive is the conversation they just closed, and
+                // when it began says nothing about where it sits in that list —
+                // a week-old session archived this morning was buried under
+                // everything started since. A record from a daemon too old to
+                // say when it ended falls back to when it began.
+                .then_with(|| {
+                    let when = |session: &AgentSession| {
+                        session
+                            .archived_at
+                            .filter(|_| session.dead)
+                            .unwrap_or(session.created_at)
+                    };
+                    when(right).cmp(&when(left))
+                })
         });
 
         let by_id: HashMap<&str, &AgentSession> = sessions
@@ -5996,6 +6014,7 @@ impl App {
                 path: record.cwd,
                 label: record.label,
                 created_at: record.created_at,
+                archived_at: record.archived_at,
                 // Nothing is running, so it belongs with the archived entries:
                 // read-only until it is put back on the machine.
                 dead: true,
@@ -11969,6 +11988,7 @@ fn recoverable_backup_records(
             title: record.title,
             recap: record.recap,
             created_at: record.created_at,
+            archived_at: record.archived_at,
             native_id: record.native_id,
         })
         .collect()
@@ -12652,6 +12672,7 @@ mod tests {
             path: "/work".into(),
             label: "live status".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -12749,6 +12770,7 @@ mod tests {
                 path: "/work/project".into(),
                 label: "big refactor".into(),
                 created_at: 1,
+                archived_at: None,
                 dead: false,
                 pid: Some(10),
                 working: false,
@@ -12766,6 +12788,7 @@ mod tests {
                 path: "/work/project".into(),
                 label: "dev server".into(),
                 created_at: 2,
+                archived_at: None,
                 dead: false,
                 pid: Some(11),
                 working: false,
@@ -13013,6 +13036,7 @@ mod tests {
                 path: "/work/a".into(),
                 label: "selected".into(),
                 created_at: 1,
+                archived_at: None,
                 dead: false,
                 pid: Some(10),
                 working: false,
@@ -13030,6 +13054,7 @@ mod tests {
                 path: "/work/b".into(),
                 label: "background".into(),
                 created_at: 2,
+                archived_at: None,
                 dead: false,
                 pid: Some(20),
                 working: true,
@@ -13083,6 +13108,7 @@ mod tests {
             path: "/work".into(),
             label: "waiting".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(10),
             working: false,
@@ -13133,6 +13159,7 @@ mod tests {
             path: "/work".into(),
             label: id.into(),
             created_at,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -13150,6 +13177,55 @@ mod tests {
             .into_iter()
             .map(|(session, shape)| (session.id.clone(), shape.depth, shape.descendants))
             .collect()
+    }
+
+    /// The archive is read for the conversation somebody just put down, so
+    /// inside a folder it goes newest-archived first — which is nothing like
+    /// newest-started, the order it used to be in.
+    #[test]
+    fn a_folders_archive_is_ordered_by_when_each_session_was_put_down() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.state.show_archived = true;
+        let archived = |id: &str, created_at: u64, archived_at: Option<u64>| AgentSession {
+            dead: true,
+            pid: None,
+            archived_at,
+            ..tree_session(id, None, created_at)
+        };
+        app.sessions = vec![
+            // Started first, closed last: the one to come back to.
+            archived("old-but-just-closed", 10, Some(900)),
+            archived("newer-and-long-gone", 80, Some(100)),
+            // No archive time at all, from a daemon too old to write one down:
+            // when it began is all there is to sort it by.
+            archived("no-account-of-it", 50, None),
+        ];
+        assert_eq!(
+            app.visible_sessions()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "old-but-just-closed",
+                "newer-and-long-gone",
+                "no-account-of-it"
+            ]
+        );
+
+        // A live session is still placed by when it started: it has not been
+        // put down, and a stale archive stamp from an earlier life must not
+        // decide where it sits.
+        app.sessions.push(AgentSession {
+            archived_at: Some(1),
+            ..tree_session("running", None, 40)
+        });
+        assert_eq!(
+            app.visible_sessions()
+                .first()
+                .map(|session| session.id.as_str()),
+            Some("running"),
+            "the live session heads the folder, ahead of the archive"
+        );
     }
 
     /// What an agent starts is part of that agent's work, so it is listed under
@@ -13391,6 +13467,7 @@ mod tests {
             path: "/work".into(),
             label: "refresh".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -13432,6 +13509,7 @@ mod tests {
             path: "/old".into(),
             label: "old".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(10),
             working: false,
@@ -13887,6 +13965,7 @@ mod tests {
             path: "/work".into(),
             label: "next".into(),
             created_at: 2,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -14781,6 +14860,7 @@ mod tests {
             path: "/work".into(),
             label: "long history".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -14924,6 +15004,7 @@ mod tests {
             path: "/work".into(),
             label: "finished".into(),
             created_at: 1,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -14941,6 +15022,7 @@ mod tests {
             path: "/work".into(),
             label: "finished shell".into(),
             created_at: 2,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -15003,6 +15085,7 @@ mod tests {
             path: "/work/project".into(),
             label: "fix renderer".into(),
             created_at: 1,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -15127,6 +15210,7 @@ mod tests {
             path: "/work/project".into(),
             label: "sglang proxy".into(),
             created_at: 1,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -15266,6 +15350,7 @@ mod tests {
             path: "/work/project".into(),
             label: "old".into(),
             created_at: 1,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -15314,6 +15399,7 @@ mod tests {
             path: "/work/project".into(),
             label: "failed".into(),
             created_at: 2,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -15364,6 +15450,7 @@ mod tests {
             path: "/work".into(),
             label: "live".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: None,
             working: false,
@@ -15458,6 +15545,7 @@ mod tests {
             path: "/work/project".into(),
             label: "files".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: None,
             working: false,
@@ -16402,6 +16490,7 @@ mod tests {
             path: "/work/project".into(),
             label: "modal".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: None,
             working: false,
@@ -16473,6 +16562,7 @@ mod tests {
             path: "/work/project".into(),
             label: "nav".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: None,
             working: false,
@@ -17207,6 +17297,7 @@ mod tests {
             path: "/work".into(),
             label: "last success".into(),
             created_at: 1,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,
@@ -17465,6 +17556,7 @@ mod tests {
             path: "/work".into(),
             label: id.into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -17653,6 +17745,7 @@ mod tests {
                     path: "/work/new".into(),
                     label: "new agent".into(),
                     created_at: 1,
+                    archived_at: None,
                     dead: false,
                     pid: Some(1),
                     working: false,
@@ -17719,6 +17812,7 @@ mod tests {
             path: "/work/current".into(),
             label: "current".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -17798,6 +17892,7 @@ mod tests {
             path: "/work/current".into(),
             label: "Temporal Chat".into(),
             created_at: 2,
+            archived_at: None,
             dead: false,
             pid: Some(2),
             working: false,
@@ -17866,6 +17961,7 @@ mod tests {
             path: "/work/web".into(),
             label: "web".into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -18000,6 +18096,7 @@ mod tests {
             path: path.into(),
             label: id.into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -18069,6 +18166,7 @@ mod tests {
             path: "/work".into(),
             label: id.into(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -18379,6 +18477,7 @@ mod tests {
             path: "/work/project".into(),
             label: String::new(),
             created_at: 1,
+            archived_at: None,
             dead: false,
             pid: Some(1),
             working: false,
@@ -18486,6 +18585,7 @@ mod tests {
             path: format!("/work/{id}"),
             label: id.into(),
             created_at,
+            archived_at: None,
             dead: true,
             pid: None,
             working: false,

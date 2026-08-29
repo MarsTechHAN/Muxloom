@@ -1492,6 +1492,10 @@ mod platform {
                 label: "recovered session".into(),
                 temporary: false,
                 created_at,
+                // The record is being written the moment the session is found
+                // gone, which is the only account of when it stopped that
+                // survived the metadata going missing.
+                archived_at: Some(now_secs()),
                 pid: None,
                 dead: true,
                 archived: true,
@@ -3649,6 +3653,9 @@ mod platform {
             label,
             temporary,
             created_at,
+            // Live again: whatever this conversation's last ending was, it is
+            // not where it sits in the archive any more.
+            archived_at: None,
             pid: None,
             dead: false,
             archived: false,
@@ -4528,6 +4535,15 @@ mod platform {
             .min(u128::from(u64::MAX)) as u64
     }
 
+    /// Seconds since the epoch, the unit a session's own timestamps are kept
+    /// in: `created_at` is seconds, so what it is compared against must be.
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     fn daemon_session(state: &DaemonState, session_id: &str) -> Result<Arc<ManagedSession>> {
         state
             .sessions
@@ -4830,6 +4846,7 @@ mod platform {
                 metadata.working = false;
                 metadata.needs_attention = false;
                 metadata.attention_reason = None;
+                metadata.archived_at.get_or_insert_with(now_secs);
                 metadata.clone()
             };
             persist_session_metadata(&self.metadata_path, &metadata)
@@ -5412,6 +5429,10 @@ mod platform {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 metadata.dead = true;
                 metadata.pid = None;
+                // The first death is the one that counts: a record read again
+                // by a later generation must not be restamped with the moment
+                // that generation noticed it was gone.
+                metadata.archived_at.get_or_insert_with(now_secs);
             }
             let _ = self.persist_metadata();
         }
@@ -7836,6 +7857,12 @@ mod platform {
             assert!(archived.archived && archived.dead);
             assert!(!archived.working);
             assert!(!archived.needs_attention);
+            // When it was put down, which is what orders an archive. Recorded
+            // once: a later look at the same record must not restamp it.
+            let put_down = archived.archived_at.expect("archived_at is recorded");
+            assert!(put_down >= archived.created_at);
+            session.mark_dead();
+            assert_eq!(session.snapshot().archived_at, Some(put_down));
         }
 
         /// A question as the daemon sees it: the configured words, and the
@@ -8810,6 +8837,7 @@ mod platform {
                     label: "persisted archive".into(),
                     temporary: false,
                     created_at: 42,
+                    archived_at: None,
                     pid: None,
                     dead: true,
                     archived: true,
@@ -8867,6 +8895,7 @@ mod platform {
                 label: "interrupted work".into(),
                 temporary: false,
                 created_at: 7,
+                archived_at: None,
                 pid,
                 dead: false,
                 archived: false,
@@ -10945,6 +10974,7 @@ mod platform {
                     label: "original".into(),
                     temporary: false,
                     created_at: 42,
+                    archived_at: None,
                     pid: None,
                     dead: true,
                     archived: true,

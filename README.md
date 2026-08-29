@@ -237,7 +237,9 @@ to copy · drag local files in to upload.
 
 `/` searches every enabled target's history — live and archived — ranked by
 label and folder, then recap, then remaining history. Each session carries a
-recap line, and archived agents stay searchable and resumable.
+recap line, and archived agents stay searchable and resumable. Inside a folder
+the archive is ordered by when each session was put down, not by when it
+started, so the conversation you just closed is at the top of its folder.
 Resuming an Archived agent asks whether to remove the superseded archive after
 the new agent starts successfully. Removal is enabled by default, can be toggled
 with `Space`, and the choice is remembered; launch or cleanup failure keeps the
