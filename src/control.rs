@@ -1493,6 +1493,12 @@ fn check_may_launch(own: &Powers, kind: AgentKind) -> Result<()> {
 /// How far up a chain of parents one reach check will walk. A session ten
 /// handoffs down is still on the same piece of work, and past that a cycle is
 /// the likelier explanation than a team.
+///
+/// This and the four below are the daemon flavor's alone, and the daemon runs
+/// on Unix — off it there is no `muxloomd` to compile them for. The controller
+/// weighs the same powers, but it does it against its own fleet rather than
+/// against one machine's records.
+#[cfg(unix)]
 const TASK_WALK_MAX: usize = 16;
 
 /// Whether `target` is on the same piece of work as this session.
@@ -1504,6 +1510,7 @@ const TASK_WALK_MAX: usize = 16;
 /// there. A chain that runs out unrecognised belongs to somebody else.
 ///
 /// A process running in no session has no task to be outside of, so nothing is.
+#[cfg(unix)]
 fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
     let mine: Vec<String> = [task_root(), launching_session()]
         .into_iter()
@@ -1530,6 +1537,7 @@ fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
 }
 
 /// Who begat whom, taken from session records.
+#[cfg(unix)]
 fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
     sessions
         .iter()
@@ -1539,6 +1547,7 @@ fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
 
 /// The same, read back out of a rendered `list_sessions` answer — which is all
 /// another machine ever hands over.
+#[cfg(unix)]
 fn lineage_of_answer(rendered: &str) -> Vec<(String, Option<String>)> {
     serde_json::from_str::<Vec<Value>>(rendered)
         .unwrap_or_default()
@@ -1557,6 +1566,7 @@ fn lineage_of_answer(rendered: &str) -> Vec<(String, Option<String>)> {
 
 /// Refuse a message this session may not send, saying who it may speak to and
 /// who set that, so the answer is a route rather than a flag.
+#[cfg(unix)]
 fn check_may_message(
     own: &Powers,
     target: &str,
@@ -1647,6 +1657,7 @@ const POWERS_ARGUMENT: &str = "_muxloom_powers";
 /// it may hand on is written in this session's environment — which the
 /// controller cannot read, because the controller runs in no session at all.
 /// So the side that can read it works the grant out and sends it along.
+#[cfg(unix)]
 fn stamp_powers(arguments: &mut Value, powers: &Powers) {
     if let (Some(object), Ok(value)) = (arguments.as_object_mut(), serde_json::to_value(powers)) {
         object.insert(POWERS_ARGUMENT.into(), value);
@@ -5979,6 +5990,7 @@ mod tests {
     /// A launch aimed at another machine is weighed where the powers are
     /// legible and arrives holding the answer, because the controller running
     /// it lives in no session and has nothing to read.
+    #[cfg(unix)]
     #[test]
     fn a_relayed_launch_carries_the_grant_its_own_machine_worked_out() {
         let _lock = daemon_env_lock();
@@ -6005,6 +6017,7 @@ mod tests {
     /// A task-scoped session talks to its own team and is refused the rest —
     /// and the team is the whole tree under the task, not the siblings it
     /// happens to know about.
+    #[cfg(unix)]
     #[test]
     fn a_task_scoped_session_reaches_its_own_work_and_stops_there() {
         let _lock = daemon_env_lock();
