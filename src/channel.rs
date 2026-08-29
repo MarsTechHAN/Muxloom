@@ -1304,6 +1304,52 @@ impl Inbox {
         self.receipts.drain(..over);
     }
 
+    /// Point this chat at somebody, from here on.
+    ///
+    /// Aiming also files a receipt in that agent's name, because an aim that is
+    /// not also the last thing said would be beaten by whatever card happened
+    /// to arrive before it: an unaddressed sentence answers the last sender
+    /// first. The id is muxloom's own and names no message on the far end, so
+    /// nobody can quote it — it exists to put the newly aimed agent at the end
+    /// of the line, which is where `/select` means to put it.
+    pub fn aim(&mut self, binding: &str, who: Correspondent) {
+        self.remember(ChannelReceipt {
+            channel: binding.to_string(),
+            message_id: aim_receipt_id(binding),
+            machine: who.machine.clone(),
+            session_id: who.session_id.clone(),
+            label: who.label.clone(),
+        });
+        self.aimed.insert(binding.to_string(), who);
+    }
+
+    /// Stop pointing this chat anywhere, taking back the receipt aiming filed:
+    /// an aim nobody wants any more must not go on answering as the last
+    /// sender either.
+    pub fn unaim(&mut self, binding: &str) -> Option<Correspondent> {
+        let id = aim_receipt_id(binding);
+        self.receipts.retain(|receipt| receipt.message_id != id);
+        self.aimed.remove(binding)
+    }
+
+    /// Forget a session that is not there any more: its aim, and every receipt
+    /// naming it. Both have to go — a chat whose last sender has exited would
+    /// otherwise answer that same dead session forever, once per sentence.
+    pub fn forget(&mut self, binding: &str, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        self.receipts
+            .retain(|receipt| receipt.session_id != session_id);
+        if self
+            .aimed
+            .get(binding)
+            .is_some_and(|aim| aim.session_id == session_id)
+        {
+            self.aimed.remove(binding);
+        }
+    }
+
     fn mark(&mut self, message_id: &str) {
         self.handled.push(message_id.to_string());
         let over = self.handled.len().saturating_sub(RECEIPT_CAP * 2);
@@ -1358,6 +1404,12 @@ impl Inbox {
         *count = count.saturating_add(1);
         format!("*— {machine} #{count}*")
     }
+}
+
+/// The id muxloom files its own aim receipt under, one per binding. Deliberately
+/// not shaped like a platform message id: nothing on the far end can name it.
+fn aim_receipt_id(binding: &str) -> String {
+    format!("muxloom-aim:{binding}")
 }
 
 /// Where a dashboard keeps what it has read, given its state directory. Beside
@@ -1465,11 +1517,16 @@ pub fn route(
     if let Some(who) = reply_to.and_then(|id| inbox.sender_of(id)) {
         return (Route::Agent(who), text.to_string());
     }
-    if let Some(who) = inbox.aimed.get(binding) {
-        return (Route::Agent(who.clone()), text.to_string());
-    }
+    // Then whoever spoke last. A person reading their phone answers the card
+    // in front of them; if that is not the agent this chat was aimed at an hour
+    // ago, the card is what they meant and the aim is stale. So the aim is a
+    // fallback rather than a lock — and aiming files a receipt of its own
+    // (`Inbox::aim`), which is what makes a fresh `/select` the last word too.
     if solo && let Some(who) = inbox.last_sender(binding) {
         return (Route::Agent(who), text.to_string());
+    }
+    if let Some(who) = inbox.aimed.get(binding) {
+        return (Route::Agent(who.clone()), text.to_string());
     }
     (Route::Board { asked: false }, text.to_string())
 }
@@ -2668,7 +2725,7 @@ fn handle(
                 "  /call <text>        run <text> with a fresh one-shot agent (the one /call last used), once".into(),
                 "  /list              active agents, grouped by folder, with a glance at what each is doing".into(),
                 "  /list <num>        the active agents on one machine (number from /list)".into(),
-                "  /select <num>-<n>  aim this chat at one agent until /clear".into(),
+                "  /select <num>-<n>  aim this chat at one agent, until another writes or /clear".into(),
                 "  /select <name>     aim at an agent by name".into(),
                 "  /who               every agent everywhere (not only active, not grouped)".into(),
                 "  /clear             stop aiming; plain messages go to the board".into(),
@@ -2678,7 +2735,7 @@ fn handle(
             ];
             lines.push(String::new());
             lines.push(match binding.kind.solo() {
-                true => "Just type a plain sentence and it goes to whoever you last talked to; use /select to aim it somewhere fixed.".into(),
+                true => "Just type a plain sentence and it goes to whoever you last talked to — /select picks that up front, and reply to a card to answer that agent instead.".into(),
                 false => "Just type a plain sentence and it goes where this chat is aimed, or to the board if nothing is. A reply to a card always reaches the agent who sent it.".into(),
             });
             lines.join("\n")
@@ -2834,7 +2891,7 @@ fn handle(
             }
             out
         }
-        Route::Clear => match inbox.aimed.remove(&binding.id) {
+        Route::Clear => match inbox.unaim(&binding.id) {
             Some(who) => format!("· no longer aimed at {}", who.name()),
             None => "· nothing was aimed".into(),
         },
@@ -2853,7 +2910,7 @@ fn handle(
             if let Some(only) = desk.resolve_numbered_from(&words) {
                 let name = only.name();
                 desk.last_agent = Some(only.clone());
-                inbox.aimed.insert(binding.id.clone(), only.clone());
+                inbox.aim(&binding.id, only.clone());
                 return format!("· aimed at {name}");
             }
             let found: Vec<Correspondent> = desk
@@ -2867,7 +2924,7 @@ fn handle(
                 [only] => {
                     let name = only.name();
                     desk.last_agent = Some(only.clone());
-                    inbox.aimed.insert(binding.id.clone(), only.clone());
+                    inbox.aim(&binding.id, only.clone());
                     format!("· aimed at {name}")
                 }
                 several => format!(
@@ -2883,7 +2940,7 @@ fn handle(
         }
         Route::Agent(who) => {
             let Some(who) = desk.locate(&who) else {
-                inbox.aimed.remove(&binding.id);
+                inbox.forget(&binding.id, &who.session_id);
                 return format!(
                     "· {} is not running any more, so that went nowhere. `/who` lists what is.",
                     who.name()
@@ -3516,6 +3573,66 @@ mod tests {
         // And it is per chat: another binding's history is not this one's.
         assert_eq!(
             route("go ahead", None, "wechat-2", true, &inbox).0,
+            Route::Board { asked: false }
+        );
+    }
+
+    /// Who the last card came from beats where the chat was aimed. A person
+    /// reading their phone answers what is in front of them, and an aim set
+    /// before that card is not what they are looking at.
+    #[test]
+    fn an_unaddressed_answer_goes_to_whoever_wrote_last_not_to_an_older_aim() {
+        let mut inbox = Inbox::default();
+        inbox.aim("wechat-1", who("s-parser", "parser"));
+        // Nothing has been said since, so the aim is also the last word.
+        assert_eq!(
+            route("go ahead", None, "wechat-1", true, &inbox).0,
+            Route::Agent(who("s-parser", "parser")),
+            "aiming must put its agent at the end of the line, or /select does nothing"
+        );
+
+        inbox.remember(ChannelReceipt {
+            channel: "wechat-1".into(),
+            message_id: "m_9".into(),
+            machine: "seed".into(),
+            session_id: "s-lexer".into(),
+            label: "lexer".into(),
+        });
+        assert_eq!(
+            route("go ahead", None, "wechat-1", true, &inbox).0,
+            Route::Agent(who("s-lexer", "lexer")),
+            "the card that just arrived is what an unaddressed yes answers"
+        );
+        // A quote is still an address, and outranks both.
+        assert_eq!(
+            route("go ahead", Some("m_9"), "wechat-1", true, &inbox).0,
+            Route::Agent(who("s-lexer", "lexer"))
+        );
+        // In a group nothing is anybody's in particular, so there the aim is
+        // the only thing that settles it.
+        assert_eq!(
+            route("go ahead", None, "wechat-1", false, &inbox).0,
+            Route::Agent(who("s-parser", "parser"))
+        );
+
+        // Clearing takes back the aim and the receipt aiming filed, so the
+        // last real card is once again the last word.
+        inbox.unaim("wechat-1");
+        assert_eq!(
+            route("go ahead", None, "wechat-1", false, &inbox).0,
+            Route::Board { asked: false }
+        );
+        assert_eq!(
+            route("go ahead", None, "wechat-1", true, &inbox).0,
+            Route::Agent(who("s-lexer", "lexer"))
+        );
+
+        // An agent that has exited is forgotten entirely: aim and receipts.
+        // Otherwise every following sentence chases the same dead session.
+        inbox.aim("wechat-1", who("s-lexer", "lexer"));
+        inbox.forget("wechat-1", "s-lexer");
+        assert_eq!(
+            route("go ahead", None, "wechat-1", true, &inbox).0,
             Route::Board { asked: false }
         );
     }
