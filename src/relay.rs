@@ -253,28 +253,59 @@ fn surface_for<'a>(
     }
 }
 
-/// Ask the person over the bound chat, and say whether the ask went out.
+/// Ask the person over the bound chat. `Ok` when the ask actually reached them,
+/// and otherwise the reason it did not, in words worth repeating to the agent.
 ///
 /// It has to build the surface rather than use one that happens to be there:
 /// a round whose only job is the gated one had never made a surface, so the
 /// ask fell out of a `let Some(..) else { return }` and nobody was ever asked
-/// while the agent was told they had been. When there is no chat bound the
-/// answer is false, and the agent is told plainly that nobody heard.
+/// while the agent was told they had been. Everything below is the same
+/// mistake wearing a different coat, which is why the answer carries a reason
+/// rather than a bare no: there was never one way for an ask to go missing.
 fn try_chat_ask(
     surface: &mut Option<ControllerControl>,
     config: &Config,
     runtime: &Runtime,
     ask: &str,
-) -> bool {
-    let Ok(surface) = surface_for(surface, config, runtime) else {
-        return false;
-    };
-    surface
+) -> Result<(), String> {
+    let surface = surface_for(surface, config, runtime).map_err(|error| format!("{error:#}"))?;
+    let answer = surface
         .call(
             "send_channel_message",
             &serde_json::json!({ "text": ask, "title": "approval needed" }),
         )
-        .is_ok()
+        .map_err(|error| format!("{error:#}"))?;
+    match heard(&answer) {
+        true => Ok(()),
+        false => Err(
+            "the chat took it and never delivered it, which is what a stale WeChat \
+                      conversation does to a message"
+                .into(),
+        ),
+    }
+}
+
+/// Whether a `send_channel_message` answer says the message reached the person.
+///
+/// The tool reports a WeChat send that was accepted and dropped as a success
+/// carrying the bad news, because for most callers a message that went nowhere
+/// is still better described than turned into an error. Here it is not: an ask
+/// nobody received, recorded as an ask that was made, parks an approval nothing
+/// can ever answer and leaves the agent waiting on a person who was never
+/// spoken to — the same failure the comment above is about.
+///
+/// Only an explicit denial counts. Lark carries no such flag and an answer that
+/// will not parse says nothing either way, and neither is grounds for throwing
+/// away an ask that most likely went out.
+fn heard(answer: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(answer)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/wechat/delivery_confirmed")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
 }
 
 #[derive(Debug)]
@@ -593,7 +624,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                         // leaving one behind would tell every later attempt it
                         // is waiting on a person who never heard.
                         match try_chat_ask(&mut surface, config, runtime, &ask) {
-                            true => {
+                            Ok(()) => {
                                 approvals.park(
                                     id,
                                     ApprovalsPending {
@@ -612,10 +643,12 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                                      or `reject-{number}`; make this call again once they have."
                                 )
                             }
-                            false => format!(
-                                "{tool} needs the person's approval, and muxloom has no chat \
-                                 bound to ask on — nobody has been asked. Ask them yourself, or \
-                                 have an agent on that machine do the work instead."
+                            Err(why) => format!(
+                                "{tool} needs the person's approval and the ask never reached \
+                                 them: {why}. Nobody has been asked and nothing is parked \
+                                 waiting on an answer, so making this call again will only ask \
+                                 again. Ask them yourself, or have an agent on that machine do \
+                                 the work instead."
                             ),
                         }
                     }
@@ -731,6 +764,29 @@ fn bounded(mut arguments: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An approval parked against an ask nobody received is an approval nothing
+    /// can answer, so the one thing this reading must get right is the explicit
+    /// no — and the one thing it must not do is invent one.
+    #[test]
+    fn an_ask_the_chat_swallowed_does_not_count_as_having_been_made() {
+        let answer = |confirmed| {
+            serde_json::json!({
+                "channel": "wechat-1",
+                "message_id": "muxloom-minted",
+                "wechat": { "code": 0, "reason": "success", "delivery_confirmed": confirmed },
+            })
+            .to_string()
+        };
+        assert!(heard(&answer(true)));
+        assert!(!heard(&answer(false)));
+        // Lark reports no verdict, and its status line already said the message
+        // went out. Nor is an answer nobody can parse evidence of anything.
+        assert!(heard(
+            &serde_json::json!({ "channel": "lark-1" }).to_string()
+        ));
+        assert!(heard("not json at all"));
+    }
 
     /// The ask and the reply are written on two sides of the fleet — the
     /// controller composes the words, the chat adapter parses them back — and

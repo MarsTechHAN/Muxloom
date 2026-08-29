@@ -860,7 +860,10 @@ the controller runs the call over there. Looking and saying go straight through
 board. Changing something on another machine is put to you first: starting a
 session, typing into one, archiving or deleting one, arming a trigger, running a
 shell. Those come back as an approval id, and the agent asked for them again
-once you have answered in chat. `launch_session` needs an absolute `path` when
+once you have answered in chat. If the ask cannot reach you — no chat bound, or
+a chat that took it and never delivered it — nothing is parked at all: the agent
+is told plainly that nobody was asked, rather than left waiting on an approval
+you never saw. `launch_session` needs an absolute `path` when
 it names another machine — the caller's own folder is on this one. `wait_for`
 never travels; it watches the machine it runs on. Machine enablement and SSH
 edits are never relayed at all. With no dashboard attached, every cross-machine
