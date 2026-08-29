@@ -273,17 +273,23 @@ fn help_modal_never_panics() {
 #[test]
 fn search_modal_never_panics() {
     for (w, h) in SIZES {
-        let form = SearchForm {
-            query: "needle".into(),
-            submitted_query: "needle".into(),
-            results: Vec::new(),
-            result_rows: Vec::new(),
-            selected: 0,
-            loading: false,
-            error: Some("machine unreachable".into()),
-            edited_at: std::time::Instant::now(),
-        };
-        draw_with(Some(Modal::Search(form)), *w, *h);
+        // Finished, and part way through reading the fleet's histories: the
+        // progress line is wider than the answer it replaces, so the narrow
+        // terminals have to see it too.
+        for reading in [None, Some((3, 157))] {
+            let form = SearchForm {
+                query: "needle".into(),
+                submitted_query: "needle".into(),
+                results: Vec::new(),
+                result_rows: Vec::new(),
+                selected: 0,
+                loading: reading.is_some(),
+                error: Some("machine unreachable".into()),
+                edited_at: std::time::Instant::now(),
+                reading,
+            };
+            draw_with(Some(Modal::Search(form)), *w, *h);
+        }
     }
 }
 

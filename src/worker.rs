@@ -317,6 +317,12 @@ pub enum Event {
         /// them an empty result list cannot tell "nothing matched" apart from
         /// "nothing could be looked at".
         unreachable: Vec<String>,
+        /// An instalment: how many captures have been read of how many, with
+        /// more still to come. Names and recaps are in hand at once and are
+        /// answered with the first of these; reading a fleet's scrollback takes
+        /// seconds, so what it finds arrives a batch at a time. `None` is the
+        /// last word on this query.
+        reading: Option<(usize, usize)>,
     },
     DirectoryListed {
         target_id: String,
@@ -789,6 +795,35 @@ impl Worker {
                         // Multiplex a bounded number of SSH/tmux searches at once. This keeps
                         // large fleets responsive without opening an unbounded connection burst.
                         let mut unreachable: Vec<String> = Vec::new();
+                        let captures = history_jobs.len();
+                        // What was matched without reading anything - names,
+                        // paths, recaps - goes out before the first capture is
+                        // opened, so the list is on screen while the slow half
+                        // runs underneath it.
+                        let instalment =
+                            |results: &[(SearchResult, usize)],
+                             unreachable: &[String],
+                             read: Option<usize>| {
+                                let mut ranked = results.to_vec();
+                                ranked.sort_by(|left, right| {
+                                    right
+                                        .0
+                                        .match_kind
+                                        .cmp(&left.0.match_kind)
+                                        .then_with(|| left.1.cmp(&right.1))
+                                        .then_with(|| right.0.created_at.cmp(&left.0.created_at))
+                                        .then_with(|| left.0.target_id.cmp(&right.0.target_id))
+                                });
+                                ranked.truncate(100);
+                                let _ = events.send(Event::Searched {
+                                    query: query.clone(),
+                                    results: ranked.into_iter().map(|(result, _)| result).collect(),
+                                    unreachable: unreachable.to_vec(),
+                                    reading: read.map(|read| (read, captures)),
+                                });
+                            };
+                        instalment(&results, &unreachable, (captures > 0).then_some(0));
+                        let mut read = 0;
                         for jobs in history_jobs.chunks(8) {
                             let batch = thread::scope(|scope| {
                                 let mut handles = Vec::new();
@@ -817,28 +852,19 @@ impl Worker {
                                     }
                                 }
                             }
+                            read += jobs.len();
+                            // The last batch is reported as the final answer
+                            // rather than as progress, so the search is never
+                            // left looking like it is still running.
+                            instalment(&results, &unreachable, (read < captures).then_some(read));
                         }
-                        results.sort_by(|left, right| {
-                            right
-                                .0
-                                .match_kind
-                                .cmp(&left.0.match_kind)
-                                .then_with(|| left.1.cmp(&right.1))
-                                .then_with(|| right.0.created_at.cmp(&left.0.created_at))
-                                .then_with(|| left.0.target_id.cmp(&right.0.target_id))
-                        });
-                        results.truncate(100);
-                        let results: Vec<_> =
-                            results.into_iter().map(|(result, _)| result).collect();
                         debug::log(
                             "search",
-                            format!("query completed results={}", results.len()),
+                            format!(
+                                "query completed results={} captures={captures}",
+                                results.len()
+                            ),
                         );
-                        let _ = events.send(Event::Searched {
-                            query,
-                            results,
-                            unreachable,
-                        });
                     }
                     Request::ListDirectory { target, path } => {
                         let target_id = target.id.clone();

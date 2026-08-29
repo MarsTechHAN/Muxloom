@@ -3828,6 +3828,18 @@ fn draw_resume_history_panel(frame: &mut Frame<'_>, form: &ResumeForm, inner: Re
     }
 }
 
+/// A bar of `width` cells, `done` of `total` filled. Nothing done still shows
+/// the track, so the bar appears at its full length the moment work starts
+/// rather than growing out of nothing.
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        (done * width).div_ceil(total).min(width)
+    };
+    format!("[{}{}]", "━".repeat(filled), "·".repeat(width - filled))
+}
+
 fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) {
     let area = centered_rect(104, 31, outer);
     frame.render_widget(Clear, area);
@@ -3847,7 +3859,19 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
-    let status = if form.loading {
+    let status = if let Some((read, total)) = form.reading {
+        // Names and recaps are already listed by now; what is left is reading
+        // scrollback, which is the part worth a bar.
+        format!(
+            "{} {read}/{total} histories read{}",
+            progress_bar(read, total, 24),
+            if form.results.is_empty() {
+                String::new()
+            } else {
+                format!("; {} matches so far", form.results.len())
+            }
+        )
+    } else if form.loading {
         "Searching full tmux scrollback on all discovered machines...".to_string()
     } else if let Some(error) = &form.error {
         error.clone()
@@ -6751,6 +6775,7 @@ mod tests {
             loading: false,
             error: None,
             edited_at: std::time::Instant::now(),
+            reading: None,
         }));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal
@@ -6763,6 +6788,28 @@ mod tests {
         assert!(rendered.contains("Search all agent history"));
         assert!(rendered.contains("exact optional name/path, recap, then newest history"));
         assert!(rendered.contains("optional-name"));
+
+        // Mid-search the same list is on screen with a bar over it: what has
+        // been read of what there is, and what has turned up so far.
+        if let Some(Modal::Search(form)) = app.modal.as_mut() {
+            form.loading = true;
+            form.reading = Some((3, 12));
+        }
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("3/12 histories read"));
+        assert!(rendered.contains("1 matches so far"));
+        assert!(rendered.contains('·'), "the unread part of the bar shows");
+        assert!(
+            rendered.contains("optional-name"),
+            "and the names found already stay listed while it runs"
+        );
 
         app.modal = Some(Modal::PathPicker(PathPickerForm {
             launch: LaunchForm {

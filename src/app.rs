@@ -874,6 +874,9 @@ pub struct SearchForm {
     pub loading: bool,
     pub error: Option<String>,
     pub edited_at: Instant,
+    /// How far the slow half has got: captures read of captures to read. Set
+    /// while history is still being searched, cleared once the answer is whole.
+    pub reading: Option<(usize, usize)>,
 }
 
 /// The tail of the talk board as the dashboard holds it: what has been said
@@ -5357,14 +5360,29 @@ impl App {
                 query,
                 results,
                 unreachable,
+                reading,
             } => {
                 if let Some(Modal::Search(form)) = self.modal.as_mut()
                     && form.submitted_query == query
                 {
-                    form.loading = false;
+                    form.loading = reading.is_some();
+                    form.reading = reading;
+                    // An instalment arriving under the cursor must not move it:
+                    // the selection follows the session it is on, not the row
+                    // number it happened to have when the list was shorter.
+                    let selected = form
+                        .results
+                        .get(form.selected)
+                        .map(|result| (result.target_id.clone(), result.session_id.clone()));
                     form.results = results;
                     form.result_rows.clear();
-                    form.selected = 0;
+                    form.selected = selected
+                        .and_then(|(target_id, session_id)| {
+                            form.results.iter().position(|result| {
+                                result.target_id == target_id && result.session_id == session_id
+                            })
+                        })
+                        .unwrap_or(0);
                     // A machine that could not be reached is not a machine that
                     // holds no match, and saying otherwise sends the user
                     // looking for a session that is really still there.
@@ -5374,6 +5392,10 @@ impl App {
                         many => Some(format!("{} machines could not be searched", many.len())),
                     };
                     form.error = match (form.results.is_empty(), skipped) {
+                        // Still reading: how far along it is says more than a
+                        // count of what has turned up so far, and "no matches"
+                        // would be a lie about a search that is not over.
+                        _ if reading.is_some() => None,
                         (true, Some(skipped)) => Some(format!("No matches so far; {skipped}")),
                         (true, None) => Some("No matching agent name, recap, or history".into()),
                         (false, Some(skipped)) => {
@@ -9149,6 +9171,7 @@ impl App {
             loading: false,
             error: None,
             edited_at: Instant::now(),
+            reading: None,
         }));
     }
 
@@ -9944,6 +9967,7 @@ impl App {
         form.selected = 0;
         form.loading = true;
         form.error = None;
+        form.reading = None;
         if self
             .worker
             .requests
@@ -19003,6 +19027,117 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Reading a fleet's scrollback takes seconds; matching names and recaps
+    /// takes none. The search answers with the second lot at once and fills in
+    /// the first as it goes, so the list has to survive being rewritten under a
+    /// cursor that is already somewhere in it.
+    #[test]
+    fn a_search_lists_what_it_has_while_the_histories_are_still_being_read() {
+        use crate::model::SearchMatchKind;
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        let hit = |session_id: &str, match_kind| crate::model::SearchResult {
+            session_id: session_id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            label: session_id.into(),
+            path: "/work".into(),
+            match_kind,
+            snippet: "needle".into(),
+            line_number: None,
+            created_at: 1,
+            dead: false,
+        };
+        let searched = |results: Vec<crate::model::SearchResult>, reading| Event::Searched {
+            query: "needle".into(),
+            results,
+            unreachable: Vec::new(),
+            reading,
+        };
+        app.open_search();
+        let Some(Modal::Search(form)) = app.modal.as_mut() else {
+            panic!("the search modal should be open");
+        };
+        form.query = "needle".into();
+        form.submitted_query = "needle".into();
+        form.loading = true;
+
+        // Nothing matched by name, and three machines still to read: that is
+        // not "no matches", and saying so would send the user away.
+        app.handle_worker_event(searched(Vec::new(), Some((0, 3))));
+        let form = match app.modal.as_ref() {
+            Some(Modal::Search(form)) => form,
+            _ => panic!("the search modal should still be open"),
+        };
+        assert_eq!(form.reading, Some((0, 3)));
+        assert!(form.loading);
+        assert_eq!(form.error, None, "an unfinished search reports no verdict");
+
+        app.handle_worker_event(searched(
+            vec![
+                hit("muxloomd-codex-alpha", SearchMatchKind::Name),
+                hit("muxloomd-codex-beta", SearchMatchKind::Name),
+            ],
+            Some((1, 3)),
+        ));
+        let Some(Modal::Search(form)) = app.modal.as_mut() else {
+            panic!("the search modal should still be open");
+        };
+        assert_eq!(form.results.len(), 2, "names are listed before any reading");
+        form.selected = 1;
+
+        // A history hit lands above the row the cursor is on. The cursor stays
+        // on the session it was on rather than on the row number.
+        app.handle_worker_event(searched(
+            vec![
+                hit("muxloomd-codex-gamma", SearchMatchKind::History),
+                hit("muxloomd-codex-alpha", SearchMatchKind::Name),
+                hit("muxloomd-codex-beta", SearchMatchKind::Name),
+            ],
+            Some((2, 3)),
+        ));
+        let form = match app.modal.as_ref() {
+            Some(Modal::Search(form)) => form,
+            _ => panic!("the search modal should still be open"),
+        };
+        assert_eq!(form.selected, 2);
+        assert_eq!(
+            form.results[form.selected].session_id, "muxloomd-codex-beta",
+            "the cursor follows the session it was on"
+        );
+
+        // The last instalment is the answer: no progress, nothing still running.
+        app.handle_worker_event(searched(
+            vec![hit("muxloomd-codex-alpha", SearchMatchKind::Name)],
+            None,
+        ));
+        let form = match app.modal.as_ref() {
+            Some(Modal::Search(form)) => form,
+            _ => panic!("the search modal should still be open"),
+        };
+        assert_eq!(form.reading, None);
+        assert!(!form.loading);
+        assert_eq!(
+            form.selected, 0,
+            "with the old cursor gone, back to the top"
+        );
+        drop(request_rx);
     }
 
     /// The archive a resume supersedes is removed from its machine, and the
