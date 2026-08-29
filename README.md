@@ -698,11 +698,14 @@ claims nothing, so the agents on your desk keep pointing at the daemon that has
 your sessions. Set `MUXLOOM_MCP_REGISTER=1` if you do want such a daemon to take
 the entry. Only that one entry is written, only when it is missing or points
 somewhere stale, and a file it cannot parse is left untouched. The same start
-leaves Claude Code a
-skill at `~/.claude/skills/muxloom/SKILL.md` describing how the fleet works;
-it carries a revision stamp and is rewritten only while that stamp is Muxloom's
-and out of date, so a file you edit is yours from then on. Codex has no skill
-mechanism and gets the short version through the MCP `instructions` field.
+leaves every agent that
+loads the Agent Skills standard a skill describing how the fleet works —
+`~/.claude/skills/muxloom/SKILL.md`, `~/.codex/skills/muxloom/SKILL.md`, and
+`~/.pi/agent/skills/muxloom/SKILL.md`, the same file in all three, so a fleet
+behaviour learned in one agent works in the others. It carries a revision stamp
+and is rewritten only while that stamp is Muxloom's and out of date, so a file
+you edit is yours from then on. OpenCode has no skill directory and gets the
+short version through the MCP `instructions` field, as every agent does.
 Set `MUXLOOM_MCP_REGISTER=0` in the daemon's environment to turn all of it off,
 or `MUXLOOM_SKILL=0` to keep the server entry and drop the skill.
 

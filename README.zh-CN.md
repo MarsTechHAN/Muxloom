@@ -405,10 +405,12 @@ companion 的远端拿到 daemon 的条目，你用来驱动机队的这台拿�
 并存。而一个被交付了状态目录才起来的 daemon——测试用的、临时的、你正在调试的第二个——
 不属于这台机器，什么都不认领，于是你手边的 agent 仍然指着那个真正装着你会话的 daemon。
 确实想让这类 daemon 接管条目，就设 `MUXLOOM_MCP_REGISTER=1`。只写这一条目，且只在缺失或
-指向过期路径时才写，解析不了的文件原样保留。同一次启动还会给 Claude Code 留一份
-`~/.claude/skills/muxloom/SKILL.md`，讲清楚这套机队怎么协作；文件带版本戳，只在戳是
-Muxloom 的且已过期时才重写，所以你一旦改过它，它就归你了。Codex 没有 skill 机制，靠 MCP
-`instructions` 拿到精简版。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以整体关闭，
+指向过期路径时才写，解析不了的文件原样保留。同一次启动还会给每个支持 Agent Skills 标准的
+agent 留一份 skill，讲清楚这套机队怎么协作——`~/.claude/skills/muxloom/SKILL.md`、
+`~/.codex/skills/muxloom/SKILL.md`、`~/.pi/agent/skills/muxloom/SKILL.md`，三份内容相
+同，因此在一个 agent 里学会的机队习惯在另外两个里同样管用；文件带版本戳，只在戳是
+Muxloom 的且已过期时才重写，所以你一旦改过它，它就归你了。OpenCode 没有 skill 目录，和
+所有 agent 一样靠 MCP `instructions` 拿到精简版。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以整体关闭，
 `MUXLOOM_SKILL=0` 则只关 skill、保留 MCP 条目。
 
 手工注册跨机器的 Controller 面：
