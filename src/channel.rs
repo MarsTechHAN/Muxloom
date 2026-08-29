@@ -2495,15 +2495,23 @@ impl<'a> Desk<'a> {
         machines
     }
 
-    /// The agents (non-temporary sessions) on one machine, in a stable order.
-    /// Numbering within a machine is 1-based over this order, so a numbering
-    /// already printed is re-entered unchanged.
-    fn agents_on(&mut self, machine: &str) -> Vec<Correspondent> {
-        self.sessions()
+    /// The agents on one machine exactly as `/list` prints them: the active
+    /// ones, in folder order. `/select <machine>-<n>` counts along this same
+    /// list, so a number read off the screen and a number typed back mean the
+    /// same agent. Anything else - counting the dead ones in, or counting them
+    /// in the order the daemon happens to list them - aims the chat at whoever
+    /// is sitting at that offset instead, which is a stranger.
+    fn listed_agents(&mut self, machine: &str) -> Vec<Correspondent> {
+        let mut agents: Vec<Correspondent> = self
+            .sessions()
             .iter()
-            .filter(|it| it.machine == machine)
+            .filter(|it| it.machine == machine && it.alive)
             .cloned()
-            .collect()
+            .collect();
+        // Sorted by folder alone, and stably: within a folder they stay in the
+        // order the machine listed them.
+        agents.sort_by(|left, right| folder_of(left).cmp(folder_of(right)));
+        agents
     }
 
     /// Resolve a `/select <machine>-<agent>` pair of 1-based numbers to the
@@ -2511,7 +2519,7 @@ impl<'a> Desk<'a> {
     fn resolve_numbered(&mut self, machine_no: usize, agent_no: usize) -> Option<Correspondent> {
         let machines = self.machines_ordered();
         let target = machines.get(machine_no.checked_sub(1)?)?.clone();
-        let agents = self.agents_on(&target.id);
+        let agents = self.listed_agents(&target.id);
         agents.get(agent_no.checked_sub(1)?).cloned()
     }
 
@@ -2603,39 +2611,48 @@ impl<'a> Desk<'a> {
 /// last thing the model said) on the line under it. A folder with no path — a
 /// session that did not say where it runs — is grouped under `~`.
 fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
-    use std::collections::BTreeMap;
-    let mut by_folder: BTreeMap<&str, Vec<&Correspondent>> = BTreeMap::new();
-    for who in agents {
-        let folder = if who.path.trim().is_empty() {
-            "~"
-        } else {
-            who.path.trim()
-        };
-        by_folder.entry(folder).or_default().push(who);
-    }
     let mut lines = Vec::new();
-    let mut number = 1;
-    for (folder, members) in &by_folder {
-        lines.push(folder.to_string());
-        for who in members {
-            lines.push(format!("  {number}  {}", who.list_name()));
-            if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
-                let one = recap.split('\n').next().unwrap_or("").trim();
-                if !one.is_empty() {
-                    let recap_line = if one.chars().count() > 140 {
-                        let cut: String = one.chars().take(137).collect();
-                        format!("{cut}…")
-                    } else {
-                        one.to_string()
-                    };
-                    lines.push(format!("      {recap_line}"));
-                }
+    let mut heading: Option<&str> = None;
+    // Counted straight along the list it was handed, and never re-ordered
+    // here: the caller's order is the one `/select` counts along, and a
+    // renderer that quietly sorted differently is how a number came to mean
+    // one agent on the screen and another in the command.
+    for (index, who) in agents.iter().enumerate() {
+        let folder = folder_of(who);
+        if heading != Some(folder) {
+            if heading.is_some() {
+                lines.push(String::new());
             }
-            number += 1;
+            lines.push(folder.to_string());
+            heading = Some(folder);
         }
+        lines.push(format!("  {}  {}", index + 1, who.list_name()));
+        if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
+            let one = recap.split('\n').next().unwrap_or("").trim();
+            if !one.is_empty() {
+                let recap_line = if one.chars().count() > 140 {
+                    let cut: String = one.chars().take(137).collect();
+                    format!("{cut}…")
+                } else {
+                    one.to_string()
+                };
+                lines.push(format!("      {recap_line}"));
+            }
+        }
+    }
+    if heading.is_some() {
         lines.push(String::new());
     }
     lines
+}
+
+/// The folder an agent is listed under. A session that did not say where it
+/// runs is grouped under `~`, which sorts last.
+fn folder_of(who: &Correspondent) -> &str {
+    match who.path.trim() {
+        "" => "~",
+        folder => folder,
+    }
 }
 
 /// Act on one thing a human said, and answer in the words they should see.
@@ -2718,9 +2735,10 @@ fn handle(
                     let machines = desk.machines_ordered();
                     match machines.get(number.checked_sub(1).unwrap_or(usize::MAX)) {
                         Some(m) => {
-                            let agents = desk.agents_on(&m.id);
-                            let active: Vec<&Correspondent> =
-                                agents.iter().filter(|who| who.alive).collect();
+                            // The very list `/select <machine>-<n>` counts
+                            // along, printed with those numbers on it.
+                            let agents = desk.listed_agents(&m.id);
+                            let active: Vec<&Correspondent> = agents.iter().collect();
                             if active.is_empty() {
                                 format!("· {} has no active agents", m.label_or_id())
                             } else {
@@ -3977,6 +3995,74 @@ mod tests {
             ..named.clone()
         };
         assert_eq!(silent.name(), "2");
+    }
+
+    /// The number `/list` prints and the number `/select` counts along were
+    /// two different lists: the screen showed the active agents grouped by
+    /// folder, while the command counted every session the machine had ever
+    /// held, dead ones included, in the order the daemon happened to list
+    /// them. On a machine with a long history that aims the chat at a
+    /// stranger - typing the number next to the agent you are reading about
+    /// hands your message to whoever sits at that offset among the dead.
+    #[test]
+    fn the_number_beside_an_agent_is_the_number_that_aims_the_chat_at_it() {
+        let config = crate::config::Config::default();
+        let runtime = Runtime::new(&config);
+        let mut desk = Desk::new(&runtime, &[], &config);
+        let session = |id: &str, label: &str, path: &str, alive: bool| Correspondent {
+            machine: "local".into(),
+            session_id: id.into(),
+            label: label.into(),
+            path: path.into(),
+            alive,
+            working: false,
+            recap: None,
+        };
+        // As a real machine reports itself: piles of finished conversations,
+        // a handful of live ones, in no particular order.
+        desk.sessions = Some(vec![
+            session("s-dead-1", "last week", "/works/arena", false),
+            session(
+                "s-me",
+                "the one you are talking to",
+                "/works/terminal",
+                true,
+            ),
+            session("s-dead-2", "yesterday", "/works/arena", false),
+            session("s-arena", "the arena", "/works/arena", true),
+            session("s-dead-3", "this morning", "/works/terminal", false),
+            session("s-sibling", "its neighbour", "/works/arena", true),
+        ]);
+
+        let listed = desk.listed_agents("local");
+        let refs: Vec<&Correspondent> = listed.iter().collect();
+        let printed = folder_grouped(&refs).join("\n");
+        assert!(
+            !printed.contains("yesterday") && !printed.contains("last week"),
+            "only the live ones are printed: {printed}"
+        );
+        // Whatever number stands next to an agent on the screen, typing that
+        // number reaches that agent - checked for every line of the list.
+        for (index, who) in listed.iter().enumerate() {
+            let number = index + 1;
+            assert!(
+                printed.contains(&format!("  {number}  {}", who.list_name())),
+                "agent {number} is printed as {}: {printed}",
+                who.list_name()
+            );
+            assert_eq!(
+                desk.resolve_numbered(1, number).map(|it| it.session_id),
+                Some(who.session_id.clone()),
+                "`/select 1-{number}` must reach the agent printed as {number}"
+            );
+        }
+        // Which, in the case that started this, is the arena agent rather than
+        // the second session the machine happened to list.
+        assert_eq!(
+            desk.resolve_numbered_from("1-1").map(|it| it.session_id),
+            Some("s-arena".into())
+        );
+        assert_eq!(desk.resolve_numbered(1, listed.len() + 1), None);
     }
 
     #[test]
