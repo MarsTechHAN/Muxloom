@@ -1680,7 +1680,7 @@ mod platform {
         }
         listener.set_nonblocking(true)?;
         let result = (|| -> Result<()> {
-            while !state.shutdown.load(Ordering::Acquire) && !signalled.load(Ordering::Acquire) {
+            while still_serving(&state, &signalled) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false)?;
@@ -1703,6 +1703,25 @@ mod platform {
         // Sessions are not retired here: their keepers own them, keep writing
         // their histories, and hand them to whichever daemon serves next.
         result
+    }
+
+    /// Whether this generation is still serving, latching a signal into the
+    /// shutdown flag on the way past.
+    ///
+    /// The latch is the point. A signal is this generation being retired, and
+    /// the session readers decide what a keeper hanging up meant by reading
+    /// that flag: with it set the keeper was taken over, without it the keeper
+    /// crashed and the session is dead. Ending the accept loop on a signal
+    /// alone left it clear, so the readers of a daemon that had been told to
+    /// stand down outlived it just long enough to see the next generation adopt
+    /// their keepers, call that a crash, and write `dead` over the sessions
+    /// that generation had brought back — every session grey right after an
+    /// upgrade, with its keeper and its child running the whole time.
+    fn still_serving(state: &DaemonState, signalled: &AtomicBool) -> bool {
+        if signalled.load(Ordering::Acquire) {
+            state.shutdown.store(true, Ordering::Release);
+        }
+        !state.shutdown.load(Ordering::Acquire)
     }
 
     struct SocketGuard {
@@ -9408,6 +9427,39 @@ mod platform {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(adopted.snapshot().dead, "a stopped adopted session dies");
+            fs::remove_dir_all(paths.root).unwrap();
+        }
+
+        /// The test above sets the flag by hand because that is what the loop
+        /// is meant to have done. A signal has to be latched, not merely
+        /// noticed: the readers decide what a keeper hanging up meant by
+        /// reading it, and they run on past the round that saw the signal.
+        #[test]
+        fn a_signalled_daemon_says_so_where_its_readers_look() {
+            let state = test_state("signal-latch");
+            let paths = state.paths.clone();
+            let signalled = AtomicBool::new(false);
+
+            assert!(
+                still_serving(&state, &signalled),
+                "nothing has happened yet"
+            );
+            assert!(!state.shutdown.load(Ordering::Acquire));
+
+            signalled.store(true, Ordering::Release);
+            assert!(
+                !still_serving(&state, &signalled),
+                "a signal ends the round"
+            );
+            assert!(
+                state.shutdown.load(Ordering::Acquire),
+                "and every reader is told, which is the whole of it"
+            );
+            assert!(
+                !still_serving(&state, &AtomicBool::new(false)),
+                "the flag outlives the signal that set it"
+            );
+
             fs::remove_dir_all(paths.root).unwrap();
         }
 
