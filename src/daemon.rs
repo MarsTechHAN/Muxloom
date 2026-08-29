@@ -4204,24 +4204,15 @@ mod platform {
     /// Put a copy of `running` in the state directory and forget every copy
     /// that is not it.
     ///
-    /// The name carries the build's identity *and* the file's size and
-    /// timestamp, so a rebuilt working tree — which keeps the same generation
-    /// all day — is never mistaken for a copy already taken. Discarding the
-    /// others is safe while their keepers run: a running process holds its
-    /// file open, and on unix that is all it needs.
+    /// The name is the generation, which ends in the running file's own size
+    /// and write time, so a rebuilt working tree is never mistaken for a copy
+    /// already taken. Discarding the others is safe while their keepers run: a
+    /// running process holds its file open, and on unix that is all it needs.
     fn stash_executable(paths: &DaemonPaths, running: &Path) -> Result<PathBuf> {
-        let source =
-            fs::metadata(running).with_context(|| format!("cannot read {}", running.display()))?;
-        let stamp = source
-            .modified()
-            .ok()
-            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |since| since.as_millis());
-        let name = format!(
-            "muxloomd-{}-{}-{stamp}",
-            slugged(&current_generation()),
-            source.len()
-        );
+        // Read before copying: an unreadable executable is worth saying so
+        // about here, rather than failing halfway through the copy below.
+        fs::metadata(running).with_context(|| format!("cannot read {}", running.display()))?;
+        let name = format!("muxloomd-{}", slugged(&current_generation()));
         let stashed = paths.bin.join(&name);
         if !stashed.exists() {
             // Whole or not at all: a copy interrupted halfway is a file that
@@ -6337,19 +6328,57 @@ mod platform {
     /// What this build stamps into the state directory while it is serving, so
     /// the next client can tell whether it is talking to its own build.
     ///
-    /// The last field is what orders two of them. CI stamps in the number of
+    /// The fourth field is what orders two of them. CI stamps in the number of
     /// commits behind the build, which is the only thing that tells two
     /// nightlies carrying the same package version apart; a build made by hand
     /// says `local` and ranks above every numbered build of its version,
     /// because somebody made it deliberately and means it to be in front.
+    ///
+    /// Ordering is not identity, though, and only CI fills those fields in.
+    /// Every `cargo build` of one version stamped the same `local:local`, so a
+    /// daemon compiled from yesterday's source read as this build's own and
+    /// went on serving: the fix was in the binary, the running code was the old
+    /// one, and nothing short of stopping the daemon by hand changed that. So
+    /// the file itself ends the stamp — the same size and write time
+    /// [`stash_executable`] has always used to tell one build's copy from
+    /// another's.
     fn current_generation() -> String {
         format!(
-            "{}:protocol-{}:{}:{}",
+            "{}:protocol-{}:{}:{}:{}",
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION,
             option_env!("MUXLOOM_BUILD_ID").unwrap_or("local"),
             option_env!("MUXLOOM_BUILD_HEIGHT").unwrap_or("local"),
+            running_executable_identity(),
         )
+    }
+
+    /// Which file this process is running, as the stamp spells it.
+    ///
+    /// `unknown` when the executable cannot be read at all — a package manager
+    /// that replaced it mid-life is the ordinary reason. Two builds that both
+    /// say `unknown` compare equal, which is exactly how the stamp behaved
+    /// before this field existed: no worse than it was, and it settles instead
+    /// of handing over on every connection.
+    fn running_executable_identity() -> String {
+        std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(file_identity)
+            .unwrap_or_else(|| "unknown".into())
+    }
+
+    /// What tells one file apart from another that has taken its place: how big
+    /// it is and when it was written.
+    fn file_identity(path: &Path) -> Option<String> {
+        let file = fs::metadata(path).ok()?;
+        let written = file
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        Some(format!("{}-{written}", file.len()))
     }
 
     /// A generation broken down into what two of them can be compared by.
@@ -7666,6 +7695,38 @@ mod platform {
             let mut fields: Vec<&str> = current.split(':').collect();
             fields[2] = "a-different-commit";
             assert!(should_replace_generation(&fields.join(":")));
+        }
+
+        /// Nothing CI does not fill in tells two hand-made builds apart, and
+        /// nobody builds by hand except to run what they just changed. Without
+        /// the file's own identity in the stamp both compiles say `local:local`
+        /// and the daemon from before the change serves on.
+        #[test]
+        fn two_builds_of_one_tree_are_told_apart_by_the_file_each_one_is() {
+            let current = current_generation();
+            let fields: Vec<&str> = current.split(':').collect();
+            assert_eq!(fields.len(), 5, "{current}");
+            let running = std::env::current_exe().expect("this test is a file somewhere");
+            assert_eq!(
+                Some(fields[4].to_string()),
+                file_identity(&running),
+                "the last field is the running executable"
+            );
+
+            // What a rebuild of the same tree looks like: everything CI would
+            // have stamped is identical, and only the file has moved on.
+            let rebuilt = format!("{}:{}", fields[..4].join(":"), "1-1");
+            assert_ne!(rebuilt, current);
+            assert!(
+                should_replace_generation(&rebuilt),
+                "a daemon running the file this build replaced makes way"
+            );
+            assert_eq!(
+                generation_rank(&rebuilt),
+                generation_rank(&current),
+                "and it is still the same rank, so it asks rather than insists"
+            );
+            assert!(!outranks_running_version(&rebuilt));
         }
 
         /// Asking is not the same as being allowed to insist. A rebuild of the
