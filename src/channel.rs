@@ -2604,6 +2604,17 @@ impl<'a> Desk<'a> {
         agents
     }
 
+    /// How many agents on one machine are running under another agent, which
+    /// is exactly what `listed_agents` left out. Said as a count rather than
+    /// as rows: a person reading a chat wants to know the work is being done
+    /// without having to read the name of everyone doing it.
+    fn helpers_on(&mut self, machine: &str) -> usize {
+        self.sessions()
+            .iter()
+            .filter(|it| it.machine == machine && it.alive && it.parent.is_some())
+            .count()
+    }
+
     /// Resolve a `/select <machine>-<agent>` pair of 1-based numbers to the
     /// agent they name, from the same orderings `/list` printed.
     fn resolve_numbered(&mut self, machine_no: usize, agent_no: usize) -> Option<Correspondent> {
@@ -2701,16 +2712,21 @@ impl<'a> Desk<'a> {
     }
 }
 
-/// Render active agents grouped by the folder they run in, each numbered so
-/// `/select <machine>-<n>` can reach it, each saying what it is doing, and
-/// each carrying its `recap` (the last thing the model said) on the line under
-/// it. A folder with no path — a session that did not say where it runs — is
-/// grouped under `~`.
+/// Render active agents grouped by the folder they run in, each carrying the
+/// `<machine>-<agent>` number `/select` takes, what it is doing, and its
+/// `recap` (the last thing the model said) on the line under it. A folder with
+/// no path — a session that did not say where it runs — is grouped under `~`.
+///
+/// The whole `machine-agent` pair is printed, not the agent's ordinal alone,
+/// because the pair is what a person types back. A list that prints `2` under
+/// a heading and asks for `/select <machine>-<agent>` in the footer makes the
+/// reader assemble the command out of two halves printed in different places,
+/// on a phone, from memory.
 ///
 /// The state is on the name's own line, not in the recap: the recap is the
 /// last thing the model said, and the last thing a model said reads exactly
 /// the same whether it said it ten seconds ago or yesterday.
-fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
+fn folder_grouped(machine_no: usize, agents: &[&Correspondent]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut heading: Option<&str> = None;
     // Counted straight along the list it was handed, and never re-ordered
@@ -2723,11 +2739,11 @@ fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
             if heading.is_some() {
                 lines.push(String::new());
             }
-            lines.push(folder.to_string());
+            lines.push(folder_shown(folder));
             heading = Some(folder);
         }
         lines.push(format!(
-            "  {}  {} · {}",
+            "  {machine_no}-{}  {} · {}",
             index + 1,
             who.list_name(),
             who.state()
@@ -2735,13 +2751,19 @@ fn folder_grouped(agents: &[&Correspondent]) -> Vec<String> {
         if let Some(recap) = who.recap.as_ref().filter(|r| !r.trim().is_empty()) {
             let one = recap.split('\n').next().unwrap_or("").trim();
             if !one.is_empty() {
-                let recap_line = if one.chars().count() > 140 {
-                    let cut: String = one.chars().take(137).collect();
+                // Shorter than a terminal would allow: a hundred characters is
+                // already three lines on a phone, and this is a glance at what
+                // the agent is on, not the sentence itself.
+                let recap_line = if one.chars().count() > 100 {
+                    let cut: String = one.chars().take(97).collect();
                     format!("{cut}…")
                 } else {
                     one.to_string()
                 };
-                lines.push(format!("      {recap_line}"));
+                // Three spaces, not more: four is a code block in every
+                // markdown a chat renders, and a recap set in a grey monospace
+                // box is not what this line is.
+                lines.push(format!("   {recap_line}"));
             }
         }
     }
@@ -2758,6 +2780,20 @@ fn folder_of(who: &Correspondent) -> &str {
         "" => "~",
         folder => folder,
     }
+}
+
+/// The heading a folder gets in a chat: its last two components, with what was
+/// dropped marked. Grouping is still by the whole path — two folders that end
+/// the same way are still two folders — but the whole path is not what goes on
+/// the screen. `/Users/someone/Works/Terminal` is a line and a half on a
+/// phone, most of it the same prefix on every row, and the part of it that is
+/// a person's home directory is not something to put in a chat at all.
+fn folder_shown(folder: &str) -> String {
+    let parts: Vec<&str> = folder.split('/').filter(|it| !it.is_empty()).collect();
+    if parts.len() < 3 {
+        return folder.trim_end_matches('/').to_string();
+    }
+    format!("…/{}", parts[parts.len() - 2..].join("/"))
 }
 
 /// Act on one thing a human said, and answer in the words they should see.
@@ -2840,13 +2876,23 @@ fn handle(
             if machines.is_empty() {
                 "· no machines to list".into()
             } else {
-                let mut lines: Vec<String> = machines
-                    .iter()
-                    .enumerate()
-                    .map(|(index, m)| format!("{}  {}", index + 1, m.label_or_id()))
-                    .collect();
+                // With a count beside each, because a bare list of machine
+                // names does not say which one to open, and opening the wrong
+                // one on a phone costs a round trip to find out it was empty.
+                let mut lines: Vec<String> = Vec::new();
+                for (index, m) in machines.iter().enumerate() {
+                    let agents = desk.listed_agents(&m.id).len();
+                    lines.push(match agents {
+                        0 => format!("{}  {} · no agents", index + 1, m.label_or_id()),
+                        1 => format!("{}  {} · 1 agent", index + 1, m.label_or_id()),
+                        n => format!("{}  {} · {n} agents", index + 1, m.label_or_id()),
+                    });
+                }
                 lines.push(String::new());
-                lines.push("`/list <number>` shows one machine's agents · `/select <machine>-<agent>` aims this chat".into());
+                lines.push(
+                    "`/list 1` shows that machine's agents · `/select 1-2` aims this chat at one"
+                        .into(),
+                );
                 lines.join("\n")
             }
         }
@@ -2865,9 +2911,20 @@ fn handle(
                             if active.is_empty() {
                                 format!("· {} has no active agents", m.label_or_id())
                             } else {
-                                let mut lines = folder_grouped(&active);
-                                lines.push(String::new());
-                                lines.push(format!("`/select <machine>-<agent>` aims this chat · `/new {number}` starts one here · only active agents shown"));
+                                // The example is a real number off this very
+                                // list rather than `<machine>-<agent>`: a
+                                // placeholder is one more thing to work out on
+                                // a phone, and the first row is always there.
+                                let mut lines = folder_grouped(number, &active);
+                                lines.push(format!(
+                                    "`/select {number}-1` aims this chat · `/new {number}` starts a fresh agent here"
+                                ));
+                                lines.push(match desk.helpers_on(&m.id) {
+                                    0 => "· active agents only".to_string(),
+                                    n => format!(
+                                        "· active agents only, and {n} more working under the ones listed"
+                                    ),
+                                });
                                 lines.join("\n")
                             }
                         }
@@ -2884,11 +2941,11 @@ fn handle(
             let mut lines: Vec<String> = vec![
                 "Commands this chat understands:".into(),
                 "  /call <text>        run <text> with a fresh one-shot agent (the one /call last used), once".into(),
-                "  /list              active agents, grouped by folder, with a glance at what each is doing".into(),
-                "  /list <num>        the active agents on one machine (number from /list)".into(),
+                "  /list              the machines, with how many agents are running on each".into(),
+                "  /list <num>        one machine's agents, grouped by folder, with what each is doing".into(),
                 "  /select <num>-<n>  aim this chat at one agent, until another writes or /clear".into(),
                 "  /select <name>     aim at an agent by name".into(),
-                "  /who               every agent everywhere (not only active, not grouped)".into(),
+                "  /who               every running agent everywhere, in one flat list".into(),
                 "  /clear             stop aiming; plain messages go to the board".into(),
                 "  /all <text>        put something on the board every agent reads".into(),
                 "  /new <machine>     start a fresh agent there, in a scratch folder, aimed at this chat".into(),
@@ -4290,7 +4347,7 @@ mod tests {
 
         let listed = desk.listed_agents("local");
         let refs: Vec<&Correspondent> = listed.iter().collect();
-        let printed = folder_grouped(&refs).join("\n");
+        let printed = folder_grouped(1, &refs).join("\n");
         assert!(
             !printed.contains("yesterday") && !printed.contains("last week"),
             "only the live ones are printed: {printed}"
@@ -4300,8 +4357,8 @@ mod tests {
         for (index, who) in listed.iter().enumerate() {
             let number = index + 1;
             assert!(
-                printed.contains(&format!("  {number}  {}", who.list_name())),
-                "agent {number} is printed as {}: {printed}",
+                printed.contains(&format!("  1-{number}  {}", who.list_name())),
+                "agent 1-{number} is printed as {}: {printed}",
                 who.list_name()
             );
             assert_eq!(
@@ -4357,14 +4414,14 @@ mod tests {
             "only the agents a person started belong in a chat list"
         );
         let refs: Vec<&Correspondent> = listed.iter().collect();
-        let printed = folder_grouped(&refs).join("\n");
+        let printed = folder_grouped(1, &refs).join("\n");
         assert!(
             !printed.contains("reviewing the"),
             "a subagent is not printed: {printed}"
         );
         // And the numbers count along that same list, so `/select 1-2` is the
         // second agent printed rather than the second session on the machine.
-        assert!(printed.contains("  2  the seo run"), "{printed}");
+        assert!(printed.contains("  1-2  the seo run"), "{printed}");
         assert_eq!(
             desk.resolve_numbered_from("1-2").map(|it| it.session_id),
             Some("s-other".into())
@@ -4391,6 +4448,38 @@ mod tests {
         assert!(roster.contains("- the seo run · local"), "{roster}");
         assert!(!roster.contains("reviewing the"), "{roster}");
         assert!(roster.contains("(2 working under them)"), "{roster}");
+
+        // `/list` counts the same agents beside each machine, so a person can
+        // see where the work is without opening every machine to find out.
+        let listing = handle(
+            &mut desk,
+            &binding,
+            &Incoming {
+                text: "/list".into(),
+                ..Default::default()
+            },
+            &mut inbox,
+        );
+        assert!(listing.contains("· 2 agents"), "{listing}");
+
+        // And one machine's list says outright that the rest are working
+        // under the ones it named, rather than dropping them in silence.
+        let opened = handle(
+            &mut desk,
+            &binding,
+            &Incoming {
+                text: "/list 1".into(),
+                ..Default::default()
+            },
+            &mut inbox,
+        );
+        assert!(opened.contains("  1-1  the arena"), "{opened}");
+        assert!(opened.contains("  1-2  the seo run"), "{opened}");
+        assert!(!opened.contains("reviewing the"), "{opened}");
+        assert!(
+            opened.contains("2 more working under the ones listed"),
+            "{opened}"
+        );
 
         // Nothing is hidden by leaving them out: a chat already aimed at a
         // subagent still finds it, because that goes by id and not by number.
@@ -4447,9 +4536,9 @@ mod tests {
         // grouping are the handler's. So we exercise the pure renderer here
         // over exactly the active subset the handler would pass it.
         let active: Vec<&Correspondent> = agents.iter().filter(|a| a.alive).collect();
-        let lines = folder_grouped(&active);
+        let lines = folder_grouped(1, &active);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("/works/x/"), "folder is the heading");
+        assert!(rendered.contains("/works/x"), "folder is the heading");
         assert!(rendered.contains("lexer"), "the labelled agent is there");
         assert!(
             rendered.contains("splitting the lexer"),
@@ -4462,9 +4551,52 @@ mod tests {
         // Numbering stays stable across folders, so /select's machine-agent
         // numbers stay stable even as folders move around.
         assert!(
-            rendered.contains("  1  lexer · working"),
+            rendered.contains("  1-1  lexer · working"),
             "numbering starts at one: {rendered}"
         );
+    }
+
+    /// A folder heading is read on a phone, where a full path is a line and a
+    /// half of which most is the same prefix on every row — and the part of it
+    /// that is somebody's home directory has no business in a chat at all.
+    #[test]
+    fn a_folder_heading_is_the_end_of_the_path_rather_than_the_whole_of_it() {
+        assert_eq!(
+            folder_shown("/Users/someone/Works/Terminal"),
+            "…/Works/Terminal"
+        );
+        // Nothing dropped, nothing marked as dropped.
+        assert_eq!(folder_shown("/works/x/"), "/works/x");
+        assert_eq!(folder_shown("/works"), "/works");
+        // A session that did not say where it runs keeps its own heading.
+        assert_eq!(folder_shown("~"), "~");
+        // Grouping is still by the whole path, so two folders that end the
+        // same way stay two folders even though they now read alike.
+        let agent = |path: &str, label: &str| Correspondent {
+            machine: "m".into(),
+            session_id: format!("s-{label}"),
+            label: label.into(),
+            path: path.into(),
+            alive: true,
+            working: false,
+            needs_attention: false,
+            recap: None,
+            parent: None,
+        };
+        let agents = [
+            agent("/home/a/works/api", "one"),
+            agent("/home/b/works/api", "two"),
+        ];
+        let listed: Vec<&Correspondent> = agents.iter().collect();
+        let rendered = folder_grouped(2, &listed).join("\n");
+        assert_eq!(
+            rendered.matches("…/works/api").count(),
+            2,
+            "two headings, not one: {rendered}"
+        );
+        // And the number printed is the pair `/select` takes, machine and all.
+        assert!(rendered.contains("  2-1  one"), "{rendered}");
+        assert!(rendered.contains("  2-2  two"), "{rendered}");
     }
 
     /// A chat has no colour and no spinner, so an agent's line has to say
@@ -4491,13 +4623,13 @@ mod tests {
             agent("done", false, false),
         ];
         let listed: Vec<&Correspondent> = agents.iter().collect();
-        let rendered = folder_grouped(&listed).join("\n");
-        assert!(rendered.contains("  1  busy · working"), "{rendered}");
+        let rendered = folder_grouped(1, &listed).join("\n");
+        assert!(rendered.contains("  1-1  busy · working"), "{rendered}");
         assert!(
-            rendered.contains("  2  asking · waiting for you"),
+            rendered.contains("  1-2  asking · waiting for you"),
             "{rendered}"
         );
-        assert!(rendered.contains("  3  done · idle"), "{rendered}");
+        assert!(rendered.contains("  1-3  done · idle"), "{rendered}");
 
         // A session that has stopped for good says so rather than keeping
         // whatever it last happened to be.
