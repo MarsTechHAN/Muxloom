@@ -1490,6 +1490,138 @@ fn check_may_launch(own: &Powers, kind: AgentKind) -> Result<()> {
     )
 }
 
+/// How far up a chain of parents one reach check will walk. A session ten
+/// handoffs down is still on the same piece of work, and past that a cycle is
+/// the likelier explanation than a team.
+const TASK_WALK_MAX: usize = 16;
+
+/// Whether `target` is on the same piece of work as this session.
+///
+/// The chain of parents above the target is walked until it reaches something
+/// this session recognises: the task it belongs to, or itself — anything under
+/// this session is its own work by definition, and that hop is what lets a
+/// subagent started on another machine be recognised from one record over
+/// there. A chain that runs out unrecognised belongs to somebody else.
+///
+/// A process running in no session has no task to be outside of, so nothing is.
+fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
+    let mine: Vec<String> = [task_root(), launching_session()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if mine.is_empty() {
+        return true;
+    }
+    let mut at = target.trim().to_string();
+    for _ in 0..TASK_WALK_MAX {
+        if mine.contains(&at) {
+            return true;
+        }
+        let Some(parent) = lineage
+            .iter()
+            .find(|(id, _)| *id == at)
+            .and_then(|(_, parent)| parent.clone())
+        else {
+            return false;
+        };
+        at = parent;
+    }
+    false
+}
+
+/// Who begat whom, taken from session records.
+fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
+    sessions
+        .iter()
+        .map(|record| (record.id.clone(), record.parent.clone()))
+        .collect()
+}
+
+/// The same, read back out of a rendered `list_sessions` answer — which is all
+/// another machine ever hands over.
+fn lineage_of_answer(rendered: &str) -> Vec<(String, Option<String>)> {
+    serde_json::from_str::<Vec<Value>>(rendered)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.get("session_id")?.as_str()?.to_string();
+            Some((
+                id,
+                row.get("parent")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ))
+        })
+        .collect()
+}
+
+/// Refuse a message this session may not send, saying who it may speak to and
+/// who set that, so the answer is a route rather than a flag.
+fn check_may_message(
+    own: &Powers,
+    target: &str,
+    lineage: &[(String, Option<String>)],
+) -> Result<()> {
+    match own.reach {
+        Reach::Fleet => Ok(()),
+        Reach::Task if same_task(lineage, target) => Ok(()),
+        Reach::Task => bail!(
+            "{target} is not on this piece of work, and this session speaks within its own: the \
+             agent that started it set that. Tell that agent what needs saying, and let it carry \
+             the message."
+        ),
+        Reach::Parent
+            if session_env("MUXLOOM_SESSION_PARENT").as_deref() == Some(target.trim()) =>
+        {
+            Ok(())
+        }
+        Reach::Parent => bail!(
+            "this session answers to the agent that started it and to nobody else, which is what \
+             that agent asked for. Report to it, and it can pass anything on."
+        ),
+    }
+}
+
+/// Refuse a message to the person from a session that was not handed the
+/// person to talk to. One agent answers them, and it is not this one.
+fn check_may_reach_person(own: &Powers) -> Result<()> {
+    if own.may_reach_person {
+        return Ok(());
+    }
+    bail!(
+        "this session does not write to the person's chat: the agent that started it is the one \
+         answering them, and asked to keep it that way. Tell that agent what the person needs to \
+         hear, and it will carry it."
+    )
+}
+
+/// Refuse a board post aimed wider than this session may speak.
+///
+/// The board is a set of rooms rather than one, and the same dial says which
+/// of them a session may be heard in: its own task's room always, the folder
+/// it works in once it may talk to the others working there, and the machine
+/// and the world only when it may speak to any agent at all.
+fn check_may_post(own: &Powers, scope: &TalkScope) -> Result<()> {
+    let allowed = matches!(
+        (own.reach, scope),
+        (Reach::Fleet, _) | (_, TalkScope::Task { .. }) | (Reach::Task, TalkScope::Path { .. })
+    );
+    if allowed {
+        return Ok(());
+    }
+    match own.reach {
+        Reach::Parent => bail!(
+            "this session posts to its own task's board and nowhere else: the agent that started \
+             it set that. Use scope \"task\", or report to that agent."
+        ),
+        _ => bail!(
+            "this session speaks within its own task and the folder it works in: the agent that \
+             started it set that. Use scope \"task\" or \"path\", or ask that agent to say it \
+             more widely."
+        ),
+    }
+}
+
 /// The caller a relayed launch names for itself. The controller's own process
 /// never runs inside a session, so a launch arriving through a relay has no
 /// environment to read and would otherwise lose its parent entirely: the
@@ -1909,6 +2041,7 @@ fn send_channel(
     now: Option<String>,
     leave: impl FnOnce(crate::channel::ChannelReceipt),
 ) -> Result<String> {
+    check_may_reach_person(&own_powers())?;
     let message = crate::channel::Outgoing {
         title: optional_str(arguments, "title").unwrap_or_default().into(),
         text: required_str(arguments, "text")?.into(),
@@ -2022,6 +2155,7 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
         },
         other => bail!("unknown scope {other}: use path, machine, task, or global"),
     };
+    check_may_post(&own_powers(), &scope)?;
     Ok(TalkDraft {
         scope,
         author,
@@ -3683,14 +3817,15 @@ mod daemon_surface {
 
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
-        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, check_may_launch, delivery_json,
-        direct_draft, enforce_policy, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
-        fleet_resume_target, granted_powers, instructions, launch_path_within, launching_session,
-        message_author, native_resume_id, optional_bool, optional_str, optional_usize, own_powers,
-        plain_screen, pretty, preview_text, required_str, screen_page, send_channel, session_env,
-        session_json, session_kind, session_name_now, shell_report, stamp_powers,
-        synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait, trigger_json,
-        trigger_spec, wait_loop,
+        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, check_may_launch,
+        check_may_message, check_may_reach_person, delivery_json, direct_draft, enforce_policy,
+        fleet_outcome_json, fleet_resume_caption, fleet_resume_plan, fleet_resume_target,
+        granted_powers, instructions, launch_path_within, launching_session, lineage,
+        lineage_of_answer, message_author, native_resume_id, optional_bool, optional_str,
+        optional_usize, own_powers, plain_screen, pretty, preview_text, required_str, screen_page,
+        send_channel, session_env, session_json, session_kind, session_name_now, shell_report,
+        stamp_powers, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
+        trigger_json, trigger_spec, wait_loop,
     };
     use crate::{
         channel::ChannelSet,
@@ -3699,7 +3834,7 @@ mod daemon_surface {
         daemon_protocol::{
             DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, Trigger, stream,
         },
-        model::{AgentKind, LOCAL_TARGET_ID},
+        model::{AgentKind, LOCAL_TARGET_ID, Reach},
         runtime::{launch_arguments, launch_seed, new_daemon_session_id},
     };
 
@@ -4094,6 +4229,14 @@ mod daemon_surface {
         }
 
         fn message_agent(&self, arguments: &Value) -> Result<String> {
+            let own = own_powers();
+            if own.reach != Reach::Fleet {
+                check_may_message(
+                    &own,
+                    required_str(arguments, "session_id")?,
+                    &lineage(&self.sessions()?),
+                )?;
+            }
             // The board here is the one the message will be filed on, so an
             // author with no machine on it would be right anyway; asking keeps
             // the record the same shape as one that crossed a machine.
@@ -4484,6 +4627,29 @@ mod daemon_surface {
                     let mut relayed = arguments.clone();
                     stamp_powers(&mut relayed, &granted_powers(arguments, &own)?);
                     return self.relay(name, &relayed);
+                }
+                // Borrowing the controller's credentials does not widen what
+                // this session may say to the person.
+                if name == "send_channel_message" {
+                    check_may_reach_person(&own_powers())?;
+                }
+                // How far this session may speak is written here too, and a
+                // message crossing a machine is still it speaking. The chain
+                // above the session it is aimed at lives over there, so the
+                // list comes back first and the walk happens on this side,
+                // where what counts as "our task" is known.
+                if name == "message_agent" {
+                    let own = own_powers();
+                    if own.reach != Reach::Fleet {
+                        let machine = elsewhere.clone().unwrap_or_default();
+                        let over_there =
+                            self.relay("list_sessions", &json!({ "machine": machine }))?;
+                        check_may_message(
+                            &own,
+                            required_str(arguments, "session_id")?,
+                            &lineage_of_answer(&over_there),
+                        )?;
+                    }
                 }
                 return self.relay(name, arguments);
             }
@@ -5827,6 +5993,142 @@ mod tests {
         // otherwise is an agent talking about itself.
         let _env = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-4-1-0"));
         assert_eq!(relayed_powers(&relayed), None);
+    }
+
+    /// A task-scoped session talks to its own team and is refused the rest —
+    /// and the team is the whole tree under the task, not the siblings it
+    /// happens to know about.
+    #[test]
+    fn a_task_scoped_session_reaches_its_own_work_and_stops_there() {
+        let _lock = daemon_env_lock();
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-lead"));
+        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", Some("muxloomd-claude-lead"));
+        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", None);
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
+        let here = lineage(&[
+            fleet_row("muxloomd-claude-lead", None),
+            fleet_row("muxloomd-claude-hand", Some("muxloomd-claude-lead")),
+            fleet_row("muxloomd-claude-grandchild", Some("muxloomd-claude-hand")),
+            fleet_row("muxloomd-claude-stranger", None),
+            fleet_row(
+                "muxloomd-claude-someone-elses",
+                Some("muxloomd-claude-stranger"),
+            ),
+        ]);
+        let own = own_powers();
+        for reachable in [
+            "muxloomd-claude-lead",
+            "muxloomd-claude-hand",
+            "muxloomd-claude-grandchild",
+        ] {
+            check_may_message(&own, reachable, &here).unwrap();
+        }
+        let error = check_may_message(&own, "muxloomd-claude-someone-elses", &here)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("not on this piece of work"), "{error}");
+        assert!(error.contains("let it carry the message"), "{error}");
+        // A session nobody on this machine has a record of is not this
+        // session's team by default.
+        assert!(check_may_message(&own, "muxloomd-claude-nowhere", &here).is_err());
+
+        // A subagent started on another machine is one hop from this session
+        // on that machine's own list, and that is enough to recognise it.
+        let over_there = lineage_of_answer(
+            &json!([
+                { "session_id": "muxloomd-codex-far", "parent": "muxloomd-claude-lead" },
+                { "session_id": "muxloomd-codex-native", "parent": null },
+            ])
+            .to_string(),
+        );
+        check_may_message(&own, "muxloomd-codex-far", &over_there).unwrap();
+        assert!(check_may_message(&own, "muxloomd-codex-native", &over_there).is_err());
+
+        // The full reach asks nothing of a lineage at all.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("fleet"));
+        check_may_message(&own_powers(), "muxloomd-claude-someone-elses", &[]).unwrap();
+
+        // The narrowest answers to one session and no other, wherever it runs.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
+        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", Some("muxloomd-claude-boss"));
+        check_may_message(&own_powers(), "muxloomd-claude-boss", &here).unwrap();
+        let error = check_may_message(&own_powers(), "muxloomd-claude-hand", &here)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("and to nobody else"), "{error}");
+    }
+
+    /// The person hears about a piece of work from the agent they asked, not
+    /// from every session working on it.
+    #[test]
+    fn a_session_not_handed_the_person_cannot_write_to_them() {
+        let _lock = daemon_env_lock();
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
+        let error = check_may_reach_person(&own_powers())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("does not write to the person's chat"),
+            "{error}"
+        );
+        assert!(error.contains("Tell that agent"), "{error}");
+
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("yes"));
+        check_may_reach_person(&own_powers()).unwrap();
+
+        // A session nobody set limits on is a person's own agent.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", None);
+        check_may_reach_person(&own_powers()).unwrap();
+    }
+
+    /// The board is rooms, and the same dial says which of them a session may
+    /// be heard in: its own task always, the folder it works in when it may
+    /// talk to the others there, the machine and the world only at full reach.
+    #[test]
+    fn a_narrowed_session_posts_to_its_own_rooms_and_no_wider() {
+        let _lock = daemon_env_lock();
+        let task = TalkScope::Task {
+            machine: String::new(),
+            root_session: "muxloomd-claude-lead".into(),
+        };
+        let folder = TalkScope::Path {
+            machine: String::new(),
+            path: "/works/Terminal".into(),
+        };
+        let machine = TalkScope::Machine {
+            machine: String::new(),
+        };
+        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
+
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+        let own = own_powers();
+        check_may_post(&own, &task).unwrap();
+        check_may_post(&own, &folder).unwrap();
+        let error = check_may_post(&own, &machine).err().unwrap().to_string();
+        assert!(error.contains("scope \"task\" or \"path\""), "{error}");
+        assert!(check_may_post(&own, &TalkScope::Global).is_err());
+
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
+        let own = own_powers();
+        check_may_post(&own, &task).unwrap();
+        let error = check_may_post(&own, &folder).err().unwrap().to_string();
+        assert!(error.contains("its own task's board"), "{error}");
+
+        // Nothing said about this session: a person's agent, and every room
+        // is open to it.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
+        for scope in [task, folder, machine, TalkScope::Global] {
+            check_may_post(&own_powers(), &scope).unwrap();
+        }
     }
 
     /// A session is signed with what it is called now, not what it was named

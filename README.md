@@ -747,6 +747,20 @@ and recorded beside it, never taken from a tool argument the agent could have
 written about itself, and a resume restores what the record held — so a session
 cannot shed its limits by dying and coming back.
 
+The dials are enforced where the writing happens. `message_agent` walks the
+chain of parents above the session it is aimed at: a `task` session reaches
+anything under its own task — including a subagent it started on another
+machine, which a cross-machine message resolves by fetching that machine's
+list first — and a `parent` session reaches the one agent that started it.
+`talk_post` is held to the same reach, because the board is a set of rooms and
+posting to the wider ones is another way of being heard: `task` scope is always
+open, `path` opens once the session may talk to the others working in that
+folder, and `machine` and `global` need the full reach. `send_channel_message`
+is refused outright to a session that was not handed the person, on the way out
+and again before a relayed one borrows the controller's credentials. Every
+refusal names the agent that set the limit and the route around it, because the
+session reading it cannot lift the limit itself.
+
 The tool surface itself is transport-agnostic (`src/control.rs`); MCP stdio
 is its first adapter, and the same seam is intended to carry a TCP or serial
 adapter so hardware status panels can read agent state.

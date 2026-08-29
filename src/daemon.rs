@@ -3858,6 +3858,11 @@ mod platform {
         }
         keeper_environment.push(("MUXLOOM_SESSION_ID".into(), session_id.clone()));
         keeper_environment.push(("MUXLOOM_SESSION_PATH".into(), path.clone()));
+        // Who to answer. Absent on a session a person started, which has
+        // nobody to report to and is not held to reporting to anybody.
+        if let Some(parent) = parent.as_deref() {
+            keeper_environment.push(("MUXLOOM_SESSION_PARENT".into(), parent.into()));
+        }
         // Which piece of work this session is part of, for the task scope on
         // the board. Worked out once, here, because parentage is fixed at
         // launch: the chain a session hangs off cannot change under it later,
