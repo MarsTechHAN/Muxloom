@@ -1135,16 +1135,16 @@ fn default_true() -> bool {
 }
 
 impl Correspondent {
-    /// How the human reads it: the label if the session has one, and enough of
-    /// the id to tell two apart if it does not.
+    /// How the human reads it, machine and all.
+    ///
+    /// Never the session id. `muxloomd-claude-1787996682-39374-2` identifies
+    /// the session exactly and names it not at all, and a person reading their
+    /// phone can do nothing with it but squint — what it has been doing, or
+    /// failing that its number, at least says which agent this is.
     pub fn name(&self) -> String {
-        let called = if self.label.trim().is_empty() {
-            self.session_id.as_str()
-        } else {
-            self.label.trim()
-        };
+        let called = self.list_name();
         if self.machine.is_empty() {
-            return called.to_string();
+            return called;
         }
         format!("{called} · {}", self.machine)
     }
@@ -2443,7 +2443,15 @@ impl<'a> Desk<'a> {
                         .map(|session| Correspondent {
                             machine: machine.id.clone(),
                             session_id: session.id,
-                            label: session.label,
+                            // The runtime's own title for the conversation
+                            // stands in for a session nobody has named: it is
+                            // what the dashboard shows, and a chat that calls
+                            // the same agent something else is a chat the
+                            // human has to translate.
+                            label: match session.label.trim() {
+                                "" => session.title.clone().unwrap_or_default(),
+                                label => label.to_string(),
+                            },
                             path: session.path.clone(),
                             alive: !session.dead && session.pid.is_some(),
                             working: session.working,
@@ -2515,13 +2523,19 @@ impl<'a> Desk<'a> {
         self.resolve_numbered(machine, agent)
     }
 
-    /// Start a fresh agent session of `kind` in `folder` on the local machine.
-    /// When `temporary`, the daemon gives it a private scratch folder that is
-    /// removed with the session. `initial_prompt` seeds a fresh session, and
-    /// `label` names it. A launch a person asks for from a chat has no parent:
-    /// it is their own piece of work, not a subagent of anything.
+    /// Start a fresh agent session of `kind` in `folder` on `target`. When
+    /// `temporary`, the daemon gives it a private scratch folder that is
+    /// removed with the session, whatever folder was named. `initial_prompt`
+    /// seeds a fresh session, and `label` names it. A launch a person asks for
+    /// from a chat has no parent: it is their own piece of work, not a
+    /// subagent of anything.
+    ///
+    /// The command and environment are the ones configured for that machine —
+    /// a chat launching on `gpu-box` must get the same codex path the dashboard
+    /// would give it there, not this controller's.
     fn launch(
         &self,
+        target: &Target,
         kind: crate::model::AgentKind,
         folder: &str,
         temporary: bool,
@@ -2530,7 +2544,7 @@ impl<'a> Desk<'a> {
     ) -> Result<String> {
         use crate::model::LaunchRequest;
         let request = LaunchRequest {
-            target: Target::local(),
+            target: target.clone(),
             kind,
             path: folder.to_string(),
             label: label.to_string(),
@@ -2539,12 +2553,9 @@ impl<'a> Desk<'a> {
             initial_prompt,
             parent: None,
         };
-        let command = self.config.agents.get(kind).clone();
-        let environment = self
-            .config
-            .environment_for(crate::model::LOCAL_TARGET_ID)
-            .unwrap_or_default();
-        self.runtime.launch(&request, &command, &environment)
+        let command = self.config.command_for(&target.id, kind);
+        let environment = self.config.environment_for(&target.id).unwrap_or_default();
+        self.runtime.launch(&request, command, &environment)
     }
 
     /// Send the interrupt byte to an agent's session, the way an attached
@@ -2640,6 +2651,15 @@ fn handle(
     } else {
         format!("{} via {}", binding.label.trim(), binding.kind.title())
     };
+    // What to call a session this chat starts. `called` is how the *person*
+    // signs what they say — "Ming via WeChat" — and naming an agent after the
+    // human who asked for it is how a fleet ends up with four agents all called
+    // WeChat. The chat is the one true thing about it until it names itself
+    // with `set_head_name`, which is what a person then reads.
+    let chat_name = match binding.label.trim() {
+        "" => binding.kind.title().to_string(),
+        label => label.to_string(),
+    };
     let (decision, text) = route(
         &message.text,
         message.reply_to.as_deref(),
@@ -2706,7 +2726,7 @@ fn handle(
                             } else {
                                 let mut lines = folder_grouped(&active);
                                 lines.push(String::new());
-                                lines.push("`/select <machine>-<agent>` aims this chat · `/new` to start one here · only active agents shown".into());
+                                lines.push(format!("`/select <machine>-<agent>` aims this chat · `/new {number}` starts one here · only active agents shown"));
                                 lines.join("\n")
                             }
                         }
@@ -2730,7 +2750,7 @@ fn handle(
                 "  /who               every agent everywhere (not only active, not grouped)".into(),
                 "  /clear             stop aiming; plain messages go to the board".into(),
                 "  /all <text>        put something on the board every agent reads".into(),
-                "  /new               start a fresh agent".into(),
+                "  /new <machine>     start a fresh agent there, in a scratch folder, aimed at this chat".into(),
                 "  /help              this list".into(),
             ];
             lines.push(String::new());
@@ -2741,32 +2761,63 @@ fn handle(
             lines.join("\n")
         }
         Route::New(arg) => {
-            // Start a fresh agent in this machine's folder. `/new <path>` uses
-            // that folder; otherwise the current directory. The kind is this
-            // chat's default (set by /agent), defaulting to claude.
+            // Which machine has to be said. A chat is read on a phone, from
+            // anywhere, and the controller's own current directory is not a
+            // place the person can see; guessing it means an agent quietly
+            // starting on the wrong side of the fleet.
+            let machines = desk.machines_ordered();
+            let Ok(number) = arg.trim().parse::<usize>() else {
+                let mut lines = vec![match arg.trim().is_empty() {
+                    true => "· `/new <machine>` — which machine:".to_string(),
+                    false => format!(
+                        "· `/new` takes a machine number — `{}` is not one:",
+                        arg.trim()
+                    ),
+                }];
+                lines.extend(
+                    machines
+                        .iter()
+                        .enumerate()
+                        .map(|(index, m)| format!("{}  {}", index + 1, m.label_or_id())),
+                );
+                return lines.join("\n");
+            };
+            let Some(target) = machines
+                .get(number.checked_sub(1).unwrap_or(usize::MAX))
+                .cloned()
+            else {
+                return format!("· no machine numbered `{number}` — `/list` shows them");
+            };
+            // The kind is this chat's default (set by /agent), defaulting to
+            // claude.
             let kind = inbox
                 .default_kind
                 .get(&binding.id)
                 .copied()
                 .unwrap_or(AgentKind::Claude);
-            let folder = {
-                let arg = arg.trim();
-                if arg.is_empty() {
-                    crate::config::expand_tilde(".")
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    crate::config::expand_tilde(arg)
-                        .to_string_lossy()
-                        .into_owned()
-                }
-            };
-            match desk.launch(kind, &folder, false, None, &called) {
+            // In muxloom's own scratch folder, made and removed by the daemon
+            // on that machine. An agent started from a chat has no project
+            // behind it — nobody chose a repository, and moving into whichever
+            // directory the controller happened to be launched from leaves its
+            // droppings somewhere that never asked for them.
+            match desk.launch(&target, kind, ".", true, None, &chat_name) {
                 Ok(session_id) => {
-                    let short = session_id.rsplit('-').next().unwrap_or(&session_id);
+                    // A scratch session is not in `/list`, so nothing could aim
+                    // at it afterwards: aim this chat at it now, which is what
+                    // somebody who just started an agent meant anyway.
+                    let who = Correspondent {
+                        machine: target.id.clone(),
+                        session_id: session_id.clone(),
+                        label: chat_name.clone(),
+                        alive: true,
+                        ..Default::default()
+                    };
+                    desk.last_agent = Some(who.clone());
+                    inbox.aim(&binding.id, who);
                     format!(
-                        "· started {} in {folder} — aim this chat with `/select <machine>-<n>` once `/list` shows it (session {short})",
-                        kind.as_str()
+                        "· started {} on {} in a scratch folder, and aimed this chat at it — just type",
+                        kind.as_str(),
+                        target.label_or_id()
                     )
                 }
                 Err(error) => format!("· could not start an agent: {error:#}"),
@@ -2786,16 +2837,15 @@ fn handle(
             } else {
                 Some(text.clone())
             };
-            match desk.launch(kind, ".", true, prompt, &called) {
-                Ok(session_id) => {
-                    let short = session_id.rsplit('-').next().unwrap_or(&session_id);
+            match desk.launch(&Target::local(), kind, ".", true, prompt, &chat_name) {
+                Ok(_) => {
                     let what = if text.is_empty() {
                         "(no instruction given)".to_string()
                     } else {
                         text
                     };
                     format!(
-                        "· {} running `{what}` in a scratch folder — one-shot (session {short})",
+                        "· {} running `{what}` in a scratch folder — one-shot",
                         kind.as_str()
                     )
                 }
@@ -3879,12 +3929,54 @@ mod tests {
             Route::Current
         );
         assert_eq!(route("/stop", None, "lark-1", false, &inbox).0, Route::Stop);
+        // /new carries the machine it was given, including nothing at all —
+        // which machine is asked for rather than guessed, so the empty case has
+        // to reach the handler to be answered there.
+        assert_eq!(
+            route("/new 2", None, "lark-1", false, &inbox).0,
+            Route::New("2".into())
+        );
+        assert_eq!(
+            route("/new", None, "lark-1", false, &inbox).0,
+            Route::New(String::new())
+        );
         // parse_kind is case-insensitive and rejects what is not a runtime.
         assert_eq!(parse_kind("CLAUDE"), Some(AgentKind::Claude));
         assert_eq!(parse_kind("pi"), Some(AgentKind::Pi));
         assert_eq!(parse_kind("opencode"), Some(AgentKind::OpenCode));
         assert_eq!(parse_kind("grok"), None);
         assert_eq!(parse_kind(""), None);
+    }
+
+    /// A chat message names an agent; it never prints its id. The id is exact
+    /// and says nothing, and `muxloomd-claude-1787996682-39374-2` on a phone is
+    /// something the person has to decode rather than read.
+    #[test]
+    fn an_agent_is_named_to_the_human_and_never_numbered() {
+        let named = Correspondent {
+            machine: "seed".into(),
+            session_id: "muxloomd-claude-1787996682-39374-2".into(),
+            label: "lexer".into(),
+            ..Default::default()
+        };
+        assert_eq!(named.name(), "lexer · seed");
+        // Nameless, but it has been doing something: the recap says which agent
+        // this is far better than the id would.
+        let working = Correspondent {
+            recap: Some("rewriting the tokenizer\nand its tests".into()),
+            label: String::new(),
+            ..named.clone()
+        };
+        assert_eq!(working.name(), "rewriting the tokenizer · seed");
+        // Nameless and silent: the session's number, which is at least short
+        // enough to tell two apart, and never the whole id.
+        let silent = Correspondent {
+            recap: None,
+            label: String::new(),
+            machine: String::new(),
+            ..named.clone()
+        };
+        assert_eq!(silent.name(), "2");
     }
 
     #[test]
