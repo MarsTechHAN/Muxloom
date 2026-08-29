@@ -3428,7 +3428,9 @@ pub(crate) fn attention_reason(
     screen: &str,
     patterns: &[String],
 ) -> Option<String> {
-    let screen = attention_tail(screen).to_lowercase();
+    let tail = attention_tail(screen);
+    let rows: Vec<&str> = tail.lines().collect();
+    let screen = tail.to_lowercase();
 
     let has_yes = screen.lines().any(|line| choice_line(line, "yes"));
     let has_no = screen.lines().any(|line| choice_line(line, "no"));
@@ -3452,6 +3454,15 @@ pub(crate) fn attention_reason(
     let menu_open = !working_hint && bottom_menu_is_open(&screen);
     let dialog_open = has_choice || permission_shape || menu_open;
 
+    // What the dialog is actually asking, when it can be read. Every reason
+    // below is a category — "permission request", "confirmation" — and a
+    // category is the same for every session that lands on one: a fleet of
+    // agents each stopped at a different question all read back identically,
+    // and the one thing the reader needs, which question, is the one thing the
+    // reason did not say. The category stays as the fallback.
+    let asked = dialog_open.then(|| question_line(&rows)).flatten();
+    let because = |category: &str| Some(asked.clone().unwrap_or_else(|| category.to_string()));
+
     // A configured pattern is a word, and words are what transcripts are made
     // of: a briefing quoted on screen asking to "approve" things, a recap
     // mentioning a "user-approved" path, an agent saying "Standing by" — each
@@ -3466,11 +3477,11 @@ pub(crate) fn attention_reason(
                 line.contains(needle.as_str()) && (dialog_open || interactive_line(line))
             })
     }) {
-        return Some(pattern.clone());
+        return because(pattern);
     }
 
     if permission_shape {
-        return Some("permission request".into());
+        return because("permission request");
     }
 
     let builtins: &[(&str, &[&str])] = match kind {
@@ -3518,7 +3529,7 @@ pub(crate) fn attention_reason(
     };
     for (reason, markers) in builtins {
         if markers.iter().any(|marker| screen.contains(marker)) && has_choice {
-            return Some((*reason).into());
+            return because(reason);
         }
     }
     if has_choice
@@ -3532,7 +3543,7 @@ pub(crate) fn attention_reason(
         .iter()
         .any(|marker| screen.contains(marker))
     {
-        return Some("interactive choice".into());
+        return because("interactive choice");
     }
     // A selection menu open at the bottom of the screen is a question being
     // asked even when no option says yes or no — the answers to a
@@ -3542,9 +3553,114 @@ pub(crate) fn attention_reason(
     // cursor, and a key hint. The interrupt marker rules out the working
     // phase, whose panels can also draw pointed lists.
     if menu_open {
-        return Some("interactive choice".into());
+        return because("interactive choice");
+    }
+    // Last, and weakest: a turn Claude Code stopped part-way through. Nothing
+    // is drawn to say so, which is exactly why it has to be looked for.
+    if kind == AgentKind::Claude
+        && !working_hint
+        && !rows.iter().any(|line| spinner_status_line(line))
+        && claude_stopped_mid_turn(&rows)
+    {
+        return Some("interrupted, waiting for a new instruction".into());
     }
     None
+}
+
+/// The question a dialog is asking, in the words it is asking it.
+///
+/// A dialog draws its question above its answers, so the question is the last
+/// row of prose above the first option row. Box borders and transcript markers
+/// are stripped, and a row that says nothing a person could read as a question
+/// — chrome, a bare rule, a row of buttons — is skipped rather than reported.
+///
+/// `None` when nothing above the options reads as a question: the caller falls
+/// back to naming the category, which is what it always did.
+fn question_line(rows: &[&str]) -> Option<String> {
+    let last = rows.iter().rposition(|line| numbered_option_line(line))?;
+    // Back to the top of this block of options: everything from there down is
+    // the answers, and the question is above all of them.
+    let mut first = last;
+    while first > 0 {
+        let above = rows[first - 1];
+        if above.trim().is_empty() || numbered_option_line(above) {
+            first -= 1;
+            continue;
+        }
+        break;
+    }
+    rows[..first]
+        .iter()
+        .rev()
+        .filter_map(|line| dialog_prose(line))
+        .next()
+}
+
+/// One row of a dialog with its chrome taken off, if what is left reads as
+/// something a person was asked.
+fn dialog_prose(line: &str) -> Option<String> {
+    let stripped = line
+        .trim()
+        .trim_start_matches([
+            '│', '┃', '┆', '┇', '╭', '╮', '╯', '╰', '┌', '┐', '└', '┘', '╹', '╺', '─', '━', '⏺',
+            '⎿', '✻', '✽', '✶', '✳', '✢', '❯', '›', '»', '▸', '·', '*', '•',
+        ])
+        .trim_end_matches(['│', '┃', '┆', '┇', '╮', '╯', '─', '━'])
+        .trim();
+    // Long enough to be a sentence, short enough to be a question rather than
+    // the paragraph of transcript a dialog was drawn over.
+    if stripped.chars().count() < 8 || stripped.chars().count() > 200 {
+        return None;
+    }
+    if !stripped.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    // A row of buttons is the dialog's answers restated, not its question.
+    if interactive_line(&format!("  {stripped}")) {
+        return None;
+    }
+    Some(match stripped.chars().count() > 80 {
+        true => format!("{}…", stripped.chars().take(79).collect::<String>()),
+        false => stripped.to_string(),
+    })
+}
+
+/// The turn Claude Code stopped part-way through: the transcript ends with its
+/// interrupt marker and the prompt box below is open and empty, waiting to be
+/// told what to do instead.
+///
+/// Nothing on that screen says a question is being asked. There is no dialog,
+/// no options and no spinner — an interrupted agent looks exactly like one
+/// that finished its turn and has nothing left to do. So it was reported as
+/// plain idle, and whoever was waiting on it, a person or the agent that
+/// started it, was told nothing at all and went on waiting.
+///
+/// The marker stays in the scrollback for good, so it only counts as the last
+/// thing that happened: the transcript has to end there, with nothing but the
+/// prompt box under it. Anything typed into that box since is a turn about to
+/// run rather than a session standing still.
+fn claude_stopped_mid_turn(tail: &[&str]) -> bool {
+    if claude_composer(tail) != Composer::Ready {
+        return false;
+    }
+    let Some(bottom) = tail.iter().rposition(|line| is_rule(line)) else {
+        return false;
+    };
+    let Some(top) = tail[..bottom].iter().rposition(|line| is_rule(line)) else {
+        return false;
+    };
+    tail[..top]
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            // The two halves are matched apart because the terminal grid can
+            // put any amount of space between them: Claude writes the second
+            // half at a fixed column, so a narrow pane draws
+            // `Interrupted ·        What should Claude do instead?`.
+            let line = line.to_lowercase();
+            line.contains("interrupted") && line.contains("what should claude do instead")
+        })
 }
 
 fn bottom_menu_is_open(tail: &str) -> bool {
@@ -5867,14 +5983,23 @@ mod tests {
 
     #[test]
     fn detects_runtime_attention_prompts() {
+        // The reason is the question, in the words it was asked: a fleet all
+        // stopped at "command approval" says nothing about which command.
         let codex = "Would you like to run the following command?\n› 1. Yes\n  2. No\nPress enter to confirm";
         assert_eq!(
             attention_reason(AgentKind::Codex, codex, &[]).as_deref(),
-            Some("command approval")
+            Some("Would you like to run the following command?")
         );
         let claude = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
         assert_eq!(
             attention_reason(AgentKind::Claude, claude, &[]).as_deref(),
+            Some("Do you want to proceed?")
+        );
+        // The category is still the answer when the question cannot be read:
+        // here the dialog is drawn with nothing above its options.
+        let unreadable = "❯ 1. Yes\n  2. No\nEsc to cancel";
+        assert_eq!(
+            attention_reason(AgentKind::Claude, unreadable, &[]).as_deref(),
             Some("confirmation")
         );
         let idle_prompt = concat!(
@@ -5965,7 +6090,7 @@ mod tests {
         );
         assert_eq!(
             attention_reason(AgentKind::Claude, &asking, &patterns).as_deref(),
-            Some("approve"),
+            Some("Allow this change to the approved list?"),
             "the pattern belongs in a live question box"
         );
         // And on a shaped row even without a full dialog: the prompt glyph
@@ -6057,7 +6182,46 @@ mod tests {
             "╌".repeat(120)
         );
         assert_eq!(composer(AgentKind::Claude, &dialog), Some(Composer::Absent));
-        assert!(attention_reason(AgentKind::Claude, &dialog, &[]).is_some());
+        // And the reason it gives is the question itself, read from the row
+        // above the options — not the category every such dialog shares.
+        assert_eq!(
+            attention_reason(AgentKind::Claude, &dialog, &[]).as_deref(),
+            Some("Do you want to create probe.txt?")
+        );
+    }
+
+    #[test]
+    fn a_turn_claude_stopped_part_way_through_is_still_waiting() {
+        // Read off a stuck session: the turn was interrupted, the prompt box
+        // reopened empty, and nothing else on screen says anything is wrong.
+        // Whoever started it — a person or another agent — was told the
+        // session was plain idle and went on waiting for a reply.
+        let interrupted = format!(
+            "⏺ Bash(sleep 300)\n  ⎿  Interrupted · What should Claude do instead?\n\n{}\n❯\n{}\n  \
+             ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(
+            attention_reason(AgentKind::Claude, &interrupted, &[]).as_deref(),
+            Some("interrupted, waiting for a new instruction")
+        );
+        // A narrow pane draws the second half at its own column; the halves
+        // are read apart so the gap between them does not matter.
+        let split = interrupted.replace("Interrupted · What", "Interrupted ·         What");
+        assert!(attention_reason(AgentKind::Claude, &split, &[]).is_some());
+
+        // Once something is typed into the box, a turn is about to run.
+        let answered = interrupted.replace("\n❯\n", "\n❯ carry on without the sleep\n");
+        assert_eq!(attention_reason(AgentKind::Claude, &answered, &[]), None);
+        // And a marker left in the scrollback above later work is history.
+        let moved_on = format!(
+            "⏺ Bash(sleep 300)\n  ⎿  Interrupted · What should Claude do instead?\n\n⏺ Read(\
+             src/lib.rs)\n  ⎿  Read 40 lines\n\n{}\n❯\n{}\n  ⏵⏵ auto mode on · ← for agents\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(attention_reason(AgentKind::Claude, &moved_on, &[]), None);
     }
 
     #[test]
@@ -6439,7 +6603,7 @@ mod tests {
                     esc to skip\n";
         assert_eq!(
             attention_reason(AgentKind::Claude, menu, &[]).as_deref(),
-            Some("interactive choice")
+            Some("Which approach should we take?")
         );
         // The same pointed list while a turn is running is a progress panel,
         // not a question.

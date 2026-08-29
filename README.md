@@ -179,9 +179,14 @@ CLI erasing and repainting the visible `Working` line. When a session needs
 input — approval prompts, numbered menus, or your own `attention_patterns`,
 which the daemon now applies itself at its own refresh cadence — its entire
 agent item turns bold yellow, it raises a clickable banner, rings the bell,
-and emits a desktop notification. Opening the session clears the banner — the
-session list keeps showing Waiting until the agent stops asking — and a later
-prompt raises it again.
+and emits a desktop notification. The reason it reports is the question being
+asked, in the words it is asked in, read off the row above the options; a
+category ("permission request", "confirmation") is the fallback for a dialog
+whose question cannot be read. Claude Code also counts as waiting when a turn
+was interrupted and the prompt box reopened empty: nothing on that screen says
+so, which is why whoever started it used to be told nothing at all. Opening the
+session clears the banner — the session list keeps showing Waiting until the
+agent stops asking — and a later prompt raises it again.
 
 **Keys** — spinners are automatic · `a` show/hide archived · click the attention
 banner to jump to the session.

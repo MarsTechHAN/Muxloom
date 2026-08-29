@@ -7878,7 +7878,9 @@ mod platform {
             assert!(session.snapshot().working);
 
             // Patterns a controller sank down classify waiting on the
-            // daemon's own snapshots, custom wording included.
+            // daemon's own snapshots, custom wording included. The reason
+            // reads back as the question the screen is asking, which is what
+            // the pattern matched inside.
             session.record_output(&approval_screen("gpu quota approval"));
             *state
                 .attention_patterns
@@ -7889,7 +7891,7 @@ mod platform {
             assert!(snapshot.needs_attention);
             assert_eq!(
                 snapshot.attention_reason.as_deref(),
-                Some("gpu quota approval")
+                Some("gpu quota approval needed")
             );
 
             session.archive().unwrap();
@@ -7977,7 +7979,7 @@ mod platform {
             assert_eq!(alert.kind, "codex");
             assert_eq!(
                 alert.attention_reason.as_deref(),
-                Some("gpu quota approval")
+                Some("gpu quota approval needed")
             );
 
             // The same question afterwards: nothing in the same breath, the
@@ -8035,7 +8037,10 @@ mod platform {
             child.record_output(&approval_screen("second opinion"));
             note(&child);
             let alert = child.take_parent_alert().expect("new reason is a new edge");
-            assert_eq!(alert.attention_reason.as_deref(), Some("second opinion"));
+            assert_eq!(
+                alert.attention_reason.as_deref(),
+                Some("second opinion needed")
+            );
 
             // A child nobody started is no one's errand: the same fall marks
             // nothing for no parent to hear about.
