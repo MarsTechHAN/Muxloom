@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Read,
     os::unix::net::UnixListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -244,4 +245,66 @@ fn a_daemon_that_cannot_answer_the_ask_is_replaced_instead_of_failing_the_call()
     unsafe {
         libc::kill(standing_in as i32, libc::SIGKILL);
     }
+}
+
+/// Two daemons must never serve one state directory, and deciding it by
+/// looking around is a race the handover walks straight into: several clients
+/// stop the daemon they are replacing and start one at the same moment, each
+/// finds the socket stale, each removes it, and each binds. Taking the socket
+/// and the pid file away here is that window held open — everything a second
+/// arrival would look at is gone, and it must still refuse.
+#[test]
+fn a_second_daemon_cannot_serve_a_directory_that_is_already_served() {
+    let state = TestState::new();
+    let mut serve = state
+        .command()
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    wait_for(&state.root.join("muxloomd.sock"), &mut serve);
+
+    fs::remove_file(state.root.join("muxloomd.sock")).unwrap();
+    fs::remove_file(state.root.join("muxloomd.pid")).unwrap();
+
+    // Spawned rather than waited on: a second daemon that does serve serves
+    // forever, and this has to come back and say so rather than hang.
+    let mut second = state
+        .command()
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let refused = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!("a second daemon served a directory that already had one");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut complaint = String::new();
+    if let Some(stderr) = second.stderr.as_mut() {
+        let _ = stderr.read_to_string(&mut complaint);
+    }
+    assert!(
+        !refused.success(),
+        "a second daemon exited cleanly instead of refusing: {complaint}"
+    );
+    assert!(
+        complaint.contains("already running"),
+        "refused for the wrong reason: {complaint}"
+    );
+    assert!(
+        !state.root.join("muxloomd.sock").exists(),
+        "the daemon already serving had its socket taken over"
+    );
+
+    stop(serve);
 }

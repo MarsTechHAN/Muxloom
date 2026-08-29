@@ -72,6 +72,7 @@ mod platform {
         net::{Shutdown, TcpStream},
         os::unix::{
             fs::PermissionsExt,
+            io::AsRawFd,
             net::{UnixListener, UnixStream},
             process::CommandExt,
             process::ExitStatusExt,
@@ -199,6 +200,9 @@ mod platform {
         pub root: PathBuf,
         pub socket: PathBuf,
         pub pid: PathBuf,
+        /// Held open and locked for as long as a daemon serves this directory,
+        /// and never removed. See [`hold_the_serving_lock`].
+        pub lock: PathBuf,
         pub log: PathBuf,
         pub generation: PathBuf,
         /// Which generation a newer build has asked to replace, and when it
@@ -261,6 +265,7 @@ mod platform {
             Self {
                 socket: root.join("muxloomd.sock"),
                 pid: root.join("muxloomd.pid"),
+                lock: root.join("muxloomd.lock"),
                 log: root.join("muxloomd.log"),
                 generation: root.join("muxloomd.generation"),
                 handover: root.join("muxloomd.handover"),
@@ -1676,6 +1681,13 @@ mod platform {
 
     fn serve_with_mode(paths: &DaemonPaths, keeper_mode: KeeperMode) -> Result<()> {
         paths.prepare()?;
+        // Settled before anything is looked at, and held until this process
+        // ends: everything below reads and rewrites the state directory on the
+        // strength of what it found a moment ago.
+        let _serving = match hold_the_serving_lock(paths)? {
+            Some(lock) => lock,
+            None => bail!("muxloomd is already running"),
+        };
         if paths.socket.exists() {
             if UnixStream::connect(&paths.socket).is_ok() {
                 bail!("muxloomd is already running");
@@ -1787,6 +1799,59 @@ mod platform {
             state.shutdown.store(true, Ordering::Release);
         }
         !state.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Held for as long as this process serves the state directory, and given
+    /// up by the kernel however the process ends — including the ends that run
+    /// no destructor.
+    struct ServeLock {
+        /// Nothing reads it; the lock lasts exactly as long as the descriptor
+        /// stays open, so holding it is the whole job.
+        #[allow(dead_code)]
+        held: File,
+    }
+
+    /// Which daemon serves a state directory, decided once by the kernel
+    /// rather than by each arrival looking around.
+    ///
+    /// Looking was a race, and the handover walks straight into it: a client
+    /// stops the daemon it is replacing and starts one, and every other client
+    /// on the machine is doing the same thing at the same moment. Each finds
+    /// nothing listening, each removes the socket it just found stale, and each
+    /// binds. The last to bind owns the path; the others hold a listener on an
+    /// unlinked inode and accept nothing for the rest of their lives, having
+    /// already written their pid over the winner's — and when one of them goes,
+    /// its [`SocketGuard`] takes the winner's socket and pid file with it. A
+    /// machine could come out of an upgrade with a daemon nobody can reach and
+    /// a pid file naming a daemon that is not serving.
+    ///
+    /// An exclusive lock answers it before anything is looked at. The file is
+    /// never removed, so the lock is on one inode for the life of the directory
+    /// and cannot be lost by somebody unlinking the thing it is held on.
+    ///
+    /// `Ok(None)` means another daemon is already serving here. A filesystem
+    /// that cannot lock at all is not a reason to refuse to serve: say so and
+    /// go on, which is no worse than every build before this one.
+    fn hold_the_serving_lock(paths: &DaemonPaths) -> Result<Option<ServeLock>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&paths.lock)
+            .with_context(|| format!("failed to open {}", paths.lock.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(ServeLock { held: file }));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        eprintln!(
+            "muxloomd cannot lock {}, so it is serving without one: {error}",
+            paths.lock.display()
+        );
+        Ok(Some(ServeLock { held: file }))
     }
 
     struct SocketGuard {
