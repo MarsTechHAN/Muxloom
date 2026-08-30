@@ -4469,7 +4469,7 @@ mod platform {
         Ok(Some(record))
     }
 
-    /// The archived record a new-id launch reopens: same runtime, same
+    /// The stopped record a new-id launch reopens: same runtime, same
     /// folder, and the command line names the very conversation the record
     /// was matched to - or, never matched, the one its own launch was told to
     /// reopen. Deliberately narrow: without that seed to agree on, a kind and
@@ -4502,7 +4502,15 @@ mod platform {
         live.iter()
             .map(|session| session.snapshot())
             .chain(persisted.iter().map(|entry| entry.snapshot()))
-            .filter(|record| record.archived)
+            // Stopped, however it stopped. What must never be matched is a
+            // session still running - reopening one would repoint its fleet
+            // onto a second number while the first still answers - and being
+            // retired is not the only way to have stopped. An agent whose
+            // turn ended, or a child the daemon found gone when it came back,
+            // is a record nobody archived and a conversation just as over,
+            // and skipping those is what left a reopen minting a fresh number
+            // with the old one's fleet still hanging off it.
+            .filter(|record| record.archived || record.dead)
             .filter(|record| record.kind == kind && record.path == path)
             .filter(|record| {
                 record.thread.as_deref() == Some(wanted) || record.seed.as_deref() == Some(wanted)
@@ -8368,6 +8376,86 @@ mod platform {
             };
             assert!(format!("{error:#}").contains("still live"), "{error:#}");
             assert_eq!(first.snapshot().label, "first");
+        }
+
+        #[test]
+        fn a_conversation_that_ended_on_its_own_is_still_the_one_a_reopen_matches() {
+            let state = test_state("reopen-ended");
+            let master = "muxloomd-claude-reopen-master";
+            let successor = "muxloomd-claude-reopen-successor";
+            let old = launch_session(
+                &state,
+                master.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/echo".into(),
+                vec!["--resume".into(), "ses-ended".into()],
+                vec![],
+                100,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let child = launch_session(
+                &state,
+                "muxloomd-claude-reopen-child".into(),
+                "claude".into(),
+                "/tmp".into(),
+                "worker".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                101,
+                80,
+                24,
+                Some(master.into()),
+                None,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !old.snapshot().dead {
+                assert!(Instant::now() < deadline, "the master never ended");
+                thread::sleep(Duration::from_millis(20));
+            }
+            // Nobody retired it. It stopped by itself, which is the ordinary
+            // way an agent's turn runs out.
+            assert!(!old.snapshot().archived);
+            drop(old);
+
+            let revived = launch_session(
+                &state,
+                successor.into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-ended".into()],
+                vec![],
+                200,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let snapshot = revived.snapshot();
+            assert_eq!(
+                snapshot.resumed_from.as_deref(),
+                Some(master),
+                "the reopen never found the conversation its own command line names"
+            );
+            assert_eq!(snapshot.label, "coordinator");
+            assert_eq!(
+                child.snapshot().parent.as_deref(),
+                Some(successor),
+                "the fleet was left hanging off a number that has stopped answering"
+            );
         }
 
         #[test]
