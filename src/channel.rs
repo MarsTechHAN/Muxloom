@@ -65,6 +65,16 @@ pub const LEASE_TTL_MS: u64 = 45_000;
 /// either one answers.
 pub const LEASE_SETTLE_MS: u64 = 10_000;
 
+/// How little of a lease may be left before the holder says it again.
+///
+/// A round comes about every five seconds and a lease lasts forty-five, so a
+/// holder that re-posted every round put nine notes on the board for every one
+/// that was needed — and the board is append-only, so all nine stay. Re-posting
+/// at a third of the life left keeps two full rounds of slack in front of the
+/// expiry a peer is watching, and ties the rate to the lease rather than to
+/// the poll.
+pub const LEASE_REFRESH_MS: u64 = LEASE_TTL_MS / 3;
+
 /// How recently a target must have answered the channel round to count as a
 /// live peer. A round knocks on every enabled target about every two seconds,
 /// so thirty seconds is fifteen missed knocks.
@@ -1320,6 +1330,18 @@ pub struct ChannelReceipt {
 /// collecting them. Old ones are the ones nobody is going to reply to.
 pub const RECEIPT_CAP: usize = 256;
 
+/// The lease note this machine last got onto the board, remembered so it is
+/// not said again while it still stands and still says the same thing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostedLease {
+    /// When the posted note runs out, epoch milliseconds.
+    #[serde(default)]
+    pub until: u64,
+    /// The cursor it carries, which is the part a successor needs right.
+    #[serde(default)]
+    pub cursor: String,
+}
+
 /// Everything reading a chat needs to remember between rounds.
 ///
 /// It lives on the dashboard, because the dashboard is the only thing that
@@ -1365,6 +1387,10 @@ pub struct Inbox {
     /// dashboard knows it still has to introduce itself to the fleet.
     #[serde(default)]
     pub lease_claims: HashMap<String, u64>,
+    /// Per WeChat binding: the lease note this machine actually got onto the
+    /// board, so a round that would say the same thing again can stay quiet.
+    #[serde(default)]
+    pub leases_posted: HashMap<String, PostedLease>,
     /// Per binding: how many replies this machine has sent into it. Two
     /// machines bound to one chat must look different to the person reading
     /// their phone, and the number is the part only true on the sender.
@@ -2119,11 +2145,25 @@ fn lease_decision(
     }
 }
 
-/// Publish this machine's lease for the account to the board, carrying the
-/// cursor the account has been read to so a successor can resume past it. A
-/// post that fails is logged and shrugged off: the account stays usable, the
-/// election just runs without this voice for a round.
-fn publish_lease(runtime: &Runtime, account: &str, binding: &str, cursor: &str) {
+/// Whether the lease this machine last got onto the board still speaks for it.
+///
+/// It does not once it is close enough to running out that a peer could see it
+/// lapse, and it does not once the cursor has moved past what it carries: a
+/// successor resuming from a stale cursor re-reads, and re-answers, what this
+/// machine already handled. Anything else is a note the board already has.
+fn lease_still_stands(posted: Option<&PostedLease>, now: u64, cursor: &str) -> bool {
+    let Some(posted) = posted else {
+        return false;
+    };
+    posted.cursor == cursor && posted.until.saturating_sub(now) > LEASE_REFRESH_MS
+}
+
+/// Put this machine's lease for the account on the board, carrying the cursor
+/// the account has been read to so a successor can resume past it. A post that
+/// fails is logged and shrugged off: the account stays usable, the election
+/// just runs without this voice for a round — and nothing is remembered, so the
+/// next round says it again.
+fn claim_lease(runtime: &Runtime, inbox: &mut Inbox, account: &str, binding: &str, cursor: &str) {
     let until = now_ms().saturating_add(LEASE_TTL_MS);
     let draft = crate::talk::TalkDraft {
         scope: crate::talk::TalkScope::Path {
@@ -2136,12 +2176,35 @@ fn publish_lease(runtime: &Runtime, account: &str, binding: &str, cursor: &str) 
         reply_to: None,
         text: format!("{LEASE_PREFIX}\naccount={account}\nuntil={until}\ncursor={cursor}"),
     };
-    if let Err(error) = runtime.bridge_pool().talk_post(&Target::local(), draft) {
-        debug::log(
-            "channel",
-            format!("{binding}: could not post its lease for {account}: {error:#}"),
-        );
+    match runtime.bridge_pool().talk_post(&Target::local(), draft) {
+        Ok(_) => {
+            inbox.leases_posted.insert(
+                binding.to_string(),
+                PostedLease {
+                    until,
+                    cursor: cursor.to_string(),
+                },
+            );
+        }
+        Err(error) => {
+            inbox.leases_posted.remove(binding);
+            debug::log(
+                "channel",
+                format!("{binding}: could not post its lease for {account}: {error:#}"),
+            );
+        }
     }
+}
+
+/// Keep this machine's lease standing, saying nothing when the note already on
+/// the board says it. The board is append-only: a lease repeated every round is
+/// a note kept forever, thousands of them, crowding out the history the
+/// retention window is meant to hold.
+fn refresh_lease(runtime: &Runtime, inbox: &mut Inbox, account: &str, binding: &str, cursor: &str) {
+    if lease_still_stands(inbox.leases_posted.get(binding), now_ms(), cursor) {
+        return;
+    }
+    claim_lease(runtime, inbox, account, binding, cursor);
 }
 
 /// Read the newest notes one board path is carrying, from every machine.
@@ -2429,7 +2492,7 @@ fn lease_round(
         }
         LeaseDecision::Quiet => {
             let cursor = inbox.cursors.get(&binding.id).cloned().unwrap_or_default();
-            publish_lease(runtime, &account, &binding.id, &cursor);
+            refresh_lease(runtime, inbox, &account, &binding.id, &cursor);
             debug::log(
                 "channel",
                 format!(
@@ -2445,7 +2508,9 @@ fn lease_round(
             adopt_newer_cursor(inbox, binding, &leases, &local.origin);
             inbox.lease_claims.insert(binding.id.clone(), now);
             let cursor = inbox.cursors.get(&binding.id).cloned().unwrap_or_default();
-            publish_lease(runtime, &account, &binding.id, &cursor);
+            // An introduction is a claim, not a reminder: the board has no
+            // live lease for this account, so this one has to be said.
+            claim_lease(runtime, inbox, &account, &binding.id, &cursor);
             debug::log(
                 "channel",
                 format!(
@@ -2577,18 +2642,12 @@ pub fn run_inbox(
             }
         };
         if binding.kind == ChannelKind::WeChat {
-            // Publish the lease with the cursor the read just advanced, so a
-            // successor resumes past what was already consumed.
-            publish_lease(
-                runtime,
-                &account_key(binding),
-                &binding.id,
-                inbox
-                    .cursors
-                    .get(&binding.id)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            );
+            // Keep the lease standing with the cursor the read just advanced,
+            // so a successor resumes past what was already consumed. A cursor
+            // that did not move on a lease with life left in it is a note the
+            // board already has.
+            let cursor = inbox.cursors.get(&binding.id).cloned().unwrap_or_default();
+            refresh_lease(runtime, inbox, &account_key(binding), &binding.id, &cursor);
         }
         if inbox.waking.contains_key(&binding.id) {
             round.asleep.push(binding.id.clone());
@@ -5301,6 +5360,71 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_lease_is_only_said_again_when_it_runs_low_or_its_cursor_moves() {
+        let now = 1_000_000;
+        let posted = |until: u64, cursor: &str| PostedLease {
+            until,
+            cursor: cursor.into(),
+        };
+        for (what, note, cursor, stands) in [
+            ("nothing posted yet", None, "cur1", false),
+            (
+                "posted a moment ago, cursor where it was",
+                Some(posted(now + LEASE_TTL_MS, "cur1")),
+                "cur1",
+                true,
+            ),
+            (
+                "life left above the refresh line",
+                Some(posted(now + LEASE_REFRESH_MS + 1, "cur1")),
+                "cur1",
+                true,
+            ),
+            (
+                "down to the refresh line, and a peer is watching it lapse",
+                Some(posted(now + LEASE_REFRESH_MS, "cur1")),
+                "cur1",
+                false,
+            ),
+            ("lapsed", Some(posted(now - 1, "cur1")), "cur1", false),
+            (
+                "still live, but the cursor moved past what it carries",
+                Some(posted(now + LEASE_TTL_MS, "cur1")),
+                "cur2",
+                false,
+            ),
+            (
+                "the first cursor a fresh binding got",
+                Some(posted(now + LEASE_TTL_MS, "")),
+                "cur1",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                lease_still_stands(note.as_ref(), now, cursor),
+                stands,
+                "{what}"
+            );
+        }
+        // What that adds up to over one machine's rounds: a holder that polls
+        // every five seconds used to put a note on an append-only board every
+        // one of them. Walking three lease lifetimes with a cursor nobody is
+        // moving, it now speaks a handful of times instead of twenty-seven.
+        let round = 5_000;
+        let mut standing: Option<PostedLease> = None;
+        let mut posts = 0;
+        let mut at = now;
+        while at < now + 3 * LEASE_TTL_MS {
+            if !lease_still_stands(standing.as_ref(), at, "cur1") {
+                standing = Some(posted(at + LEASE_TTL_MS, "cur1"));
+                posts += 1;
+            }
+            at += round;
+        }
+        assert_eq!(posts, 5);
     }
 
     #[test]
