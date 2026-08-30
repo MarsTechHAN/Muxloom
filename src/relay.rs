@@ -737,6 +737,10 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                                     ApprovalsPending {
                                         session: job.session.clone(),
                                         machine: machine.clone(),
+                                        // Where the asking session lives, so
+                                        // the answer has somewhere to go back
+                                        // to. The job came off this daemon.
+                                        origin: target.id.clone(),
                                         tool: tool.clone(),
                                         ask,
                                         at_ms: now_ms(),

@@ -41,6 +41,12 @@ pub struct Pending {
     /// The machine the tool was aimed at.
     #[serde(default)]
     pub machine: String,
+    /// The machine the asking session is on, which is rarely the one the write
+    /// was aimed at. Without it an answer has nowhere to go: the person says
+    /// yes, and the agent waiting on it is never told. Empty in a ledger
+    /// written before this was recorded.
+    #[serde(default)]
+    pub origin: String,
     /// The tool name (e.g. "launch_session").
     pub tool: String,
     /// A short human-readable description of what was asked, shown to the
@@ -323,6 +329,7 @@ mod tests {
         let ask = |session: &str, machine: &str, tool: &str, at_ms: u64| Pending {
             session: session.into(),
             machine: machine.into(),
+            origin: "seed".into(),
             tool: tool.into(),
             ask: String::new(),
             at_ms,
@@ -364,6 +371,7 @@ mod tests {
         let ask = || Pending {
             session: "s1".into(),
             machine: "seed".into(),
+            origin: "laptop".into(),
             tool: "launch_session".into(),
             ask: String::new(),
             at_ms: 1,
@@ -408,6 +416,7 @@ mod tests {
         let ask = |at_ms: u64| Pending {
             session: "s1".into(),
             machine: "seed".into(),
+            origin: "laptop".into(),
             tool: "launch_session".into(),
             ask: String::new(),
             at_ms,
@@ -455,6 +464,7 @@ mod tests {
             Pending {
                 session: "s1".into(),
                 machine: "seed".into(),
+                origin: "laptop".into(),
                 tool: "launch_session".into(),
                 ask: "run launch_session on seed".into(),
                 at_ms: 1,
