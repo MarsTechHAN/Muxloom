@@ -4432,8 +4432,8 @@ mod platform {
     }
 
     /// Relay keeper frames into the session until the keeper goes away. The
-    /// keeper appends history itself, so output here only feeds the screen,
-    /// the retained ring, and the attached subscribers.
+    /// keeper appends history itself, so output here only feeds the screen and
+    /// the attached subscribers.
     fn spawn_session_reader(
         state: &Arc<DaemonState>,
         session: Arc<ManagedSession>,

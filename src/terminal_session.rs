@@ -46,11 +46,11 @@ const DRAIN_BUDGET: usize = 256 * 1024;
 
 /// Rows of rendered scrollback to ask the daemon for when attaching.
 ///
-/// The raw output the daemon retains repaints the screen but is a poor source
-/// of history: a redraw-heavy agent can spend the whole 2 MiB ring on frames
-/// that commit only a handful of transcript lines, which left a fresh attach
-/// with less than a screenful to page through. The daemon renders these rows
-/// from the session's full log instead, so scrolling starts out deep.
+/// Replaying the tail of a session's raw output repaints the screen but is a
+/// poor source of history: a redraw-heavy agent can spend a whole window of it
+/// on frames that commit only a handful of transcript lines, which left a fresh
+/// attach with less than a screenful to page through. The daemon renders these
+/// rows from the session's full log instead, so scrolling starts out deep.
 pub(crate) const SCROLLBACK_SEED_ROWS: usize = 2_000;
 
 /// Rows a seed may carry at most, whatever a client asks for. Bounds both the
