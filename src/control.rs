@@ -1938,6 +1938,28 @@ fn fleet_resume_caption(
     lines.join("\n")
 }
 
+/// What a fleet resume has already put back, for the one case where saying
+/// so is the whole message: the master failed to come back, and the children
+/// that did are now running under a number that answers nothing. A caller
+/// told only that the resume failed would go looking for a fleet it cannot
+/// see, or start a second one on top of it.
+fn fleet_already_back(master_id: &str, outcomes: &[FleetOutcome]) -> Option<String> {
+    let back: Vec<&str> = outcomes
+        .iter()
+        .filter(|outcome| outcome.status == "restored" || outcome.status == "fresh")
+        .map(|outcome| outcome.record.id.as_str())
+        .collect();
+    (!back.is_empty()).then(|| {
+        format!(
+            "{} child session(s) came back before this failed and are running under \
+             {master_id}, which did not: {}. Resuming {master_id} again picks them up where \
+             they are rather than starting them twice.",
+            back.len(),
+            back.join(", ")
+        )
+    })
+}
+
 /// What a `launch_session` resume_id means when it names a muxloom session:
 /// `Ok(None)` passes it on as the ordinary relaunch of an agent-native
 /// conversation; `Ok(Some(record))` is an archived session coming back as
@@ -3472,6 +3494,19 @@ impl ControllerControl {
         arguments: &Value,
     ) -> Result<String> {
         let environment = self.config.environment_for(&target.id)?;
+        // What the master needs to come back is worked out before a single
+        // child is touched. A fleet resume that cannot end with the master
+        // running must not begin by relaunching everyone under it: they would
+        // come back pointed at a number that answers nothing, and the only
+        // account of it would be an error about the master.
+        let master_kind = master
+            .kind
+            .parse::<AgentKind>()
+            .map_err(|error: String| anyhow::anyhow!(error))?;
+        let master_command = self.config.command_for(&target.id, master_kind).clone();
+        if master_command.command.trim().is_empty() && master_kind != AgentKind::Terminal {
+            bail!("command for {master_kind} is empty; the master cannot come back either");
+        }
         let sessions = self.runtime.bridge_pool().list_sessions(target)?;
         let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
         let pool = self.runtime.bridge_pool();
@@ -3558,35 +3593,40 @@ impl ControllerControl {
                 )),
             }
         }
-        let kind = master
-            .kind
-            .parse::<AgentKind>()
-            .map_err(|error: String| anyhow::anyhow!(error))?;
-        let command = self.config.command_for(&target.id, kind).clone();
         let resume_with = native_resume_id(master).map(str::to_string);
-        let args =
-            crate::runtime::launch_arguments(&command, kind, false, resume_with.as_deref(), None);
+        let args = crate::runtime::launch_arguments(
+            &master_command,
+            master_kind,
+            false,
+            resume_with.as_deref(),
+            None,
+        );
         let caption = fleet_resume_caption(&master.id, &master.label, &outcomes, truncated);
         let label = optional_str(arguments, "label")
             .unwrap_or_default()
             .replace(['\t', '\n', '\r'], " ");
         // The daemon revives the record in place: the same number answers,
         // and the record's own label and parent survive an empty request.
-        let session = pool.launch(
-            target,
-            master.id.clone(),
-            master.kind.clone(),
-            master.path.clone(),
-            label,
-            false,
-            command.command.clone(),
-            args,
-            environment,
-            master.created_at,
-            relayed_caller(arguments),
-            None,
-            Some(caption),
-        )?;
+        let session = pool
+            .launch(
+                target,
+                master.id.clone(),
+                master.kind.clone(),
+                master.path.clone(),
+                label,
+                false,
+                master_command.command.clone(),
+                args,
+                environment,
+                master.created_at,
+                relayed_caller(arguments),
+                None,
+                Some(caption),
+            )
+            .map_err(|error| match fleet_already_back(&master.id, &outcomes) {
+                Some(note) => error.context(note),
+                None => error,
+            })?;
         Ok(pretty(&json!({
             "session_id": session.id,
             "machine": target.id,
@@ -3959,9 +3999,9 @@ mod daemon_surface {
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
         WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, check_may_launch,
         check_may_message, check_may_reach_person, delivery_json, direct_draft, enforce_policy,
-        fleet_outcome_json, fleet_resume_caption, fleet_resume_plan, fleet_resume_target,
-        granted_powers, instructions, launch_path_within, launching_session, lineage,
-        lineage_of_answer, message_author, native_resume_id, optional_bool, optional_str,
+        fleet_already_back, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
+        fleet_resume_target, granted_powers, instructions, launch_path_within, launching_session,
+        lineage, lineage_of_answer, message_author, native_resume_id, optional_bool, optional_str,
         optional_usize, own_powers, plain_screen, pretty, preview_text, required_str, screen_page,
         send_channel, session_env, session_json, session_kind, session_name_now, shell_report,
         stamp_powers, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
@@ -4522,6 +4562,21 @@ mod daemon_surface {
                 );
             }
             let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
+            // Asked before a single child is touched: the master's own way
+            // back does not depend on any of them, and a resume that cannot
+            // end with the master running must not begin by putting a fleet
+            // under a number that will answer nothing.
+            let master_kind = master
+                .kind
+                .parse::<AgentKind>()
+                .map_err(|error: String| anyhow::anyhow!(error))?;
+            let master_command = self
+                .config
+                .command_for(LOCAL_TARGET_ID, master_kind)
+                .clone();
+            if master_command.command.trim().is_empty() && master_kind != AgentKind::Terminal {
+                bail!("command for {master_kind} is empty; the master cannot come back either");
+            }
             let sessions = self.sessions()?;
             let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
             let mut outcomes: Vec<FleetOutcome> = Vec::new();
@@ -4616,16 +4671,14 @@ mod daemon_surface {
                     )),
                 }
             }
-            let kind = master
-                .kind
-                .parse::<AgentKind>()
-                .map_err(|error: String| anyhow::anyhow!(error))?;
-            let command = self.config.command_for(LOCAL_TARGET_ID, kind).clone();
-            if command.command.trim().is_empty() && kind != AgentKind::Terminal {
-                bail!("command for {kind} is empty; the master cannot come back either");
-            }
             let resume_with = native_resume_id(master).map(str::to_string);
-            let args = launch_arguments(&command, kind, false, resume_with.as_deref(), None);
+            let args = launch_arguments(
+                &master_command,
+                master_kind,
+                false,
+                resume_with.as_deref(),
+                None,
+            );
             let caption = fleet_resume_caption(&master.id, &master.label, &outcomes, truncated);
             let response = self
                 .transact(&DaemonRequest::Launch {
@@ -4636,7 +4689,7 @@ mod daemon_surface {
                         .unwrap_or_default()
                         .replace(['\t', '\n', '\r'], " "),
                     temporary: false,
-                    executable: command.command.clone(),
+                    executable: master_command.command.clone(),
                     args,
                     environment,
                     created_at: master.created_at,
@@ -4645,6 +4698,10 @@ mod daemon_surface {
                     parent: launching_session(),
                     powers: None,
                     initial_prompt: Some(caption),
+                })
+                .map_err(|error| match fleet_already_back(&master.id, &outcomes) {
+                    Some(note) => error.context(note),
+                    None => error,
                 })?
                 .0;
             match response {
@@ -6050,6 +6107,38 @@ mod tests {
             ),
             "{caption}"
         );
+    }
+
+    #[test]
+    fn a_master_that_could_not_come_back_says_what_already_did() {
+        let row = |id: &str, status: &'static str| FleetOutcome {
+            record: fleet_row(id, None),
+            status,
+            resumed_with: None,
+            detail: None,
+        };
+        let outcomes = vec![
+            row("muxloomd-claude-restored", "restored"),
+            row("muxloomd-claude-fresh", "fresh"),
+            row("muxloomd-claude-lost", "unresumed"),
+            row("muxloomd-claude-untouched", "running"),
+        ];
+        let said = fleet_already_back("muxloomd-claude-master", &outcomes)
+            .expect("two children came back and the master did not");
+        assert!(said.contains("muxloomd-claude-restored"), "{said}");
+        assert!(said.contains("muxloomd-claude-fresh"), "{said}");
+        // Only what this resume put back. One that never came back is not
+        // running under anything, and one that never stopped was not this
+        // resume's doing - naming either would send the caller after a
+        // session that is not there or is not its concern.
+        assert!(!said.contains("muxloomd-claude-lost"), "{said}");
+        assert!(!said.contains("muxloomd-claude-untouched"), "{said}");
+        // And the number to ask for to pick them up.
+        assert!(said.contains("muxloomd-claude-master"), "{said}");
+
+        // Nothing came back, so the failure is the whole of the story.
+        let nothing = vec![row("muxloomd-claude-lost", "unresumed")];
+        assert!(fleet_already_back("muxloomd-claude-master", &nothing).is_none());
     }
 
     #[test]
