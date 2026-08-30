@@ -15,7 +15,8 @@
 //! ordering, never for deciding what is missing.
 
 use std::{
-    collections::BTreeMap,
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap},
     fmt,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -383,6 +384,89 @@ pub struct TalkPage {
     pub truncated: bool,
 }
 
+/// The newest `limit` messages of however many are offered, in the order a
+/// page reads them: oldest first.
+///
+/// A page is the tail of what matched, so the walk that finds it never needs
+/// more than a page in hand. Holding only that is what keeps reading the board
+/// costing a page rather than a copy of everything on it.
+struct NewestFirst {
+    limit: usize,
+    /// Oldest first, so the one to drop is the one on top.
+    heap: BinaryHeap<Oldest>,
+    dropped: bool,
+}
+
+/// A message ordered so the *oldest* compares greatest, which is what puts it
+/// on top of a [`BinaryHeap`] and first out of a full page.
+struct Oldest(TalkMessage);
+
+impl Ord for Oldest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (other.0.ts, &other.0.origin, other.0.seq).cmp(&(self.0.ts, &self.0.origin, self.0.seq))
+    }
+}
+
+impl PartialOrd for Oldest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Oldest {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Oldest {}
+
+impl NewestFirst {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            heap: BinaryHeap::new(),
+            dropped: false,
+        }
+    }
+
+    /// Take `message` if the page has room or if it is newer than the oldest
+    /// the page is holding. Only then is it copied: everything older than a
+    /// full page is looked at and let go.
+    fn offer(&mut self, message: &TalkMessage) {
+        if self.heap.len() == self.limit {
+            let older_than_held = self.heap.peek().is_some_and(|oldest| {
+                (message.ts, &message.origin, message.seq)
+                    <= (oldest.0.ts, &oldest.0.origin, oldest.0.seq)
+            });
+            self.dropped = true;
+            if older_than_held {
+                return;
+            }
+            self.heap.pop();
+        }
+        self.heap.push(Oldest(message.clone()));
+    }
+
+    /// Whether anything matched that the page had no room for.
+    fn dropped(&self) -> bool {
+        self.dropped
+    }
+
+    fn into_page(self) -> Vec<TalkMessage> {
+        // `into_sorted_vec` ascends by [`Oldest`]'s order, which is newest
+        // first; a page reads the other way round.
+        let mut messages: Vec<TalkMessage> = self
+            .heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|held| held.0)
+            .collect();
+        messages.reverse();
+        messages
+    }
+}
+
 /// The board on one machine.
 pub struct TalkStore {
     root: PathBuf,
@@ -591,51 +675,52 @@ impl TalkStore {
         let mine = inner.identity.origin.clone();
         let label = inner.identity.label.clone();
         let query = filter.query.as_ref().map(|query| query.to_lowercase());
-        let mut matched: Vec<TalkMessage> = inner
-            .logs
-            .values()
-            .flat_map(|log| log.messages.iter())
-            .filter(|message| {
-                message.seq > filter.since.get(&message.origin).copied().unwrap_or(0)
-                    && filter.before.is_none_or(|before| message.ts < before)
-                    && visible(message, filter, &mine, &label)
-                    && (filter.kinds.is_empty()
-                        || filter.kinds.iter().any(|kind| kind == message.kind.name()))
-                    && (filter.authors.is_empty()
-                        || filter.authors.iter().any(|author| {
-                            message
-                                .author
-                                .voice
-                                .session_id
-                                .as_deref()
-                                .is_some_and(|id| id.eq_ignore_ascii_case(author))
-                                || message
-                                    .author
-                                    .voice
-                                    .label
-                                    .as_deref()
-                                    .is_some_and(|label| label.eq_ignore_ascii_case(author))
-                        }))
-                    && query
-                        .as_ref()
-                        .is_none_or(|query| message.text.to_lowercase().contains(query))
-            })
-            .cloned()
-            .collect();
-        matched.sort_by(|left, right| {
-            (left.ts, &left.origin, left.seq).cmp(&(right.ts, &right.origin, right.seq))
-        });
         let limit = if filter.limit == 0 {
             50
         } else {
             filter.limit.min(MAX_PAGE)
         };
-        let truncated = matched.len() > limit;
-        if truncated {
-            // The newest are the ones worth having; the cursor and `before`
-            // are how a caller reaches the rest.
-            matched.drain(..matched.len() - limit);
+        // A board holds up to [`RETAIN_PER_ORIGIN`] messages per machine and a
+        // page carries at most a few dozen, so the walk keeps only the newest
+        // it has seen rather than collecting every match to sort and throw
+        // away. What that saves is a copy of each message it looked at - and a
+        // read of the whole board is what a caller waiting for an answer does
+        // every couple of seconds.
+        let mut page = NewestFirst::new(limit);
+        for message in inner.logs.values().flat_map(|log| log.messages.iter()) {
+            if message.seq <= filter.since.get(&message.origin).copied().unwrap_or(0)
+                || !filter.before.is_none_or(|before| message.ts < before)
+                || !visible(message, filter, &mine, &label)
+                || !(filter.kinds.is_empty()
+                    || filter.kinds.iter().any(|kind| kind == message.kind.name()))
+                || !(filter.authors.is_empty()
+                    || filter.authors.iter().any(|author| {
+                        message
+                            .author
+                            .voice
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(author))
+                            || message
+                                .author
+                                .voice
+                                .label
+                                .as_deref()
+                                .is_some_and(|label| label.eq_ignore_ascii_case(author))
+                    }))
+            {
+                continue;
+            }
+            if query
+                .as_ref()
+                .is_some_and(|query| !message.text.to_lowercase().contains(query))
+            {
+                continue;
+            }
+            page.offer(message);
         }
+        let truncated = page.dropped();
+        let matched = page.into_page();
         let cursor = encode_cursor(
             &inner
                 .logs
@@ -1577,6 +1662,80 @@ mod tests {
             .map(|message| message.seq)
             .collect();
         assert_eq!(from_two, vec![3]);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_page_is_the_newest_that_matched_however_much_the_board_holds() {
+        let store = store("page");
+        let far = |origin: &str, seq: u64, ts: u64| TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.into(),
+            seq,
+            ts,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: origin.into(),
+                machine_label: origin.into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("at {ts}"),
+        };
+        // Two machines talking in turn, so the newest of the two boards
+        // together is not the newest of either one on its own.
+        let mut held = Vec::new();
+        for round in 1..=4 {
+            held.push(far("aaaa-1234abcd", round, round * 200 - 100));
+            held.push(far("bbbb-5678cdef", round, round * 200));
+        }
+        assert_eq!(store.merge(held).unwrap(), 8);
+
+        let texts = |limit: usize| -> (Vec<String>, bool) {
+            let page = store.read(&TalkFilter {
+                limit,
+                ..TalkFilter::default()
+            });
+            (
+                page.messages
+                    .into_iter()
+                    .map(|message| message.text)
+                    .collect(),
+                page.truncated,
+            )
+        };
+
+        // A page smaller than what matched is its tail, still oldest first,
+        // and says so.
+        assert_eq!(
+            texts(3),
+            (
+                vec!["at 600".to_string(), "at 700".into(), "at 800".into()],
+                true
+            )
+        );
+        // Room for everything is everything, and nothing was left behind.
+        assert_eq!(
+            texts(100),
+            (
+                vec![
+                    "at 100".to_string(),
+                    "at 200".into(),
+                    "at 300".into(),
+                    "at 400".into(),
+                    "at 500".into(),
+                    "at 600".into(),
+                    "at 700".into(),
+                    "at 800".into(),
+                ],
+                false
+            )
+        );
+        // Exactly enough room is not a page that dropped anything.
+        assert!(!texts(8).1);
 
         fs::remove_dir_all(&store.root).ok();
     }
