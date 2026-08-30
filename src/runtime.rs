@@ -539,10 +539,15 @@ impl Runtime {
 
     /// Refresh muxloomd-owned session metadata without running executable
     /// probes or touching the legacy tmux compatibility path.
+    ///
+    /// This is the round the dashboard makes several times a second to keep
+    /// working/waiting up to date, so it asks only for what is running: the
+    /// machine's archive cannot change under it, and a full scan is what picks
+    /// up a record that did.
     pub fn daemon_sessions(&self, target: &Target) -> Result<Vec<AgentSession>> {
         let sessions = self
             .bridges
-            .list_sessions(target)?
+            .list_live_sessions(target)?
             .into_iter()
             .filter_map(|session| daemon_agent_session(&target.id, session))
             .collect();

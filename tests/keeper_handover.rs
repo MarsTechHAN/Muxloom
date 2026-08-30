@@ -123,7 +123,13 @@ fn request(
 
 fn sessions(state: &TestState) -> Vec<DaemonSession> {
     let mut client = state.connect();
-    match request(&mut client, 1, &DaemonRequest::ListSessions).0 {
+    match request(
+        &mut client,
+        1,
+        &DaemonRequest::ListSessions { live_only: false },
+    )
+    .0
+    {
         DaemonResponse::Sessions { sessions } => sessions,
         response => panic!("unexpected session list: {response:?}"),
     }

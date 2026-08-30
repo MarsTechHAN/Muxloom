@@ -639,7 +639,21 @@ impl BridgeConnection {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<DaemonSession>> {
-        match self.request(DaemonRequest::ListSessions)?.response {
+        self.sessions(false)
+    }
+
+    /// Only what the daemon is running: the archive it loaded at startup is
+    /// left out. This is what to ask on a repeating round — see
+    /// [`DaemonRequest::ListSessions`] for what it saves.
+    pub fn list_live_sessions(&self) -> Result<Vec<DaemonSession>> {
+        self.sessions(true)
+    }
+
+    fn sessions(&self, live_only: bool) -> Result<Vec<DaemonSession>> {
+        match self
+            .request(DaemonRequest::ListSessions { live_only })?
+            .response
+        {
             DaemonResponse::Sessions { sessions } => Ok(sessions),
             response => bail!("unexpected session-list response: {response:?}"),
         }
@@ -2158,6 +2172,11 @@ impl BridgePool {
 
     pub fn list_sessions(&self, target: &Target) -> Result<Vec<DaemonSession>> {
         self.connection_for_target(target)?.list_sessions()
+    }
+
+    /// Only what the daemon is running, for a caller asking over and over.
+    pub fn list_live_sessions(&self, target: &Target) -> Result<Vec<DaemonSession>> {
+        self.connection_for_target(target)?.list_live_sessions()
     }
 
     pub fn probe_executables(

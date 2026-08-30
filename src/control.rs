@@ -4041,7 +4041,10 @@ mod daemon_surface {
         }
 
         fn sessions(&self) -> Result<Vec<DaemonSession>> {
-            match self.transact(&DaemonRequest::ListSessions)?.0 {
+            match self
+                .transact(&DaemonRequest::ListSessions { live_only: false })?
+                .0
+            {
                 DaemonResponse::Sessions { sessions } => Ok(sessions),
                 response => bail!("unexpected session-list response: {response:?}"),
             }

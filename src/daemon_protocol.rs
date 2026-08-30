@@ -229,7 +229,23 @@ pub enum DaemonRequest {
         executables: Vec<String>,
     },
     ListTcpListeners,
-    ListSessions,
+    ListSessions {
+        /// Leave out the archive: the records this daemon loaded off disk when
+        /// it started, which nothing running can change.
+        ///
+        /// A dashboard asks what the sessions are doing three times a second,
+        /// and every one of those answers used to carry the machine's whole
+        /// history with it — a record per conversation ever held there, none of
+        /// which has moved since the daemon read it, all of them serialized,
+        /// written down a socket (an ssh one, for another machine) and parsed
+        /// again to be thrown away. What changes on that cadence is what is
+        /// running, and that is all this asks for.
+        ///
+        /// Absent from a client too old to send one, and absent means the whole
+        /// list — which is also what a daemon too old to read it will answer.
+        #[serde(default)]
+        live_only: bool,
+    },
     Launch {
         session_id: String,
         kind: String,

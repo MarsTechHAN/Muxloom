@@ -2762,7 +2762,7 @@ mod platform {
                     ports: tcp_listener_ports()?,
                 },
             ),
-            DaemonRequest::ListSessions => {
+            DaemonRequest::ListSessions { live_only } => {
                 let mut sessions: Vec<_> = state
                     .sessions
                     .lock()
@@ -2779,14 +2779,20 @@ mod platform {
                         snapshot
                     })
                     .collect();
-                sessions.extend(
-                    state
-                        .persisted_sessions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .values()
-                        .map(|session| session.snapshot()),
-                );
+                // The archive this daemon read at startup. A caller watching
+                // what is running does not want it: no session in there can
+                // change while the daemon runs, and there is one for every
+                // conversation the machine has ever held.
+                if !live_only {
+                    sessions.extend(
+                        state
+                            .persisted_sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .values()
+                            .map(|session| session.snapshot()),
+                    );
+                }
                 write_response(writer, request_id, &DaemonResponse::Sessions { sessions })
             }
             DaemonRequest::Launch {
@@ -6951,7 +6957,9 @@ mod platform {
             FrameKind::Request,
             0,
             SESSIONS_REQUEST,
-            &DaemonRequest::ListSessions,
+            // Only what is running: the archive is all dead and archived
+            // already, so it can only add weight to the answer.
+            &DaemonRequest::ListSessions { live_only: true },
         )?
         .write_to(stream)?;
         let mut sole_client = None;
@@ -7645,6 +7653,101 @@ mod platform {
             drop(triggers);
 
             fs::remove_dir_all(&state.paths.root).ok();
+        }
+
+        #[test]
+        fn a_repeating_round_is_answered_with_what_is_running_and_not_the_archive() {
+            // A machine with a conversation behind it: one record put down, and
+            // a daemon starting on top of it.
+            let initial = test_state("live-only");
+            let paths = initial.paths.clone();
+            drop(initial);
+            let put_down = "muxloomd-terminal-1700000111-9-1";
+            let mut retired = live_metadata(put_down, "terminal", None);
+            retired.dead = true;
+            retired.archived = true;
+            retired.archived_at = Some(1);
+            retired.working = false;
+            persist_session_metadata(&paths.sessions.join(format!("{put_down}.json")), &retired)
+                .unwrap();
+            fs::write(
+                paths.history.join(format!("{put_down}.ansi")),
+                b"yesterday\n",
+            )
+            .unwrap();
+
+            // Nothing running can change that record, which is why a round
+            // watching what is running has no use for it.
+            let state = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            assert!(
+                state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(put_down),
+                "the archived record has to be in the archive for this to say anything"
+            );
+            let running = "muxloomd-terminal-live-only-now";
+            launch_session(
+                &state,
+                running.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "today".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                222,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let serve = Arc::clone(&state);
+            let handle = thread::spawn(move || serve_client(server, serve));
+            let mut ask = |request_id: u64, live_only: bool| {
+                Frame::json(
+                    FrameKind::Request,
+                    0,
+                    request_id,
+                    &DaemonRequest::ListSessions { live_only },
+                )
+                .unwrap()
+                .write_to(&mut client)
+                .unwrap();
+                loop {
+                    let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                    if frame.kind != FrameKind::Response || frame.request_id != request_id {
+                        continue;
+                    }
+                    match frame.decode_json::<DaemonResponse>().unwrap() {
+                        DaemonResponse::Sessions { sessions } => {
+                            return sessions
+                                .into_iter()
+                                .map(|session| session.id)
+                                .collect::<Vec<_>>();
+                        }
+                        response => panic!("unexpected response {response:?}"),
+                    }
+                }
+            };
+
+            // What a dashboard asks several times a second, and what it costs:
+            // one record, not one per conversation the machine has ever held.
+            assert_eq!(ask(20, true), vec![running.to_string()]);
+            // Asked for the whole list, the answer still holds the archive - an
+            // older client sends no flag at all and must keep seeing it.
+            let mut everything = ask(21, false);
+            everything.sort();
+            assert_eq!(everything, vec![put_down.to_string(), running.to_string()]);
+
+            drop(client);
+            handle.join().unwrap().unwrap();
+            discard_root(paths.root);
         }
 
         #[test]
@@ -8904,13 +9007,25 @@ mod platform {
 
             // A ListSessions is what marks it - the dashboard's own poll does
             // not take it away from the controller that will deliver it.
-            handle_request(&writer, &state, 1, DaemonRequest::ListSessions).unwrap();
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::ListSessions { live_only: true },
+            )
+            .unwrap();
             assert!(matches!(
                 answer(&mut client, 1),
                 DaemonResponse::Sessions { .. }
             ));
             assert!(child.alert_pending.load(Ordering::Relaxed));
-            handle_request(&writer, &state, 2, DaemonRequest::ListSessions).unwrap();
+            handle_request(
+                &writer,
+                &state,
+                2,
+                DaemonRequest::ListSessions { live_only: true },
+            )
+            .unwrap();
             assert!(matches!(
                 answer(&mut client, 2),
                 DaemonResponse::Sessions { .. }

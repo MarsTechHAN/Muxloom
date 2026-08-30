@@ -116,7 +116,11 @@ fn request(stream: &mut UnixStream, request_id: u64, request: &DaemonRequest) ->
 }
 
 fn sessions(stream: &mut UnixStream, request_id: u64) -> Vec<DaemonSession> {
-    match request(stream, request_id, &DaemonRequest::ListSessions) {
+    match request(
+        stream,
+        request_id,
+        &DaemonRequest::ListSessions { live_only: false },
+    ) {
         DaemonResponse::Sessions { sessions } => sessions,
         response => panic!("unexpected list response: {response:?}"),
     }
