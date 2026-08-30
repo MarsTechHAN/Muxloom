@@ -3773,7 +3773,7 @@ mod platform {
         label: String,
         temporary: bool,
         executable: String,
-        args: Vec<String>,
+        mut args: Vec<String>,
         environment: Vec<(String, String)>,
         created_at: u64,
         columns: u16,
@@ -3782,6 +3782,27 @@ mod platform {
         powers: Option<crate::model::Powers>,
     ) -> Result<Arc<ManagedSession>> {
         validate_session_id(&session_id)?;
+        // Nobody is in front of a session at the moment it starts, so it starts
+        // in the runtime's unattended mode - and that is settled here rather
+        // than taken on faith from whoever composed the command line. A muxloom
+        // from an older build still launches through this daemon, and a session
+        // it starts would otherwise sit on the first approval prompt with no
+        // one to answer it.
+        //
+        // Only ever onto the runtime's own executable, though: these are that
+        // CLI's flags and mean nothing to anything else. Whatever a wrapper
+        // wants said to the agent it wraps, it is the one that knows how. The
+        // flags go in front, because Codex reads a `resume` further along as
+        // its subcommand and options come before it.
+        if let Ok(kind) = kind.parse::<AgentKind>()
+            && Path::new(&executable).file_name() == Some(kind.as_str().as_ref())
+            && let Some(unattended) = crate::runtime::missing_unattended_arguments(kind, &args)
+        {
+            args.splice(
+                0..0,
+                unattended.iter().map(|argument| (*argument).to_string()),
+            );
+        }
         // A parent is a session id and is written down as given, even when it
         // names a session on another machine: it says which piece of work this
         // belongs to, and that is true wherever the parent runs. What it must
@@ -9424,6 +9445,110 @@ mod platform {
             assert!(!state.sessions.lock().unwrap().contains_key(session_id));
             assert!(!paths.sessions.join(format!("{session_id}.json")).exists());
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
+            discard_root(paths.root);
+        }
+
+        /// The muxloom that composes a launch can be older than the daemon that
+        /// runs it - an upgrade replaces the daemon while every client already
+        /// talking to it keeps the build it started with. A session started by
+        /// one of those would sit on its runtime's first approval prompt with
+        /// nobody in front of it, so the daemon settles the mode itself, and
+        /// leaves alone both a mode already chosen and an executable that is
+        /// not the runtime whose flags these are.
+        #[test]
+        fn a_daemon_starts_an_agent_unattended_even_when_its_client_did_not() {
+            let state = test_state("unattended");
+            let paths = state.paths.clone();
+            let dir = paths.root.join("fake-runtime");
+            fs::create_dir_all(&dir).unwrap();
+
+            // Stands in for the agent CLI: writes down how it was called, then
+            // sits quietly on the pty like any other session.
+            let record_argv = |name: &str| {
+                let recorded = dir.join(format!("{name}.argv"));
+                let executable = dir.join(name);
+                fs::write(
+                    &executable,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec cat\n",
+                        recorded.display()
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+                (executable, recorded)
+            };
+            let start = |session_id: &str, executable: &Path, args: Vec<String>| {
+                launch_session(
+                    &state,
+                    session_id.into(),
+                    "claude".into(),
+                    "/tmp".into(),
+                    session_id.into(),
+                    false,
+                    executable.to_string_lossy().into_owned(),
+                    args,
+                    Vec::new(),
+                    1,
+                    80,
+                    24,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let argv = |recorded: &Path| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !recorded.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                fs::read_to_string(recorded)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+
+            // An older client's command line: it chose a model, not a mode.
+            let (executable, recorded) = record_argv("claude");
+            let old = start(
+                "muxloomd-claude-unattended-old",
+                &executable,
+                vec!["--model".into(), "opus".into()],
+            );
+            assert_eq!(
+                argv(&recorded),
+                ["--permission-mode", "auto", "--model", "opus"],
+                "a client that named no mode must not leave the session waiting on a prompt"
+            );
+            old.stop().unwrap();
+
+            // A mode the person chose is a decision, whoever passed it along.
+            let (executable, recorded) = record_argv("claude");
+            let _ = fs::remove_file(&recorded);
+            let chosen = start(
+                "muxloomd-claude-unattended-chosen",
+                &executable,
+                vec!["--permission-mode".into(), "plan".into()],
+            );
+            assert_eq!(argv(&recorded), ["--permission-mode", "plan"]);
+            chosen.stop().unwrap();
+
+            // These are Claude's own flags. Something else standing in its
+            // place is not owed them and would not know what to do with them.
+            let (executable, recorded) = record_argv("claude-wrapper");
+            let wrapped = start(
+                "muxloomd-claude-unattended-wrapped",
+                &executable,
+                vec!["--model".into(), "opus".into()],
+            );
+            assert_eq!(
+                argv(&recorded),
+                ["--model", "opus"],
+                "a wrapper must be called the way it was configured"
+            );
+            wrapped.stop().unwrap();
+
             discard_root(paths.root);
         }
 

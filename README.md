@@ -646,7 +646,10 @@ args = ["--sandbox", "read-only"]
   launched in its own unattended mode: Claude `--permission-mode auto`, Codex
   `--sandbox workspace-write --ask-for-approval never`, OpenCode `--auto` (pi
   asks for nothing). Naming a mode in `args` — including a narrower one, as
-  above — uses that one instead.
+  above — uses that one instead. The daemon checks this again as it spawns, so
+  a session started through a muxloom left over from an older build still comes
+  up unattended rather than stopping at its first prompt; it only ever adds a
+  runtime's flags to that runtime's own executable, never to a wrapper.
 - `environment` uses shell-style assignments
   (`HTTP_PROXY=http://proxy:8118 TOKEN='two words'`). Global values merge with
   the selected machine's overrides.

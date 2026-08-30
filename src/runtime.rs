@@ -117,6 +117,28 @@ fn unattended_mode(kind: AgentKind) -> Option<UnattendedMode> {
     }
 }
 
+/// What `args` is still missing before the runtime will run unattended, or
+/// `None` when it already says what mode to run in - either because the person
+/// configured one or because whoever built this command line has been here
+/// already.
+///
+/// Asked twice about the same launch, because both ends ask: the client builds
+/// the command line, and the daemon that spawns it checks the answer again
+/// rather than trusting it. A muxloom left running from an older build is still
+/// the process that composes a launch, and a session it starts is no less
+/// unattended for that - so the side that outlives it has the last word.
+pub(crate) fn missing_unattended_arguments(
+    kind: AgentKind,
+    args: &[String],
+) -> Option<&'static [&'static str]> {
+    let mode = unattended_mode(kind)?;
+    let decided = mode
+        .conflicts
+        .iter()
+        .any(|flag| args.iter().any(|argument| argument_is(argument, flag)));
+    (!decided).then_some(mode.args)
+}
+
 /// The most of a text file a preview will pull across. A preview is something
 /// to glance through, and reading a log of any size whole — over SSH, into
 /// memory, behind a spinner that cannot say how long it will take — is not that.
@@ -5005,13 +5027,8 @@ pub(crate) fn launch_arguments(
     // asked to run unattended unless the configured arguments already choose a
     // mode. Like the flags below, this must precede Codex's `resume`
     // subcommand, so it goes on first.
-    if let Some(mode) = unattended_mode(kind)
-        && !mode
-            .conflicts
-            .iter()
-            .any(|flag| args.iter().any(|argument| argument_is(argument, flag)))
-    {
-        args.extend(mode.args.iter().map(|argument| (*argument).to_string()));
+    if let Some(unattended) = missing_unattended_arguments(kind, &args) {
+        args.extend(unattended.iter().map(|argument| (*argument).to_string()));
     }
     // Keep this session-local instead of changing the user's global Codex
     // configuration. The flag must precede the `resume` subcommand.

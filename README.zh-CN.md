@@ -349,7 +349,12 @@ Reporting 的程序。
 - `[hosts.<alias>]` 下对某台机器的 Runtime 覆盖。
 
 `command` 是单个可执行文件名或路径，参数作为结构化数组传输。Pipe、Redirect 或复杂初始化
-应写入 Wrapper。环境变量使用下面的非 JSON 格式，并默认注入 Install 和 Launch；legacy
+应写入 Wrapper。Muxloom 启动的会话前面没有人坐着，因此每个 Runtime 都以各自的无人值守模式
+启动：Claude `--permission-mode auto`、Codex `--sandbox workspace-write --ask-for-approval
+never`、OpenCode `--auto`（Pi 本来就不问）。在 `args` 里指定了模式——哪怕是更严格的——就用
+指定的那个。Daemon 在真正拉起进程时会再确认一次，所以即使发起启动的是升级前遗留的旧
+Controller，会话也不会停在第一个确认框上；它只会把某个 Runtime 的参数加到该 Runtime 自己的
+可执行文件上，不会加到 Wrapper 上。环境变量使用下面的非 JSON 格式，并默认注入 Install 和 Launch；legacy
 Shell Probe 也会注入，但 daemon-native executable probe 不会：
 
 ```text
