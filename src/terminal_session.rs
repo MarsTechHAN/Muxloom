@@ -29,6 +29,21 @@ enum TerminalEvent {
 /// grows the buffer lazily, so this cap only bounds a long-lived session.
 const SCROLLBACK_LINES: usize = 20_000;
 
+/// How much of what a session has queued up one drain may take in.
+///
+/// Draining runs those bytes through this session's emulator, and it happens
+/// on the thread that draws - for the session being watched, the one being
+/// dialled, and every cached one, on every frame. Left unbounded it is however
+/// long the agent behind it goes on talking: a build's output, a file dumped to
+/// the terminal, a log tailed. The window stops answering the keyboard for all
+/// of it, and the reason is a session nobody is even looking at.
+///
+/// Nothing is dropped - what does not fit is read on the next frame - and at a
+/// 30 Hz redraw this still takes in several megabytes a second, far more than
+/// an agent sustains. So a session is only ever behind for the length of a
+/// burst, and the burst is watched scrolling past rather than waited out.
+const DRAIN_BUDGET: usize = 256 * 1024;
+
 /// Rows of rendered scrollback to ask the daemon for when attaching.
 ///
 /// The raw output the daemon retains repaints the screen but is a poor source
@@ -240,10 +255,17 @@ impl TerminalSession {
         })
     }
 
+    /// Take in what the session has said since the last look, up to
+    /// [`DRAIN_BUDGET`], and report whether anything arrived.
     pub fn drain(&mut self) -> bool {
         let mut changed = false;
+        let mut taken = 0;
         if let Some(daemon) = &mut self.daemon {
-            while let Some(bytes) = daemon.stream.try_read() {
+            while taken < DRAIN_BUDGET {
+                let Some(bytes) = daemon.stream.try_read() else {
+                    break;
+                };
+                taken += bytes.len();
                 self.codex_activity.process(&bytes);
                 self.inline.process(&mut self.parser, &bytes);
                 changed = true;
@@ -253,9 +275,13 @@ impl TerminalSession {
                 changed = true;
             }
         } else if let Some(events) = &self.events {
-            while let Ok(event) = events.try_recv() {
+            while taken < DRAIN_BUDGET {
+                let Ok(event) = events.try_recv() else {
+                    break;
+                };
                 match event {
                     TerminalEvent::Output(bytes) => {
+                        taken += bytes.len();
                         self.codex_activity.process(&bytes);
                         self.inline.process(&mut self.parser, &bytes);
                         changed = true;
@@ -276,6 +302,16 @@ impl TerminalSession {
 
     pub fn codex_working_hint(&self) -> Option<bool> {
         self.codex_activity.working()
+    }
+
+    /// A session with no process behind it whose output is whatever a test
+    /// sends down the returned channel.
+    #[cfg(test)]
+    fn queued(width: u16, height: u16) -> (Self, mpsc::Sender<TerminalEvent>) {
+        let (sender, events) = mpsc::channel();
+        let mut session = Self::detached(width, height);
+        session.events = Some(events);
+        (session, sender)
     }
 
     /// A session with no process behind it, for tests that only exercise the
@@ -1670,6 +1706,38 @@ mod tests {
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
+    }
+
+    #[test]
+    fn one_drain_takes_a_burst_in_pieces_rather_than_all_of_it() {
+        let (mut session, feed) = TerminalSession::queued(80, 24);
+        // Four drains' worth, in pieces the size a session's output arrives
+        // in, and a word at the end that says the whole burst has been read.
+        let piece = vec![b'x'; 16 * 1024];
+        for _ in 0..(4 * DRAIN_BUDGET / piece.len()) {
+            feed.send(TerminalEvent::Output(piece.clone())).unwrap();
+        }
+        feed.send(TerminalEvent::Output(b"\r\nEND".to_vec()))
+            .unwrap();
+
+        assert!(session.drain(), "the first drain reads what is waiting");
+        assert!(
+            !session.screen().contents().contains("END"),
+            "one drain must not swallow a whole burst: it runs the bytes through the emulator on \
+             the thread that draws, so the window answers nothing until it returns"
+        );
+
+        // What did not fit is left for the next drain, not dropped.
+        let mut drains = 1;
+        while !session.screen().contents().contains("END") {
+            assert!(
+                drains < 100,
+                "the rest of the burst has to arrive on later drains; stopped seeing any after \
+                 {drains}"
+            );
+            session.drain();
+            drains += 1;
+        }
     }
 
     #[test]
