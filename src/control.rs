@@ -3236,7 +3236,19 @@ impl ControllerControl {
         let include_archived = optional_bool(arguments, "include_archived");
         let mut rendered = Vec::new();
         for target in self.targets(arguments)? {
-            match self.runtime.bridge_pool().list_sessions(&target) {
+            // Nobody asked for the archive: don't make the machine send it.
+            // The filter below used to be where every record of every
+            // conversation the machine has ever held was thrown away, after
+            // being serialized, carried here - over ssh, for another machine -
+            // and parsed. What is left in the live list and still archived is
+            // a session put down since this daemon started, which the filter
+            // still has to catch.
+            let pool = self.runtime.bridge_pool();
+            let listed = match include_archived {
+                true => pool.list_sessions(&target),
+                false => pool.list_live_sessions(&target),
+            };
+            match listed {
                 Ok(sessions) => rendered.extend(
                     sessions
                         .iter()
@@ -3278,6 +3290,22 @@ impl ControllerControl {
             arguments,
             &target.id,
             || {
+                // A wait polls this every second or so for up to a minute, and
+                // what it waits for is a session that is running: asking for
+                // the machine's archive on every one of those rounds carried a
+                // record per conversation ever held there, sixty times, to
+                // find one id.
+                if let Some(running) = pool
+                    .list_live_sessions(&target)?
+                    .into_iter()
+                    .find(|session| session.id == session_id)
+                {
+                    return Ok(Some(running));
+                }
+                // Nothing running holds that id, so the wait is over either
+                // way - but the archive is the only place that can still say
+                // what the session was, and the answer names what it waited
+                // on. One look, on the round that ends the loop.
                 Ok(pool
                     .list_sessions(&target)?
                     .into_iter()
@@ -3324,7 +3352,7 @@ impl ControllerControl {
     fn talk_post(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        let now = session_name_now(|| pool.list_sessions(&Target::local()));
+        let now = session_name_now(|| pool.list_live_sessions(&Target::local()));
         let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let message = pool.talk_post(&target, talk_draft(arguments, author)?)?;
         Ok(pretty(&talk_json(&message)))
@@ -3357,7 +3385,11 @@ impl ControllerControl {
         // Left with the daemon on this machine rather than kept here: this
         // process ends when the tool call does, and the dashboard that reads
         // the chat is somewhere else entirely.
-        let now = session_name_now(|| self.runtime.bridge_pool().list_sessions(&Target::local()));
+        let now = session_name_now(|| {
+            self.runtime
+                .bridge_pool()
+                .list_live_sessions(&Target::local())
+        });
         send_channel(binding, arguments, &environment, now, |receipt| {
             let _ = self
                 .runtime
@@ -3369,7 +3401,7 @@ impl ControllerControl {
     fn message_agent(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        let now = session_name_now(|| pool.list_sessions(&Target::local()));
+        let now = session_name_now(|| pool.list_live_sessions(&Target::local()));
         let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let (draft, deliver, reply_expected) = direct_draft(arguments, author)?;
         let (message, delivery, reason) =
@@ -3847,10 +3879,12 @@ impl ControlSurface for ControllerControl {
             "send_input" => {
                 let target = self.target(arguments)?;
                 let session_id = required_str(arguments, "session_id")?;
+                // Only a running session can be typed into, so the archive
+                // has nothing to say about which one this is.
                 let kind = self
                     .runtime
                     .bridge_pool()
-                    .list_sessions(&target)
+                    .list_live_sessions(&target)
                     .ok()
                     .and_then(|sessions| session_kind(&sessions, session_id));
                 let bytes = build_input(arguments, kind)?;
@@ -4041,10 +4075,18 @@ mod daemon_surface {
         }
 
         fn sessions(&self) -> Result<Vec<DaemonSession>> {
-            match self
-                .transact(&DaemonRequest::ListSessions { live_only: false })?
-                .0
-            {
+            self.session_list(false)
+        }
+
+        /// Only what the daemon is running. A lineage walk wants the whole
+        /// list — a parent can be archived — but everything that asks only
+        /// what is going on now should ask for that.
+        fn live_sessions(&self) -> Result<Vec<DaemonSession>> {
+            self.session_list(true)
+        }
+
+        fn session_list(&self, live_only: bool) -> Result<Vec<DaemonSession>> {
+            match self.transact(&DaemonRequest::ListSessions { live_only })?.0 {
                 DaemonResponse::Sessions { sessions } => Ok(sessions),
                 response => bail!("unexpected session-list response: {response:?}"),
             }
@@ -4785,7 +4827,14 @@ mod daemon_surface {
                 "list_machines" => self.list_machines(),
                 "list_sessions" => {
                     let include_archived = optional_bool(arguments, "include_archived");
-                    let sessions = self.sessions()?;
+                    // Nobody asked for the archive: don't make the daemon
+                    // gather it. What is still in the live list and archived
+                    // was put down since the daemon started, and the filter
+                    // below is what catches it.
+                    let sessions = match include_archived {
+                        true => self.sessions()?,
+                        false => self.live_sessions()?,
+                    };
                     let rendered: Vec<Value> = sessions
                         .iter()
                         .filter(|session| include_archived || !session.archived)
@@ -4802,8 +4851,9 @@ mod daemon_surface {
                 "send_channel_message" => self.send_channel_message(arguments),
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
+                    // Only a running session can be typed into.
                     let kind = self
-                        .sessions()
+                        .live_sessions()
                         .ok()
                         .and_then(|sessions| session_kind(&sessions, session_id));
                     let bytes = build_input(arguments, kind)?;
@@ -6481,6 +6531,43 @@ mod tests {
             surface
                 .call(name, &arguments)
                 .unwrap_or_else(|error| panic!("{name} failed: {error:#}"))
+        }
+
+        #[test]
+        fn a_default_listing_still_leaves_out_a_session_that_was_put_down() {
+            let mut surface = surface("listing-put-down");
+            let workdir = std::env::temp_dir();
+            let launched = call(
+                &mut surface,
+                "launch_session",
+                json!({ "kind": "terminal", "path": workdir.to_str().unwrap() }),
+            );
+            let launched: Value = serde_json::from_str(&launched).unwrap();
+            let session_id = launched["session_id"].as_str().unwrap().to_string();
+            call(
+                &mut surface,
+                "archive_session",
+                json!({ "session_id": session_id }),
+            );
+
+            // A default listing asks the daemon for what it is running, which
+            // is not the same as what is still going: a session put down under
+            // this daemon stays in that map until a later generation retires
+            // it, so leaving it out is this side's job either way.
+            let listed = call(&mut surface, "list_sessions", json!({}));
+            assert!(
+                !listed.contains(&session_id),
+                "an archived session is not what is going on: {listed}"
+            );
+            let all = call(
+                &mut surface,
+                "list_sessions",
+                json!({ "include_archived": true }),
+            );
+            assert!(
+                all.contains(&session_id),
+                "and asked for, it must still be there: {all}"
+            );
         }
 
         #[test]
