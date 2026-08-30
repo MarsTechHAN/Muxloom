@@ -430,6 +430,9 @@ mod platform {
         metadata: Mutex<DaemonSession>,
         history_path: PathBuf,
         metadata_path: PathBuf,
+        /// Whether this record's file has been deleted on purpose. See
+        /// [`PersistedSession::persist`].
+        discarded: Mutex<bool>,
         line_count: OnceLock<usize>,
         columns: u16,
         rows: u16,
@@ -512,6 +515,9 @@ mod platform {
         native: Mutex<NativeLink>,
         history_path: PathBuf,
         metadata_path: PathBuf,
+        /// Whether this session's record has been deleted on purpose. See
+        /// [`ManagedSession::persist_metadata`].
+        discarded: Mutex<bool>,
         archived: AtomicBool,
         line_count: AtomicUsize,
         columns: AtomicU16,
@@ -1620,6 +1626,7 @@ mod platform {
                 metadata: Mutex::new(metadata),
                 history_path,
                 metadata_path: path.to_path_buf(),
+                discarded: Mutex::new(false),
                 line_count: OnceLock::new(),
                 columns: 80,
                 rows: 24,
@@ -1763,6 +1770,7 @@ mod platform {
                     metadata: Mutex::new(metadata),
                     history_path,
                     metadata_path,
+                    discarded: Mutex::new(false),
                     line_count: OnceLock::new(),
                     columns: 80,
                     rows: 24,
@@ -3260,7 +3268,11 @@ mod platform {
                 if let Some(session) = live {
                     session.stop()?;
                     let _ = fs::remove_file(&session.history_path);
-                    let _ = fs::remove_file(&session.metadata_path);
+                    // Not a plain remove: a round that took this handle before
+                    // the map lost it can still be about to write the record,
+                    // and a write that lands after the delete brings the
+                    // session back for every daemon that starts afterwards.
+                    session.discard();
                 } else {
                     let session = state
                         .persisted_sessions
@@ -3269,7 +3281,7 @@ mod platform {
                         .remove(&session_id)
                         .with_context(|| format!("unknown daemon session {session_id}"))?;
                     let _ = fs::remove_file(&session.history_path);
-                    let _ = fs::remove_file(&session.metadata_path);
+                    session.discard();
                 }
                 remove_scratch_dir(&state.paths, &session_id);
                 write_response(writer, request_id, &DaemonResponse::Ack)
@@ -3299,7 +3311,7 @@ mod platform {
                             metadata.label = label.clone();
                             metadata.clone()
                         };
-                        persist_session_metadata(&session.metadata_path, &metadata)?;
+                        session.persist(&metadata)?;
                     }
                 }
                 write_response(writer, request_id, &DaemonResponse::Ack)
@@ -4243,6 +4255,7 @@ mod platform {
             }),
             history_path,
             metadata_path,
+            discarded: Mutex::new(false),
             archived: AtomicBool::new(false),
             line_count: AtomicUsize::new(0),
             columns: AtomicU16::new(columns.max(20)),
@@ -4397,11 +4410,13 @@ mod platform {
     /// places it can rest: the archived index and an ended entry still held
     /// live until the next daemon retires it.
     fn mark_resumed_to(state: &DaemonState, previous_id: &str, successor: &str) {
-        let persisted = state
+        let entry = state
             .persisted_sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = persisted.get(previous_id) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(previous_id)
+            .map(Arc::clone);
+        if let Some(entry) = entry {
             let record = {
                 let mut metadata = entry
                     .metadata
@@ -4410,7 +4425,7 @@ mod platform {
                 metadata.resumed_to = Some(successor.to_string());
                 metadata.clone()
             };
-            if let Err(error) = persist_session_metadata(&entry.metadata_path, &record) {
+            if let Err(error) = entry.persist(&record) {
                 eprintln!("muxloomd could not record a resume alias on {previous_id}: {error:#}");
             }
         }
@@ -4497,7 +4512,7 @@ mod platform {
                 }
             };
             if let Some(record) = record {
-                if let Err(error) = persist_session_metadata(&entry.metadata_path, &record) {
+                if let Err(error) = entry.persist(&record) {
                     eprintln!("muxloomd could not repoint a child of {previous_id}: {error:#}");
                 }
                 moved += 1;
@@ -4567,7 +4582,7 @@ mod platform {
                 // whatever looks next, a scan or a restarting daemon, would
                 // find a temporary session that was supposed to leave nothing.
                 let _ = fs::remove_file(&session.history_path);
-                let _ = fs::remove_file(&session.metadata_path);
+                session.discard();
                 remove_scratch_dir(&state.paths, &session.session_id());
                 if still_tracked {
                     state
@@ -5001,6 +5016,7 @@ mod platform {
             }),
             history_path,
             metadata_path,
+            discarded: Mutex::new(false),
             archived: AtomicBool::new(archived),
             line_count: AtomicUsize::new(0),
             columns: AtomicU16::new(columns),
@@ -5333,6 +5349,42 @@ mod platform {
                 .clone()
         }
 
+        /// Write this record to its file, unless the file is gone on purpose.
+        ///
+        /// A handle to a record outlives its removal from the archive index:
+        /// every round that walks the sessions takes the handles under the lock
+        /// and does its work after letting go, so a rewrite can still be in
+        /// flight when a delete lands. Writing it afterwards puts the file back,
+        /// the next daemon reads it in at startup, and the session the person
+        /// deleted is in their archive again - permanently, because nothing
+        /// looks at that file again to notice it should not exist.
+        ///
+        /// The gate is held across the write, and [`Self::discard`] takes it to
+        /// remove the file, so the two cannot cross: either the write finishes
+        /// and the delete takes it away, or the delete goes first and the write
+        /// is dropped.
+        fn persist(&self, metadata: &DaemonSession) -> Result<()> {
+            let discarded = self
+                .discarded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *discarded {
+                return Ok(());
+            }
+            persist_session_metadata(&self.metadata_path, metadata)
+        }
+
+        /// Take this record off disk for good. Anything still holding a handle
+        /// and about to write finds the gate shut and writes nothing.
+        fn discard(&self) {
+            let mut discarded = self
+                .discarded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *discarded = true;
+            let _ = fs::remove_file(&self.metadata_path);
+        }
+
         fn archive(&self) -> Result<()> {
             let metadata = {
                 let mut metadata = self
@@ -5351,7 +5403,7 @@ mod platform {
                 metadata.archived_at.get_or_insert_with(now_secs);
                 metadata.clone()
             };
-            persist_session_metadata(&self.metadata_path, &metadata)
+            self.persist(&metadata)
         }
 
         fn line_count(&self) -> Result<usize> {
@@ -5690,8 +5742,44 @@ mod platform {
             })
         }
 
+        /// Write what this session is to its file, unless the file is gone on
+        /// purpose.
+        ///
+        /// A handle to a session outlives its removal from the map: the rounds
+        /// that walk the sessions take the handles under the lock and do the
+        /// work - drawing a screen, syncing a file - after letting go, so a
+        /// write can still be in flight when a delete lands. Writing it
+        /// afterwards puts the record back, the next daemon reads it in at
+        /// startup, and the session the person deleted is in their archive
+        /// again for good. The pump loop has always checked the map before
+        /// recording a death for exactly this reason; this is that check, made
+        /// the session's own and unmissable.
+        ///
+        /// The gate is held across the write and [`Self::discard`] takes it to
+        /// remove the file, so the two cannot cross.
         fn persist_metadata(&self) -> Result<()> {
-            persist_session_metadata(&self.metadata_path, &self.snapshot())
+            // Outside the gate: a snapshot draws this session's screen and
+            // takes its own locks, and the gate is only ever the innermost one.
+            let record = self.snapshot();
+            let discarded = self
+                .discarded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *discarded {
+                return Ok(());
+            }
+            persist_session_metadata(&self.metadata_path, &record)
+        }
+
+        /// Take this session's record off disk for good. Anything still holding
+        /// a handle and about to write finds the gate shut and writes nothing.
+        fn discard(&self) {
+            let mut discarded = self
+                .discarded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *discarded = true;
+            let _ = fs::remove_file(&self.metadata_path);
         }
 
         fn keeper_frame(&self, kind: u8, payload: &[u8]) -> Result<()> {
@@ -10053,6 +10141,92 @@ mod platform {
                 thread::yield_now();
             }
             assert!(!scratch.exists(), "the folder ends with the session");
+            discard_root(paths.root);
+        }
+
+        /// A delete has to outlast the writes that were already on their way.
+        ///
+        /// Nothing here walks the session map with the map lock in hand: the
+        /// transcript scan, the session listing, a resume repointing a whole
+        /// subtree - each takes the handles under the lock and does its work
+        /// after letting go, because that work draws screens and syncs files.
+        /// So a handle to a session outlives its removal from the map by
+        /// however long the round it is part of takes, and a write landing
+        /// after the delete writes the record back. Nothing looks at that file
+        /// again to notice it should not be there; the next daemon reads it in
+        /// at startup, and the conversation the person deleted is in their
+        /// archive from then on.
+        #[test]
+        fn a_deleted_session_is_not_written_back_by_a_round_that_was_already_holding_it() {
+            let state = test_state("delete-outlives");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-claude-deleted";
+            let session = launch_session(
+                &state,
+                session_id.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "on its way out".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let record = paths.sessions.join(format!("{session_id}.json"));
+            assert!(record.exists(), "a launch records what it started");
+
+            // What the delete request does, in the order it does it: out of the
+            // index the daemon finds sessions by, then off the disk.
+            state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id);
+            session.discard();
+            assert!(!record.exists());
+
+            // And the round that took the handle a moment before finishes.
+            session.persist_metadata().unwrap();
+            assert!(
+                !record.exists(),
+                "the deleted session came back, and every daemon after this one reads it in"
+            );
+            session.stop().unwrap();
+
+            // The archive's own records take the same care. A resume rewrites
+            // the parent of every child the old master had, archived ones
+            // included, and a delete can land in the middle of that walk.
+            let archived_id = "muxloomd-claude-1700000222-9-1";
+            let archived_path = paths.sessions.join(format!("{archived_id}.json"));
+            let mut retired = live_metadata(archived_id, "claude", None);
+            retired.dead = true;
+            retired.archived = true;
+            retired.archived_at = Some(1);
+            retired.working = false;
+            persist_session_metadata(&archived_path, &retired).unwrap();
+            fs::write(paths.history.join(format!("{archived_id}.ansi")), b"done\n").unwrap();
+            let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
+            let entry = restarted
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(archived_id)
+                .map(Arc::clone)
+                .expect("the archived record has to be in the archive for this to say anything");
+            entry.discard();
+            assert!(!archived_path.exists());
+            entry.persist(&retired).unwrap();
+            assert!(
+                !archived_path.exists(),
+                "the deleted record came back into the archive"
+            );
+
             discard_root(paths.root);
         }
 
