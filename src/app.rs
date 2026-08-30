@@ -645,6 +645,26 @@ struct RecoveryInfo {
     restorable: bool,
 }
 
+/// What the backup last said one machine had lost, and the two things that
+/// answer depends on: the index the store keeps, and which sessions the machine
+/// itself reported.
+///
+/// The look itself reads and parses the whole index and stats a blob for every
+/// record it cannot settle from the index alone, and it happens once per machine
+/// every time a machine answers - which is every refresh interval, as low as
+/// half a second. Neither input changes on that clock, and the index is a file
+/// that only grows: doing it again for an unchanged pair is work that scales
+/// with how much history there is and returns what it returned last time.
+#[derive(Debug)]
+struct RecoveryScan {
+    /// The backup index as the filesystem describes it - modification time and
+    /// length. A rewritten index is a different index; nothing about the store
+    /// changes underneath one that was not.
+    index_stamp: Option<(u64, u64)>,
+    live: HashSet<String>,
+    found: Vec<RecoverableSession>,
+}
+
 #[derive(Debug)]
 pub struct FileManagerForm {
     pub origin: FileManagerOrigin,
@@ -1665,6 +1685,9 @@ pub struct App {
     /// local backup — the machine it ran on no longer has it. These are read
     /// from the store instead of the daemon, and pushed back onto it on demand.
     recoverable: HashMap<(String, String), RecoveryInfo>,
+    /// Per machine, what the last look through the backup found and what it
+    /// found it from. See [`RecoveryScan`].
+    recovery_scans: HashMap<String, RecoveryScan>,
     /// Sessions whose transcript is being transferred back to their machine.
     restoring: HashSet<(String, String)>,
     /// Sessions already put back this run. Their transcript is on the machine
@@ -1847,6 +1870,7 @@ impl App {
             relay_in_flight: false,
             backup_root,
             recoverable: HashMap::new(),
+            recovery_scans: HashMap::new(),
             restoring: HashSet::new(),
             restored: HashSet::new(),
             top_up_count: 0,
@@ -6162,7 +6186,7 @@ impl App {
                 self.persist_state();
             }
         }
-        for record in recoverable_backup_records(&self.backup_root, target_id, &live) {
+        for record in self.recoverable_records_for(target_id, live) {
             let Ok(kind) = record.kind.parse::<AgentKind>() else {
                 continue;
             };
@@ -6216,6 +6240,33 @@ impl App {
                 parent: None,
             });
         }
+    }
+
+    /// What the backup still holds for `target_id` that the machine no longer
+    /// reports, answered from [`RecoveryScan`] when neither the store's index nor
+    /// the machine's own session list has moved since the last look.
+    fn recoverable_records_for(
+        &mut self,
+        target_id: &str,
+        live: HashSet<String>,
+    ) -> Vec<RecoverableSession> {
+        let index_stamp = backup_index_stamp(&self.backup_root);
+        if let Some(scan) = self.recovery_scans.get(target_id)
+            && scan.index_stamp == index_stamp
+            && scan.live == live
+        {
+            return scan.found.clone();
+        }
+        let found = recoverable_backup_records(&self.backup_root, target_id, &live);
+        self.recovery_scans.insert(
+            target_id.to_string(),
+            RecoveryScan {
+                index_stamp,
+                live,
+                found: found.clone(),
+            },
+        );
+        found
     }
 
     /// Show a recoverable session's history out of the local backup: the machine
@@ -12517,6 +12568,22 @@ fn backup_session_transcript(target_id: &str, session_id: &str, max_chars: usize
 #[cfg(not(feature = "controller"))]
 fn backup_session_transcript(_target_id: &str, _session_id: &str, _max_chars: usize) -> String {
     String::new()
+}
+
+/// How the filesystem describes the store's index right now: when it was last
+/// written, and how long it is. Two looks that see the same pair are two looks
+/// at the same index, and `None` - no index yet, or one that cannot be stat'd -
+/// only ever compares equal to another `None`, which is the same answer.
+fn backup_index_stamp(root: &Path) -> Option<(u64, u64)> {
+    let path = crate::backup::BackupStore::new(root.to_path_buf()).index_path();
+    let meta = fs::metadata(path).ok()?;
+    let written = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((written, meta.len()))
 }
 
 /// The conversations the local store holds for `alias` that the machine itself
@@ -19493,6 +19560,107 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.file_manager.as_ref().unwrap().entries, [original]);
+    }
+
+    /// The store is read again when it has been written, and not otherwise. A
+    /// machine answers on the refresh interval — twice a second, if that is how
+    /// it is configured — and reading the whole index for each of them is work
+    /// that grows with how much history there is and says the same thing.
+    #[test]
+    #[cfg(feature = "controller")]
+    fn a_machine_answering_again_does_not_read_the_whole_backup_again() {
+        use crate::{
+            backup::{BackupIndex, BackupRecord, BackupStore, CAPTURE_BLOB},
+            model::Probe,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("muxloom-app-rescan-{nonce}"));
+        let store = BackupStore::new(root.clone());
+        // Nothing mirrored yet, so there is nothing to list: whether this record
+        // counts is a question about the blobs, which is what makes the second
+        // look observable.
+        let mut index = BackupIndex::default();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-lost".into(),
+            kind: "codex".into(),
+            cwd: "/work/project".into(),
+            created_at: 42,
+            dead: true,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.backup_root = root.clone();
+        app.targets[0].probe.set(AgentKind::Codex, true);
+
+        let answer_empty = |app: &mut App| {
+            app.handle_worker_event(Event::Scanned {
+                target_id: "local".into(),
+                result: Ok((Probe::default(), Vec::new())),
+            });
+        };
+        answer_empty(&mut app);
+        assert!(app.sessions.is_empty(), "nothing is mirrored yet");
+
+        // Put the capture there. A sync that writes a blob writes the index
+        // after it, so this half-written state is not one the store is ever
+        // left in - and until the index says so, the machine answering again
+        // is answered from what the last look found.
+        store
+            .append_frame("local", "muxloomd-codex-lost", CAPTURE_BLOB, b"all green\n")
+            .unwrap();
+        answer_empty(&mut app);
+        assert!(
+            app.sessions.is_empty(),
+            "an unchanged machine and an unchanged index must not be looked up again"
+        );
+
+        // The index is written - a real sync records what it mirrored - and the
+        // store is read again, so the capture counts.
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "muxloomd-codex-lost".into(),
+            kind: "codex".into(),
+            cwd: "/work/project".into(),
+            created_at: 42,
+            dead: true,
+            ansi_lines_synced: 1,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+        answer_empty(&mut app);
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["muxloomd-codex-lost"],
+            "a store that has been written to has to be read again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A machine that came back empty still shows what the local backup holds
