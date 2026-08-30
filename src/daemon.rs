@@ -433,7 +433,6 @@ mod platform {
         /// hand the client the same `DECSTBM` the app left behind.
         inline: Mutex<InlineScrollback>,
         codex_activity: Mutex<CodexActivity>,
-        recent_output: Mutex<Vec<u8>>,
         /// The text last read out of this session's composer box, and the
         /// epoch-ms when it last changed. The outbox path reads it on every
         /// pass to age an unsent draft: a box that keeps changing has someone
@@ -4152,7 +4151,6 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
-            recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
             // A revival that reopens the thread carries the opening words too;
             // a fresh session starts with nothing heard, and the recorder
@@ -4182,7 +4180,7 @@ mod platform {
         // Output the child produced before the keeper connection existed —
         // the first prompt of a fast-starting agent — is only in the history
         // file. The greeting's byte count splits the transcript exactly, so
-        // replaying that prefix leaves the ring gapless and duplicate-free.
+        // replaying that prefix leaves the screen gapless and duplicate-free.
         if !temporary
             && let Some(head) = history_prefix_tail(
                 &session.history_path,
@@ -4885,7 +4883,6 @@ mod platform {
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
-            recent_output: Mutex::new(Vec::new()),
             draft_watch: Mutex::new(None),
             // Read back out of the metadata, the same as the seed and the
             // claim below: this daemon did not hear the conversation open,
@@ -4919,10 +4916,10 @@ mod platform {
             columns: AtomicU16::new(columns),
             rows: AtomicU16::new(rows),
         });
-        // Rebuild the screen, the retained ring, and with them the
-        // working/attention classification from the transcript the keeper
-        // kept appending while no daemon was watching. The greeting's byte
-        // count bounds the read so nothing streaming in now is doubled.
+        // Rebuild the screen, and with it the working/attention
+        // classification, from the transcript the keeper kept appending while
+        // no daemon was watching. The greeting's byte count bounds the read so
+        // nothing streaming in now is doubled.
         if !temporary
             && let Some(tail) = history_prefix_tail(
                 &session.history_path,
@@ -5810,6 +5807,16 @@ mod platform {
             out
         }
 
+        /// Take in everything the session has just written: the screen the
+        /// daemon keeps of it, what that says about whether it is working, and
+        /// how far its transcript has got.
+        ///
+        /// Every byte every session produces arrives here, on the thread
+        /// draining that session's PTY, in whatever sized pieces the PTY hands
+        /// over - an agent repainting its window does so a few hundred bytes at
+        /// a time, tens of times a second. So this runs on the critical path of
+        /// the child's own output, and work proportional to anything but
+        /// `bytes` does not belong in it.
         fn record_output(&self, bytes: &[u8]) {
             self.line_count.fetch_add(
                 bytes.iter().filter(|&&byte| byte == b'\n').count(),
@@ -5833,15 +5840,6 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .process(bytes);
-            let mut recent = self
-                .recent_output
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            recent.extend_from_slice(bytes);
-            if recent.len() > RECENT_OUTPUT_LIMIT {
-                let remove = recent.len() - RECENT_OUTPUT_LIMIT;
-                recent.drain(..remove);
-            }
         }
 
         fn broadcast(&self, bytes: &[u8]) {
@@ -7945,11 +7943,8 @@ mod platform {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut output = Vec::new();
             while Instant::now() < deadline {
-                output = session
-                    .recent_output
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
+                output = history_tail(&session.history_path, RECENT_OUTPUT_LIMIT as u64)
+                    .unwrap_or_default();
                 if output.windows(probe.len()).any(|window| window == probe) {
                     break;
                 }
@@ -10129,11 +10124,8 @@ mod platform {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut output = Vec::new();
             while Instant::now() < deadline {
-                output = adopted
-                    .recent_output
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
+                output = history_tail(&adopted.history_path, RECENT_OUTPUT_LIMIT as u64)
+                    .unwrap_or_default();
                 if output.windows(probe.len()).any(|window| window == probe) {
                     break;
                 }
