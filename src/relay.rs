@@ -256,9 +256,9 @@ fn routable(fleet: &[String], machine: &str) -> bool {
 ///
 /// The words carry the bare number, not the ledger's key. The ledger files the
 /// ask under `approve-7` and the person types `approve-7`, so quoting the key
-/// would ask them for `approve-approve-7` — which the chat side will not parse
-/// at all, leaving every gated write unanswerable and the agent stuck being
-/// told to wait for an answer nobody could give.
+/// would ask them for `approve-approve-7`. The chat side reads that form now,
+/// but a card is what a person answers off their phone and it should say the
+/// thing they type.
 fn approval_ask(tool: &str, machine: &str, number: u64) -> String {
     let at = match machine.is_empty() {
         true => "another machine".to_string(),
@@ -710,10 +710,18 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 // every retry has to land on the ask already in front of them
                 // rather than put another copy of it on their phone.
                 let output = match approvals.open_ask(&job.session, &machine, &tool) {
-                    Some(id) => format!(
-                        "{tool} is waiting on the person: they were asked as {id} and have not \
-                         answered yet. Make this call again once they have."
-                    ),
+                    // Spell the words out. Naming the ledger's key and leaving
+                    // the agent to work out the reply from it is how a person
+                    // came to be told to type `always-approve-19870001`.
+                    Some(id) => {
+                        let number = id.strip_prefix("approve-").unwrap_or(id);
+                        format!(
+                            "{tool} is waiting on the person and they have not answered yet. They \
+                             were asked in chat, and they answer it there with `approve-{number}`, \
+                             `always-{number}` or `reject-{number}` — those exact words, not the \
+                             id {id}. Make this call again once they have."
+                        )
+                    }
                     None => {
                         let number = approvals.mint();
                         let id = format!("approve-{number}");

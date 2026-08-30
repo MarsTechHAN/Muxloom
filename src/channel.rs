@@ -1684,24 +1684,59 @@ pub fn parse_kind(word: &str) -> Option<AgentKind> {
     }
 }
 
-/// Recognise a bare approval reply — `approve-12`, `always-12`, `reject-12` —
-/// and turn it into an Approval route. Anything that is not one of those three
-/// words followed by a numeric id is left alone.
+/// Recognise an approval reply — `approve-12`, `always-12`, `reject-12` — and
+/// turn it into an Approval route. Anything that is not one of those three
+/// words naming a number is left alone.
+///
+/// It reads the forms people and agents actually send, because the cost of not
+/// reading one is silence. A reply this does not recognise is delivered to an
+/// agent as a sentence: nobody is told it was not an approval, the card stays
+/// open, and the person watches nothing happen. That has already happened in
+/// this fleet — an agent relaying the ask quoted the ledger's key instead of
+/// the words on the card, the person dutifully typed `always-approve-19870001`,
+/// and it went to an agent as prose. So a slash in front, a space or a colon
+/// instead of the dash, and the ledger's key quoted back where the number
+/// belongs all mean what they plainly mean.
+///
+/// The three words are matched exactly, and nothing shorter or friendlier is:
+/// `no 2` and `yes 3` are how a person answers an agent's numbered question,
+/// and reading those as verdicts would break a working thing to fix a broken
+/// one. Trailing text is not read either — a message with a sentence after the
+/// verdict is a person talking to an agent.
 pub fn approval_route(text: &str) -> Option<Route> {
-    let (word, id) = text.trim().split_once('-')?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let verdict = match word.trim().to_ascii_lowercase().as_str() {
+    let said = text.trim().trim_start_matches('/').trim();
+    let said = said.trim_end_matches(|c: char| c.is_whitespace() || ".!?,;。！？，、".contains(c));
+    let head = said
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(said.len());
+    let verdict = match said[..head].to_ascii_lowercase().as_str() {
         "approve" => crate::approvals::Verdict::Yes,
         "always" => crate::approvals::Verdict::Always,
         "reject" => crate::approvals::Verdict::No,
         _ => return None,
     };
+    let mut id = joint(&said[head..]);
+    // The ask is filed as `approve-7` and answered `approve-7`. An agent
+    // passing the ledger's key on rather than the card's words produces
+    // `always-approve-7`, which says exactly one thing and used to say nothing.
+    if let Some(quoted) = id
+        .get(..7)
+        .filter(|word| word.eq_ignore_ascii_case("approve"))
+    {
+        id = joint(&id[quoted.len()..]);
+    }
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     Some(Route::Approval {
         id: format!("approve-{id}"),
         verdict,
     })
+}
+
+/// Step over whatever was put between the verdict word and its number.
+fn joint(rest: &str) -> &str {
+    rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | ':' | '#' | '='))
 }
 
 fn meant_as_a_command(word: &str) -> bool {
@@ -5038,6 +5073,70 @@ mod tests {
             route("approve", None, "lark-1", false, &inbox).0,
             Route::Board { .. }
         ));
+    }
+
+    /// What a reply this does not read gets is silence: it goes to an agent as
+    /// a sentence, the card stays open, and the person watches nothing happen.
+    /// Every accepted form below is one somebody has typed or an agent has told
+    /// somebody to type — `always-approve-19870001` is verbatim out of this
+    /// fleet's own history, and it went nowhere.
+    #[test]
+    fn an_approval_is_read_however_it_was_typed_and_only_when_it_is_one() {
+        use crate::approvals::Verdict;
+        let yes = |id: &str| {
+            Some(Route::Approval {
+                id: id.to_string(),
+                verdict: Verdict::Yes,
+            })
+        };
+        let cases: &[(&str, Option<Route>)] = &[
+            // The card's own words, and the shapes a phone or an agent puts
+            // around them.
+            ("approve-12", yes("approve-12")),
+            ("  approve-12  ", yes("approve-12")),
+            ("APPROVE-12", yes("approve-12")),
+            ("/approve-12", yes("approve-12")),
+            ("approve 12", yes("approve-12")),
+            ("approve:12", yes("approve-12")),
+            ("approve#12", yes("approve-12")),
+            ("approve12", yes("approve-12")),
+            ("approve-12.", yes("approve-12")),
+            ("approve-12。", yes("approve-12")),
+            // The ledger's key quoted back where the number belongs.
+            ("approve-approve-12", yes("approve-12")),
+            ("approve approve-12", yes("approve-12")),
+            (
+                "always-approve-19870001",
+                Some(Route::Approval {
+                    id: "approve-19870001".into(),
+                    verdict: Verdict::Always,
+                }),
+            ),
+            (
+                "reject-approve-3",
+                Some(Route::Approval {
+                    id: "approve-3".into(),
+                    verdict: Verdict::No,
+                }),
+            ),
+            // And what is deliberately still not an approval. `no 2` and
+            // `yes 3` are how a person answers an agent's numbered question,
+            // and a sentence after the verdict is a person talking to an agent.
+            ("yes 3", None),
+            ("no 2", None),
+            ("ok-1", None),
+            ("allow-1", None),
+            ("approve", None),
+            ("approve-", None),
+            ("approve-twelve", None),
+            ("approve-12 and restart the box", None),
+            ("disapprove-12", None),
+            ("12", None),
+            ("", None),
+        ];
+        for (typed, want) in cases {
+            assert_eq!(&approval_route(typed), want, "reading {typed:?}");
+        }
     }
 
     fn lease_note(holder: &str, _account: &str, until: u64, cursor: &str, ts: u64) -> Leased {
