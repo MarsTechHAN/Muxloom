@@ -2074,9 +2074,14 @@ fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
 ///
 /// Asked rather than inferred, and only of the session's own record: an agent
 /// naming itself in an argument could only get it wrong.
-fn session_name_now(sessions: impl FnOnce() -> Result<Vec<DaemonSession>>) -> Option<String> {
+///
+/// One record is the whole question, and the session it is about is the one
+/// asking — running, by definition. So `look` is handed the id: every message
+/// an agent sends used to have the machine gather, draw and classify every
+/// session on it, and read its own line off the bottom of that.
+fn session_name_now(look: impl FnOnce(&str) -> Result<Option<DaemonSession>>) -> Option<String> {
     let id = session_env("MUXLOOM_SESSION_ID")?;
-    let session = sessions().ok()?.into_iter().find(|it| it.id == id)?;
+    let session = look(&id).ok()??;
     let named = |value: &str| {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
@@ -3384,7 +3389,7 @@ impl ControllerControl {
     fn talk_post(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        let now = session_name_now(|| pool.list_live_sessions(&Target::local()));
+        let now = session_name_now(|id| pool.live_session(&Target::local(), id));
         let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let message = pool.talk_post(&target, talk_draft(arguments, author)?)?;
         Ok(pretty(&talk_json(&message)))
@@ -3417,10 +3422,10 @@ impl ControllerControl {
         // Left with the daemon on this machine rather than kept here: this
         // process ends when the tool call does, and the dashboard that reads
         // the chat is somewhere else entirely.
-        let now = session_name_now(|| {
+        let now = session_name_now(|id| {
             self.runtime
                 .bridge_pool()
-                .list_live_sessions(&Target::local())
+                .live_session(&Target::local(), id)
         });
         send_channel(binding, arguments, &environment, now, |receipt| {
             let _ = self
@@ -3433,7 +3438,7 @@ impl ControllerControl {
     fn message_agent(&self, arguments: &Value) -> Result<String> {
         let target = self.target(arguments)?;
         let pool = self.runtime.bridge_pool();
-        let now = session_name_now(|| pool.list_live_sessions(&Target::local()));
+        let now = session_name_now(|id| pool.live_session(&Target::local(), id));
         let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let (draft, deliver, reply_expected) = direct_draft(arguments, author)?;
         let (message, delivery, reason) =
@@ -4292,7 +4297,7 @@ mod daemon_surface {
         }
 
         fn talk_post(&self, arguments: &Value) -> Result<String> {
-            let now = session_name_now(|| self.sessions());
+            let now = session_name_now(|id| self.live_session(id));
             let author = message_author(now, || {
                 match self.transact(&DaemonRequest::TalkStatus { label: None })?.0 {
                     DaemonResponse::TalkBoard { state } => Ok(state),
@@ -4351,7 +4356,7 @@ mod daemon_surface {
             let environment = self.config.environment_for(LOCAL_TARGET_ID)?;
             match channels.pick(optional_str(arguments, "channel")) {
                 Ok(binding) => {
-                    let now = session_name_now(|| self.sessions());
+                    let now = session_name_now(|id| self.live_session(id));
                     send_channel(binding, arguments, &environment, now, |receipt| {
                         let _ = self.transact(&DaemonRequest::ChannelSent { receipt });
                     })
@@ -4477,7 +4482,7 @@ mod daemon_surface {
             // The board here is the one the message will be filed on, so an
             // author with no machine on it would be right anyway; asking keeps
             // the record the same shape as one that crossed a machine.
-            let now = session_name_now(|| self.sessions());
+            let now = session_name_now(|id| self.live_session(id));
             let author = message_author(now, || {
                 match self.transact(&DaemonRequest::TalkStatus { label: None })?.0 {
                     DaemonResponse::TalkBoard { state } => Ok(state),
@@ -6535,10 +6540,23 @@ mod tests {
 
         let mut renamed = fleet_row("muxloomd-claude-9-1-0", None);
         renamed.label = "channel routing".into();
-        let table = vec![fleet_row("muxloomd-claude-8-1-0", None), renamed.clone()];
+        let table = [fleet_row("muxloomd-claude-8-1-0", None), renamed.clone()];
 
-        let now = session_name_now(|| Ok(table.clone()));
+        // The lookup is handed the caller's own id, because that is the whole
+        // question: what one session is called. It used to be read off a
+        // listing of every session on the machine, gathered and classified to
+        // have one line taken from it.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let now = session_name_now(|id| {
+            asked.borrow_mut().push(id.to_string());
+            Ok(table.iter().find(|row| row.id == id).cloned())
+        });
         assert_eq!(now.as_deref(), Some("channel routing"));
+        assert_eq!(
+            asked.into_inner(),
+            vec!["muxloomd-claude-9-1-0".to_string()],
+            "a session asked for a name other than its own"
+        );
         assert_eq!(speaker(now), "channel routing · seed");
 
         // Nobody named it, but its runtime titled the conversation: that is
@@ -6547,7 +6565,7 @@ mod tests {
         titled.label = String::new();
         titled.title = Some("tracking down the resume leak".into());
         assert_eq!(
-            session_name_now(|| Ok(vec![titled])).as_deref(),
+            session_name_now(|_| Ok(Some(titled))).as_deref(),
             Some("tracking down the resume leak")
         );
 
