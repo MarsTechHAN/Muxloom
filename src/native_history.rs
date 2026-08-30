@@ -142,7 +142,13 @@ pub fn resume_seed(kind: AgentKind, args: &[String]) -> Option<String> {
         }
         if argument == flag {
             let id = args.get(index + 1)?;
-            return (!id.starts_with('-')).then(|| id.clone());
+            // Empty is not an id, the same as it is not one in the joined
+            // form. A blank word after the flag used to be read as a thread
+            // named "", and that name went onto the record: two launches in
+            // one folder that both said nothing then agreed on a thread, and
+            // a reopen matching on that seed would repoint one of them onto
+            // the other's number with its fleet still hanging off it.
+            return (!id.is_empty() && !id.starts_with('-')).then(|| id.clone());
         }
     }
     None
@@ -1791,6 +1797,11 @@ mod tests {
             Some("ses_one".into())
         );
         assert_eq!(resume_seed(AgentKind::Claude, &["--resume".into()]), None);
+        assert_eq!(
+            resume_seed(AgentKind::Claude, &["--resume".into(), String::new()]),
+            None
+        );
+        assert_eq!(resume_seed(AgentKind::Pi, &["--session=".into()]), None);
         assert_eq!(
             resume_seed(AgentKind::Terminal, &["resume".into(), "one".into()]),
             None
