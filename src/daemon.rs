@@ -2763,11 +2763,23 @@ mod platform {
                 },
             ),
             DaemonRequest::ListSessions { live_only } => {
-                let mut sessions: Vec<_> = state
+                // Which sessions there are is taken under the lock; what each
+                // of them is doing is worked out after letting it go. Reading a
+                // session means drawing its screen and running the classifiers
+                // over it, and the map this holds is the one every other thing
+                // the daemon does has to go through to find a session at all -
+                // typing into one, opening its screen, handing it a message. A
+                // dashboard asking three times a second is not a reason for
+                // those to queue behind a room-full of screens being drawn.
+                let live = state
                     .sessions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .values()
+                    .map(Arc::clone)
+                    .collect::<Vec<_>>();
+                let mut sessions: Vec<_> = live
+                    .iter()
                     .map(|session| {
                         // This pass of classification is also where a waiting
                         // child gets marked for its parent: whoever is asking —
