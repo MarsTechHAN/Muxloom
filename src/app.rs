@@ -12574,6 +12574,7 @@ fn backup_session_transcript(_target_id: &str, _session_id: &str, _max_chars: us
 /// written, and how long it is. Two looks that see the same pair are two looks
 /// at the same index, and `None` - no index yet, or one that cannot be stat'd -
 /// only ever compares equal to another `None`, which is the same answer.
+#[cfg(feature = "controller")]
 fn backup_index_stamp(root: &Path) -> Option<(u64, u64)> {
     let path = crate::backup::BackupStore::new(root.to_path_buf()).index_path();
     let meta = fs::metadata(path).ok()?;
@@ -12584,6 +12585,14 @@ fn backup_index_stamp(root: &Path) -> Option<(u64, u64)> {
         .ok()?
         .as_nanos() as u64;
     Some((written, meta.len()))
+}
+
+/// Without the store there is no index to describe, and the answer never
+/// changes - which is the right one to cache against, since the records it
+/// guards are empty too.
+#[cfg(not(feature = "controller"))]
+fn backup_index_stamp(_root: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// The conversations the local store holds for `alias` that the machine itself
