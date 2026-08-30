@@ -956,6 +956,7 @@ impl BridgeConnection {
         &self,
         peers: Vec<RelayPeer>,
         via: &str,
+        who: &str,
     ) -> Result<(Vec<RelayJob>, Vec<RelayPeer>)> {
         if !self.has_capability(RELAY_CAPABILITY) {
             return Ok((Vec::new(), Vec::new()));
@@ -964,6 +965,7 @@ impl BridgeConnection {
             .request(DaemonRequest::RelayPoll {
                 peers,
                 via: via.to_string(),
+                who: who.to_string(),
             })?
             .response
         {
@@ -2501,8 +2503,10 @@ impl BridgePool {
         target: &Target,
         peers: Vec<RelayPeer>,
         via: &str,
+        who: &str,
     ) -> Result<(Vec<RelayJob>, Vec<RelayPeer>)> {
-        self.connection_for_target(target)?.relay_poll(peers, via)
+        self.connection_for_target(target)?
+            .relay_poll(peers, via, who)
     }
 
     pub fn relay_complete(

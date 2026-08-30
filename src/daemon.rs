@@ -3073,13 +3073,13 @@ mod platform {
                     .submit(&tool, &arguments, &session, crate::relay::now_ms())?;
                 write_response(writer, request_id, &DaemonResponse::RelayTicket { id })
             }
-            DaemonRequest::RelayPoll { peers, via } => {
+            DaemonRequest::RelayPoll { peers, via, who } => {
                 let now = crate::relay::now_ms();
                 let mut relay = state
                     .relay
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let jobs = relay.poll(now, peers, &via);
+                let jobs = relay.poll(now, peers, &via, &who);
                 // Told back in the same breath: whatever other controllers
                 // have said they can reach from here. This daemon carries
                 // nothing itself — it only repeats what it was told, to the

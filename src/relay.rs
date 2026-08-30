@@ -356,10 +356,25 @@ struct Entry {
 /// machine, and one of them naming its fleet must not erase the other's.
 #[derive(Debug)]
 struct Reach {
-    /// What that controller calls itself.
+    /// Which controller this is. Its own name for itself, not its host's:
+    /// `via` is the way there and two controllers on one machine share it.
+    /// Empty from a controller too old to say, which then keys by `via` as
+    /// it always did.
+    who: String,
+    /// What that controller calls itself, which is what a reader is shown.
     via: String,
     peers: Vec<RelayPeer>,
     at: u64,
+}
+
+impl Reach {
+    /// The name this entry is kept under.
+    fn key(&self) -> &str {
+        match self.who.is_empty() {
+            true => &self.via,
+            false => &self.who,
+        }
+    }
 }
 
 /// The daemon's side of the relay: jobs waiting, jobs answered, and when a
@@ -498,18 +513,27 @@ impl RelayQueue {
     /// always reach the one it is polling, so nothing to say means a build from
     /// before there was anything to say. Such a poll leaves the fleet alone
     /// rather than emptying it.
-    pub fn poll(&mut self, now: u64, peers: Vec<RelayPeer>, via: &str) -> Vec<RelayJob> {
+    pub fn poll(&mut self, now: u64, peers: Vec<RelayPeer>, via: &str, who: &str) -> Vec<RelayJob> {
         self.last_poll = now;
+        // Which entry this poll owns. Its own name where it gave one, and its
+        // host where it did not — two controllers on one host then share an
+        // entry, which is what they always did and all an old build allows.
+        let mine = match who.is_empty() {
+            true => via,
+            false => who,
+        };
         // Whether this poll said anything about a fleet at all, which is what
         // decides whether there is a route to sort the waiting jobs by.
         let named = !peers.is_empty();
         if named {
-            match self.reaches.iter_mut().find(|reach| reach.via == via) {
+            match self.reaches.iter_mut().find(|reach| reach.key() == mine) {
                 Some(reach) => {
+                    reach.via = via.to_string();
                     reach.peers = peers;
                     reach.at = now;
                 }
                 None => self.reaches.push(Reach {
+                    who: who.to_string(),
                     via: via.to_string(),
                     peers,
                     at: now,
@@ -529,7 +553,7 @@ impl RelayQueue {
         let fleet: Option<Vec<String>> = named.then(|| {
             self.reaches
                 .iter()
-                .find(|reach| reach.via == via)
+                .find(|reach| reach.key() == mine)
                 .map(|reach| reach.peers.iter().map(|peer| peer.id.clone()).collect())
                 .unwrap_or_default()
         });
@@ -634,6 +658,17 @@ impl fmt::Display for RelayRound {
     }
 }
 
+/// Which controller this one is, for as long as it runs.
+///
+/// Not the hostname: that is the name of the way here, and two controllers on
+/// one machine share it. A daemon keeps what each controller reaches under this
+/// name, so sharing one means the second to come round overwrites the first,
+/// and every machine only the first could reach quietly stops being reachable.
+/// The host is still in it so a person reading a debug log can see whose it is.
+fn controller_id() -> String {
+    format!("{}#{}", crate::talk::hostname(), std::process::id())
+}
+
 /// Run one round of errands for every machine, this one included: an agent on
 /// the controller's own machine talks to its daemon too, and is just as blind
 /// to the other machines as one across the network.
@@ -650,6 +685,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
         .chain(targets.iter().filter(|it| it.id != local.id))
         .collect();
     let via = crate::talk::hostname();
+    let who = controller_id();
     // What this controller can reach, which is the same list for everyone: the
     // machines the user enabled. Each daemon is told which of them is itself,
     // so it knows the one place a call does not have to come back through here.
@@ -686,7 +722,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 ..peer.clone()
             })
             .collect();
-        let (jobs, known) = match pool.relay_poll(target, peers, &via) {
+        let (jobs, known) = match pool.relay_poll(target, peers, &via, &who) {
             Ok(answer) => answer,
             Err(error) => {
                 debug::log("relay", format!("{}: no relay ({error})", target.id));
@@ -956,17 +992,17 @@ mod tests {
         );
 
         // A controller shows up and the same call goes through.
-        assert!(queue.poll(t0, Vec::new(), "").is_empty());
+        assert!(queue.poll(t0, Vec::new(), "", "").is_empty());
         let id = queue.submit("list_machines", "{}", "", t0).unwrap();
         assert!(!id.is_empty(), "a relayed job gets an id");
         // Still nothing back, and asking does not consume the job.
         assert_eq!(queue.result(&id, t0).unwrap(), RelayAnswer::default());
 
         // It is handed out once, however often the controller asks.
-        let jobs = queue.poll(t0 + 100, Vec::new(), "");
+        let jobs = queue.poll(t0 + 100, Vec::new(), "", "");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].tool, "list_machines");
-        assert!(queue.poll(t0 + 200, Vec::new(), "").is_empty());
+        assert!(queue.poll(t0 + 200, Vec::new(), "", "").is_empty());
 
         queue.complete(&id, true, "[]".into(), t0 + 300);
         let answer = queue.result(&id, t0 + 400).unwrap();
@@ -980,7 +1016,7 @@ mod tests {
     fn the_controller_runs_errands_not_commands() {
         let mut queue = RelayQueue::default();
         let t0 = 2_000_000;
-        queue.poll(t0, Vec::new(), "");
+        queue.poll(t0, Vec::new(), "", "");
         // Nothing that would sit there: a relayed job runs on the controller's
         // own round, so a wait is refused wherever it is named.
         let error = queue
@@ -1069,7 +1105,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        queue.poll(t0, fleet.clone(), "laptop");
+        queue.poll(t0, fleet.clone(), "laptop", "laptop#1");
         let peers = queue.peers(t0);
         assert_eq!(
             peers
@@ -1088,7 +1124,7 @@ mod tests {
         // A controller from before there was anything to say leaves the fleet
         // alone rather than emptying it: it cannot reach nothing at all, so an
         // empty list is silence, not news.
-        queue.poll(t0 + 1, Vec::new(), "");
+        queue.poll(t0 + 1, Vec::new(), "", "");
         assert_eq!(queue.peers(t0 + 1).len(), 2);
 
         // A second dashboard watching the same machine adds what only it can
@@ -1109,6 +1145,7 @@ mod tests {
                 },
             ],
             "desk",
+            "desk#2",
         );
         let peers = queue.peers(t0 + 2);
         let named = |id: &str| {
@@ -1123,7 +1160,8 @@ mod tests {
         assert_eq!(named("gpu").via, "desk");
         assert!(named("seed").own);
 
-        // A controller that stopped coming round stops being a way anywhere.
+        // A controller that stopped coming round stops being a way anywhere,
+        // and the one still coming round is only a way to what it still names.
         let later = t0 + ATTACHED_MS + 1;
         queue.poll(
             later,
@@ -1133,6 +1171,7 @@ mod tests {
                 ..Default::default()
             }],
             "desk",
+            "desk#2",
         );
         assert_eq!(
             queue
@@ -1167,17 +1206,25 @@ mod tests {
             peer("mac", true),
             peer("seed", false),
         ];
-        queue.poll(t0, desk.clone(), "desk");
-        queue.poll(t0, laptop.clone(), "laptop");
+        queue.poll(t0, desk.clone(), "desk", "desk#1");
+        queue.poll(t0, laptop.clone(), "laptop", "laptop#1");
 
         let far = queue
             .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
             .unwrap();
         // The dashboard with no route there is offered nothing however often
         // it asks, and asking does not spend the job.
-        assert!(queue.poll(t0 + 1, desk.clone(), "desk").is_empty());
-        assert!(queue.poll(t0 + 2, desk.clone(), "desk").is_empty());
-        let jobs = queue.poll(t0 + 3, laptop.clone(), "laptop");
+        assert!(
+            queue
+                .poll(t0 + 1, desk.clone(), "desk", "desk#1")
+                .is_empty()
+        );
+        assert!(
+            queue
+                .poll(t0 + 2, desk.clone(), "desk", "desk#1")
+                .is_empty()
+        );
+        let jobs = queue.poll(t0 + 3, laptop.clone(), "laptop", "laptop#1");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, far);
 
@@ -1191,7 +1238,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             queue
-                .poll(t0 + 5, desk.clone(), "desk")
+                .poll(t0 + 5, desk.clone(), "desk", "desk#1")
                 .into_iter()
                 .map(|job| job.id)
                 .collect::<Vec<_>>(),
@@ -1204,9 +1251,81 @@ mod tests {
         let far = queue
             .submit("read_screen", r#"{"machine":"seed"}"#, "", t0 + 6)
             .unwrap();
-        let jobs = queue.poll(t0 + 7, Vec::new(), "");
+        let jobs = queue.poll(t0 + 7, Vec::new(), "", "");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, far);
+    }
+
+    /// Two controllers on one host are two routes, not one. Kept under the
+    /// host they came from, the second one's fleet overwrote the first one's,
+    /// and a call aimed at a machine only the first reaches was then refused
+    /// outright — the queue believed that host carried whatever the last poll
+    /// happened to say. Each says who it is now, and the host is only the way
+    /// back to it.
+    #[test]
+    fn two_controllers_on_one_host_do_not_stand_in_for_each_other() {
+        let mut queue = RelayQueue::default();
+        let t0 = 9_000_000;
+        let peer = |id: &str, own: bool| RelayPeer {
+            id: id.into(),
+            label: id.into(),
+            own,
+            via: String::new(),
+        };
+        // One dashboard on this host reaches `seed`, the other reaches `gpu`,
+        // and both call the host they run on `desk`.
+        let first = vec![peer("desk", true), peer("seed", false)];
+        let second = vec![peer("desk", true), peer("gpu", false)];
+        queue.poll(t0, first.clone(), "desk", "desk#1");
+        queue.poll(t0, second.clone(), "desk", "desk#2");
+
+        // Both machines are still reachable: the later poll did not take the
+        // earlier one's fleet off the board.
+        let far = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
+            .unwrap();
+        let other = queue
+            .submit("read_screen", r#"{"machine":"gpu"}"#, "", t0)
+            .unwrap();
+
+        // And each job goes to the one that can run it, however often the
+        // other asks.
+        let jobs = queue.poll(t0 + 1, second.clone(), "desk", "desk#2");
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            [other.as_str()]
+        );
+        let jobs = queue.poll(t0 + 2, first.clone(), "desk", "desk#1");
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            [far.as_str()]
+        );
+
+        // A controller too old to say who it is still keys by its host, which
+        // is what it always did — it and any other silent one on that host
+        // share the entry, and nothing about the two named ones moves.
+        queue.poll(t0 + 3, vec![peer("desk", true)], "desk", "");
+        assert_eq!(
+            queue
+                .reaches
+                .iter()
+                .map(|reach| reach.key())
+                .collect::<Vec<_>>(),
+            ["desk#1", "desk#2", "desk"]
+        );
+        let far = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", t0 + 4)
+            .unwrap();
+        assert!(
+            queue
+                .poll(t0 + 5, vec![peer("desk", true)], "desk", "")
+                .is_empty()
+        );
+        let jobs = queue.poll(t0 + 6, first.clone(), "desk", "desk#1");
+        assert_eq!(
+            jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            [far.as_str()]
+        );
     }
 
     /// A machine nothing here can reach is news the agent gets on the call it
@@ -1222,7 +1341,7 @@ mod tests {
             label: id.into(),
             ..Default::default()
         };
-        queue.poll(t0, vec![peer("desk"), peer("mac")], "desk");
+        queue.poll(t0, vec![peer("desk"), peer("mac")], "desk", "desk#1");
 
         let error = queue
             .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
@@ -1249,6 +1368,7 @@ mod tests {
             t0,
             vec![peer("laptop"), peer("mac"), peer("seed")],
             "laptop",
+            "laptop#1",
         );
         assert!(
             queue
@@ -1259,7 +1379,7 @@ mod tests {
         // Then it walks off, and the route goes with it: the call is refused
         // again rather than parked against a dashboard that is not there.
         let later = t0 + ATTACHED_MS + 1;
-        queue.poll(later, vec![peer("desk"), peer("mac")], "desk");
+        queue.poll(later, vec![peer("desk"), peer("mac")], "desk", "desk#1");
         let error = queue
             .submit("read_screen", r#"{"machine":"seed"}"#, "", later)
             .unwrap_err()
@@ -1268,7 +1388,7 @@ mod tests {
 
         // Nothing to check against is not grounds for refusing anything.
         let mut old = RelayQueue::default();
-        old.poll(t0, Vec::new(), "");
+        old.poll(t0, Vec::new(), "", "");
         assert!(
             old.submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
                 .is_ok()
@@ -1334,6 +1454,7 @@ mod tests {
         assert_eq!(
             bare,
             DaemonRequest::RelayPoll {
+                who: String::new(),
                 peers: Vec::new(),
                 via: String::new(),
             }
@@ -1344,9 +1465,9 @@ mod tests {
     fn a_controller_that_walks_off_mid_errand_does_not_strand_the_asker() {
         let mut queue = RelayQueue::default();
         let t0 = 3_000_000;
-        queue.poll(t0, Vec::new(), "");
+        queue.poll(t0, Vec::new(), "", "");
         let id = queue.submit("read_conversation", "{}", "", t0).unwrap();
-        queue.poll(t0, Vec::new(), "");
+        queue.poll(t0, Vec::new(), "", "");
         // The controller took it and never came back.
         assert!(!queue.result(&id, t0 + EXPIRY_MS - 1).unwrap().done);
         let error = queue.result(&id, t0 + EXPIRY_MS).unwrap_err();

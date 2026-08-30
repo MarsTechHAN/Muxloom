@@ -408,15 +408,27 @@ pub enum DaemonRequest {
     /// is there at all, and the peer list is the only way it ever learns that
     /// another machine exists — it never looks for one itself.
     ///
-    /// Both fields are additions: a daemon from before them reads this as the
+    /// Every field is an addition: a daemon from before them reads this as the
     /// bare ask it always was, and simply goes on knowing only itself.
     RelayPoll {
         #[serde(default)]
         peers: Vec<RelayPeer>,
         /// What the controller calls itself, for saying which way a machine is
-        /// reached.
+        /// reached. Two controllers on one host say the same thing here, and
+        /// should: it is the name of the way, not of the traveller.
         #[serde(default)]
         via: String,
+        /// Which controller this is, as distinct from what it is called.
+        ///
+        /// A daemon keeps what each controller reaches under its own name, so
+        /// that one of them naming its fleet does not erase another's. `via` is
+        /// a host, and two controllers on one host share it — so keyed by
+        /// `via`, the second one to come round overwrites the first, and every
+        /// machine only the first could reach stops being reachable at all.
+        /// Empty from a controller too old to say, which is then keyed the way
+        /// it always was.
+        #[serde(default)]
+        who: String,
     },
     /// A controller handing back what a job produced.
     RelayComplete {

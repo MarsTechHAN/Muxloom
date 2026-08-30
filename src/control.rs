@@ -6996,6 +6996,7 @@ mod tests {
                 let first = ask(
                     &controller,
                     &DaemonRequest::RelayPoll {
+                        who: String::new(),
                         peers: Vec::new(),
                         via: String::new(),
                     },
@@ -7010,6 +7011,7 @@ mod tests {
                     if let DaemonResponse::RelayWork { jobs, .. } = ask(
                         &controller,
                         &DaemonRequest::RelayPoll {
+                            who: String::new(),
                             peers: Vec::new(),
                             via: String::new(),
                         },
@@ -7120,6 +7122,7 @@ mod tests {
             // A controller comes round and says where it can reach, which is
             // the only way this daemon ever learns another machine exists.
             let poll = DaemonRequest::RelayPoll {
+                who: String::new(),
                 peers: vec![
                     crate::relay::RelayPeer {
                         id: "seed".into(),
