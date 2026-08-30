@@ -468,7 +468,10 @@ impl BridgeConnection {
             );
         }
         let executable = if configured_command == "muxloomd" {
-            local_companion_command()
+            local_companion()
+                .map_err(|places| anyhow!(no_local_companion(&places)))?
+                .to_string_lossy()
+                .into_owned()
         } else {
             configured_command.into()
         };
@@ -1338,24 +1341,117 @@ fn spawn_heartbeat(state: Weak<ConnectionState>) {
     });
 }
 
-fn local_companion_command() -> String {
-    let executable_name = format!("muxloomd{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(current) = std::env::current_exe()
-        && let Some(parent) = current.parent()
-    {
-        for candidate in [
-            parent.join(&executable_name),
-            parent.parent().map_or_else(
-                || parent.join(&executable_name),
-                |root| root.join(&executable_name),
-            ),
-        ] {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
+/// Every place a `muxloomd` for this controller may be, in the order it is
+/// looked for. Pure, so the search can be described without running it.
+///
+/// The layouts, in the order a running controller is most likely to have come
+/// out of one: beside the controller, which is how an installed pair sits and
+/// how a cargo profile directory holds both; one level up, which is the
+/// bundle layouts; the sibling profile of the same cargo `target`, because a
+/// controller built in debug and a companion built in release are still the
+/// same tree; and finally the two roots muxloom installs a companion into,
+/// which is the same list the remote side already looks through
+/// (`Runtime::register_target_agents`). `PATH` is asked last and separately —
+/// it is the only entry that is not a path we can name in advance.
+fn local_companion_places(
+    current_exe: Option<&Path>,
+    home: Option<&Path>,
+    data_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let name = companion_name();
+    let mut places: Vec<PathBuf> = Vec::new();
+    let mut remember = |directory: PathBuf| {
+        let candidate = directory.join(&name);
+        if !places.contains(&candidate) {
+            places.push(candidate);
+        }
+    };
+    if let Some(directory) = current_exe.and_then(Path::parent) {
+        remember(directory.to_path_buf());
+        if let Some(up) = directory.parent() {
+            remember(up.to_path_buf());
+        }
+        // A cargo tree: `target/<profile>` and `target/<triple>/<profile>` both
+        // hang off a directory called `target`, and the profile beside the one
+        // this controller was built in is the companion a person most often
+        // has lying about.
+        if let Some(target) = directory
+            .ancestors()
+            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("target")))
+        {
+            for profile in ["debug", "release"] {
+                remember(target.join(profile));
             }
         }
     }
-    executable_name
+    let data_home = data_home
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|home| home.join(".local/share")));
+    if let Some(data_home) = data_home {
+        remember(data_home.join("muxloom/bin"));
+    }
+    if let Some(home) = home {
+        remember(home.join(".local/bin"));
+    }
+    places
+}
+
+fn companion_name() -> String {
+    format!("muxloomd{}", env::consts::EXE_SUFFIX)
+}
+
+/// The companion this controller should run, or every place that was looked in
+/// without finding one.
+///
+/// A controller that is built rather than installed used to fall off the end of
+/// this search onto the bare name `muxloomd`, and a `PATH` without one turned
+/// that into an `ENOENT` naming nothing anybody could act on — while every
+/// session call on this machine goes through the bridge, so the machine simply
+/// stopped existing to the fleet. Ending in a list of places is what makes the
+/// failure answerable.
+fn local_companion_in(
+    places: Vec<PathBuf>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, Vec<PathBuf>> {
+    if let Some(found) = places.iter().find(|candidate| candidate.is_file()) {
+        return Ok(found.clone());
+    }
+    // `PATH` last, and resolved to the path it was found at rather than left as
+    // a bare name: the difference is whether the next error can say where it
+    // looked.
+    let name = companion_name();
+    let found = path_var.and_then(|path| {
+        env::split_paths(path)
+            .map(|directory| directory.join(&name))
+            .find(|candidate| candidate.is_file())
+    });
+    found.ok_or(places)
+}
+
+/// The search, run against this process's own environment.
+fn local_companion() -> Result<PathBuf, Vec<PathBuf>> {
+    let exe = env::current_exe().ok();
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let places = local_companion_places(exe.as_deref(), home.as_deref(), data_home.as_deref());
+    local_companion_in(places, env::var_os("PATH").as_deref())
+}
+
+/// What a controller with no companion says, naming every place it looked.
+fn no_local_companion(places: &[PathBuf]) -> String {
+    let looked = places
+        .iter()
+        .map(|place| place.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "this machine has no muxloomd to run its sessions. Looked in {looked}, and on PATH. \
+         Everything about a session — listing, launching, typing, reading a screen — goes \
+         through it, so until one is there this machine is unreachable to the fleet. A \
+         controller built from the workspace wants `cargo build --bin muxloomd`, which puts \
+         one beside it; an installed one wants muxloom installed whole, which puts both in \
+         the same place."
+    )
 }
 
 const BOOTSTRAP_MARKER: &str = "__MUXLOOM_BOOTSTRAP__";
@@ -3270,5 +3366,76 @@ mod tests {
         assert_eq!(updates.first().unwrap().completed, 0);
         assert_eq!(updates.last().unwrap().completed, contents.len() as u64);
         assert_eq!(updates.last().unwrap().total, Some(contents.len() as u64));
+    }
+
+    /// A controller built in one cargo profile must find the companion built
+    /// in the other, and a controller that finds none anywhere must say where
+    /// it looked. The old search knew two directories and then handed the bare
+    /// name to `PATH`, so a built controller on a machine with no installed
+    /// muxloomd got `No such file or directory` — and with every session call
+    /// going through the bridge, that machine left the fleet.
+    #[test]
+    fn a_missing_companion_names_every_place_it_was_looked_for() {
+        let root = env::temp_dir().join(format!(
+            "muxloom-companion-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let workspace = root.join("workspace");
+        let debug = workspace.join("target/debug");
+        let release = workspace.join("target/release");
+        let home = root.join("home");
+        fs::create_dir_all(&debug).unwrap();
+        fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let controller = debug.join(format!("muxloom{}", env::consts::EXE_SUFFIX));
+        fs::write(&controller, b"controller").unwrap();
+        let name = companion_name();
+        let look = || {
+            local_companion_in(
+                local_companion_places(Some(&controller), Some(&home), None),
+                Some(std::ffi::OsStr::new("")),
+            )
+        };
+
+        // Nothing anywhere: the answer is the list of places, and it names the
+        // sibling profile and both install roots rather than only the two
+        // directories the old search knew.
+        let places = look().unwrap_err();
+        assert!(places.contains(&debug.join(&name)));
+        assert!(places.contains(&release.join(&name)));
+        assert!(places.contains(&home.join(".local/share/muxloom/bin").join(&name)));
+        assert!(places.contains(&home.join(".local/bin").join(&name)));
+        let said = no_local_companion(&places);
+        assert!(said.contains(&release.join(&name).display().to_string()));
+        assert!(said.contains("PATH"));
+        assert!(!said.contains("No such file"));
+
+        // A companion built in the other profile is the same tree's companion.
+        fs::write(release.join(&name), b"companion").unwrap();
+        assert_eq!(look().unwrap(), release.join(&name));
+
+        // One beside the controller outranks it.
+        fs::write(debug.join(&name), b"companion").unwrap();
+        assert_eq!(look().unwrap(), debug.join(&name));
+
+        // And with nothing on disk, a `muxloomd` on PATH is still taken — but
+        // as the path it was found at, so a later failure can name it.
+        fs::remove_file(debug.join(&name)).unwrap();
+        fs::remove_file(release.join(&name)).unwrap();
+        let on_path = home.join(".local/bin");
+        fs::write(on_path.join(&name), b"companion").unwrap();
+        assert_eq!(
+            local_companion_in(
+                local_companion_places(Some(&controller), None, None),
+                Some(on_path.as_os_str()),
+            )
+            .unwrap(),
+            on_path.join(&name)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
