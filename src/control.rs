@@ -1246,6 +1246,33 @@ fn screen_tail(screen: &str) -> String {
     lines[lines.len().saturating_sub(WAIT_TAIL_LINES)..].join("\n")
 }
 
+/// Find the session a wait is watching, where a wait needs it looked for.
+///
+/// A wait polls this every second or so for up to a minute, and what it waits
+/// on is a session that is running - so that is the only list the rounds in
+/// the middle read. Asking for the archive as well carried a record per
+/// conversation the machine has ever held, sixty times over, to find one id.
+///
+/// The archive is still asked once, on the round that ends the loop: nothing
+/// running holds that id, so the wait is over either way, and the archive is
+/// the only place that can still say what the session was. An answer that
+/// could not name what it had been waiting on would be a worse answer.
+fn waited_session(
+    session_id: &str,
+    running: impl FnOnce() -> Result<Vec<DaemonSession>>,
+    filed: impl FnOnce() -> Result<Vec<DaemonSession>>,
+) -> Result<Option<DaemonSession>> {
+    if let Some(session) = running()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+    {
+        return Ok(Some(session));
+    }
+    Ok(filed()?
+        .into_iter()
+        .find(|session| session.id == session_id))
+}
+
 /// Poll a session until it reaches the state the caller is waiting for.
 ///
 /// Both surfaces share this loop, and both drive it from the adapter side:
@@ -3312,26 +3339,11 @@ impl ControllerControl {
             arguments,
             &target.id,
             || {
-                // A wait polls this every second or so for up to a minute, and
-                // what it waits for is a session that is running: asking for
-                // the machine's archive on every one of those rounds carried a
-                // record per conversation ever held there, sixty times, to
-                // find one id.
-                if let Some(running) = pool
-                    .list_live_sessions(&target)?
-                    .into_iter()
-                    .find(|session| session.id == session_id)
-                {
-                    return Ok(Some(running));
-                }
-                // Nothing running holds that id, so the wait is over either
-                // way - but the archive is the only place that can still say
-                // what the session was, and the answer names what it waited
-                // on. One look, on the round that ends the loop.
-                Ok(pool
-                    .list_sessions(&target)?
-                    .into_iter()
-                    .find(|session| session.id == session_id))
+                waited_session(
+                    &session_id,
+                    || pool.list_live_sessions(&target),
+                    || pool.list_sessions(&target),
+                )
             },
             || {
                 let page =
@@ -4005,7 +4017,7 @@ mod daemon_surface {
         optional_usize, own_powers, plain_screen, pretty, preview_text, required_str, screen_page,
         send_channel, session_env, session_json, session_kind, session_name_now, shell_report,
         stamp_powers, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
-        trigger_json, trigger_spec, wait_loop, written_to,
+        trigger_json, trigger_spec, wait_loop, waited_session, written_to,
     };
     use crate::{
         channel::ChannelSet,
@@ -4204,12 +4216,9 @@ mod daemon_surface {
             wait_loop(
                 arguments,
                 LOCAL_TARGET_ID,
-                || {
-                    Ok(self
-                        .sessions()?
-                        .into_iter()
-                        .find(|session| session.id == session_id))
-                },
+                // The same round the controller's wait makes, and this is the
+                // copy every agent living on the machine calls.
+                || waited_session(&session_id, || self.live_sessions(), || self.sessions()),
                 || {
                     let (text, ..) = self.screen_rows(&session_id, 0, WAIT_SCREEN_LINES)?;
                     Ok(plain_screen(&text))
@@ -5087,6 +5096,40 @@ mod tests {
             resumed_from: None,
             resumed_to: None,
         }
+    }
+
+    #[test]
+    fn a_wait_reads_the_archive_only_on_the_round_that_ends_it() {
+        let filed = std::cell::Cell::new(0usize);
+        let archive = || {
+            filed.set(filed.get() + 1);
+            let mut ended = probe_session("over", false, false);
+            ended.dead = true;
+            ended.archived = true;
+            Ok(vec![ended])
+        };
+
+        // The rounds in the middle: the session is running, and the machine's
+        // whole history of conversations is not what says so. Sixty of these
+        // go by in one wait.
+        let running = waited_session(
+            "runs",
+            || Ok(vec![probe_session("runs", true, false)]),
+            archive,
+        )
+        .unwrap();
+        assert_eq!(running.map(|session| session.id).as_deref(), Some("runs"));
+        assert_eq!(
+            filed.get(),
+            0,
+            "a running session was looked up in the archive"
+        );
+
+        // The round that ends it: nothing running holds the id, and the answer
+        // still has to be able to say what the wait had been waiting on.
+        let over = waited_session("over", || Ok(Vec::new()), archive).unwrap();
+        assert_eq!(over.map(|session| session.id).as_deref(), Some("over"));
+        assert_eq!(filed.get(), 1);
     }
 
     #[test]
