@@ -635,12 +635,15 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         items.push(ListItem::new(lines));
     }
     // Machines this dashboard only knows about: some other controller told a
-    // daemon here that it can reach them. They carry no entry in `rows`, so
-    // the cursor steps over them and a click lands on nothing — there is
-    // nothing here to enable, and no session to start over a route this
-    // muxloom does not have. Saying they exist is the whole of the offer.
-    for peer in &app.forwarded {
-        let name_lines = wrap_display(&peer.label, name_width);
+    // daemon here that it can reach them. Selecting one lists its agents and
+    // shows their screens, fetched by leaving errands on the daemon that named
+    // it — looking, which is all a relay carries. There is still nothing to
+    // enable and no session to start: the route belongs to whoever is named on
+    // the row, and starting or typing into something over there is that
+    // machine's own agents' to do.
+    for (index, forwarded) in app.forwarded.iter().enumerate() {
+        let peer = &forwarded.peer;
+        let name_lines = wrap_display(peer.display(), name_width);
         let first_name = name_lines.first().map(String::as_str).unwrap_or("");
         let mut lines = vec![Line::from(vec![
             Span::styled("» ", Style::default().fg(Color::Cyan)),
@@ -655,14 +658,18 @@ fn draw_machines(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Style::default().fg(MUTED),
             ));
         }
+        let looking = app.forwarded_pending.as_deref() == Some(peer.id.as_str());
         lines.push(Line::styled(
-            if peer.via.is_empty() {
+            if looking {
+                "    looking...".to_string()
+            } else if peer.via.is_empty() {
                 "    via another muxloom".to_string()
             } else {
                 format!("    via {}", truncate(&peer.via, name_width))
             },
             Style::default().fg(MUTED),
         ));
+        rows.push((MachineRow::Forwarded(index), lines.len() as u16));
         items.push(ListItem::new(lines));
     }
     // Trails the rows it explains, and carries no entry in `rows`, so a click
@@ -1092,6 +1099,14 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_file_watch_panel(frame, app, area);
         return;
     }
+    // A machine only another controller reaches has no terminal to attach to:
+    // the relay carries one question and one answer, never a stream. What it
+    // shows is the last screen that came back, refetched while it is watched.
+    if app.forwarded_in_view().is_some() {
+        app.terminal_back = None;
+        draw_forwarded_screen(frame, app, area);
+        return;
+    }
     // Take the emulator's own scrollback position before anything reads
     // `history_offset`, so the title and the rows agree on where the view sits.
     app.sync_terminal_scrollback();
@@ -1211,6 +1226,93 @@ fn draw_terminal_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let paragraph = Paragraph::new(history).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
     highlight_terminal_selection(frame, inner, app.terminal_selection);
+}
+
+/// The pane for a machine this muxloom has no route to, borrowed from the
+/// controller that has one.
+///
+/// It says so in the title, because the difference matters to whoever is
+/// reading: this is a photograph taken a moment ago and taken again every few
+/// seconds, not a terminal. Nothing typed here goes anywhere. Work on that
+/// machine is the job of the agents living on it — message one.
+fn draw_forwarded_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(peer) = app.forwarded_in_view() else {
+        return;
+    };
+    let machine = peer.peer.display().to_string();
+    let via = peer.peer.via.clone();
+    let selected = app.selected_session().cloned();
+    let title = match &selected {
+        Some(session) => format!(" {machine} / {} / snapshot via {via} ", session.kind),
+        None => format!(" {machine} - reached through {via} "),
+    };
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::raw(title.trim().to_string()),
+            Span::raw(" "),
+        ]))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.focus == Focus::Recap {
+            ACCENT
+        } else {
+            Color::DarkGray
+        }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.resize_agent_viewport(inner.width, inner.height);
+
+    let waiting = |what: &str| {
+        Text::from(vec![Line::from(Span::styled(
+            what.to_string(),
+            Style::default().fg(MUTED),
+        ))])
+    };
+    let body = match &selected {
+        Some(session) => match &app.forwarded_screen {
+            Some((id, screen)) if id == &session.id => ansi_history_text(screen),
+            _ => waiting("Asking another muxloom for this screen..."),
+        },
+        None => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!("{machine} is not a machine this muxloom can reach."),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!("Another controller, on {via}, is looking at it for you."),
+                    Style::default().fg(MUTED),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    "Pick one of its agents to see what is on its screen. There is no",
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    "attaching and no typing over a relay: to get something done there,",
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    "message one of its agents.",
+                    Style::default().fg(MUTED),
+                )),
+            ];
+            if let Some(error) = &app.forwarded_error {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            Text::from(lines)
+        }
+    };
+    let height = body.height().min(u16::MAX as usize) as u16;
+    let scroll = if selected.is_some() {
+        height.saturating_sub(inner.height)
+    } else {
+        0
+    };
+    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), inner);
 }
 
 fn highlight_terminal_selection(
@@ -5971,7 +6073,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_only_another_muxloom_reaches_is_shown_but_not_offered() {
+    fn a_machine_only_another_muxloom_reaches_is_shown_and_can_be_looked_at() {
         let config = Config::default();
         let worker = Worker::start(Runtime::new(&config));
         let mut state = State::default();
@@ -5984,11 +6086,14 @@ mod tests {
             vec![Target::local()],
             worker,
         );
-        app.forwarded = vec![crate::relay::RelayPeer {
-            id: "gpu".into(),
-            label: "gpu".into(),
-            via: "desk".into(),
-            own: false,
+        app.forwarded = vec![crate::relay::Forwarded {
+            peer: crate::relay::RelayPeer {
+                id: "gpu".into(),
+                label: "gpu".into(),
+                via: "desk".into(),
+                own: false,
+            },
+            through: "local".into(),
         }];
 
         let backend = TestBackend::new(40, 10);
@@ -6009,8 +6114,9 @@ mod tests {
         assert!(screen.contains("» "), "{screen}");
         assert!(screen.contains("gpu"), "{screen}");
         assert!(screen.contains("via desk"), "{screen}");
-        // And it is not a row: nothing selects it, so nothing offers to
-        // enable it or start a session on it over a route muxloom has not got.
+        // It is a row of its own — the cursor lands on it and its agents can be
+        // listed — but never a `Machine`, which is what enabling and starting
+        // sessions are keyed on. There is no route here to do either over.
         assert!(
             app.machine_rows
                 .iter()
@@ -6018,7 +6124,12 @@ mod tests {
             "{:?}",
             app.machine_rows
         );
-        assert_eq!(app.machine_rows.len(), 2);
+        assert_eq!(
+            app.machine_rows.last().map(|(row, _)| *row),
+            Some(MachineRow::Forwarded(0)),
+            "{:?}",
+            app.machine_rows
+        );
     }
 
     #[test]

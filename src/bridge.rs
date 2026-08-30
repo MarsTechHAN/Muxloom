@@ -24,7 +24,7 @@ use crate::{
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
-    relay::{RELAY_CAPABILITY, RelayJob, RelayPeer},
+    relay::{RELAY_CAPABILITY, RelayAnswer, RelayJob, RelayPeer},
     talk::{
         DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
         TalkPage, TalkState, TalkVector,
@@ -941,6 +941,37 @@ impl BridgeConnection {
     /// Hand back what a job produced, successfully or not.
     pub fn relay_complete(&self, id: String, ok: bool, output: String) -> Result<()> {
         self.expect_ack(DaemonRequest::RelayComplete { id, ok, output })
+    }
+
+    /// Leave an errand on this machine's queue for whichever controller can run
+    /// it. A dashboard uses this the same way an agent does, and for the same
+    /// reason: the machine it wants is one it has no route to, and this daemon
+    /// is where the controller that does have one comes round.
+    pub fn relay_submit(&self, tool: &str, arguments: &str, session: &str) -> Result<String> {
+        self.require_capability(RELAY_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::RelaySubmit {
+                tool: tool.to_string(),
+                arguments: arguments.to_string(),
+                session: session.to_string(),
+            })?
+            .response
+        {
+            DaemonResponse::RelayTicket { id } => Ok(id),
+            response => bail!("unexpected relay response: {response:?}"),
+        }
+    }
+
+    /// What came back for an errand, or that nothing has yet.
+    pub fn relay_result(&self, id: &str) -> Result<RelayAnswer> {
+        self.require_capability(RELAY_CAPABILITY)?;
+        match self
+            .request(DaemonRequest::RelayResult { id: id.to_string() })?
+            .response
+        {
+            DaemonResponse::Relayed { answer } => Ok(answer),
+            response => bail!("unexpected relay response: {response:?}"),
+        }
     }
 
     /// What channel set this machine holds and what its agents have said to
@@ -2351,6 +2382,21 @@ impl BridgePool {
     ) -> Result<()> {
         self.connection_for_target(target)?
             .relay_complete(id, ok, output)
+    }
+
+    pub fn relay_submit(
+        &self,
+        target: &Target,
+        tool: &str,
+        arguments: &str,
+        session: &str,
+    ) -> Result<String> {
+        self.connection_for_target(target)?
+            .relay_submit(tool, arguments, session)
+    }
+
+    pub fn relay_result(&self, target: &Target, id: &str) -> Result<RelayAnswer> {
+        self.connection_for_target(target)?.relay_result(id)
     }
 
     pub fn channels_get(

@@ -27,6 +27,39 @@ use crate::{
     },
 };
 
+/// What a dashboard asks another controller to look at for it. Only looking:
+/// the relay carries reads freely, and everything that would change a machine
+/// belongs to the agents living on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Errand {
+    /// The agents on a machine this dashboard cannot reach.
+    Sessions,
+    /// What is on one of their screens.
+    Screen { session_id: String, lines: u16 },
+}
+
+impl Errand {
+    /// The tool call this errand is, as the controller's own tool surface
+    /// takes it.
+    fn call(&self, machine: &str) -> (&'static str, serde_json::Value) {
+        match self {
+            Self::Sessions => (
+                "list_sessions",
+                serde_json::json!({ "machine": machine, "include_archived": false }),
+            ),
+            Self::Screen { session_id, lines } => (
+                "read_screen",
+                serde_json::json!({
+                    "machine": machine,
+                    "session_id": session_id,
+                    "lines": lines,
+                    "raw": true,
+                }),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanRequest {
     pub target: Target,
@@ -203,6 +236,16 @@ pub enum Request {
         /// The errands are run through the same tool surface the MCP adapter
         /// serves, policy included, so the config travels with them.
         config: Box<Config>,
+    },
+    /// Borrow another controller's reach for one look, on behalf of the person
+    /// at this dashboard. The errand is left on `through` — the machine whose
+    /// daemon named the one being asked about, which is where the controller
+    /// that can reach it comes round — and this waits there for the answer.
+    RelayErrand {
+        through: Target,
+        /// The machine the answer is about, as that controller addresses it.
+        machine: String,
+        errand: Errand,
     },
     /// Say something on the board as the person at the keyboard. The draft goes
     /// to this machine's daemon like any other post; replication carries it from
@@ -438,8 +481,15 @@ pub enum Event {
     /// One round of errands finished.
     RelayPumped {
         /// Machines another controller told one of these daemons it could
-        /// reach, which this one cannot. Shown, never opened.
-        forwarded: Vec<crate::relay::RelayPeer>,
+        /// reach, which this one cannot, each with the daemon that named it.
+        forwarded: Vec<crate::relay::Forwarded>,
+    },
+    /// An errand this dashboard left for another controller came back.
+    RelayErranded {
+        machine: String,
+        errand: Errand,
+        /// The tool's own output, or why there was none.
+        result: Result<String, String>,
     },
     /// A message the human wrote is on the board, or could not be put there.
     TalkPosted {
@@ -1457,6 +1507,22 @@ impl Worker {
                         };
                         let _ = events.send(Event::RelayPumped { forwarded });
                     }
+                    Request::RelayErrand {
+                        through,
+                        machine,
+                        errand,
+                    } => {
+                        let result = run_errand(&runtime, &through, &machine, &errand)
+                            .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            debug::log("relay", format!("{machine}: errand failed ({error})"));
+                        }
+                        let _ = events.send(Event::RelayErranded {
+                            machine,
+                            errand,
+                            result,
+                        });
+                    }
                 });
             }
         });
@@ -1472,6 +1538,48 @@ impl Worker {
 /// How much of the board one round carries to the dashboard. The overlay shows
 /// a tail, not an archive: what does not fit was said before anyone opened it.
 const BOARD_PAGE: usize = 200;
+
+/// How long a dashboard waits on another controller's round before giving up.
+/// Two carriers' rounds have to line up — the daemon has to be polled, the job
+/// run, the answer written back — and a look at a machine three seconds away is
+/// still a look. Past this the person is told, rather than left watching a
+/// pane that says nothing.
+const ERRAND_WAIT: Duration = Duration::from_secs(20);
+const ERRAND_POLL: Duration = Duration::from_millis(120);
+
+/// Leave one look on a daemon's queue and wait there for whichever controller
+/// can reach the machine to run it.
+///
+/// This is exactly what an agent with no fleet of its own does (see
+/// `relay.rs`), for exactly the same reason: the machine is one this process
+/// has no route to, and the daemon is where the route comes round.
+fn run_errand(
+    runtime: &Runtime,
+    through: &Target,
+    machine: &str,
+    errand: &Errand,
+) -> anyhow::Result<String> {
+    let pool = runtime.bridge_pool();
+    let (tool, arguments) = errand.call(machine);
+    let id = pool.relay_submit(through, tool, &arguments.to_string(), "")?;
+    let deadline = Instant::now() + ERRAND_WAIT;
+    loop {
+        let answer = pool.relay_result(through, &id)?;
+        if answer.done {
+            if answer.ok {
+                return Ok(answer.output);
+            }
+            anyhow::bail!("{}", answer.output);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "no muxloom controller answered for {machine} within {} seconds",
+                ERRAND_WAIT.as_secs()
+            );
+        }
+        thread::sleep(ERRAND_POLL);
+    }
+}
 
 /// What the local board has said since the dashboard last looked.
 ///

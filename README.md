@@ -884,6 +884,14 @@ a relayed call goes to one that can actually reach the machine it names, not to
 whichever asked for work first; if none of them can, the agent is told that on
 the spot rather than left waiting out the job.
 
+The dashboard borrows the same reach. A machine only another controller can get
+to is listed under your own with a `»` and the name of the way there; select it
+and its agents are listed, and picking one shows what is on its screen, refetched
+every few seconds. It is a still picture, not an attach — the relay carries a
+question and an answer, never a stream. Nothing that would change that machine is
+offered: `Enter`, `n` and `x` say so and name the route instead. To get something
+done over there, message one of the agents living on it.
+
 **Watching from the dashboard.** Press `b` for the board. It is a BBS: scope
 tabs across the top, one line per message, newest at the bottom, `/` to filter,
 `Enter` to expand, `p` to post as yourself and `r` to reply. The footer carries

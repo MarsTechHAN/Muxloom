@@ -59,6 +59,10 @@ pub enum LaunchField {
 pub enum MachineRow {
     Moderators,
     Machine(usize),
+    /// A machine only another controller can reach, indexed into `forwarded`.
+    /// It has no target of its own — nothing here has a route to it — so what
+    /// it shows is fetched by leaving errands on the daemon that named it.
+    Forwarded(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +823,12 @@ const TALK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// a small question down a connection that is already open, and a daemon with
 /// nothing waiting answers it with an empty list.
 const RELAY_PUMP_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the machine the cursor is on that this dashboard cannot reach is
+/// asked what it has. Slow, and deliberately: the answer is fetched by another
+/// person's controller on its own round, so the cost of looking is paid by
+/// somebody else's machine. Slow enough to be polite, fast enough that a screen
+/// is not obviously stale while you watch it.
+const FORWARDED_LOOK_INTERVAL: Duration = Duration::from_secs(3);
 /// How often a chat app is asked what the human said. Long enough not to be a
 /// nuisance to the platform, short enough that an answer feels like an answer.
 const INBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -1475,9 +1485,32 @@ pub struct App {
     pub targets: Vec<TargetStatus>,
     /// Machines this dashboard knows of but cannot reach: another controller
     /// told a daemon here that it can reach them, and the daemon repeated it.
-    /// Shown so the fleet does not look smaller than it is, and never more
-    /// than shown — the way there belongs to whoever is named on it.
-    pub forwarded: Vec<crate::relay::RelayPeer>,
+    /// Selecting one lists its agents by leaving an errand on the daemon that
+    /// named it, which is where the controller that does have a route comes
+    /// round. Looking is all that travels — see [`App::forwarded_sessions`].
+    pub forwarded: Vec<crate::relay::Forwarded>,
+    /// Which forwarded machine the cursor is on, by peer id rather than by
+    /// index: the list is rebuilt every relay round and a machine can drop out
+    /// of it mid-look.
+    pub selected_forwarded: Option<String>,
+    /// The forwarded machine an errand is out for, so the pane can say it is
+    /// asking rather than say nothing, and so two rounds do not both ask.
+    pub forwarded_pending: Option<String>,
+    /// When the selected forwarded machine's agents were last asked for. A
+    /// relayed look costs another controller's round, so it is on a slow timer
+    /// rather than on every scan.
+    forwarded_asked: Option<Instant>,
+    /// Why the last look at a forwarded machine came back empty, if it did.
+    pub forwarded_error: Option<String>,
+    /// The last screen fetched from a forwarded session, and whose it is. A
+    /// still picture: nothing streams over a relay, so it is refetched on the
+    /// same slow clock as the agent list.
+    pub forwarded_screen: Option<(String, String)>,
+    forwarded_screen_pending: Option<String>,
+    forwarded_screen_asked: Option<Instant>,
+    /// Which forwarded machine the flattened list looks at next. There is no
+    /// machine cursor to read there, so they take it in turns.
+    forwarded_turn: usize,
     /// The ways to reach the human who is not at this dashboard. Edited here,
     /// held here, and pushed to every machine on the talk round: an agent
     /// sends its own messages, so every machine needs the credentials.
@@ -1724,6 +1757,14 @@ impl App {
             state_path,
             targets: statuses,
             forwarded: Vec::new(),
+            selected_forwarded: None,
+            forwarded_pending: None,
+            forwarded_asked: None,
+            forwarded_error: None,
+            forwarded_screen: None,
+            forwarded_screen_pending: None,
+            forwarded_screen_asked: None,
+            forwarded_turn: 0,
             channels,
             channel_sync: crate::channel::ChannelRound::default(),
             channels_path,
@@ -2413,6 +2454,8 @@ impl App {
         self.maybe_backup_sync();
         self.maybe_talk_sync();
         self.maybe_relay_pump();
+        self.maybe_forwarded_look();
+        self.maybe_forwarded_screen();
         if !self.has_terminal_for_selected()
             && self
                 .terminal_retry_at
@@ -3824,6 +3867,9 @@ impl App {
         if self.state.flatten {
             return true;
         }
+        if let Some(peer) = self.selected_peer() {
+            return session.target_id == peer.peer.id;
+        }
         if self.showing_moderators() {
             return self.is_moderator_session(session);
         }
@@ -4207,6 +4253,12 @@ impl App {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        // An attach is a stream, and the relay is a question and an answer.
+        // The pane is already showing the last screen that came back; say that
+        // rather than opening an empty terminal that never fills.
+        if self.refuse_forwarded(&session.target_id, "attach") {
+            return;
+        }
         // Opening the session is how the user answers the prompt, so stop
         // reminding them about it the moment they step in.
         self.acknowledge_attention(&session.id);
@@ -5904,10 +5956,37 @@ impl App {
                         !self
                             .targets
                             .iter()
-                            .any(|status| status.target.id == peer.id)
+                            .any(|status| status.target.id == peer.peer.id)
                     })
                     .collect();
+                // A machine whose carrier stopped coming round is not a machine
+                // any more, and the agents last seen on it are a photograph of
+                // somewhere nobody can currently look.
+                let known: HashSet<&str> = self
+                    .targets
+                    .iter()
+                    .map(|status| status.target.id.as_str())
+                    .chain(self.forwarded.iter().map(|peer| peer.peer.id.as_str()))
+                    .collect();
+                let stale: Vec<String> = self
+                    .sessions
+                    .iter()
+                    .filter(|session| !known.contains(session.target_id.as_str()))
+                    .map(|session| session.id.clone())
+                    .collect();
+                self.sessions.retain(|session| !stale.contains(&session.id));
+                if self.selected_forwarded_index().is_none() {
+                    self.selected_forwarded = None;
+                }
+                if self.forwarded_turn >= self.forwarded.len() {
+                    self.forwarded_turn = 0;
+                }
             }
+            Event::RelayErranded {
+                machine,
+                errand,
+                result,
+            } => self.absorb_forwarded(machine, errand, result),
             Event::TalkPosted { result } => match *result {
                 Ok(message) => {
                     // It is on the board already; showing it now rather than on
@@ -6360,6 +6439,147 @@ impl App {
             targets,
             config: Box::new(self.config.clone()),
         });
+    }
+
+    /// Ask another controller what is on a forwarded machine, when nothing is
+    /// out and the last answer has gone stale.
+    ///
+    /// One machine per turn of a slow clock: every look costs somebody else's
+    /// round, and a dashboard that refreshed six machines it cannot reach every
+    /// two seconds would spend another person's controller on a pane nobody is
+    /// reading. Which machine depends on what is on screen — the one the pane
+    /// is showing, or, in the flattened list where there is no machine cursor
+    /// to read, each of them in turn so none of them sits stale forever.
+    fn maybe_forwarded_look(&mut self) {
+        if self.forwarded_pending.is_some() {
+            return;
+        }
+        let due = self
+            .forwarded_asked
+            .is_none_or(|at| at.elapsed() >= FORWARDED_LOOK_INTERVAL);
+        if !due {
+            return;
+        }
+        let peer = match self.forwarded_in_view() {
+            Some(peer) => peer,
+            None if self.state.flatten && !self.forwarded.is_empty() => {
+                self.forwarded_turn = (self.forwarded_turn + 1) % self.forwarded.len();
+                &self.forwarded[self.forwarded_turn]
+            }
+            None => return,
+        };
+        let machine = peer.peer.id.clone();
+        let Some(through) = self
+            .targets
+            .iter()
+            .find(|status| status.target.id == peer.through)
+            .map(|status| status.target.clone())
+        else {
+            // The daemon that named it is gone from this dashboard's own list.
+            // The next relay round will drop the machine with it.
+            return;
+        };
+        self.forwarded_asked = Some(Instant::now());
+        self.forwarded_pending = Some(machine.clone());
+        let _ = self.worker.requests.send(Request::RelayErrand {
+            through,
+            machine,
+            errand: crate::worker::Errand::Sessions,
+        });
+    }
+
+    /// Ask for the selected forwarded session's screen, on the same terms: one
+    /// at a time, and only while somebody is looking at it.
+    fn maybe_forwarded_screen(&mut self) {
+        if self.forwarded_screen_pending.is_some() {
+            return;
+        }
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        let Some(peer) = self.forwarded_machine(&session.target_id) else {
+            return;
+        };
+        let session = session.id;
+        let showing = self
+            .forwarded_screen
+            .as_ref()
+            .is_some_and(|(id, _)| id == &session);
+        let due = !showing
+            || self
+                .forwarded_screen_asked
+                .is_none_or(|at| at.elapsed() >= FORWARDED_LOOK_INTERVAL);
+        if !due {
+            return;
+        }
+        let machine = peer.peer.id.clone();
+        let Some(through) = self
+            .targets
+            .iter()
+            .find(|status| status.target.id == peer.through)
+            .map(|status| status.target.clone())
+        else {
+            return;
+        };
+        self.forwarded_screen_asked = Some(Instant::now());
+        self.forwarded_screen_pending = Some(session.clone());
+        let _ = self.worker.requests.send(Request::RelayErrand {
+            through,
+            machine,
+            errand: crate::worker::Errand::Screen {
+                session_id: session,
+                lines: self.agent_viewport_height.max(24),
+            },
+        });
+    }
+
+    /// What came back from a look at a machine only another controller can
+    /// reach. A machine the cursor has since left is still absorbed: it cost a
+    /// round trip, and it is what that machine looked like a moment ago.
+    fn absorb_forwarded(
+        &mut self,
+        machine: String,
+        errand: crate::worker::Errand,
+        result: Result<String, String>,
+    ) {
+        match errand {
+            crate::worker::Errand::Sessions => {
+                if self.forwarded_pending.as_deref() == Some(machine.as_str()) {
+                    self.forwarded_pending = None;
+                }
+                match result {
+                    Ok(body) => match forwarded_sessions(&machine, &body) {
+                        Ok(sessions) => {
+                            self.forwarded_error = None;
+                            self.sessions.retain(|session| session.target_id != machine);
+                            self.sessions.extend(sessions);
+                            self.apply_session_labels();
+                        }
+                        Err(error) => self.forwarded_error = Some(error),
+                    },
+                    Err(error) => self.forwarded_error = Some(short_error(&error)),
+                }
+            }
+            crate::worker::Errand::Screen { session_id, .. } => {
+                if self.forwarded_screen_pending.as_deref() == Some(session_id.as_str()) {
+                    self.forwarded_screen_pending = None;
+                }
+                // A screen that arrived after the cursor moved on is a picture
+                // of somewhere else, and drawing it in the pane would be a lie.
+                if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                self.forwarded_screen = Some((
+                    session_id,
+                    match result {
+                        Ok(body) => body,
+                        Err(error) => {
+                            format!("Could not read that screen: {}", short_error(&error))
+                        }
+                    },
+                ));
+            }
+        }
     }
 
     /// Take back what the round read out of the chats. The file is only
@@ -7014,10 +7234,16 @@ impl App {
                 .into_iter()
                 .map(MachineRow::Machine),
         );
+        // Below the machines this dashboard reaches, the ones it can only look
+        // at. They sort last because that is what they are: further away.
+        rows.extend((0..self.forwarded.len()).map(MachineRow::Forwarded));
         rows
     }
 
     pub fn selected_machine_row(&self) -> MachineRow {
+        if let Some(index) = self.selected_forwarded_index() {
+            return MachineRow::Forwarded(index);
+        }
         if self.moderators_selected {
             MachineRow::Moderators
         } else {
@@ -7025,12 +7251,90 @@ impl App {
         }
     }
 
+    /// Where the selected forwarded machine sits in the list right now, if it
+    /// is still in it. A machine drops out the moment the controller carrying
+    /// it stops coming round, and the cursor then falls back to a machine this
+    /// dashboard actually reaches.
+    pub fn selected_forwarded_index(&self) -> Option<usize> {
+        let id = self.selected_forwarded.as_deref()?;
+        self.forwarded.iter().position(|peer| peer.peer.id == id)
+    }
+
+    /// The forwarded machine the cursor is on, if any.
+    pub fn selected_peer(&self) -> Option<&crate::relay::Forwarded> {
+        self.selected_forwarded_index()
+            .and_then(|index| self.forwarded.get(index))
+    }
+
+    /// This machine, if it is one only another controller reaches.
+    ///
+    /// The relay carries looking and nothing else, so every key that would
+    /// change such a machine says so instead of half-doing it. The route back
+    /// is the same one a person has: message an agent living over there.
+    pub fn forwarded_machine(&self, target_id: &str) -> Option<&crate::relay::Forwarded> {
+        self.forwarded.iter().find(|far| far.peer.id == target_id)
+    }
+
+    /// The forwarded machine the pane is showing: the one the selected agent
+    /// lives on, or, with no agent selected, the one the cursor is on.
+    ///
+    /// The session comes first because the agent list can be flattened, and
+    /// then the machine cursor is not what the person is looking at.
+    pub fn forwarded_in_view(&self) -> Option<&crate::relay::Forwarded> {
+        match self.selected_session() {
+            Some(session) => self.forwarded_machine(&session.target_id),
+            None => self.selected_peer(),
+        }
+    }
+
+    /// Refuse an action on a forwarded machine, in the words of what was tried.
+    /// Returns whether it was refused.
+    fn refuse_forwarded(&mut self, target_id: &str, what: &str) -> bool {
+        let Some(far) = self.forwarded_machine(target_id) else {
+            return false;
+        };
+        self.status_message = format!(
+            "{} is reached through {}: muxloom can look, not {what}. Message an agent there instead",
+            far.peer.display(),
+            far.peer.via,
+        );
+        true
+    }
+
     /// Move the machine pane's cursor. The moderators row keeps `selected_target`
     /// on this machine rather than clearing it: a moderator runs here, so the
     /// file browser, the settings panel and a launch all still mean this
     /// machine while the row is highlighted.
     pub fn select_machine_row(&mut self, row: MachineRow) {
+        // Any row but a forwarded one puts the cursor back on a machine this
+        // dashboard reaches, so the file browser, the settings panel and a
+        // launch all mean that machine again.
+        if !matches!(row, MachineRow::Forwarded(_)) {
+            self.selected_forwarded = None;
+        }
         match row {
+            MachineRow::Forwarded(index) => {
+                let Some(peer) = self.forwarded.get(index) else {
+                    return;
+                };
+                let id = peer.peer.id.clone();
+                let changed = self.selected_forwarded.as_deref() != Some(id.as_str());
+                self.selected_forwarded = Some(id.clone());
+                self.moderators_selected = false;
+                if changed {
+                    // Whatever the last look brought back was another
+                    // machine's, and asking again is a round trip through
+                    // somebody else's controller: show what is known and let
+                    // the timer refresh it.
+                    self.forwarded_asked = None;
+                    self.forwarded_error = None;
+                    self.selected_session_id = self
+                        .selected_sessions_by_target
+                        .get(&id)
+                        .cloned()
+                        .filter(|session| self.sessions.iter().any(|it| &it.id == session));
+                }
+            }
             MachineRow::Machine(index) => {
                 let leaving_moderators = self.moderators_selected;
                 self.moderators_selected = false;
@@ -7801,6 +8105,17 @@ impl App {
         // agent starts the kind of agent that row holds.
         if self.showing_moderators() {
             self.open_moderator_launch();
+            return;
+        }
+        // The cursor is on a machine this dashboard has no route to. Falling
+        // through would open the launch form on some other machine entirely,
+        // which is the kind of quiet substitution nobody wants from a keystroke.
+        if let Some(far) = self.selected_peer() {
+            self.status_message = format!(
+                "{} is reached through {}: start an agent there by asking one that already runs on it",
+                far.peer.display(),
+                far.peer.via,
+            );
             return;
         }
         let Some(target) = self.launch_target() else {
@@ -11242,6 +11557,19 @@ impl App {
     }
 
     fn delete_session(&mut self, session_id: &str) {
+        let Some(target_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.target_id.clone())
+        else {
+            return;
+        };
+        // Closing something on a machine muxloom only hears about second hand
+        // is not muxloom's to do, and the relay would not carry it anyway.
+        if self.refuse_forwarded(&target_id, "close a session") {
+            return;
+        }
         let Some(session) = self
             .sessions
             .iter()
@@ -11477,10 +11805,16 @@ impl App {
                         self.last_machine_click = None;
                     }
                 }
-                // The moderators row has no checkbox to hit: it is not a
-                // machine and there is nothing about it to enable.
+                // Neither the moderators row nor a forwarded machine has a
+                // checkbox to hit: one is not a machine, and the other is one
+                // this dashboard has no route to enable or disable.
                 Some((MachineRow::Moderators, _)) => {
                     self.select_machine_row(MachineRow::Moderators);
+                    self.ensure_session_selection();
+                    self.last_machine_click = None;
+                }
+                Some((MachineRow::Forwarded(index), _)) => {
+                    self.select_machine_row(MachineRow::Forwarded(index));
                     self.ensure_session_selection();
                     self.last_machine_click = None;
                 }
@@ -12282,6 +12616,82 @@ fn short_error(error: &str) -> String {
         .filter(|character| !character.is_control())
         .take(120)
         .collect()
+}
+
+/// The agents on a machine only another controller can reach, read back out of
+/// what its `list_sessions` answered.
+///
+/// This crosses two processes as text, so it is read defensively: an entry that
+/// is not a session is skipped rather than fatal, and a run of them that names
+/// no session at all is the controller reporting it could not look either — the
+/// `error` it puts in place of the list is what the person needs to see.
+fn forwarded_sessions(machine: &str, body: &str) -> Result<Vec<AgentSession>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| short_error(&error.to_string()))?;
+    let entries = value.as_array().ok_or_else(|| {
+        "that machine answered with something that is not a session list".to_string()
+    })?;
+    let mut sessions = Vec::new();
+    let mut refused = None;
+    for entry in entries {
+        let Some(id) = entry.get("session_id").and_then(|it| it.as_str()) else {
+            if let Some(error) = entry.get("error").and_then(|it| it.as_str()) {
+                refused.get_or_insert_with(|| short_error(error));
+            }
+            continue;
+        };
+        let Some(kind) = entry
+            .get("kind")
+            .and_then(|it| it.as_str())
+            .and_then(|kind| kind.parse::<AgentKind>().ok())
+        else {
+            continue;
+        };
+        let text = |field: &str| {
+            entry
+                .get(field)
+                .and_then(|it| it.as_str())
+                .map(str::to_string)
+        };
+        let flag = |field: &str| {
+            entry
+                .get(field)
+                .and_then(|it| it.as_bool())
+                .unwrap_or(false)
+        };
+        sessions.push(AgentSession {
+            id: id.to_string(),
+            target_id: machine.to_string(),
+            kind,
+            path: text("path").unwrap_or_default(),
+            label: text("label").unwrap_or_default(),
+            created_at: entry
+                .get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            // Nothing across the relay says when a session was put down; the
+            // list asks for live ones anyway.
+            archived_at: None,
+            dead: flag("dead") || flag("archived"),
+            pid: entry
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .map(|pid| pid as u32),
+            working: flag("working"),
+            needs_attention: flag("needs_attention"),
+            attention_reason: text("attention_reason"),
+            recap: text("recap"),
+            title: text("title"),
+            // Resuming one is that machine's to do, so the thread it would be
+            // resumed from is not carried.
+            thread: None,
+            parent: text("parent"),
+        });
+    }
+    match refused {
+        Some(error) if sessions.is_empty() => Err(error),
+        _ => Ok(sessions),
+    }
 }
 
 fn sanitize_terminal_text(output: &str) -> String {
@@ -19852,6 +20262,187 @@ mod tests {
             matches!(receive_request(&requests), Request::RelayPump { .. }),
             "errands are asked for while the board round is still running"
         );
+    }
+
+    fn far_peer(id: &str, via: &str) -> crate::relay::Forwarded {
+        crate::relay::Forwarded {
+            peer: crate::relay::RelayPeer {
+                id: id.into(),
+                label: id.into(),
+                own: false,
+                via: via.into(),
+            },
+            through: LOCAL_TARGET_ID.into(),
+        }
+    }
+
+    /// The whole of request (s): a machine muxloom only hears about is a row
+    /// the cursor lands on, its agents are listed, and picking one shows what
+    /// is on its screen — each of them an errand left on the local daemon's
+    /// queue for the controller that does have a route there.
+    #[test]
+    fn a_machine_another_controller_carries_lists_its_agents_and_shows_a_screen() {
+        let (mut app, requests) = board_app();
+        app.handle_worker_event(Event::RelayPumped {
+            forwarded: vec![far_peer("gpu", "desk")],
+        });
+        // It is a row now, and the cursor can be put on it.
+        assert!(app.machine_column().contains(&MachineRow::Forwarded(0)));
+        app.select_machine_row(MachineRow::Forwarded(0));
+        assert_eq!(
+            app.selected_peer().map(|far| far.peer.id.as_str()),
+            Some("gpu")
+        );
+
+        // Looking at it asks whoever carries it, through the daemon that named
+        // it — not through the machine itself, which this muxloom cannot reach.
+        app.maybe_forwarded_look();
+        let Request::RelayErrand {
+            through,
+            machine,
+            errand,
+        } = receive_request(&requests)
+        else {
+            panic!("no look went out for the selected machine");
+        };
+        assert_eq!(through.id, LOCAL_TARGET_ID);
+        assert_eq!(machine, "gpu");
+        assert_eq!(errand, crate::worker::Errand::Sessions);
+        // One at a time: a look already out is not asked for again.
+        app.forwarded_asked = None;
+        app.maybe_forwarded_look();
+        assert!(
+            requests.try_recv().is_err(),
+            "a look already out was repeated"
+        );
+
+        app.handle_worker_event(Event::RelayErranded {
+            machine: "gpu".into(),
+            errand: crate::worker::Errand::Sessions,
+            result: Ok(serde_json::json!([{
+                "session_id": "gpu-codex-1",
+                "machine": "gpu",
+                "kind": "codex",
+                "path": "/work",
+                "label": "trainer",
+                "working": true,
+            }])
+            .to_string()),
+        });
+        assert_eq!(
+            app.visible_sessions()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpu-codex-1"],
+            "the far machine's agents belong to its row"
+        );
+
+        // And its screen is a second errand, asked for once the agent is picked.
+        app.ensure_session_selection();
+        app.maybe_forwarded_screen();
+        let Request::RelayErrand { errand, .. } = receive_request(&requests) else {
+            panic!("no screen was asked for");
+        };
+        assert!(matches!(
+            &errand,
+            crate::worker::Errand::Screen { session_id, .. } if session_id == "gpu-codex-1"
+        ));
+        app.handle_worker_event(Event::RelayErranded {
+            machine: "gpu".into(),
+            errand,
+            result: Ok("training step 900".into()),
+        });
+        assert_eq!(
+            app.forwarded_screen
+                .as_ref()
+                .map(|(id, body)| (id.as_str(), body.as_str())),
+            Some(("gpu-codex-1", "training step 900"))
+        );
+
+        // When the controller carrying it stops coming round, the machine and
+        // its agents go with it: nobody can look there any more, and a list
+        // left on screen would be a photograph passed off as a window.
+        app.handle_worker_event(Event::RelayPumped {
+            forwarded: Vec::new(),
+        });
+        assert!(app.forwarded.is_empty());
+        assert!(app.selected_forwarded.is_none());
+        assert!(app.sessions.is_empty(), "{:?}", app.sessions);
+    }
+
+    /// Looking is the whole offer. Every key that would change the far machine
+    /// says so and names the way there, rather than doing nothing or — worse —
+    /// quietly doing it to whichever machine this dashboard had selected.
+    #[test]
+    fn nothing_that_would_change_a_forwarded_machine_is_offered() {
+        let (mut app, requests) = board_app();
+        app.handle_worker_event(Event::RelayPumped {
+            forwarded: vec![far_peer("gpu", "desk")],
+        });
+        app.select_machine_row(MachineRow::Forwarded(0));
+        app.handle_worker_event(Event::RelayErranded {
+            machine: "gpu".into(),
+            errand: crate::worker::Errand::Sessions,
+            result: Ok(serde_json::json!([{
+                "session_id": "gpu-codex-1",
+                "kind": "codex",
+                "path": "/work",
+            }])
+            .to_string()),
+        });
+        app.ensure_session_selection();
+        assert_eq!(app.selected_session_id.as_deref(), Some("gpu-codex-1"));
+
+        app.activate_terminal();
+        assert!(
+            app.status_message.contains("desk"),
+            "{}",
+            app.status_message
+        );
+        assert!(
+            app.terminal_session_id.is_none(),
+            "an attach was started anyway"
+        );
+
+        app.open_launch();
+        assert!(
+            app.modal.is_none(),
+            "a launch form opened for a machine with no route"
+        );
+        assert!(app.status_message.contains("gpu"), "{}", app.status_message);
+
+        app.delete_session("gpu-codex-1");
+        assert!(app.status_message.contains("gpu"), "{}", app.status_message);
+        assert!(
+            requests.try_recv().is_err(),
+            "something was sent to the worker for a machine it cannot reach"
+        );
+    }
+
+    /// A controller that could not look either answers in place of the list.
+    /// Showing an empty agent pane there would read as "nothing is running",
+    /// which is a different thing from "nobody could go and see".
+    #[test]
+    fn a_refusal_from_the_far_end_is_shown_rather_than_read_as_an_empty_machine() {
+        assert_eq!(
+            forwarded_sessions(
+                "gpu",
+                r#"[{"machine":"gpu","error":"host is unreachable"}]"#
+            ),
+            Err("host is unreachable".into())
+        );
+        // But one bad entry among good ones is skipped, not fatal.
+        let sessions = forwarded_sessions(
+            "gpu",
+            r#"[{"error":"stale"},{"session_id":"a","kind":"claude"},{"session_id":"b","kind":"nonsense"}]"#,
+        )
+        .expect("a list with one session in it is a list");
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
+        assert_eq!(sessions[0].target_id, "gpu");
     }
 
     #[test]

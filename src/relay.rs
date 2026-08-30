@@ -161,6 +161,18 @@ pub struct RelayPeer {
     pub via: String,
 }
 
+impl RelayPeer {
+    /// What to call this machine on screen. A target with no label of its own
+    /// falls back to its id, which is the name an agent has to type anyway.
+    pub fn display(&self) -> &str {
+        if self.label.is_empty() {
+            &self.id
+        } else {
+            &self.label
+        }
+    }
+}
+
 /// What came back, or that nothing has yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayAnswer {
@@ -580,9 +592,23 @@ pub struct RelayRound {
     pub failed: usize,
     /// Machines some other controller told these daemons it could reach, and
     /// this one cannot. A dashboard shows them so the fleet does not look
-    /// smaller than it is; it cannot open a session on one, because the way
-    /// there belongs to the controller named on it.
-    pub heard: Vec<RelayPeer>,
+    /// smaller than it is; the way there belongs to the controller named on
+    /// each, and is borrowed by leaving an errand on the daemon that named it.
+    pub heard: Vec<Forwarded>,
+}
+
+/// A machine this controller cannot reach, and the daemon it heard about it
+/// from.
+///
+/// The daemon matters as much as the machine. A controller that can reach the
+/// machine is, by definition, one that came round to that daemon and said so —
+/// so that daemon's queue is the one place an errand for it will be picked up.
+/// Leaving it anywhere else is leaving it where the route never looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forwarded {
+    pub peer: RelayPeer,
+    /// The id of the target whose daemon named this machine.
+    pub through: String,
 }
 
 impl RelayRound {
@@ -662,7 +688,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 continue;
             }
         };
-        hear(&mut round.heard, known, &reach, &via);
+        hear(&mut round.heard, known, &reach, &via, &target.id);
         let mut approvals = Approvals::load(&Approvals::default_path());
         let mut approval_dirty = false;
         let mut next = NEXT_PENDING.fetch_add(1_000, Ordering::Relaxed) + 1;
@@ -770,17 +796,27 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
 
 /// What a daemon's answer adds to the list of machines this controller cannot
 /// reach itself. Its own reach is not news, the machine it is talking to is
-/// not news, and a machine two daemons both know about is one machine.
-fn hear(heard: &mut Vec<RelayPeer>, known: Vec<RelayPeer>, mine: &[RelayPeer], via: &str) {
+/// not news, and a machine two daemons both know about is one machine — the
+/// first daemon to name it is the one an errand for it is left on.
+fn hear(
+    heard: &mut Vec<Forwarded>,
+    known: Vec<RelayPeer>,
+    mine: &[RelayPeer],
+    via: &str,
+    through: &str,
+) {
     for peer in known {
         if peer.via == via
             || peer.own
             || mine.iter().any(|carried| carried.id == peer.id)
-            || heard.iter().any(|seen| seen.id == peer.id)
+            || heard.iter().any(|seen| seen.peer.id == peer.id)
         {
             continue;
         }
-        heard.push(peer);
+        heard.push(Forwarded {
+            peer,
+            through: through.to_string(),
+        });
     }
 }
 
@@ -1176,15 +1212,19 @@ mod tests {
             ],
             &mine,
             "laptop",
+            "seed",
         );
         assert_eq!(
             heard
                 .iter()
-                .map(|peer| peer.id.as_str())
+                .map(|far| far.peer.id.as_str())
                 .collect::<Vec<_>>(),
             ["gpu", "desk"]
         );
-        assert_eq!(heard[0].via, "desk");
+        assert_eq!(heard[0].peer.via, "desk");
+        // And the daemon it was heard from, which is the queue an errand for it
+        // has to be left on.
+        assert_eq!(heard[0].through, "seed");
 
         // A second daemon that hears about the same machine adds nothing.
         hear(
@@ -1192,6 +1232,7 @@ mod tests {
             vec![peer("gpu", "desk", false)],
             &mine,
             "laptop",
+            "other",
         );
         assert_eq!(heard.len(), 2);
     }
