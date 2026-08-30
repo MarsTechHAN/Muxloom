@@ -4347,22 +4347,27 @@ mod platform {
         seed: Option<&str>,
     ) -> Option<DaemonSession> {
         let wanted = seed?;
+        // Which sessions there are is taken under the locks; what each of them
+        // is is read after letting them go. A live session's snapshot draws its
+        // screen, and the map it is held in is the one every other request goes
+        // through to find a session at all.
         let live = state
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .map(|session| session.snapshot())
+            .map(Arc::clone)
             .collect::<Vec<_>>();
         let persisted = state
             .persisted_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .map(|entry| entry.snapshot())
+            .map(Arc::clone)
             .collect::<Vec<_>>();
-        live.into_iter()
-            .chain(persisted)
+        live.iter()
+            .map(|session| session.snapshot())
+            .chain(persisted.iter().map(|entry| entry.snapshot()))
             .filter(|record| record.archived)
             .filter(|record| record.kind == kind && record.path == path)
             .filter(|record| {
@@ -4409,11 +4414,16 @@ mod platform {
                 eprintln!("muxloomd could not record a resume alias on {previous_id}: {error:#}");
             }
         }
-        let live = state
+        // Found under the map lock, written to with it let go: persisting a
+        // session draws its screen and syncs a file to disk, and the map is
+        // what every other request has to go through to reach any session.
+        let session = state
             .sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(session) = live.get(previous_id) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(previous_id)
+            .map(Arc::clone);
+        if let Some(session) = session {
             session
                 .metadata
                 .lock()
@@ -4430,38 +4440,47 @@ mod platform {
     /// master came back to an empty fleet.
     fn reparent_children(state: &DaemonState, previous_id: &str, successor: &str) -> usize {
         let mut moved = 0;
-        {
-            let live = state
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for session in live.values() {
-                if session.session_id() == successor {
-                    continue;
+        // Every rewrite below draws a screen and syncs a file to disk, and a
+        // master coming back can have a whole subtree under it. Doing that with
+        // the session map in hand shuts the daemon for as long as it takes:
+        // nothing else can so much as find a session to type into. So the map
+        // is only held long enough to say who is in it.
+        let live = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        for session in &live {
+            if session.session_id() == successor {
+                continue;
+            }
+            let reparented = {
+                let mut metadata = session
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if metadata.parent.as_deref() == Some(previous_id) {
+                    metadata.parent = Some(successor.to_string());
+                    true
+                } else {
+                    false
                 }
-                let reparented = {
-                    let mut metadata = session
-                        .metadata
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if metadata.parent.as_deref() == Some(previous_id) {
-                        metadata.parent = Some(successor.to_string());
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if reparented {
-                    let _ = session.persist_metadata();
-                    moved += 1;
-                }
+            };
+            if reparented {
+                let _ = session.persist_metadata();
+                moved += 1;
             }
         }
         let persisted = state
             .persisted_sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for entry in persisted.values() {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        for entry in &persisted {
             if entry.snapshot().id == successor {
                 continue;
             }
