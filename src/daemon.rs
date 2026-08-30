@@ -194,6 +194,20 @@ mod platform {
     /// asked; a transcript that says nothing at all is answered by the
     /// screen, not by asking the folder forever.
     const NATIVE_CLAIM_CHECK_LOOKS: u8 = 4;
+    /// How long a write to a client may make no progress at all before that
+    /// client is taken to be gone.
+    ///
+    /// A session's frames are written by the thread reading its keeper, and that
+    /// thread is the one draining the PTY. A dashboard that stops reading -
+    /// suspended, or on a link that died without saying so - fills its socket,
+    /// which stops that thread, which fills the keeper's, which stops the keeper
+    /// reading the PTY, which blocks the agent on its own output. So the agent
+    /// freezes because somebody stopped watching it, and nothing times out.
+    ///
+    /// The window has to be wide enough for a real link carrying a real frame -
+    /// a screen snapshot, a page of history, a file - and it only ever elapses
+    /// where not one byte moved in all of it.
+    const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[derive(Debug, Clone)]
     pub struct DaemonPaths {
@@ -2069,7 +2083,12 @@ mod platform {
             state.clients.fetch_add(1, Ordering::Relaxed);
         }
         let _client_guard = ClientGuard(Arc::clone(&state));
-        let writer = Arc::new(Mutex::new(stream.try_clone()?));
+        let outbound = stream.try_clone()?;
+        // Nothing the daemon writes to a client may wait on that client for
+        // ever - see [`CLIENT_WRITE_TIMEOUT`]. The option belongs to the socket
+        // rather than to either handle on it, so reads are unaffected.
+        outbound.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+        let writer = Arc::new(Mutex::new(outbound));
         let flow = Arc::new(StreamFlow::default());
         let mut subscriptions: HashMap<u32, ClientStream> = HashMap::new();
         let result = (|| -> Result<()> {
@@ -5839,6 +5858,17 @@ mod platform {
                 )
                 .is_err()
                 {
+                    // A frame that went out in part leaves everything else on
+                    // that connection reading the rest of this payload as its
+                    // next header: the client's other streams and its request
+                    // responses all sit on this one socket. What failed is the
+                    // connection, not the subscription, so close it and let the
+                    // client come back rather than hand it garbage.
+                    let _ = subscriber
+                        .writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .shutdown(Shutdown::Both);
                     failed.push(subscriber_id);
                 }
             }
@@ -8562,6 +8592,80 @@ mod platform {
                 None,
             )
             .unwrap()
+        }
+
+        /// A client that stopped reading is let go of, rather than taking the
+        /// session down with it. The thread writing these frames is the thread
+        /// draining the session's keeper, and behind the keeper is the PTY: a
+        /// dashboard suspended mid-attach fills its socket, and with nothing to
+        /// time the write out the agent ends up blocked on its own output.
+        #[test]
+        fn a_client_that_stopped_reading_is_let_go_of_rather_than_wedging_the_session() {
+            let state = test_state("broadcast-wedge");
+            let session = launch_child_with_parent(&state, "wedged", None);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            // serve_client sets this on every connection; a short one here so
+            // the test does not sit out the real window.
+            server
+                .set_write_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            // Held here as serve_client holds it: the connection carries this
+            // client's other streams and its request answers too, so letting
+            // the subscription go does not on its own close anything.
+            let connection = Arc::new(Mutex::new(server));
+            session
+                .subscribers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    1,
+                    Subscriber {
+                        stream_id: 7,
+                        writer: Arc::clone(&connection),
+                    },
+                );
+
+            // Nobody ever reads `client`. Write until the socket will take no
+            // more, which on a real link is a dashboard that stopped keeping up.
+            let payload = vec![b'x'; DATA_CHUNK_SIZE];
+            let started = Instant::now();
+            let attached = || {
+                !session
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty()
+            };
+            for _ in 0..256 {
+                if !attached() {
+                    break;
+                }
+                session.broadcast(&payload);
+            }
+            assert!(
+                !attached(),
+                "a client taking nothing at all has to be let go of"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "broadcasting must not wait on a client indefinitely"
+            );
+
+            // And the connection went with it: everything else sharing that
+            // socket would read the tail of the half-written frame as a header.
+            client
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut sink = [0_u8; 64 * 1024];
+            let closed = loop {
+                match client.read(&mut sink) {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                }
+            };
+            assert!(closed, "a connection written half a frame has to be closed");
+            drop(connection);
         }
 
         /// Rewind the current edge's last tell so the next reminder comes due
