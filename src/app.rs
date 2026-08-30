@@ -458,7 +458,7 @@ struct ArchivedResume {
 }
 
 #[derive(Debug, Clone)]
-struct PendingInstallLaunch {
+pub struct PendingInstallLaunch {
     launch: LaunchForm,
     resume_id: Option<String>,
     initial_prompt: Option<String>,
@@ -747,10 +747,17 @@ pub enum Modal {
         archive: bool,
     },
     ConfirmInstall {
-        launch: LaunchForm,
-        resume_id: Option<String>,
-        initial_prompt: Option<String>,
-        remove_archive_session_id: Option<String>,
+        target: Target,
+        kind: AgentKind,
+        /// What to start once the runtime lands, when this install is the first
+        /// half of a launch. `None` is a bare install from a machine's settings
+        /// panel, which asks the same question and then stops there.
+        launch: Option<Box<PendingInstallLaunch>>,
+        /// Whether to copy this machine's own configuration for the runtime -
+        /// its credentials among it - onto the target, so the remote agent runs
+        /// signed in to the same account. Only offered for a remote target;
+        /// installing here has nothing to carry anywhere.
+        sync_config: bool,
     },
     ConfirmArchivedResume {
         source_session_id: String,
@@ -10512,24 +10519,36 @@ impl App {
                 }
             },
             Modal::ConfirmInstall {
+                target,
+                kind,
                 launch,
-                resume_id,
-                initial_prompt,
-                remove_archive_session_id,
+                mut sync_config,
             } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.install_and_launch(
-                    launch,
-                    resume_id,
-                    initial_prompt,
-                    remove_archive_session_id,
-                ),
+                // Nothing local has anywhere to travel to, so the toggle is not
+                // drawn for this machine and the keys that work it do nothing.
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if target.is_remote() => {
+                    sync_config = !sync_config;
+                    self.modal = Some(Modal::ConfirmInstall {
+                        target,
+                        kind,
+                        launch,
+                        sync_config,
+                    });
+                }
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let sync_config = sync_config && target.is_remote();
+                    match launch {
+                        Some(pending) => self.install_and_launch(*pending, sync_config),
+                        None => self.submit_install(&target, kind, sync_config),
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => {
                     self.modal = Some(Modal::ConfirmInstall {
+                        target,
+                        kind,
                         launch,
-                        resume_id,
-                        initial_prompt,
-                        remove_archive_session_id,
+                        sync_config,
                     })
                 }
             },
@@ -11105,19 +11124,26 @@ impl App {
         if available || form.kind == AgentKind::Terminal {
             self.submit_launch(form, resume_id, initial_prompt, remove_archive_session_id);
         } else {
+            let target = form.target.clone();
+            let kind = form.kind;
             self.modal = Some(Modal::ConfirmInstall {
-                launch: form,
-                resume_id,
-                initial_prompt,
-                remove_archive_session_id,
+                sync_config: target.is_remote(),
+                target,
+                kind,
+                launch: Some(Box::new(PendingInstallLaunch {
+                    launch: form,
+                    resume_id,
+                    initial_prompt,
+                    remove_archive_session_id,
+                })),
             });
         }
     }
 
-    /// Put one runtime on a machine from its settings panel. The panel closes
-    /// so the footer gauge, which every install already reports into, is
-    /// visible; when it lands the machine is rescanned and the runtime joins
-    /// the launch picker.
+    /// Put one runtime on a machine from its settings panel. Installing onto a
+    /// remote also offers to hand this machine's own configuration over, so it
+    /// asks the same question a launch does rather than deciding silently; a
+    /// local install has nothing to carry and starts straight away.
     fn install_runtime(&mut self, target_id: &str, kind: AgentKind) {
         let Some(target) = self.target(target_id).cloned() else {
             return;
@@ -11130,12 +11156,30 @@ impl App {
             ));
             return;
         }
-        let environment = self.config.environment_for(target_id).unwrap_or_default();
+        if target.is_remote() {
+            self.modal = Some(Modal::ConfirmInstall {
+                target,
+                kind,
+                launch: None,
+                sync_config: true,
+            });
+            return;
+        }
+        self.submit_install(&target, kind, false);
+    }
+
+    /// The panel closes so the footer gauge, which every install already
+    /// reports into, is visible; when it lands the machine is rescanned and the
+    /// runtime joins the launch picker.
+    fn submit_install(&mut self, target: &Target, kind: AgentKind, sync_config: bool) {
+        let command = self.config.command_for(&target.id, kind).clone();
+        let environment = self.config.environment_for(&target.id).unwrap_or_default();
         let request = Request::Install {
             target: target.clone(),
             kind,
             command,
             environment,
+            sync_config,
         };
         if self.worker.requests.send(request).is_ok() {
             self.busy_operations += 1;
@@ -11143,13 +11187,8 @@ impl App {
         }
     }
 
-    fn install_and_launch(
-        &mut self,
-        launch: LaunchForm,
-        resume_id: Option<String>,
-        initial_prompt: Option<String>,
-        remove_archive_session_id: Option<String>,
-    ) {
+    fn install_and_launch(&mut self, pending: PendingInstallLaunch, sync_config: bool) {
+        let launch = &pending.launch;
         let command = self
             .config
             .command_for(&launch.target.id, launch.kind)
@@ -11163,17 +11202,13 @@ impl App {
             kind: launch.kind,
             command,
             environment,
+            sync_config,
         };
+        let status = format!("Installing {} on {}...", launch.kind, launch.target.label);
         if self.worker.requests.send(request).is_ok() {
-            self.pending_install_launch = Some(PendingInstallLaunch {
-                launch: launch.clone(),
-                resume_id,
-                initial_prompt,
-                remove_archive_session_id,
-            });
+            self.pending_install_launch = Some(pending);
             self.busy_operations += 1;
-            self.status_message =
-                format!("Installing {} on {}...", launch.kind, launch.target.label);
+            self.status_message = status;
         }
     }
 
@@ -17655,10 +17690,12 @@ mod tests {
         assert!(matches!(
             app.modal,
             Some(Modal::ConfirmInstall {
+                kind: AgentKind::Codex,
+                ref target,
                 ref launch,
-                resume_id: None,
-                ..
-            }) if launch.kind == AgentKind::Codex && launch.target.id == "local"
+                // Nothing to hand over to a machine the install runs on.
+                sync_config: false,
+            }) if target.id == "local" && launch.is_some()
         ));
     }
 
@@ -18592,6 +18629,67 @@ mod tests {
             app.modal.is_none(),
             "the panel must close so the install gauge is visible"
         );
+    }
+
+    /// Installing onto another machine copies this one's settings and the
+    /// credential file sitting beside them, which is this machine's account
+    /// leaving it. That is never done quietly: the install stops on a question
+    /// naming what would travel, and the answer is what the worker is told.
+    #[test]
+    fn installing_onto_a_remote_asks_before_sending_the_local_sign_in() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("box".into());
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::ssh("box")],
+            worker,
+        );
+        app.targets[0].state = ConnectionState::Online;
+
+        app.install_runtime("box", AgentKind::Claude);
+        assert!(
+            matches!(
+                app.modal,
+                Some(Modal::ConfirmInstall {
+                    kind: AgentKind::Claude,
+                    launch: None,
+                    sync_config: true,
+                    ..
+                })
+            ),
+            "a remote install must ask, offering the sign-in by default: {:?}",
+            app.modal
+        );
+        assert!(
+            request_rx.try_recv().is_err(),
+            "nothing may be sent while the question is still up"
+        );
+
+        // Space says no to the credentials without saying no to the install.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Request::Install {
+            target,
+            kind,
+            sync_config,
+            ..
+        } = receive_request(&request_rx)
+        else {
+            panic!("answering the question did not request the install");
+        };
+        assert_eq!(target.id, "box");
+        assert_eq!(kind, AgentKind::Claude);
+        assert!(!sync_config, "the declined sign-in must not be sent anyway");
     }
 
     /// The global panel is not about one machine, so it never offers installs

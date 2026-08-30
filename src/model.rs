@@ -432,6 +432,13 @@ impl Target {
         }
     }
 
+    /// Whether reaching this machine leaves the one muxloom runs on. What is
+    /// merely a copy locally - a config file, a credential - becomes a transfer
+    /// to somewhere else the moment this is true.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.transport, Transport::Ssh { .. })
+    }
+
     /// A human-facing name for a machine list: the label if it says something
     /// other than the id, otherwise the id itself.
     pub fn label_or_id(&self) -> &str {

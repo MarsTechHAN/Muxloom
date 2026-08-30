@@ -78,6 +78,10 @@ pub enum Request {
         kind: AgentKind,
         command: CommandConfig,
         environment: Vec<(String, String)>,
+        /// Whether to carry this machine's own configuration for the runtime,
+        /// credentials included, over to the target. The person is asked before
+        /// the request is made; this is their answer.
+        sync_config: bool,
     },
     Kill {
         target: Target,
@@ -702,6 +706,7 @@ impl Worker {
                         kind,
                         command,
                         environment,
+                        sync_config,
                     } => {
                         let target_id = target.id.clone();
                         let progress_target = target_id.clone();
@@ -712,6 +717,7 @@ impl Worker {
                                 kind,
                                 &command,
                                 &environment,
+                                sync_config,
                                 move |progress| {
                                     let _ = progress_events.send(Event::TaskProgress {
                                         target_id: progress_target.clone(),

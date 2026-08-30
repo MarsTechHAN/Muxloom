@@ -434,6 +434,15 @@ a machine and its settings panel shows an **Install …** action under every
 runtime that machine is missing; `Enter` runs it and closes the panel so the
 footer gauge can report the progress.
 
+Installing onto another machine also offers to send that runtime's `sync_files`
+— its settings and, for every agent, the file it keeps its sign-in in — so the
+remote agent comes up in the same environment as the one here rather than
+asking whoever finds it to log in. Because that is this machine's account
+leaving this machine, the confirmation names it and `Space` turns it off; the
+files land at the same path under the target's home directory, and anything
+they replace is backed up there first. Installing onto this machine has nothing
+to carry anywhere and never asks.
+
 ## Controls
 
 The footer shows the most useful actions for the current context. Press `?` for

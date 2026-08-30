@@ -1685,17 +1685,24 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
                 area,
             );
         }
-        Modal::ConfirmInstall { launch, .. } => {
-            let area = centered_rect(68, 11, outer);
+        Modal::ConfirmInstall {
+            target,
+            kind,
+            launch,
+            sync_config,
+        } => {
+            let remote = target.is_remote();
+            let area = centered_rect(68, if remote { 15 } else { 11 }, outer);
             frame.render_widget(Clear, area);
-            let text = vec![
+            let mut text = vec![
                 Line::raw(""),
-                Line::raw(format!(
-                    "{} was not detected on {}.",
-                    launch.kind, launch.target.label
-                )),
+                Line::raw(format!("{kind} was not detected on {}.", target.label)),
                 Line::raw(""),
-                Line::raw("Install it now, then continue launching this agent?"),
+                Line::raw(if launch.is_some() {
+                    "Install it now, then continue launching this agent?"
+                } else {
+                    "Install it now?"
+                }),
                 Line::styled(
                     "Uses a compatible local binary or downloads the checked target package locally.",
                     Style::default().fg(MUTED),
@@ -1704,15 +1711,47 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
                     "The target needs no internet; its configured installer is only the final fallback.",
                     Style::default().fg(MUTED),
                 ),
-                Line::raw(""),
-                Line::styled(
-                    "Enter/y install    Esc/n cancel",
-                    Style::default().fg(MUTED),
-                ),
             ];
+            // Sending the credentials is what makes the remote agent the same
+            // agent - signed in to the same account - rather than a fresh
+            // install asking whoever finds it to log in. It is also this
+            // machine's account leaving this machine, so it is said plainly and
+            // the person decides, every install.
+            if remote {
+                text.push(Line::raw(""));
+                text.push(Line::from(vec![
+                    Span::styled(
+                        if *sync_config { "[x]" } else { "[ ]" },
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        " Also send this machine's {kind} settings and sign-in"
+                    )),
+                ]));
+                text.push(Line::styled(
+                    "Copied over SSH so the remote agent runs in the same environment as here.",
+                    Style::default().fg(MUTED),
+                ));
+                text.push(Line::styled(
+                    "Any file it replaces is backed up on the target first.",
+                    Style::default().fg(MUTED),
+                ));
+            }
+            text.push(Line::raw(""));
+            text.push(Line::styled(
+                if remote {
+                    "Space toggle    Enter/y install    Esc/n cancel"
+                } else {
+                    "Enter/y install    Esc/n cancel"
+                },
+                Style::default().fg(MUTED),
+            ));
             frame.render_widget(
                 Paragraph::new(text)
                     .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
                     .block(panel(" Install agent runtime ", true)),
                 area,
             );

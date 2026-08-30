@@ -792,16 +792,24 @@ impl Runtime {
         kind: AgentKind,
         command: &CommandConfig,
         environment: &[(String, String)],
+        sync_config: bool,
     ) -> Result<String> {
-        self.install_runtime_with_progress(target, kind, command, environment, |_| {})
+        self.install_runtime_with_progress(target, kind, command, environment, sync_config, |_| {})
     }
 
+    /// `sync_config` decides whether this machine's own configuration for the
+    /// runtime - which for every agent includes the file it keeps its signed-in
+    /// credentials in - is copied onto the target. Copying it is what makes the
+    /// remote agent run in the same environment as the local one, and it is
+    /// also handing an account over to another machine, so the caller asks
+    /// first rather than deciding on the person's behalf.
     pub fn install_runtime_with_progress(
         &self,
         target: &Target,
         kind: AgentKind,
         command: &CommandConfig,
         environment: &[(String, String)],
+        sync_config: bool,
         mut progress: impl FnMut(TaskProgress),
     ) -> Result<String> {
         if kind == AgentKind::Terminal {
@@ -922,7 +930,7 @@ impl Runtime {
             installed_source = Some("configured target installer".into());
         }
 
-        let synced = if matches!(target.transport, Transport::Ssh { .. }) {
+        let synced = if sync_config && matches!(target.transport, Transport::Ssh { .. }) {
             progress(TaskProgress::pending(format!(
                 "Syncing {kind} configuration"
             )));
@@ -960,8 +968,13 @@ impl Runtime {
         let output = self.run_shell(target, &verify, false)?;
         ensure_success(&output, &format!("verify {kind} install"))?;
         let source = installed_source.unwrap_or_else(|| "runtime installer".into());
+        let configuration = if sync_config {
+            format!("synced {synced} local config file(s)")
+        } else {
+            "kept the local configuration here".into()
+        };
         Ok(format!(
-            "Installed {kind} on {} from {source}; synced {synced} local config file(s)",
+            "Installed {kind} on {} from {source}; {configuration}",
             target.label
         ))
     }
