@@ -234,6 +234,14 @@ preserve.
   `cargo fmt --all -- --check`,
   `cargo clippy --locked --all-targets -- -D warnings`, and
   `cargo test --locked --all-targets -- --test-threads=1`.
+- Those three all build with the default features, so none of them compiles the
+  companion as it ships. Anything touching a module the `muxloom` dashboard and
+  the `muxloomd` companion both pull in — `app` above all, which is not itself
+  feature-gated — also runs
+  `cargo clippy --locked --no-default-features --bin muxloomd -- -D warnings`.
+  A helper that reaches for a `controller`-only module needs its
+  `#[cfg(not(feature = "controller"))]` twin, and without that command nothing
+  says so until release and nightly try to build the binary they ship.
 - Remote integration tests are opt-in. Use an explicit target, leave no test
   sessions behind, and never include private infrastructure paths in fixtures.
 - No test may reach the machine's own state directory. A suite that needs a
