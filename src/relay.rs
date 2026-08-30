@@ -695,7 +695,10 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
         };
         hear(&mut round.heard, known, &reach, &via, &target.id);
         let mut approvals = Approvals::load(&Approvals::default_path());
-        let mut approval_dirty = false;
+        // An ask a day old is not what the next try is waiting on. Left in the
+        // ledger it answers every one of them with the id of a card the person
+        // scrolled past on Thursday, and the write never happens again.
+        let mut approval_dirty = approvals.forget_stale(now_ms()) > 0;
         for job in jobs {
             // A WRITE tool held behind the approval gate runs only after the
             // person has said so — remembered for the session, or asked now.

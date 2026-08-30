@@ -140,6 +140,9 @@ impl Approvals {
     /// on the ask already in front of them: without this each attempt mints
     /// another id and puts another copy on their phone, and a person answering
     /// the first one leaves all the others open forever.
+    ///
+    /// Only asks young enough to still be waiting on somebody are here to be
+    /// found; `forget_stale` is what takes the others out of the way.
     pub fn open_ask(&self, session: &str, machine: &str, tool: &str) -> Option<&str> {
         self.pending
             .iter()
@@ -234,7 +237,30 @@ impl Approvals {
         self.pending.retain(|_, p| p.session != session);
         before - self.pending.len()
     }
+
+    /// Drop asks nobody answered in `ASK_STANDS_MS`. Returns how many went.
+    ///
+    /// Without this an ask is open forever. The person scrolls past the card,
+    /// the conversation it belonged to ends, and the entry stays — so every
+    /// later try at the same write on the same machine by the same session is
+    /// told, for as long as that session lives, that it is waiting on a
+    /// question already days old and answerable only by finding a card nobody
+    /// can see any more. Letting it lapse costs one more ask; keeping it costs
+    /// the write, permanently.
+    ///
+    /// A day, because a person who has not looked by tomorrow is not about to,
+    /// and because an answer that late lands on an agent that has long since
+    /// stopped asking.
+    pub fn forget_stale(&mut self, now: u64) -> usize {
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, ask| now.saturating_sub(ask.at_ms) < ASK_STANDS_MS);
+        before - self.pending.len()
+    }
 }
+
+/// How long an unanswered ask stands before it is treated as lapsed.
+pub const ASK_STANDS_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Parse a person's chat reply to an approval ask.
 ///
@@ -371,6 +397,41 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    /// The ask that was never answered used to block its own write forever:
+    /// `open_ask` kept finding it, and every retry for days afterwards was told
+    /// to go and wait on a card nobody could still see.
+    #[test]
+    fn an_ask_nobody_answered_in_a_day_stops_standing_in_the_way() {
+        let mut a = Approvals::default();
+        let ask = |at_ms: u64| Pending {
+            session: "s1".into(),
+            machine: "seed".into(),
+            tool: "launch_session".into(),
+            ask: String::new(),
+            at_ms,
+            open: true,
+        };
+        let now = 10 * ASK_STANDS_MS;
+        assert!(a.park("approve-1".into(), ask(now - ASK_STANDS_MS)));
+        assert!(a.park("approve-2".into(), ask(now - ASK_STANDS_MS / 2)));
+        // A clock that disagrees with ours by running ahead is not grounds for
+        // throwing an ask away.
+        assert!(a.park("approve-3".into(), ask(now + 60_000)));
+
+        assert_eq!(a.forget_stale(now), 1);
+        assert_eq!(a.pending.len(), 2);
+        assert!(!a.pending.contains_key("approve-1"));
+
+        // The one still standing is still what a retry is told to wait on, and
+        // once the day is up on that one too the next try asks afresh.
+        assert_eq!(
+            a.open_ask("s1", "seed", "launch_session"),
+            Some("approve-2")
+        );
+        assert_eq!(a.forget_stale(now + 2 * ASK_STANDS_MS), 2);
+        assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
     }
 
     #[test]
