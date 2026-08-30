@@ -205,6 +205,17 @@ static NEXT_PENDING: AtomicU64 = AtomicU64::new(0);
 /// Which machine a relayed job names, if it names one. Read from the
 /// `machine` argument the same way the tool surface does, so the ask tells the
 /// person where the write would land and the remember key is stable.
+/// Whether a controller offering `peers` is a way to `machine`. An agent
+/// addresses a machine by the id `list_machines` gave it, which is a peer id;
+/// the label is matched too, because that is the word a person reads off the
+/// dashboard and hands to an agent. Case is not part of a hostname.
+fn carries(peers: &[RelayPeer], machine: &str) -> bool {
+    peers.iter().any(|peer| {
+        peer.id.eq_ignore_ascii_case(machine)
+            || (!peer.label.is_empty() && peer.label.eq_ignore_ascii_case(machine))
+    })
+}
+
 fn job_machine(job: &RelayJob) -> String {
     serde_json::from_str::<serde_json::Value>(&job.arguments)
         .ok()
@@ -456,9 +467,65 @@ impl RelayQueue {
                 .retain(|reach| now.saturating_sub(reach.at) <= EXPIRY_MS);
         }
         self.expire(now);
+        // Which machines this controller just said it can reach. A job is
+        // handed out once, so handing it to a controller with no route there
+        // spends it: the answer comes back "machine X is not enabled in
+        // muxloom" from a controller that was never the way there, and the one
+        // that was never sees the job at all. Two dashboards watching the same
+        // machine is the ordinary case, not a corner of one.
+        //
+        // A controller too old to say what it reaches still gets everything.
+        // It answered this way before there was anything to say, and being
+        // silent is not the same as reaching nowhere.
+        let Some(mine) = self
+            .live(now)
+            .find(|reach| reach.via == via)
+            .map(|reach| reach.peers.clone())
+        else {
+            return self.hand_out(|_| true);
+        };
+        let elsewhere: Vec<Vec<RelayPeer>> = self
+            .live(now)
+            .filter(|reach| reach.via != via)
+            .map(|reach| reach.peers.clone())
+            .collect();
+        let mut orphans = Vec::new();
+        let jobs = self.hand_out(|job| {
+            let machine = job_machine(job);
+            // Naming no machine means the machine that asked, and any
+            // controller round here can answer for it.
+            if machine.is_empty() || carries(&mine, &machine) {
+                return true;
+            }
+            if !elsewhere.iter().any(|peers| carries(peers, &machine)) {
+                orphans.push((job.id.clone(), machine));
+            }
+            false
+        });
+        // Nothing here is a route to that machine, and waiting out the job's
+        // two minutes would tell the agent only that nobody answered. Say
+        // which it is while there is still someone listening.
+        for (id, machine) in orphans {
+            self.complete(
+                &id,
+                false,
+                format!(
+                    "no muxloom controller watching this machine can reach {machine}. Whichever \
+                     one could has stopped coming round; ask an agent over there instead, or tell \
+                     whoever runs muxloom."
+                ),
+                now,
+            );
+        }
+        jobs
+    }
+
+    /// Take the jobs `wanted` accepts, marking each as gone. Every job is
+    /// handed out once, to the one controller that took it.
+    fn hand_out(&mut self, mut wanted: impl FnMut(&RelayJob) -> bool) -> Vec<RelayJob> {
         self.entries
             .iter_mut()
-            .filter(|entry| !entry.taken && entry.answer.is_none())
+            .filter(|entry| !entry.taken && entry.answer.is_none() && wanted(&entry.job))
             .map(|entry| {
                 entry.taken = true;
                 entry.job.clone()
@@ -854,6 +921,66 @@ mod tests {
         assert_eq!(answer.output, "[]");
         // Read once: a second look finds nothing, and says so.
         assert!(queue.result(&id, t0 + 500).is_err());
+    }
+
+    /// Two dashboards watching one machine is the ordinary case, and a job is
+    /// handed out once. Before this, whichever asked first took every job
+    /// waiting — so a call for a machine only the other one could reach came
+    /// back "machine X is not enabled in muxloom" from a controller that was
+    /// never the way there, and the one that was never saw it.
+    #[test]
+    fn a_job_goes_to_the_controller_that_can_reach_the_machine_it_names() {
+        let peer = |id: &str| RelayPeer {
+            id: id.into(),
+            label: id.into(),
+            own: false,
+            via: String::new(),
+        };
+        let mut queue = RelayQueue::default();
+        let t0 = 3_000_000;
+        // Two controllers come round. Only the second is a way to `gpu-box`.
+        queue.poll(t0, vec![peer("laptop")], "laptop");
+        queue.poll(t0, vec![peer("laptop"), peer("gpu-box")], "office");
+
+        let far = queue
+            .submit("read_screen", r#"{"machine":"gpu-box"}"#, "", t0)
+            .unwrap();
+        let near = queue.submit("list_machines", "{}", "", t0).unwrap();
+
+        // The one that cannot reach it takes only the job that names no
+        // machine, and leaves the other where the route can find it.
+        let jobs = queue.poll(t0 + 100, vec![peer("laptop")], "laptop");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, near);
+        assert_eq!(
+            queue.result(&far, t0 + 100).unwrap(),
+            RelayAnswer::default()
+        );
+
+        let jobs = queue.poll(t0 + 200, vec![peer("laptop"), peer("gpu-box")], "office");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, far);
+
+        // A machine no controller here reaches is said so on the spot, rather
+        // than left to time out saying nobody answered.
+        let lost = queue
+            .submit("read_screen", r#"{"machine":"basement"}"#, "", t0 + 300)
+            .unwrap();
+        queue.poll(t0 + 400, vec![peer("laptop")], "laptop");
+        let answer = queue.result(&lost, t0 + 500).unwrap();
+        assert!(answer.done && !answer.ok, "{answer:?}");
+        assert!(answer.output.contains("basement"), "{}", answer.output);
+
+        // And a controller too old to say what it reaches is still given
+        // everything: silence is not the same as reaching nowhere.
+        let mut old = RelayQueue::default();
+        old.poll(t0, Vec::new(), "");
+        let id = old
+            .submit("read_screen", r#"{"machine":"gpu-box"}"#, "", t0)
+            .unwrap();
+        let jobs = old.poll(t0 + 100, Vec::new(), "");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
     }
 
     #[test]

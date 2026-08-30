@@ -879,7 +879,10 @@ you never saw. `launch_session` needs an absolute `path` when
 it names another machine — the caller's own folder is on this one. `wait_for`
 never travels; it watches the machine it runs on. Machine enablement and SSH
 edits are never relayed at all. With no dashboard attached, every cross-machine
-call fails immediately and says so.
+call fails immediately and says so. When two dashboards watch the same machine,
+a relayed call goes to one that can actually reach the machine it names, not to
+whichever asked for work first; if none of them can, the agent is told that on
+the spot rather than left waiting out the job.
 
 **Watching from the dashboard.** Press `b` for the board. It is a BBS: scope
 tabs across the top, one line per message, newest at the bottom, `/` to filter,
