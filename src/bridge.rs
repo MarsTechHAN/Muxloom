@@ -3385,8 +3385,14 @@ mod tests {
                 .as_nanos()
         ));
         let workspace = root.join("workspace");
-        let debug = workspace.join("target/debug");
-        let release = workspace.join("target/release");
+        // Joined a component at a time rather than as `target/debug`: the
+        // search builds the sibling profile out of an ancestor called
+        // `target`, so on a platform whose separator is not `/` a fixture
+        // written with one still compares equal as a path - `PathBuf` reads
+        // both separators - while the text below, which is what a person
+        // actually gets handed, does not.
+        let debug = workspace.join("target").join("debug");
+        let release = workspace.join("target").join("release");
         let home = root.join("home");
         fs::create_dir_all(&debug).unwrap();
         fs::create_dir_all(&release).unwrap();
@@ -3410,7 +3416,16 @@ mod tests {
         assert!(places.contains(&home.join(".local/share/muxloom/bin").join(&name)));
         assert!(places.contains(&home.join(".local/bin").join(&name)));
         let said = no_local_companion(&places);
-        assert!(said.contains(&release.join(&name).display().to_string()));
+        // Every place, and each of them as the search itself spelled it: a
+        // path the test writes out again by hand is a second spelling that
+        // can drift from the first without anything being wrong with the
+        // message a person is handed.
+        for place in &places {
+            assert!(
+                said.contains(&place.display().to_string()),
+                "{place:?} was looked in but goes unnamed in {said:?}"
+            );
+        }
         assert!(said.contains("PATH"));
         assert!(!said.contains("No such file"));
 
