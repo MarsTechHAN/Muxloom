@@ -1657,6 +1657,16 @@ mod platform {
     /// transcript says why it stops where it does.
     fn recover_interrupted_session(metadata: &mut DaemonSession, history_path: &Path) {
         let orphan = metadata.pid.filter(|pid| process_alive(*pid));
+        // Retired, and recorded as retired: the note below tells whoever
+        // reads the transcript that this session was archived, and the flag
+        // has to agree with it. When it did not, the record was left claiming
+        // to be a session nobody had put down - and with no hour on it, so
+        // the folder it sits in ordered it by when it *began*, burying a
+        // conversation the daemon ended this morning under everything started
+        // since. This is the only account of when it stopped that anyone has:
+        // the daemon that would have written one is what went away.
+        metadata.archived = true;
+        metadata.archived_at.get_or_insert_with(now_secs);
         if metadata.recap.is_none()
             && let Ok(kind) = metadata.kind.parse::<AgentKind>()
             && let Some(tail) = history_tail(history_path, RECENT_OUTPUT_LIMIT as u64)
@@ -8181,6 +8191,53 @@ mod platform {
             let snapshot = revived.snapshot();
             assert_eq!(snapshot.label, "worker");
             assert_eq!(snapshot.created_at, 333);
+        }
+
+        #[test]
+        fn a_session_the_daemon_never_put_down_is_filed_as_one_it_did() {
+            let state = test_state("interrupted-filed");
+            let id = "muxloomd-terminal-interrupted";
+            let session = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "worker".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            // A record caught mid-flight: how this session ended went unwritten
+            // because the daemon that would have written it is what stopped.
+            let mut record = session.snapshot();
+            assert!(!record.dead && !record.archived);
+            record.pid = None;
+
+            let restarted = restarted_around("interrupted-read-back", &record);
+            let filed = restarted
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .map(|entry| entry.snapshot())
+                .expect("the restart never read the record back");
+            assert!(filed.dead);
+            assert!(
+                filed.archived,
+                "the transcript is told this session was archived; the record has to say the same"
+            );
+            assert!(
+                filed.archived_at.is_some(),
+                "nothing says when it stopped, so its folder will order it by when it began"
+            );
+            drop(session);
         }
 
         #[test]
