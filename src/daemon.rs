@@ -830,31 +830,54 @@ mod platform {
     /// reached the screen, so a trigger sees exactly the text the attention
     /// classification and `read_screen` see.
     fn fire_triggers(state: &DaemonState, session: &ManagedSession, session_id: &str) {
+        // Whether anything watches this session at all is the cheap question,
+        // and it is asked on the thread draining that session's PTY, for every
+        // piece of output it produces.
+        let watched = {
+            let triggers = state
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            triggers
+                .iter()
+                .any(|armed| armed.spec.session_id == session_id)
+        };
+        if !watched {
+            return;
+        }
+        // Only now, with a trigger known to be watching, is rendering the
+        // screen worth it - and it is rendered with the trigger list let go
+        // of. That list is one list for the whole machine: every watched
+        // session's reader thread walks it, and so does every arm, list and
+        // delete. Laying one session's screen out as text while holding it is
+        // how one busy session's output comes to wait on another's.
+        let screen = session
+            .screen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .screen()
+            .contents()
+            .to_lowercase();
+        let rendered_at = now_ms();
         let mut fired = Vec::new();
         {
             let mut triggers = state
                 .triggers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !triggers
-                .iter()
-                .any(|armed| armed.spec.session_id == session_id)
-            {
-                return;
-            }
-            // Only now, with a trigger known to be watching, is rendering the
-            // screen worth it.
-            let screen = session
-                .screen
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .screen()
-                .contents()
-                .to_lowercase();
             let now = now_ms();
             let mut changed = false;
             triggers.retain_mut(|armed| {
                 if armed.spec.session_id != session_id {
+                    return true;
+                }
+                // Armed while this render was being taken, or after it: it
+                // was primed against a picture of the screen at least as new
+                // as this one, and judging it against an older picture is how
+                // text that was already there when it was armed would read as
+                // having just arrived - and fire. It waits for the next piece
+                // of output, which is a frame away.
+                if armed.spec.created_at >= rendered_at {
                     return true;
                 }
                 let hit = screen.contains(&armed.spec.pattern.to_lowercase());
@@ -7665,6 +7688,81 @@ mod platform {
             drop(triggers);
 
             fs::remove_dir_all(&state.paths.root).ok();
+        }
+
+        #[test]
+        fn a_trigger_armed_after_a_frame_was_drawn_waits_for_the_next_one() {
+            // A session with the pattern already on its screen. Arming against
+            // that is the ordinary case - `set_trigger` reads the screen and
+            // starts the trigger matched, so the text sitting there is text
+            // that was already seen.
+            let state = Arc::new(test_state("trigger-freshness"));
+            let session = launch_session(
+                &state,
+                "muxloomd-terminal-trigger-freshness".into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "watched".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                333,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let watched = session.session_id();
+            session.record_output(b"Ready\r\n");
+
+            // The state a race would leave behind: the arriving output was
+            // drawn into a frame, then the trigger was armed off a newer
+            // picture of the screen than that frame holds. Read against the
+            // older one, text that was there when it was armed reads as
+            // having just turned up.
+            let arm = |created_at: u64, matched: bool| {
+                let mut spec = armed_trigger(matched, 0, None).spec;
+                spec.session_id = watched.clone();
+                spec.created_at = created_at;
+                *state
+                    .triggers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    vec![ArmedTrigger { spec, matched }];
+            };
+            let notice = || {
+                session
+                    .notice
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            };
+
+            arm(now_ms() + 60_000, false);
+            fire_triggers(&state, &session, &watched);
+            assert_eq!(
+                notice(),
+                None,
+                "a trigger younger than the frame must not be judged by it"
+            );
+            let held = state
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(held.len(), 1, "and it must not be spent either");
+            assert_eq!(held[0].spec.fires, 0);
+            assert!(!held[0].matched, "its own priming is what stands");
+            drop(held);
+
+            // Older than the frame, everything else equal, it fires: the guard
+            // above is holding back exactly this.
+            arm(now_ms() - 60_000, false);
+            fire_triggers(&state, &session, &watched);
+            assert_eq!(notice().as_deref(), Some("it said ready"));
+
+            discard_root(state.paths.root.clone());
         }
 
         #[test]
