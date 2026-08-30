@@ -4407,30 +4407,56 @@ mod platform {
                 None => None,
             }
         };
-        if let Some(record) = &ended {
-            if let Some(successor) = resumed_successor(state, record) {
-                bail!(
-                    "session {session_id} was already resumed as {successor}, which is still \
-                     live; talk to it instead of resuming twice"
-                );
+        let (record, from_archive) = match ended {
+            Some(record) => (record, false),
+            None => {
+                let filed = state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(session_id)
+                    .map(|entry| entry.snapshot());
+                let Some(snapshot) = filed else {
+                    return Ok(None);
+                };
+                // The rule the running index is judged by, asked here too:
+                // retired, or ended and never retired, is a number its own
+                // conversation can come back on. It used to take the archive
+                // flag alone, which quietly meant every session that simply
+                // ended stopped being revivable the moment a daemon restarted
+                // and read it back off the disk - the same number, refused
+                // for the same conversation, on the strength of nothing but
+                // which index it was sitting in. Nothing in this one has a
+                // keeper: a record with a socket still beside it is left to
+                // adoption rather than read in here.
+                if !snapshot.archived && !snapshot.dead {
+                    bail!("daemon session already exists: {session_id}");
+                }
+                (snapshot, true)
             }
-            return Ok(ended);
+        };
+        // Asked of the record wherever it was found. A restart is where this
+        // is easiest to lose: the record a conversation moved away from is
+        // read back off the disk with the move still written on it, and
+        // reviving it there would put one conversation in two places.
+        if let Some(successor) = resumed_successor(state, &record) {
+            bail!(
+                "session {session_id} was already resumed as {successor}, which is still \
+                 live; talk to it instead of resuming twice"
+            );
         }
-        let mut persisted = state
-            .persisted_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = persisted.get(session_id) {
-            let snapshot = entry.snapshot();
-            if !snapshot.archived {
-                // A live-keeper record that never got adopted is not a free
-                // number, whatever its dead flag claims.
-                bail!("daemon session already exists: {session_id}");
-            }
-            persisted.remove(session_id);
-            return Ok(Some(snapshot));
+        if from_archive {
+            // Taken only now the record is the launch's to have: a refusal
+            // above has to leave the index as it found it, and nothing is
+            // watching to put a record back until the launch arms its
+            // rollback.
+            state
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id);
         }
-        Ok(None)
+        Ok(Some(record))
     }
 
     /// The archived record a new-id launch reopens: same runtime, same
@@ -8074,6 +8100,173 @@ mod platform {
                 assert_eq!(snapshot.label, label);
                 assert_eq!(snapshot.created_at, created);
             }
+        }
+
+        /// A record on disk, put where a restart will read it into the
+        /// archive index: a folder with no keeper socket in it, which is the
+        /// only way a record gets there rather than being left to adoption.
+        fn restarted_around(name: &str, record: &DaemonSession) -> Arc<DaemonState> {
+            let next = test_state(name);
+            persist_session_metadata(
+                &next.paths.sessions.join(format!("{}.json", record.id)),
+                record,
+            )
+            .unwrap();
+            fs::write(next.paths.history.join(format!("{}.ansi", record.id)), b"").unwrap();
+            Arc::new(DaemonState::new(next.paths.clone(), KeeperMode::InProcess))
+        }
+
+        #[test]
+        fn a_session_that_only_ended_comes_back_on_its_own_number_after_a_restart() {
+            let state = test_state("ended-revives-after-restart");
+            let id = "muxloomd-terminal-ended-restart";
+            let worker = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "worker".into(),
+                false,
+                "/bin/echo".into(),
+                vec![],
+                vec![],
+                333,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.snapshot().dead {
+                assert!(Instant::now() < deadline, "the session never ended");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let record = worker.snapshot();
+            drop(worker);
+            assert!(
+                !record.archived,
+                "a session that ended on its own is not a session anyone retired"
+            );
+
+            let restarted = restarted_around("ended-restart-read-back", &record);
+            let filed = restarted
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .map(|entry| entry.snapshot())
+                .expect("the restart never read the record back");
+            assert!(!filed.archived && filed.dead);
+
+            // The number is the conversation's, and a daemon restarting in
+            // between is not an event the conversation took part in.
+            let revived = launch_session(
+                &restarted,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+                None,
+            )
+            .expect("a session that only ended could not come back on its own number");
+            let snapshot = revived.snapshot();
+            assert_eq!(snapshot.label, "worker");
+            assert_eq!(snapshot.created_at, 333);
+        }
+
+        #[test]
+        fn a_record_that_already_moved_is_refused_out_of_the_archive_too() {
+            let state = test_state("moved-record-refused");
+            let previous = "muxloomd-terminal-moved-from";
+            let successor = "muxloomd-terminal-moved-to";
+            let first = launch_session(
+                &state,
+                previous.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                444,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            first.archive().unwrap();
+            let mut record = first.snapshot();
+            drop(first);
+            record.dead = true;
+            record.pid = None;
+            record.resumed_to = Some(successor.into());
+
+            let restarted = restarted_around("moved-record-read-back", &record);
+            let running = launch_session(
+                &restarted,
+                successor.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                555,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+
+            // The move is written on the record, and the record outlives the
+            // daemon that wrote it: reading it back off the disk must not
+            // read the move off it too.
+            let error = match launch_session(
+                &restarted,
+                previous.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+                None,
+            ) {
+                Ok(_) => panic!("one conversation was started in two places at once"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("already resumed as") && error.contains(successor),
+                "the refusal never names where the conversation went: {error}"
+            );
+            // And the record is still there to be told that again.
+            assert!(
+                restarted
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(previous),
+                "a refused revival took the record with it"
+            );
+            drop(running);
         }
 
         #[test]
