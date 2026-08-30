@@ -388,6 +388,7 @@ fn launch_and_picker_modals_never_panic() {
             history_selected: 0,
             searched_query: String::new(),
             search_edited_at: None,
+            history_loading: false,
         };
         draw_with(Some(Modal::Resume(resume)), *w, *h);
     }

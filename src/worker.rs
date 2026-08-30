@@ -132,6 +132,14 @@ pub enum Request {
         query: String,
         sessions: Vec<(Target, AgentSession)>,
     },
+    /// Search the local backup for conversations to reference. Nothing here
+    /// leaves the machine, but the corpus is every conversation every machine
+    /// ever had: reading it is not something to do between two keystrokes on
+    /// the thread that draws.
+    SearchBackup {
+        query: String,
+        limit: usize,
+    },
     ListDirectory {
         target: Target,
         path: String,
@@ -384,6 +392,13 @@ pub enum Event {
         /// seconds, so what it finds arrives a batch at a time. `None` is the
         /// last word on this query.
         reading: Option<(usize, usize)>,
+    },
+    /// What the backup held for a query. The query comes back with it: a
+    /// person types faster than a corpus can be read, and an answer to a
+    /// question they have already moved on from is not an answer.
+    BackupSearched {
+        query: String,
+        hits: Vec<crate::app::CrossMachineHit>,
     },
     DirectoryListed {
         target_id: String,
@@ -938,6 +953,10 @@ impl Worker {
                                 results.len()
                             ),
                         );
+                    }
+                    Request::SearchBackup { query, limit } => {
+                        let hits = crate::app::backup_search_hits(&query, limit);
+                        let _ = events.send(Event::BackupSearched { query, hits });
                     }
                     Request::ListDirectory { target, path } => {
                         let target_id = target.id.clone();

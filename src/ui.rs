@@ -3905,12 +3905,14 @@ fn draw_resume_history_panel(frame: &mut Frame<'_>, form: &ResumeForm, inner: Re
     // Draw the expanded hit list over the candidate area (from the top).
     let body_top = inner.y + 2;
     let mut y = body_top;
-    let status = if form.history_hits.is_empty() {
-        if form.searched_query == form.query.trim() {
-            "No matching history on any machine"
-        } else {
-            "Searching backed-up history..."
-        }
+    // The hits below belong to `searched_query`, which is only the query on
+    // screen once the reading is over. Until then they are the last question's
+    // answers, and saying so is the difference between a list that lags and a
+    // list that lies.
+    let status = if form.history_loading || form.searched_query != form.query.trim() {
+        "Searching backed-up history..."
+    } else if form.history_hits.is_empty() {
+        "No matching history on any machine"
     } else {
         "Enter references the selected conversation (transcript is injected as context)"
     };
@@ -7018,6 +7020,7 @@ mod tests {
             history_selected: 0,
             searched_query: String::new(),
             search_edited_at: None,
+            history_loading: false,
         }));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered: String = terminal

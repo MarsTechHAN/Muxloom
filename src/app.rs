@@ -585,6 +585,10 @@ pub struct ResumeForm {
     pub history_selected: usize,
     pub searched_query: String,
     pub search_edited_at: Option<Instant>,
+    /// Whether the backup is being read for `searched_query` right now. The
+    /// panel says so rather than showing the last query's hits as if they were
+    /// this one's.
+    pub history_loading: bool,
 }
 
 impl ResumeForm {
@@ -5493,6 +5497,18 @@ impl App {
                     };
                 }
             }
+            Event::BackupSearched { query, hits } => {
+                // The modal may have been closed, or the query typed past,
+                // while the corpus was being read. Either way this is the
+                // answer to a question nobody is asking any more.
+                if let Some(Modal::Resume(form)) = self.modal.as_mut()
+                    && form.searched_query == query
+                {
+                    form.history_loading = false;
+                    form.history_hits = hits;
+                    form.history_selected = 0;
+                }
+            }
             Event::DirectoryListed {
                 target_id,
                 requested_path,
@@ -5609,6 +5625,7 @@ impl App {
                                     history_selected: 0,
                                     searched_query: String::new(),
                                     search_edited_at: None,
+                                    history_loading: false,
                                 }));
                             } else if let Some(unread) = unread {
                                 self.request_history();
@@ -9437,6 +9454,7 @@ impl App {
             history_selected: 0,
             searched_query: String::new(),
             search_edited_at: None,
+            history_loading: false,
         };
         form.loading = true;
         let request = Request::ScanResumes {
@@ -10386,10 +10404,16 @@ impl App {
     }
 
     /// Debounced cross-machine history search feeding the resume modal's panel.
-    /// Runs against the local backup, so it is synchronous and needs no worker.
+    ///
+    /// It reads the local backup and nothing else, which for a long time was
+    /// taken to mean it was cheap enough to run inline. It is not: the corpus is
+    /// every conversation every machine ever had, held compressed, and reading
+    /// it between two keystrokes stops the draw, the input and the worker's
+    /// events with it. It goes to the worker like everything else that reads.
     fn maybe_search_resume_history(&mut self) {
         let ready = matches!(self.modal.as_ref(), Some(Modal::Resume(form))
             if form.history_active()
+                && !form.history_loading
                 && form.searched_query != form.query.trim()
                 && form
                     .search_edited_at
@@ -10402,8 +10426,15 @@ impl App {
         };
         let query = form.query.trim().to_string();
         form.searched_query = query.clone();
-        form.history_hits = backup_search_hits(&query, 50);
-        form.history_selected = 0;
+        form.history_loading = true;
+        if self
+            .worker
+            .requests
+            .send(Request::SearchBackup { query, limit: 50 })
+            .is_err()
+        {
+            form.history_loading = false;
+        }
     }
 
     /// Build the initial prompt that references a backed-up conversation from
@@ -12414,8 +12445,11 @@ fn single_line_paste(value: &str) -> String {
 
 /// Search the local backup for conversations matching `query`, de-duplicated to
 /// one entry per session (best-ranked hit). Empty without the controller build.
+///
+/// Reads and decompresses every conversation the backup holds, so it belongs on
+/// the worker — see [`crate::worker::Request::SearchBackup`].
 #[cfg(feature = "controller")]
-fn backup_search_hits(query: &str, limit: usize) -> Vec<CrossMachineHit> {
+pub(crate) fn backup_search_hits(query: &str, limit: usize) -> Vec<CrossMachineHit> {
     let store = crate::backup::BackupStore::new(crate::backup::BackupStore::default_root());
     let hits = match crate::backup::search(&store, query, limit.saturating_mul(4)) {
         Ok(hits) => hits,
@@ -12446,7 +12480,7 @@ fn backup_search_hits(query: &str, limit: usize) -> Vec<CrossMachineHit> {
 }
 
 #[cfg(not(feature = "controller"))]
-fn backup_search_hits(_query: &str, _limit: usize) -> Vec<CrossMachineHit> {
+pub(crate) fn backup_search_hits(_query: &str, _limit: usize) -> Vec<CrossMachineHit> {
     Vec::new()
 }
 
@@ -18095,6 +18129,7 @@ mod tests {
             history_selected: 0,
             searched_query: String::new(),
             search_edited_at: None,
+            history_loading: false,
         }));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
@@ -19315,6 +19350,7 @@ mod tests {
             history_selected: 0,
             searched_query: String::new(),
             search_edited_at: None,
+            history_loading: false,
         }));
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
