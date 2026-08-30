@@ -4329,6 +4329,23 @@ mod platform {
             let Some(record) = self.record.take() else {
                 return;
             };
+            // Back into the index it came out of, and no other. A session
+            // this daemon ran itself and has not reloaded since sits among
+            // the live records however it ended, and the take leaves it
+            // there; filing it under the archive instead would be worse than
+            // losing it, because a record in the archive that never reached
+            // the archive is one `resume_in_place` refuses to hand back at
+            // all - the number would answer nothing and revive as nothing
+            // until the daemon restarted.
+            if self
+                .state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&record.id)
+            {
+                return;
+            }
             // The file first, because a launch that got as far as writing its
             // own metadata has already written over the record's - and then
             // read back rather than trusted, so what returns to the index is
@@ -4362,7 +4379,7 @@ mod platform {
         // Launches are serialized by the caller's client gate, so the two
         // indexes cannot shift under this between look and take.
         let ended = {
-            let mut live = state
+            let live = state
                 .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4380,8 +4397,11 @@ mod platform {
                     }
                     // Archived or ended with the keeper already gone: the map
                     // entry only stood where an archive retirement would have
-                    // retired it. The launch reclaims the slot.
-                    live.remove(session_id);
+                    // retired it, and the launch reclaims the slot by writing
+                    // the live session over it at the end. Left in place until
+                    // then, because a launch that fails on the way there is a
+                    // record that has to still be here afterwards, and this is
+                    // the only copy of it there is.
                     Some(snapshot)
                 }
                 None => None,
@@ -7901,6 +7921,159 @@ mod platform {
             assert_eq!(snapshot.label, "coordinator");
             assert_eq!(snapshot.created_at, 111);
             assert!(!still_archived());
+        }
+
+        #[test]
+        fn a_refused_revival_puts_the_record_back_in_the_index_it_came_out_of() {
+            let state = test_state("revive-indexes");
+            let refuse = |state: &Arc<DaemonState>, id: &str| {
+                let missing = state.paths.scratch.join("a-folder-that-was-removed");
+                let outcome = launch_session(
+                    state,
+                    id.into(),
+                    "terminal".into(),
+                    missing.to_string_lossy().into_owned(),
+                    String::new(),
+                    false,
+                    "/bin/cat".into(),
+                    vec![],
+                    vec![],
+                    999,
+                    80,
+                    24,
+                    None,
+                    None,
+                );
+                assert!(outcome.is_err(), "the folder is gone; the launch cannot be");
+            };
+
+            // The archive index, which is where every record sits once a
+            // daemon has restarted and read it back off disk.
+            let filed = "muxloomd-terminal-revive-filed";
+            let first = launch_session(
+                &state,
+                filed.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            first.archive().unwrap();
+            let record = first.snapshot();
+            drop(first);
+            // A daemon that has gone leaves records behind and not keepers,
+            // so the restart reads this one out of a directory with nothing
+            // listening in it - which is the only way a record reaches the
+            // archive index rather than being left to adoption.
+            let next = test_state("revive-filed");
+            persist_session_metadata(&next.paths.sessions.join(format!("{filed}.json")), &record)
+                .unwrap();
+            fs::write(next.paths.history.join(format!("{filed}.ansi")), b"").unwrap();
+            let restarted = Arc::new(DaemonState::new(next.paths.clone(), KeeperMode::InProcess));
+            let archived = |state: &DaemonState| {
+                state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(filed)
+                    .map(|entry| entry.snapshot())
+            };
+            assert!(
+                archived(&restarted).is_some(),
+                "the restart never read the record back"
+            );
+            refuse(&restarted, filed);
+            let back = archived(&restarted)
+                .expect("the archive lost the record it handed to a launch that failed");
+            assert_eq!(back.label, "coordinator");
+            // Still *archived*, which is the part that matters: the archive
+            // hands a record back only if it reached the archive, so one
+            // filed there in any other state is one the number can never
+            // revive as again.
+            assert!(back.archived);
+
+            // And the running index, where a session this daemon ran itself
+            // stays however it ended - a record there has not been filed and
+            // must not be.
+            let ended = "muxloomd-terminal-revive-ended";
+            let worker = launch_session(
+                &state,
+                ended.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "worker".into(),
+                false,
+                "/bin/echo".into(),
+                vec![],
+                vec![],
+                222,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.snapshot().dead {
+                assert!(Instant::now() < deadline, "the session never ended");
+                thread::sleep(Duration::from_millis(20));
+            }
+            drop(worker);
+            refuse(&state, ended);
+            let live = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(ended)
+                .map(|session| session.snapshot());
+            let live = live.expect("a session that only ended was taken out of the running index");
+            assert_eq!(live.label, "worker");
+            assert!(
+                state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(ended)
+                    .is_none(),
+                "an ended session was filed under the archive it never reached"
+            );
+
+            // Which is the whole point of putting each back where it was:
+            // both numbers still revive as the conversations they were.
+            for (state, id, label, created) in [
+                (&restarted, filed, "coordinator", 111),
+                (&state, ended, "worker", 222),
+            ] {
+                let revived = launch_session(
+                    state,
+                    id.into(),
+                    "terminal".into(),
+                    "/tmp".into(),
+                    String::new(),
+                    false,
+                    "/bin/cat".into(),
+                    vec![],
+                    vec![],
+                    999,
+                    80,
+                    24,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let snapshot = revived.snapshot();
+                assert_eq!(snapshot.label, label);
+                assert_eq!(snapshot.created_at, created);
+            }
         }
 
         #[test]
