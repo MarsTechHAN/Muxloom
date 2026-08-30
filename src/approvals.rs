@@ -73,6 +73,15 @@ pub struct Approvals {
     /// once. The next matching job runs and then the grant is spent.
     #[serde(default)]
     pub once: Vec<(String, String, String)>,
+    /// The highest number this ledger has ever put on an ask. Kept in the file
+    /// rather than in the process, so a restart carries on counting.
+    #[serde(default)]
+    pub minted: u64,
+}
+
+/// The number an id names, when it is one of ours.
+fn id_number(id: &str) -> Option<u64> {
+    id.strip_prefix("approve-")?.parse().ok()
 }
 
 impl Approvals {
@@ -143,9 +152,37 @@ impl Approvals {
             .map(|(id, _)| id.as_str())
     }
 
-    /// Park a new ask under a fresh id and return it. Caller writes the file.
-    pub fn park(&mut self, id: String, pending: Pending) {
+    /// The number for the next ask, counted from the file.
+    ///
+    /// A person answers in hours and a controller restarts in minutes, so the
+    /// two cannot share a counter that lives in the process. One that begins
+    /// again at one hands `approve-3` to a second ask while the first
+    /// `approve-3` is still on somebody's phone, and the yes they type then
+    /// settles whichever of the two the ledger happens to be holding: a person
+    /// reading one write and granting another. The floor is the highest number
+    /// still parked as well as the recorded one, so a ledger written by a build
+    /// that had no counter is not walked over either.
+    ///
+    /// Minting alone does not dirty the file. An ask that never reaches the
+    /// person is never parked, and a number nobody was shown is free to be
+    /// handed out again.
+    pub fn mint(&mut self) -> u64 {
+        let parked = self.pending.keys().filter_map(|id| id_number(id)).max();
+        self.minted = self.minted.max(parked.unwrap_or(0)) + 1;
+        self.minted
+    }
+
+    /// Park a new ask under `id`. Caller writes the file.
+    ///
+    /// False, and nothing written, when that id is already an ask waiting on an
+    /// answer: overwriting one silently would leave the person looking at a
+    /// card for a write that is no longer what saying yes to it does.
+    pub fn park(&mut self, id: String, pending: Pending) -> bool {
+        if self.pending.get(&id).is_some_and(|open| open.open) {
+            return false;
+        }
         self.pending.insert(id, pending);
+        true
     }
 
     /// Remember `(session, machine, tool)` for the rest of the session.
@@ -196,12 +233,6 @@ impl Approvals {
         let before = self.pending.len();
         self.pending.retain(|_, p| p.session != session);
         before - self.pending.len()
-    }
-
-    /// An id the witness never touches, so two asks cannot share bookkeeping.
-    pub fn fresh_id(counter: &mut u64) -> String {
-        *counter += 1;
-        format!("approve-{}", *counter)
     }
 }
 
@@ -272,7 +303,7 @@ mod tests {
             open: true,
         };
         assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
-        a.park("approve-1".into(), ask("s1", "seed", "launch_session", 10));
+        assert!(a.park("approve-1".into(), ask("s1", "seed", "launch_session", 10)));
         assert_eq!(
             a.open_ask("s1", "seed", "launch_session"),
             Some("approve-1")
@@ -284,7 +315,7 @@ mod tests {
         assert_eq!(a.open_ask("s1", "seed", "run_shell"), None);
         // The oldest one is the one they have been looking at longest, and a
         // HashMap has no order of its own to fall back on.
-        a.park("approve-2".into(), ask("s1", "seed", "launch_session", 5));
+        assert!(a.park("approve-2".into(), ask("s1", "seed", "launch_session", 5)));
         assert_eq!(
             a.open_ask("s1", "seed", "launch_session"),
             Some("approve-2")
@@ -294,6 +325,52 @@ mod tests {
         a.take("approve-2");
         a.take("approve-1");
         assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
+    }
+
+    /// A controller restarts far more often than a person answers their phone.
+    /// A number that begins again at one puts a second write behind a card the
+    /// person is already looking at, and the yes they type grants whichever of
+    /// the two the ledger is holding.
+    #[test]
+    fn a_number_is_never_handed_out_twice_however_often_the_controller_restarts() {
+        let path = scratch("minting");
+        let _ = std::fs::remove_file(&path);
+        let ask = || Pending {
+            session: "s1".into(),
+            machine: "seed".into(),
+            tool: "launch_session".into(),
+            ask: String::new(),
+            at_ms: 1,
+            open: true,
+        };
+
+        let mut a = Approvals::default();
+        assert_eq!((a.mint(), a.mint(), a.mint()), (1, 2, 3));
+        assert!(a.park("approve-3".into(), ask()));
+        a.save(&path).unwrap();
+
+        // The restart: a whole new ledger, read off the disk, carries on where
+        // the counter left off rather than back at one.
+        let mut back = Approvals::load(&path);
+        assert_eq!(back.mint(), 4);
+
+        // And a file written by a build that kept no counter at all still puts
+        // the floor above every ask still parked in it.
+        let mut older = Approvals {
+            minted: 0,
+            ..Default::default()
+        };
+        assert!(older.park("approve-9".into(), ask()));
+        assert_eq!(older.mint(), 10);
+
+        // An id still waiting on an answer is never quietly written over; one
+        // that has been settled leaves its number free to be filed again.
+        assert!(!older.park("approve-9".into(), ask()));
+        older.take("approve-9");
+        assert!(older.park("approve-9".into(), ask()));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
     #[test]

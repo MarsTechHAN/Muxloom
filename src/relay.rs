@@ -28,7 +28,6 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -209,10 +208,6 @@ pub fn now_ms() -> u64 {
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
 }
-
-/// Source of fresh approval ids while the controller runs. A plain counter is
-/// all the uniqueness a chat reply needs.
-static NEXT_PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// Which machine a call names, if it names one. Read from the `machine`
 /// argument the same way the tool surface does, so the ask tells the person
@@ -701,7 +696,6 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
         hear(&mut round.heard, known, &reach, &via, &target.id);
         let mut approvals = Approvals::load(&Approvals::default_path());
         let mut approval_dirty = false;
-        let mut next = NEXT_PENDING.fetch_add(1_000, Ordering::Relaxed) + 1;
         for job in jobs {
             // A WRITE tool held behind the approval gate runs only after the
             // person has said so — remembered for the session, or asked now.
@@ -718,8 +712,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                          answered yet. Make this call again once they have."
                     ),
                     None => {
-                        let number = next;
-                        next += 1;
+                        let number = approvals.mint();
                         let id = format!("approve-{number}");
                         let ask = approval_ask(&tool, &machine, number);
                         // Parked only once it has actually gone out. An entry
@@ -728,7 +721,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                         // is waiting on a person who never heard.
                         match try_chat_ask(&mut surface, config, runtime, &ask) {
                             Ok(()) => {
-                                approvals.park(
+                                approval_dirty |= approvals.park(
                                     id,
                                     ApprovalsPending {
                                         session: job.session.clone(),
@@ -739,7 +732,6 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                                         open: true,
                                     },
                                 );
-                                approval_dirty = true;
                                 format!(
                                     "{tool} needs the person's approval and they have been asked \
                                      in chat. They answer `approve-{number}`, `always-{number}` \

@@ -5482,7 +5482,7 @@ mod tests {
         use crate::approvals::{Approvals, Pending, Verdict};
         fn parked(tool: &str) -> Approvals {
             let mut ledger = Approvals::default();
-            ledger.park(
+            assert!(ledger.park(
                 "approve-7".into(),
                 Pending {
                     session: "sess-1".into(),
@@ -5492,7 +5492,7 @@ mod tests {
                     at_ms: 1,
                     open: true,
                 },
-            );
+            ));
             ledger
         }
         // An id this machine never asked about is not ours to settle — this
