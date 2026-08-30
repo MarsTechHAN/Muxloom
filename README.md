@@ -879,10 +879,11 @@ you never saw. `launch_session` needs an absolute `path` when
 it names another machine — the caller's own folder is on this one. `wait_for`
 never travels; it watches the machine it runs on. Machine enablement and SSH
 edits are never relayed at all. With no dashboard attached, every cross-machine
-call fails immediately and says so. When two dashboards watch the same machine,
-a relayed call goes to one that can actually reach the machine it names, not to
-whichever asked for work first; if none of them can, the agent is told that on
-the spot rather than left waiting out the job.
+call fails immediately and says so. More than one controller can watch the same
+machine, and they need not reach the same fleet: a call goes to one that reaches
+the machine it names rather than to whichever asked for work first, and a machine
+none of them carries is refused on the call that named it — listing the machines
+they do carry — instead of waiting out the relay timeout.
 
 The dashboard borrows the same reach. A machine only another controller can get
 to is listed under your own with a `»` and the name of the way there; select it

@@ -214,22 +214,12 @@ pub fn now_ms() -> u64 {
 /// all the uniqueness a chat reply needs.
 static NEXT_PENDING: AtomicU64 = AtomicU64::new(0);
 
-/// Which machine a relayed job names, if it names one. Read from the
-/// `machine` argument the same way the tool surface does, so the ask tells the
-/// person where the write would land and the remember key is stable.
-/// Whether a controller offering `peers` is a way to `machine`. An agent
-/// addresses a machine by the id `list_machines` gave it, which is a peer id;
-/// the label is matched too, because that is the word a person reads off the
-/// dashboard and hands to an agent. Case is not part of a hostname.
-fn carries(peers: &[RelayPeer], machine: &str) -> bool {
-    peers.iter().any(|peer| {
-        peer.id.eq_ignore_ascii_case(machine)
-            || (!peer.label.is_empty() && peer.label.eq_ignore_ascii_case(machine))
-    })
-}
-
-fn job_machine(job: &RelayJob) -> String {
-    serde_json::from_str::<serde_json::Value>(&job.arguments)
+/// Which machine a call names, if it names one. Read from the `machine`
+/// argument the same way the tool surface does, so the ask tells the person
+/// where the write would land, the remember key is stable, and the controller
+/// the job is handed to is one with a route there.
+fn machine_named(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
         .and_then(|value| {
             value
@@ -238,6 +228,32 @@ fn job_machine(job: &RelayJob) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_default()
+}
+
+/// Which machine a relayed job names, if it names one.
+fn job_machine(job: &RelayJob) -> String {
+    machine_named(&job.arguments)
+}
+
+/// Whether a controller reaching `fleet` is one to hand a job aimed at
+/// `machine` to.
+///
+/// A job that names no machine is an errand about the controller itself — a
+/// fleet-wide sweep, a question about what it reaches — and whichever one came
+/// round for work is the one to answer it. A job that names a machine belongs
+/// to a controller with a route there and to no other: two dashboards may
+/// watch this daemon, and one of them holds a route the other has never heard
+/// of. Handing such a job to the wrong one spends it on a refusal saying the
+/// machine is not enabled, which is a different thing and not true — the
+/// machine is enabled, just not over there.
+///
+/// Names are matched without regard to case, the same latitude
+/// `ControllerControl::spelled_here` gives a machine named by its hostname.
+/// Being generous here cannot widen what runs: whichever controller takes the
+/// job checks the name against the machines its user enabled before it touches
+/// anything.
+fn routable(fleet: &[String], machine: &str) -> bool {
+    machine.is_empty() || fleet.iter().any(|id| id.eq_ignore_ascii_case(machine))
 }
 
 /// What the person is shown when a cross-machine write is waiting on them,
@@ -430,6 +446,35 @@ impl RelayQueue {
                  agent over there instead, or tell whoever runs muxloom that it is not running."
             );
         }
+        // A machine none of the controllers here can reach is refused on the
+        // call that named it, for the same reason an unattached machine is:
+        // the alternative is silence. The job would sit in the queue with no
+        // controller willing to take it, and the agent would wait out the
+        // whole expiry to be told nobody answered.
+        //
+        // Only a fleet that was actually named rules anything out. A
+        // controller too old to say what it reaches leaves nothing to check
+        // against, and then the job travels exactly as it always did.
+        let machine = machine_named(arguments);
+        if !machine.is_empty() {
+            let fleet: Vec<String> = self
+                .live(now)
+                .flat_map(|reach| reach.peers.iter())
+                .map(|peer| peer.id.clone())
+                .collect();
+            if !fleet.is_empty() && !routable(&fleet, &machine) {
+                let mut known: Vec<&str> = fleet.iter().map(String::as_str).collect();
+                known.sort_unstable();
+                known.dedup();
+                bail!(
+                    "no muxloom controller watching this machine can reach {machine}. The \
+                     machines they carry are: {}. Ask an agent on one of those, or have the \
+                     controller that reaches {machine} enable this machine too, so that one \
+                     controller sees both.",
+                    known.join(", ")
+                );
+            }
+        }
         self.expire(now);
         if self.entries.len() >= QUEUE_LIMIT {
             bail!("too many relayed requests are already waiting on the controller; try again");
@@ -460,7 +505,10 @@ impl RelayQueue {
     /// rather than emptying it.
     pub fn poll(&mut self, now: u64, peers: Vec<RelayPeer>, via: &str) -> Vec<RelayJob> {
         self.last_poll = now;
-        if !peers.is_empty() {
+        // Whether this poll said anything about a fleet at all, which is what
+        // decides whether there is a route to sort the waiting jobs by.
+        let named = !peers.is_empty();
+        if named {
             match self.reaches.iter_mut().find(|reach| reach.via == via) {
                 Some(reach) => {
                     reach.peers = peers;
@@ -479,65 +527,27 @@ impl RelayQueue {
                 .retain(|reach| now.saturating_sub(reach.at) <= EXPIRY_MS);
         }
         self.expire(now);
-        // Which machines this controller just said it can reach. A job is
-        // handed out once, so handing it to a controller with no route there
-        // spends it: the answer comes back "machine X is not enabled in
-        // muxloom" from a controller that was never the way there, and the one
-        // that was never sees the job at all. Two dashboards watching the same
-        // machine is the ordinary case, not a corner of one.
-        //
-        // A controller too old to say what it reaches still gets everything.
-        // It answered this way before there was anything to say, and being
-        // silent is not the same as reaching nowhere.
-        let Some(mine) = self
-            .live(now)
-            .find(|reach| reach.via == via)
-            .map(|reach| reach.peers.clone())
-        else {
-            return self.hand_out(|_| true);
-        };
-        let elsewhere: Vec<Vec<RelayPeer>> = self
-            .live(now)
-            .filter(|reach| reach.via != via)
-            .map(|reach| reach.peers.clone())
-            .collect();
-        let mut orphans = Vec::new();
-        let jobs = self.hand_out(|job| {
-            let machine = job_machine(job);
-            // Naming no machine means the machine that asked, and any
-            // controller round here can answer for it.
-            if machine.is_empty() || carries(&mine, &machine) {
-                return true;
-            }
-            if !elsewhere.iter().any(|peers| carries(peers, &machine)) {
-                orphans.push((job.id.clone(), machine));
-            }
-            false
+        // The machines this controller just said it reaches. `None` is a
+        // controller from before there was anything to say: it cannot be
+        // routed for, and it is also the only build that never had to be, so
+        // it is offered every job exactly as it always was.
+        let fleet: Option<Vec<String>> = named.then(|| {
+            self.reaches
+                .iter()
+                .find(|reach| reach.via == via)
+                .map(|reach| reach.peers.iter().map(|peer| peer.id.clone()).collect())
+                .unwrap_or_default()
         });
-        // Nothing here is a route to that machine, and waiting out the job's
-        // two minutes would tell the agent only that nobody answered. Say
-        // which it is while there is still someone listening.
-        for (id, machine) in orphans {
-            self.complete(
-                &id,
-                false,
-                format!(
-                    "no muxloom controller watching this machine can reach {machine}. Whichever \
-                     one could has stopped coming round; ask an agent over there instead, or tell \
-                     whoever runs muxloom."
-                ),
-                now,
-            );
-        }
-        jobs
-    }
-
-    /// Take the jobs `wanted` accepts, marking each as gone. Every job is
-    /// handed out once, to the one controller that took it.
-    fn hand_out(&mut self, mut wanted: impl FnMut(&RelayJob) -> bool) -> Vec<RelayJob> {
         self.entries
             .iter_mut()
-            .filter(|entry| !entry.taken && entry.answer.is_none() && wanted(&entry.job))
+            .filter(|entry| !entry.taken && entry.answer.is_none())
+            // A job is handed to a controller that can carry it there, not to
+            // whichever one asked first. Both may be watching this machine,
+            // and only one of them has the route.
+            .filter(|entry| match &fleet {
+                Some(fleet) => routable(fleet, &job_machine(&entry.job)),
+                None => true,
+            })
             .map(|entry| {
                 entry.taken = true;
                 entry.job.clone()
@@ -959,66 +969,6 @@ mod tests {
         assert!(queue.result(&id, t0 + 500).is_err());
     }
 
-    /// Two dashboards watching one machine is the ordinary case, and a job is
-    /// handed out once. Before this, whichever asked first took every job
-    /// waiting — so a call for a machine only the other one could reach came
-    /// back "machine X is not enabled in muxloom" from a controller that was
-    /// never the way there, and the one that was never saw it.
-    #[test]
-    fn a_job_goes_to_the_controller_that_can_reach_the_machine_it_names() {
-        let peer = |id: &str| RelayPeer {
-            id: id.into(),
-            label: id.into(),
-            own: false,
-            via: String::new(),
-        };
-        let mut queue = RelayQueue::default();
-        let t0 = 3_000_000;
-        // Two controllers come round. Only the second is a way to `gpu-box`.
-        queue.poll(t0, vec![peer("laptop")], "laptop");
-        queue.poll(t0, vec![peer("laptop"), peer("gpu-box")], "office");
-
-        let far = queue
-            .submit("read_screen", r#"{"machine":"gpu-box"}"#, "", t0)
-            .unwrap();
-        let near = queue.submit("list_machines", "{}", "", t0).unwrap();
-
-        // The one that cannot reach it takes only the job that names no
-        // machine, and leaves the other where the route can find it.
-        let jobs = queue.poll(t0 + 100, vec![peer("laptop")], "laptop");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, near);
-        assert_eq!(
-            queue.result(&far, t0 + 100).unwrap(),
-            RelayAnswer::default()
-        );
-
-        let jobs = queue.poll(t0 + 200, vec![peer("laptop"), peer("gpu-box")], "office");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, far);
-
-        // A machine no controller here reaches is said so on the spot, rather
-        // than left to time out saying nobody answered.
-        let lost = queue
-            .submit("read_screen", r#"{"machine":"basement"}"#, "", t0 + 300)
-            .unwrap();
-        queue.poll(t0 + 400, vec![peer("laptop")], "laptop");
-        let answer = queue.result(&lost, t0 + 500).unwrap();
-        assert!(answer.done && !answer.ok, "{answer:?}");
-        assert!(answer.output.contains("basement"), "{}", answer.output);
-
-        // And a controller too old to say what it reaches is still given
-        // everything: silence is not the same as reaching nowhere.
-        let mut old = RelayQueue::default();
-        old.poll(t0, Vec::new(), "");
-        let id = old
-            .submit("read_screen", r#"{"machine":"gpu-box"}"#, "", t0)
-            .unwrap();
-        let jobs = old.poll(t0 + 100, Vec::new(), "");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, id);
-    }
-
     #[test]
     fn the_controller_runs_errands_not_commands() {
         let mut queue = RelayQueue::default();
@@ -1184,6 +1134,137 @@ mod tests {
                 .map(|peer| peer.id.clone())
                 .collect::<Vec<_>>(),
             ["gpu"]
+        );
+    }
+
+    /// The bug this is here for: a daemon with two controllers watching it
+    /// handed every waiting job to whichever one asked first. A call aimed at
+    /// a machine only the other one reaches was spent on a controller with no
+    /// route there, which answered — correctly, for itself — that the machine
+    /// was not enabled. It was enabled; the answer came from the wrong side of
+    /// the fleet, and the controller that could have run it never saw the job.
+    #[test]
+    fn a_job_goes_to_the_controller_that_can_reach_its_machine() {
+        let mut queue = RelayQueue::default();
+        let t0 = 5_000_000;
+        let peer = |id: &str, own: bool| RelayPeer {
+            id: id.into(),
+            label: id.into(),
+            own,
+            via: String::new(),
+        };
+        // Two dashboards watch this machine. Only one of them reaches `seed`.
+        let desk = vec![peer("desk", false), peer("mac", true)];
+        let laptop = vec![
+            peer("laptop", false),
+            peer("mac", true),
+            peer("seed", false),
+        ];
+        queue.poll(t0, desk.clone(), "desk");
+        queue.poll(t0, laptop.clone(), "laptop");
+
+        let far = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
+            .unwrap();
+        // The dashboard with no route there is offered nothing however often
+        // it asks, and asking does not spend the job.
+        assert!(queue.poll(t0 + 1, desk.clone(), "desk").is_empty());
+        assert!(queue.poll(t0 + 2, desk.clone(), "desk").is_empty());
+        let jobs = queue.poll(t0 + 3, laptop.clone(), "laptop");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, far);
+
+        // A machine both of them carry goes to whichever asks first, and a
+        // call naming no machine is an errand about the controller itself.
+        let near = queue
+            .submit("list_files", r#"{"machine":"mac"}"#, "", t0 + 4)
+            .unwrap();
+        let sweep = queue
+            .submit("search_conversations", "{}", "", t0 + 4)
+            .unwrap();
+        assert_eq!(
+            queue
+                .poll(t0 + 5, desk.clone(), "desk")
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            [near, sweep]
+        );
+
+        // A controller from before there was a fleet to name is the one build
+        // that cannot be routed for, and it is also the only one that never
+        // had to be: it is offered everything, exactly as it always was.
+        let far = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", t0 + 6)
+            .unwrap();
+        let jobs = queue.poll(t0 + 7, Vec::new(), "");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, far);
+    }
+
+    /// A machine nothing here can reach is news the agent gets on the call it
+    /// made. Left to the queue it would be silence: no controller would take
+    /// the job, and the asker would wait out the whole expiry to be told that
+    /// nobody ever answered.
+    #[test]
+    fn a_machine_no_controller_here_carries_is_refused_while_the_asker_listens() {
+        let mut queue = RelayQueue::default();
+        let t0 = 6_000_000;
+        let peer = |id: &str| RelayPeer {
+            id: id.into(),
+            label: id.into(),
+            ..Default::default()
+        };
+        queue.poll(t0, vec![peer("desk"), peer("mac")], "desk");
+
+        let error = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("can reach seed"), "{error}");
+        // And it says what there is instead, so the agent can pick one rather
+        // than guess again.
+        assert!(error.contains("desk") && error.contains("mac"), "{error}");
+
+        // The machines it does carry travel, named in whatever case: the
+        // hostname a daemon answers to is the same machine however it is
+        // capitalised, and the controller weighs the name against the machines
+        // the user enabled before it touches anything.
+        assert!(
+            queue
+                .submit("read_screen", r#"{"machine":"MAC"}"#, "", t0)
+                .is_ok()
+        );
+
+        // A second dashboard that does reach `seed` arrives, and the call that
+        // was refused a moment ago goes through.
+        queue.poll(
+            t0,
+            vec![peer("laptop"), peer("mac"), peer("seed")],
+            "laptop",
+        );
+        assert!(
+            queue
+                .submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
+                .is_ok()
+        );
+
+        // Then it walks off, and the route goes with it: the call is refused
+        // again rather than parked against a dashboard that is not there.
+        let later = t0 + ATTACHED_MS + 1;
+        queue.poll(later, vec![peer("desk"), peer("mac")], "desk");
+        let error = queue
+            .submit("read_screen", r#"{"machine":"seed"}"#, "", later)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("can reach seed"), "{error}");
+
+        // Nothing to check against is not grounds for refusing anything.
+        let mut old = RelayQueue::default();
+        old.poll(t0, Vec::new(), "");
+        assert!(
+            old.submit("read_screen", r#"{"machine":"seed"}"#, "", t0)
+                .is_ok()
         );
     }
 
