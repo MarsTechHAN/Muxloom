@@ -236,6 +236,10 @@ preserve.
   `cargo test --locked --all-targets -- --test-threads=1`.
 - Remote integration tests are opt-in. Use an explicit target, leave no test
   sessions behind, and never include private infrastructure paths in fixtures.
+- No test may reach the machine's own state directory. A suite that needs a
+  daemon, a keeper, or a companion stands up a scratch root and hands it to the
+  child processes it starts; `MUXLOOMD_STATE_DIR` unset means the developer's
+  live fleet, and a test build refuses to open a local companion without one.
 - A release version must match in `Cargo.toml`, `Cargo.lock`, and the Git tag.
 - Every commit on `main` that passes the full regression suite is republished
   as the rolling `nightly` prerelease. It must stay a prerelease, because

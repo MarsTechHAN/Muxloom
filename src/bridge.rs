@@ -450,6 +450,23 @@ impl BridgeConnection {
     }
 
     pub fn connect_local(configured_command: &str) -> Result<Arc<Self>> {
+        // A test build never opens the machine's own daemon. The bridge is a
+        // child process and the state directory reaches it through the
+        // environment, so a test that sets none gets a companion pointed at
+        // whatever the developer running the suite happens to have open: it
+        // lists their real sessions, and until this was noticed it retired
+        // their daemon and put an uncommitted debug build in its place, every
+        // time `cargo test` ran. Every suite that means to drive a daemon
+        // stands up a scratch root and says so; one that has not is asking for
+        // the real one by accident, and is told no rather than answered.
+        #[cfg(test)]
+        if std::env::var_os("MUXLOOMD_STATE_DIR").is_none() {
+            bail!(
+                "a test asked for the local companion without a scratch \
+                 MUXLOOMD_STATE_DIR, and a test build will not reach the \
+                 machine's own daemon to answer it"
+            );
+        }
         let executable = if configured_command == "muxloomd" {
             local_companion_command()
         } else {
@@ -2757,6 +2774,30 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+
+    /// The suite ran on somebody's own machine and reached straight into it.
+    /// A `Runtime` built from a default config asks the local target for its
+    /// sessions, that opens a companion, and the companion inherits the
+    /// environment it was spawned with — so with nothing set it attached to
+    /// the developer's live daemon, listed the agents they had running, and,
+    /// because a hand-made build outranks an installed one, retired that
+    /// daemon and left `target/debug/muxloomd` serving their fleet. One
+    /// machine's log had two hundred and thirty-four of those.
+    #[test]
+    fn a_test_build_will_not_open_the_machine_s_own_companion() {
+        assert!(
+            std::env::var_os("MUXLOOMD_STATE_DIR").is_none(),
+            "nothing in this binary may point the whole process at a daemon; \
+             a suite that needs one gives it to the child it starts"
+        );
+        let error = BridgeConnection::connect_local("muxloomd")
+            .err()
+            .expect("a test must not be handed the machine's own daemon");
+        assert!(
+            format!("{error:#}").contains("MUXLOOMD_STATE_DIR"),
+            "and it must say what was missing: {error:#}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
