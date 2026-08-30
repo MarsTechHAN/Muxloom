@@ -5339,21 +5339,15 @@ mod platform {
         /// The last answer visible on the session's screen, or the last one
         /// that was.
         ///
-        /// Read off the screen as the terminal draws it rather than out of the
-        /// bytes that drew it: an agent paints its window with cursor moves, so
-        /// the raw stream has no lines in it - a status bar arrives as
-        /// `manualmodeon?forshortcuts` and the composer arrives one keystroke
-        /// at a time, each repaint appended to the last. Rendering first is
-        /// what makes the difference between reading a sentence and reading
-        /// the pixels it was written with.
-        fn recap_on_screen(&self, kind: AgentKind) -> Option<String> {
-            let drawn = {
-                let screen = self
-                    .screen
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                extract_recap(kind, &screen.screen().contents())
-            };
+        /// `visible_screen` is the screen as the terminal draws it rather than
+        /// the bytes that drew it: an agent paints its window with cursor
+        /// moves, so the raw stream has no lines in it - a status bar arrives
+        /// as `manualmodeon?forshortcuts` and the composer arrives one
+        /// keystroke at a time, each repaint appended to the last. Rendering
+        /// first is what makes the difference between reading a sentence and
+        /// reading the pixels it was written with.
+        fn recap_on_screen(&self, kind: AgentKind, visible_screen: &str) -> Option<String> {
+            let drawn = extract_recap(kind, visible_screen);
             let mut kept = self
                 .screen_recap
                 .lock()
@@ -5383,13 +5377,18 @@ mod platform {
             {
                 snapshot.first_prompt = Some(prompt);
             }
-            let visible_screen = self
-                .screen
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .screen()
-                .contents();
             if let Ok(kind) = snapshot.kind.parse::<AgentKind>() {
+                // Drawn once and read five ways. Laying the grid out as text is
+                // most of what classifying a session costs, and every reading
+                // below wants the same picture of the same moment - so taking
+                // it twice would not only cost twice, it would let the screen
+                // move in between and answer two questions about two screens.
+                let visible_screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .screen()
+                    .contents();
                 // What the runtime wrote down about itself beats anything read
                 // off its screen: it is the turn as the agent meant it, not
                 // the frame the terminal happened to be painting.
@@ -5414,7 +5413,8 @@ mod platform {
                 // Only when the runtime's own account of itself is not to be
                 // had. What it wrote down is the turn as the agent meant it;
                 // the screen is a guess at the same thing.
-                snapshot.recap = native_recap.or_else(|| self.recap_on_screen(kind));
+                snapshot.recap =
+                    native_recap.or_else(|| self.recap_on_screen(kind, &visible_screen));
                 if snapshot.dead || snapshot.archived {
                     snapshot.pid = None;
                     snapshot.working = false;
