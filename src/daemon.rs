@@ -194,6 +194,15 @@ mod platform {
     /// exists because one stuck screen must not become a minute-ticker at its
     /// parent: an hour of an unanswered question costs four tells, not sixty.
     const PARENT_ALERT_REMINDERS_MS: [u64; 3] = [60_000, 300_000, 900_000];
+    /// How long a child has to be read as *not* waiting before whatever it is
+    /// waiting on afterwards counts as a different question. A leash that any
+    /// changed reading can unclip is not a leash: what a session is waiting on
+    /// is read off a screen and out of a transcript, and those two disagree
+    /// with each other for reasons that have nothing to do with the child -
+    /// a claim dropped and retaken, a modal over the last thing said. The one
+    /// thing that cannot be a misreading is the child having stopped waiting,
+    /// long enough that no blink is that long.
+    const PARENT_ALERT_SETTLE_MS: u64 = PARENT_ALERT_REMINDERS_MS[0];
     /// The most messages that may be waiting for sessions to be free. Past
     /// this something is queueing faster than the machine can read, and the
     /// oldest of them are already stale.
@@ -527,12 +536,17 @@ mod platform {
     /// One waiting state a parent has been told about, as far as the alerting
     /// machine remembers it. While both keys hold, the child sits on the same
     /// question, and tells about it run out: the first, then the reminders of
-    /// `PARENT_ALERT_REMINDERS_MS`, then nothing until a key changes.
+    /// `PARENT_ALERT_REMINDERS_MS`, then nothing until a key changes over a
+    /// child that has been seen free in between.
     struct AlertEdge {
         reason_key: String,
         recap_key: String,
         told: u32,
         last_claimed_at: u64,
+        /// When the stretch of *not* waiting this child is in began, or 0 while
+        /// it is waiting. A stretch that reaches `PARENT_ALERT_SETTLE_MS` is
+        /// what makes the next question a new one.
+        free_since: u64,
     }
 
     /// What a session knows about the transcript its runtime keeps.
@@ -5617,16 +5631,33 @@ mod platform {
         /// while the *same* question sits there the tells run out along
         /// `PARENT_ALERT_REMINDERS_MS` and then stop, because a stuck screen,
         /// most of all a wrongly-classified one, must not become a
-        /// minute-ticker at its parent. A different reason, or different last
-        /// words where both readings exist, is a different question and is told
-        /// about at once; last words merely going missing and coming back are
-        /// the reading blinking, not the child moving.
+        /// minute-ticker at its parent.
         ///
-        /// An attention pass that reads *not* attention does not reset the
-        /// schedule either: a classifier blinking off and back onto the same
-        /// question would hand the ticker back, and the blink is the thing
-        /// being fixed, not a new event. Only the keys expiring a replaced
-        /// edge can restart the count.
+        /// What makes the next question a *different* one is the child having
+        /// stopped waiting for `PARENT_ALERT_SETTLE_MS` first. The keys still
+        /// say which question it is, and a new one after a settled stretch is
+        /// told about at once, schedule and all - but a key that changes while
+        /// the child has been waiting the whole time is a reading changing, not
+        /// the child moving, and it buys nothing.
+        ///
+        /// This is the difference between a leash and a leash with a catch on
+        /// it. Both keys are read off a live session: the reason off the
+        /// screen, the last words out of the runtime's transcript when it has
+        /// one and off the screen when it does not. A claim dropped and
+        /// retaken swaps the second reading for the other source's answer -
+        /// a *different* string, not a missing one - while the child sits on
+        /// the very same dialog it has sat on all afternoon. Every such swap
+        /// used to start the count at zero with the first tell due at once,
+        /// which is how one parked child spent twelve hours telling its parent
+        /// about itself fifty times in the words of the schedule that exists
+        /// to stop exactly that.
+        ///
+        /// An attention pass that reads *not* attention is therefore the only
+        /// thing that refills the tank, and only by lasting: a classifier
+        /// blinking off for a pass and back is nowhere near the settle time,
+        /// and a child that answers one dialog and lands on the next inside a
+        /// minute rides the schedule it was already on - which owes it a
+        /// reminder at the minute mark anyway.
         ///
         /// Marking is cheap and unconditional because a daemon does not know
         /// whether any controller will ever ask for these; the gate that turns
@@ -5635,7 +5666,22 @@ mod platform {
             if snapshot.parent.is_none() || snapshot.dead || snapshot.archived {
                 return;
             }
+            let now = now_ms();
             if !snapshot.needs_attention {
+                // Not waiting is not nothing to record: it is the only reading
+                // that can make the next question a new one. Timed from the
+                // first pass that saw it, so that how long the child has been
+                // free is a fact about the child rather than about how often
+                // anybody happened to look.
+                if let Some(edge) = self
+                    .alert_edge
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_mut()
+                    && edge.free_since == 0
+                {
+                    edge.free_since = now;
+                }
                 return;
             }
             let reason_key = snapshot.attention_reason.clone().unwrap_or_default();
@@ -5645,30 +5691,50 @@ mod platform {
                 .unwrap_or_default()
                 .trim()
                 .to_lowercase();
+            // The child is waiting, so whatever free stretch it was in has
+            // ended - closed here, before anything below can return early on
+            // this pass. A stretch left standing while a tell is pending would
+            // be spent minutes later by a child that has been waiting all
+            // along, which is the catch this is here to take off the leash.
+            let settled = {
+                let mut guard = self
+                    .alert_edge
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match guard.as_mut() {
+                    Some(edge) => {
+                        let settled = edge.free_since != 0
+                            && now.saturating_sub(edge.free_since) >= PARENT_ALERT_SETTLE_MS;
+                        edge.free_since = 0;
+                        settled
+                    }
+                    None => false,
+                }
+            };
             if self.alert_pending.load(Ordering::Relaxed) {
                 return;
             }
-            let now = now_ms();
             let mut guard = self
                 .alert_edge
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let replace = match guard.as_ref() {
-                // The last words are a *reading*, and a reading can be missing
-                // where the question behind it is not. The runtime drops and
-                // retakes its transcript claim, and a screen sitting behind a
-                // modal has no last word to scrape; either one blinks the recap
-                // to nothing and back while the child sits on the very same
-                // question. An edge replaced on that blink is the ceiling
-                // coming off - the count starts at zero, the first tell is due
-                // at once, and the parent gets exactly the minute-ticker this
-                // schedule exists to prevent. So only a change between two
-                // readings is news. The absence of one is not.
+                // Both keys are readings, and a reading can be missing or come
+                // from the other source while the question behind it does not
+                // move: the runtime drops and retakes its transcript claim and
+                // the last words fall back to the screen's answer, a screen
+                // behind a modal has no last word to scrape at all. An edge
+                // replaced on any of that is the ceiling coming off - the count
+                // starts at zero, the first tell is due at once, and the parent
+                // gets the minute-ticker this schedule exists to prevent. So a
+                // key change is only news about a child that has been seen free
+                // long enough for there to be a new question to be news about.
                 Some(edge) => {
-                    edge.reason_key != reason_key
-                        || (!recap_key.is_empty()
-                            && !edge.recap_key.is_empty()
-                            && edge.recap_key != recap_key)
+                    settled
+                        && (edge.reason_key != reason_key
+                            || (!recap_key.is_empty()
+                                && !edge.recap_key.is_empty()
+                                && edge.recap_key != recap_key))
                 }
                 None => true,
             };
@@ -5679,6 +5745,7 @@ mod platform {
                     recap_key,
                     told: 0,
                     last_claimed_at: 0,
+                    free_since: 0,
                 });
             } else if let Some(edge) = guard.as_mut()
                 && edge.recap_key.is_empty()
@@ -9108,6 +9175,25 @@ mod platform {
             }
         }
 
+        /// Read the child as free for long enough that what it is waiting on
+        /// afterwards counts as a different question, without the test standing
+        /// there for a minute. One pass says it stopped waiting; the rewind is
+        /// the minute it then spent not waiting.
+        fn settle_parent_alert(child: &ManagedSession) {
+            let mut free = child.snapshot();
+            free.needs_attention = false;
+            free.attention_reason = None;
+            child.note_parent_alert(&free);
+            if let Some(edge) = child
+                .alert_edge
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+            {
+                edge.free_since = edge.free_since.saturating_sub(PARENT_ALERT_SETTLE_MS + 1);
+            }
+        }
+
         /// What the parent depends on: one tell per question, widening
         /// reminders (60s, 5min, 15min) while it sits unanswered, then silence
         /// until the question actually changes - so one stuck screen, least
@@ -9196,12 +9282,11 @@ mod platform {
                 "an attention flicker resets nothing"
             );
 
-            // Silence means *until the question changes*: different last
-            // words is a new question, and so is a different reason - both
-            // are told about at once, schedule and all.
-            // Last words the child never had are not a change, so give it
-            // some to change *from* first - which is quiet, and is its own
-            // assertion.
+            // Silence means *until the child gets to a different question*,
+            // and getting to one means having stopped waiting on the way. A key
+            // changing under a child that has been waiting all along is the
+            // reading changing: last words the child never had, and last words
+            // that read differently while the same dialog sits there.
             let mut moved = child.snapshot();
             moved.recap = Some("waiting on the gpu quota".into());
             child.note_parent_alert(&moved);
@@ -9212,9 +9297,21 @@ mod platform {
             moved.recap = Some("but this line is new".into());
             child.note_parent_alert(&moved);
             assert!(
-                child.take_parent_alert().is_some(),
-                "new recap is a new edge"
+                child.take_parent_alert().is_none(),
+                "nor are they, read differently, under a child that never moved"
             );
+
+            // Free for a minute, and then the same words are a new question:
+            // this is the door the schedule is meant to reopen, and the only
+            // one.
+            settle_parent_alert(&child);
+            moved.recap = Some("and now it is asking something else".into());
+            child.note_parent_alert(&moved);
+            assert!(
+                child.take_parent_alert().is_some(),
+                "a new question after a settled stretch is told about at once"
+            );
+            settle_parent_alert(&child);
             child.record_output(&approval_screen("second opinion"));
             note(&child);
             let alert = child.take_parent_alert().expect("new reason is a new edge");
@@ -9301,13 +9398,79 @@ mod platform {
             );
             age_parent_alert(&late, PARENT_ALERT_REMINDERS_MS[0] + 1);
             assert!(told(&late, Some("waiting on the gpu quota")), "reminder");
+            settle_parent_alert(&late);
             assert!(
                 told(&late, Some("now waiting on a second opinion")),
-                "a real change is still told about at once"
+                "a real change over a settled child is still told about at once"
             );
 
             child.archive().unwrap();
             late.archive().unwrap();
+            discard_root(root);
+        }
+
+        /// The way this actually failed in the fleet, which the missing-reading
+        /// test above does not cover: the last words are read out of the
+        /// runtime's transcript when it has a claim on one and off the screen
+        /// when it does not, and those two do not agree. A claim dropped and
+        /// retaken swaps one answer for the other and back - both of them
+        /// there, neither of them empty, the child never having moved off the
+        /// permission dialog it has been parked on all afternoon.
+        ///
+        /// Counting each swap as a new question is a fresh schedule every time,
+        /// each with its first tell due at once. One OpenCode session sitting
+        /// on one dialog told its parent about itself fifty times in twelve
+        /// hours that way, every message word for word the same as the last.
+        #[test]
+        fn last_words_changing_hands_between_their_two_sources_is_not_a_new_question() {
+            let state = test_state("parent-edge-sources");
+            let root = state.paths.root.clone();
+            *state
+                .attention_patterns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                vec!["gpu quota approval".into()];
+            let told = |child: &ManagedSession, recap: &str| {
+                let mut snapshot = child.snapshot();
+                snapshot.recap = Some(recap.to_string());
+                child.note_parent_alert(&snapshot);
+                child.take_parent_alert().is_some()
+            };
+            // What the transcript says the session last said, and what can be
+            // scraped off the same session's screen. Both are true; they are
+            // answers to slightly different questions.
+            let claimed = "let me inspect the environment first";
+            let scraped = "$ venv/bin/pip list | grep -iE mlx";
+
+            let child = launch_child_with_parent(&state, "parent-edge-sources", Some("the-parent"));
+            child.record_output(&approval_screen("gpu quota approval"));
+            assert!(told(&child, claimed), "first tell");
+            assert!(
+                !told(&child, scraped),
+                "the claim dropping is not the child moving"
+            );
+            assert!(!told(&child, claimed), "nor is the claim coming back again");
+
+            // Twelve hours of that, at the rate a dashboard and a room full of
+            // MCP clients ask: the swap is the only thing happening, and the
+            // schedule is the only thing that may speak.
+            for _ in 0..64 {
+                assert!(!told(&child, scraped));
+                assert!(!told(&child, claimed));
+            }
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[0] + 1);
+            assert!(told(&child, scraped), "first reminder, at a minute");
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[1] + 1);
+            assert!(told(&child, claimed), "second, at five");
+            age_parent_alert(&child, PARENT_ALERT_REMINDERS_MS[2] + 1);
+            assert!(told(&child, scraped), "third, at fifteen");
+            age_parent_alert(&child, 86_400_000);
+            for _ in 0..64 {
+                assert!(!told(&child, claimed), "four tells is the whole leash");
+                assert!(!told(&child, scraped), "four tells is the whole leash");
+            }
+
+            child.archive().unwrap();
             discard_root(root);
         }
 
