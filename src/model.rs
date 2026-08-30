@@ -28,7 +28,7 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
 ///
 /// The stamp itself is `<version>:protocol-<n>:<commit>:<height>:<file>`, and
 /// only the first and fourth fields order anything. The commit names the build
-/// without ranking it, and the file identifies the very copy that is running —
+/// without ranking it, and the file names the very copy that is running —
 /// which differs between a controller and the companion beside it, so nothing
 /// that compares two machines may look at it.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]

@@ -16,8 +16,9 @@ use crate::daemon_protocol::PROTOCOL_VERSION;
 /// compiled from yesterday's source read as this build's own and went on
 /// serving: the fix was in the binary, the running code was the old one, and
 /// nothing short of stopping the daemon by hand changed that. So the file
-/// itself ends the stamp — the same size and write time [`stash_executable`]
-/// has always used to tell one build's copy from another's.
+/// itself ends the stamp — what it is called, and then the same size and write
+/// time [`stash_executable`] has always used to tell one build's copy from
+/// another's.
 ///
 /// Outside the Unix-only module because the controller asks it too, to see
 /// whether the daemon on a machine it is watching is behind this build. The
@@ -34,19 +35,48 @@ pub fn current_generation() -> String {
     )
 }
 
-/// Which file this process is running, as the stamp spells it.
+/// Which file this process is running, as the stamp spells it: what the
+/// executable is called, then which copy of it.
+///
+/// The name is there so two stamps can tell whether they describe the same file
+/// at all. Only copies of one file can be read as one being the other's
+/// rebuild; a controller and the companion beside it are two files from one
+/// commit, and reading those as rebuilds of each other is how a machine comes
+/// to hand its daemon back and forth all day.
 ///
 /// `unknown` when the executable cannot be read at all — a package manager that
-/// replaced it mid-life is the ordinary reason. Two builds that both say
-/// `unknown` compare equal, which is exactly how the stamp behaved before this
-/// field existed: no worse than it was, and it settles instead of handing over
-/// on every connection.
+/// replaced it mid-life is the ordinary reason. It names no file, so two builds
+/// that both say `unknown` are not each other's rebuild either: they compare by
+/// rank alone and settle, rather than handing over on every connection.
 fn running_executable_identity() -> String {
     std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(file_identity)
+        .and_then(|running| {
+            let copy = file_identity(running)?;
+            let name = running.file_name()?.to_string_lossy();
+            Some(format!("{name}{IDENTITY_SEPARATOR}{copy}"))
+        })
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// Between what the executable is called and which copy of it is running. Not
+/// a character the stamp's own fields are cut on, and not one a file that gets
+/// this far is named with.
+const IDENTITY_SEPARATOR: char = '@';
+
+/// What a stamp calls the executable it was made by, or `None` for one that
+/// cannot say: written before the name was part of it, or written by a process
+/// whose own file had already been replaced. Neither can claim to be a copy of
+/// anything, so neither is ever read as the same file as another.
+pub fn stamped_executable_name(stamp: &str) -> Option<&str> {
+    stamp
+        .trim()
+        .split(':')
+        .nth(4)?
+        .split_once(IDENTITY_SEPARATOR)
+        .map(|(name, _copy)| name)
+        .filter(|name| !name.is_empty())
 }
 
 /// What tells one file apart from another that has taken its place: how big it
@@ -64,7 +94,7 @@ fn file_identity(path: &Path) -> Option<String> {
 
 #[cfg(unix)]
 mod platform {
-    use super::current_generation;
+    use super::{current_generation, stamped_executable_name};
     use std::{
         collections::{BTreeSet, HashMap},
         fs::{self, File, OpenOptions},
@@ -6829,18 +6859,47 @@ mod platform {
     ///
     /// Never for one that outranks it. Two builds that each believe they are
     /// the current one would otherwise take turns retiring each other for as
-    /// long as both are in use — a dashboard run out of a working tree beside
-    /// an installed release is enough — and every turn costs every attached
-    /// client its connection. Equal rank and a different stamp still hands
-    /// over: that is one build replaced by another built from the same tree,
-    /// which is what a developer rebuilding expects to happen.
+    /// long as both are in use, and every turn costs every attached client its
+    /// connection.
     fn should_replace_generation(running: &str) -> bool {
-        let current = current_generation();
-        if running.trim() == current {
+        generation_makes_way(running, &current_generation())
+    }
+
+    /// The comparison itself, with both stamps spelled out.
+    ///
+    /// Rank decides it, and equal rank does not hand over. That last part is
+    /// the whole of a bug worth spelling out: a machine runs the controller and
+    /// the companion beside it, cut from one commit and ranking equal, and they
+    /// are two different files. While any difference in the stamp was enough,
+    /// every dashboard round retired the daemon the MCP servers had started and
+    /// every MCP call retired the one the dashboard started back — hundreds of
+    /// handovers in a day on one ordinary machine, each of them dropping every
+    /// client's connection and throwing away everything the daemon had worked
+    /// out about the sessions it was holding.
+    ///
+    /// The exception is the build nobody numbered. `cargo build` stamps
+    /// `local:local` whatever it compiled, so between two hand-made builds the
+    /// rank says nothing at all and the copy on disk is the only thing that
+    /// tells yesterday's source from today's — which is exactly what a
+    /// developer rebuilding means to happen. Two copies are only comparable
+    /// when they are copies of the same file, so that case asks for the name
+    /// as well: a `muxloom` and a `muxloomd` compiled from one tree are no more
+    /// each other's rebuild than the installed pair are.
+    fn generation_makes_way(running: &str, current: &str) -> bool {
+        if running.trim() == current.trim() {
             return false;
         }
-        match (generation_rank(running), generation_rank(&current)) {
-            (Some(running), Some(current)) => running <= current,
+        match (generation_rank(running), generation_rank(current)) {
+            (Some(running_rank), Some(current_rank)) => {
+                let rebuilt_in_place = running_rank.height == u64::MAX
+                    && current_rank.height == u64::MAX
+                    && stamped_executable_name(running).is_some()
+                    && stamped_executable_name(running) == stamped_executable_name(current);
+                match rebuilt_in_place {
+                    true => running_rank <= current_rank,
+                    false => running_rank < current_rank,
+                }
+            }
             // Nothing legible to order them by, so fall back to what this did
             // before there was an order: any difference is a handover.
             _ => true,
@@ -8341,11 +8400,14 @@ mod platform {
                 "a daemon from before generations were ordered still yields"
             );
 
-            // Same rank, different build: two compiles of one tree. Handing
-            // over is the whole point of rebuilding.
-            let mut fields: Vec<&str> = current.split(':').collect();
-            fields[2] = "a-different-commit";
-            assert!(should_replace_generation(&fields.join(":")));
+            // Same rank, different copy of the same hand-made file: two
+            // compiles of one tree, and handing over is the whole point of
+            // rebuilding.
+            let mine = "0.5.5:protocol-1:local:local:muxloomd@200-2";
+            assert!(generation_makes_way(
+                "0.5.5:protocol-1:local:local:muxloomd@100-1",
+                mine
+            ));
         }
 
         /// Nothing CI does not fill in tells two hand-made builds apart, and
@@ -8359,25 +8421,75 @@ mod platform {
             assert_eq!(fields.len(), 5, "{current}");
             let running = std::env::current_exe().expect("this test is a file somewhere");
             assert_eq!(
+                Some(format!(
+                    "{}@{}",
+                    running.file_name().unwrap().to_string_lossy(),
+                    crate::daemon::file_identity(&running).unwrap()
+                )),
                 Some(fields[4].to_string()),
-                crate::daemon::file_identity(&running),
-                "the last field is the running executable"
+                "the last field names the running executable and says which copy"
+            );
+            assert_eq!(
+                crate::daemon::stamped_executable_name(&current),
+                running.file_name().unwrap().to_str(),
+                "and the name can be read back out of it"
             );
 
             // What a rebuild of the same tree looks like: everything CI would
-            // have stamped is identical, and only the file has moved on.
-            let rebuilt = format!("{}:{}", fields[..4].join(":"), "1-1");
-            assert_ne!(rebuilt, current);
+            // have stamped is identical, the file is called the same thing, and
+            // only the copy has moved on.
+            let rebuilt = "0.5.5:protocol-1:local:local:muxloomd@1-1";
+            let mine = "0.5.5:protocol-1:local:local:muxloomd@2-2";
             assert!(
-                should_replace_generation(&rebuilt),
+                generation_makes_way(rebuilt, mine),
                 "a daemon running the file this build replaced makes way"
             );
             assert_eq!(
-                generation_rank(&rebuilt),
-                generation_rank(&current),
+                generation_rank(rebuilt),
+                generation_rank(mine),
                 "and it is still the same rank, so it asks rather than insists"
             );
-            assert!(!outranks_running_generation(&rebuilt));
+            assert!(!outranks_running_generation(rebuilt));
+        }
+
+        /// The pair every machine runs: a controller and the companion beside
+        /// it, cut from one commit, ranking equal, and two different files. A
+        /// stamp that said only which copy was running made each of them read
+        /// the other's daemon as a rebuild of its own — so the dashboard retired
+        /// what the MCP servers had started and the MCP servers retired what the
+        /// dashboard started back, hundreds of times over one day, every one of
+        /// them dropping every attached client and losing everything the daemon
+        /// had worked out about the sessions it held.
+        #[test]
+        fn the_controller_and_the_companion_beside_it_leave_each_other_alone() {
+            for (id, height) in [("aaac2e0", "265"), ("local", "local")] {
+                let stamp = |file: &str| format!("0.5.5:protocol-1:{id}:{height}:{file}");
+                let controller = stamp("muxloom@14772976-1788000000000");
+                let companion = stamp("muxloomd@7825712-1788000000000");
+                assert!(
+                    !generation_makes_way(&controller, &companion),
+                    "{height}: the companion must not retire the controller's daemon"
+                );
+                assert!(
+                    !generation_makes_way(&companion, &controller),
+                    "{height}: nor the controller the companion's"
+                );
+            }
+
+            // Nor may a file that cannot name itself claim to be anyone's
+            // rebuild: a package manager that replaced both of them mid-life
+            // leaves two stamps saying `unknown`, and reading those as copies
+            // of one file is the same fight by another name.
+            let replaced =
+                |id: &str, height: &str| format!("0.5.5:protocol-1:{id}:{height}:unknown");
+            assert!(!generation_makes_way(
+                &replaced("aaac2e0", "local"),
+                &replaced("4013819", "local")
+            ));
+            assert!(
+                generation_makes_way(&replaced("aaac2e0", "265"), &replaced("4013819", "local")),
+                "a build that genuinely outranks it still says so"
+            );
         }
 
         /// Asking is not the same as being allowed to insist. Equal rank asks

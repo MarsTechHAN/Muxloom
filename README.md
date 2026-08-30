@@ -972,7 +972,11 @@ itself when the release serves exactly the bytes we would otherwise send —
 the controller passes the URL and the digest, the target verifies what landed
 against it — and is otherwise shipped atomically over the same SSH stdin. Daemon replacement is non-disruptive and does not wait for
 idle: running sessions ride their keepers across the generation change, and
-the next daemon adopts them with the same processes and transcripts. The
+the next daemon adopts them with the same processes and transcripts. A daemon
+is replaced only by a build that outranks it, or by another copy of the same
+hand-made file — a controller and the companion beside it are cut from one
+commit and rank equal, so they leave each other's daemon alone rather than
+taking turns retiring it. The
 footer shows a `⟳` chip while any machine's running daemon lags this build,
 and the controller quietly cycles such a machine's bridge (never while its
 terminal is attached) to complete the update. Lag is measured on the full

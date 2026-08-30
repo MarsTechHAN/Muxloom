@@ -690,6 +690,9 @@ Bootstrap 由 Rust binary 自己计算 SHA-256 Fingerprint。缺失或过期的 
 冻结，因此它本身几乎不需要更新。daemon 只是 keeper 的当前客户端——负责屏幕、状态、
 搜索与元数据。daemon 升级不再等待空闲：换代时会话由各自的 keeper 原地带过去，新
 daemon 连上 keeper socket 即收养（同一进程、同一转录），daemon 崩溃也不再杀死会话。
+只有排名更高的构建、或同一个手工构建文件的新副本才会顶替正在跑的 daemon：Controller
+与它旁边的 companion 出自同一个 commit、排名相同却是两个不同文件，因此彼此不再轮流
+把对方刚起的 daemon 换掉。
 运行中的 daemon 落后于当前构建时，footer 右下角会出现 `⟳` 标记，Controller 会在该机
 终端未 attach 时自动重连完成升级。是否落后按 daemon 在握手里回报的完整 generation 标记
 判断——先比版本，再比构建落后的 commit 数——因此包版本号相同的两个 nightly 也能分辨；
