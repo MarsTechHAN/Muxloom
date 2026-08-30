@@ -1351,14 +1351,17 @@ fn spawn_heartbeat(state: Weak<ConnectionState>) {
 /// how a cargo profile directory holds both; one level up, which is the
 /// bundle layouts; the sibling profile of the same cargo `target`, because a
 /// controller built in debug and a companion built in release are still the
-/// same tree; and finally the two roots muxloom installs a companion into,
-/// which is the same list the remote side already looks through
-/// (`Runtime::register_target_agents`). `PATH` is asked last and separately —
-/// it is the only entry that is not a path we can name in advance.
+/// same tree; the two roots muxloom installs a companion into, which is the
+/// same list the remote side already looks through
+/// (`Runtime::register_target_agents`); and last the daemon's own stash, which
+/// is a companion this machine is guaranteed to have whenever a daemon has run
+/// here at all. `PATH` is asked after all of them and separately — it is the
+/// only entry that is not a path we can name in advance.
 fn local_companion_places(
     current_exe: Option<&Path>,
     home: Option<&Path>,
     data_home: Option<&Path>,
+    stash: Option<&Path>,
 ) -> Vec<PathBuf> {
     let name = companion_name();
     let mut places: Vec<PathBuf> = Vec::new();
@@ -1395,7 +1398,49 @@ fn local_companion_places(
     if let Some(home) = home {
         remember(home.join(".local/bin"));
     }
+    if let Some(stash) = stash {
+        remember(stash.to_path_buf());
+    }
     places
+}
+
+/// The daemon's stashed copy of itself, which is never called `muxloomd`.
+///
+/// A serving daemon copies its own executable into `<state>/muxloom/bin` so a
+/// package manager cannot take that file away from its keepers mid-life, and
+/// names the copy after the generation it is — `muxloomd-0-5-5-protocol-1-...`
+/// — then sweeps every other name out of that directory (`stash_executable` in
+/// `daemon.rs`). A machine whose only companion is that stash therefore has a
+/// perfectly good `muxloomd` that the literal-name search cannot see, and the
+/// sweep means a `muxloomd` symlink put there by hand is deleted the next time
+/// a daemon starts.
+///
+/// Guessing at a versioned name is only safe here because of that sweep: the
+/// directory holds exactly one file, and it is always a copy of a daemon that
+/// ran on this machine. The same guess beside the executable would be
+/// dangerous — a controller keeps `muxloomd-{triple}` cross-builds *for other
+/// machines* there — which is why nothing else in this search does it. What is
+/// found still has to survive `Bridge::handshake` like any other companion, so
+/// a stale generation announces itself as one rather than being trusted for
+/// its name.
+fn stashed_companion(stash: &Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(stash).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("muxloomd-") {
+            continue;
+        }
+        let Ok(data) = entry.metadata() else { continue };
+        if !data.is_file() {
+            continue;
+        }
+        let at = data.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(seen, _)| at > *seen) {
+            newest = Some((at, entry.path()));
+        }
+    }
+    newest.map(|(_, path)| path)
 }
 
 fn companion_name() -> String {
@@ -1414,11 +1459,12 @@ fn companion_name() -> String {
 fn local_companion_in(
     places: Vec<PathBuf>,
     path_var: Option<&std::ffi::OsStr>,
+    stash: Option<&Path>,
 ) -> Result<PathBuf, Vec<PathBuf>> {
     if let Some(found) = places.iter().find(|candidate| candidate.is_file()) {
         return Ok(found.clone());
     }
-    // `PATH` last, and resolved to the path it was found at rather than left as
+    // `PATH` next, and resolved to the path it was found at rather than left as
     // a bare name: the difference is whether the next error can say where it
     // looked.
     let name = companion_name();
@@ -1427,6 +1473,13 @@ fn local_companion_in(
             .map(|directory| directory.join(&name))
             .find(|candidate| candidate.is_file())
     });
+    // And last the daemon's stash, where the companion is real but is not
+    // called `muxloomd`. Last because it is the only entry found by shape
+    // rather than by name: anything installed deliberately outranks it. The
+    // directory is passed in rather than taken off the end of `places`, so a
+    // build with no stash cannot fall through to guessing at versioned names
+    // in `~/.local/bin`, where they mean something else entirely.
+    let found = found.or_else(|| stash.and_then(stashed_companion));
     found.ok_or(places)
 }
 
@@ -1435,8 +1488,29 @@ fn local_companion() -> Result<PathBuf, Vec<PathBuf>> {
     let exe = env::current_exe().ok();
     let home = env::var_os("HOME").map(PathBuf::from);
     let data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    let places = local_companion_places(exe.as_deref(), home.as_deref(), data_home.as_deref());
-    local_companion_in(places, env::var_os("PATH").as_deref())
+    let stash = daemon_stash();
+    let places = local_companion_places(
+        exe.as_deref(),
+        home.as_deref(),
+        data_home.as_deref(),
+        stash.as_deref(),
+    );
+    local_companion_in(places, env::var_os("PATH").as_deref(), stash.as_deref())
+}
+
+/// Where a serving daemon on this machine keeps the copy of itself, read the
+/// way the daemon reads it (`DaemonPaths::discover`): `MUXLOOMD_STATE_DIR` is
+/// the whole state directory, `XDG_STATE_HOME` is a root to hang `muxloom` off,
+/// and neither means `~/.local/state/muxloom`.
+fn daemon_stash() -> Option<PathBuf> {
+    let root = match env::var_os("MUXLOOMD_STATE_DIR") {
+        Some(state) => PathBuf::from(state),
+        None => match env::var_os("XDG_STATE_HOME") {
+            Some(state_home) => PathBuf::from(state_home).join("muxloom"),
+            None => PathBuf::from(env::var_os("HOME")?).join(".local/state/muxloom"),
+        },
+    };
+    Some(root.join("bin"))
 }
 
 /// What a controller with no companion says, naming every place it looked.
@@ -3404,10 +3478,12 @@ mod tests {
         let controller = debug.join(format!("muxloom{}", env::consts::EXE_SUFFIX));
         fs::write(&controller, b"controller").unwrap();
         let name = companion_name();
+        let stash = home.join(".local/state/muxloom/bin");
         let look = || {
             local_companion_in(
-                local_companion_places(Some(&controller), Some(&home), None),
+                local_companion_places(Some(&controller), Some(&home), None, Some(&stash)),
                 Some(std::ffi::OsStr::new("")),
+                Some(&stash),
             )
         };
 
@@ -3419,6 +3495,7 @@ mod tests {
         assert!(places.contains(&release.join(&name)));
         assert!(places.contains(&home.join(".local/share/muxloom/bin").join(&name)));
         assert!(places.contains(&home.join(".local/bin").join(&name)));
+        assert!(places.contains(&stash.join(&name)));
         let said = no_local_companion(&places);
         // Every place, and each of them as the search itself spelled it: a
         // path the test writes out again by hand is a second spelling that
@@ -3441,20 +3518,61 @@ mod tests {
         fs::write(debug.join(&name), b"companion").unwrap();
         assert_eq!(look().unwrap(), debug.join(&name));
 
-        // And with nothing on disk, a `muxloomd` on PATH is still taken — but
-        // as the path it was found at, so a later failure can name it.
+        // The daemon's own stash is a companion, under the only name it is
+        // ever called. This is what G3HMW had and what the search could not
+        // see: one file, put there by `stash_executable`, named after the
+        // generation it is.
         fs::remove_file(debug.join(&name)).unwrap();
         fs::remove_file(release.join(&name)).unwrap();
+        fs::create_dir_all(&stash).unwrap();
+        let stashed = stash.join("muxloomd-0-5-5-protocol-1-local-local-26328504-1788085320580");
+        fs::write(&stashed, b"companion").unwrap();
+        assert_eq!(look().unwrap(), stashed);
+
+        // But only in the stash. The same shape beside the controller is a
+        // cross-build for another machine — `muxloomd-{triple}`, which this
+        // very file downloads and parks there — and spawning one of those is
+        // an exec format error dressed up as a fix.
+        fs::write(debug.join("muxloomd-aarch64-unknown-linux-gnu"), b"foreign").unwrap();
+        fs::write(release.join("muxloomd-x86_64-pc-windows-msvc"), b"foreign").unwrap();
+        assert_eq!(look().unwrap(), stashed);
+
+        // A literal name anywhere outranks it: the stash is found by shape
+        // rather than by name, so anything installed deliberately wins.
+        fs::write(release.join(&name), b"companion").unwrap();
+        assert_eq!(look().unwrap(), release.join(&name));
+        fs::remove_file(release.join(&name)).unwrap();
+
+        // A stash holding nothing of that shape is not a companion, and the
+        // failure goes back to naming every place rather than guessing.
+        fs::remove_file(&stashed).unwrap();
+        fs::write(stash.join("muxloomd.pid"), b"1234").unwrap();
+        assert!(look().is_err());
+
+        // And with nothing on disk, a `muxloomd` on PATH is still taken — but
+        // as the path it was found at, so a later failure can name it.
         let on_path = home.join(".local/bin");
         fs::write(on_path.join(&name), b"companion").unwrap();
         assert_eq!(
             local_companion_in(
-                local_companion_places(Some(&controller), None, None),
+                local_companion_places(Some(&controller), None, None, None),
                 Some(on_path.as_os_str()),
+                None,
             )
             .unwrap(),
             on_path.join(&name)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The search has to look where the daemon actually stashes, and the two
+    /// read the environment in separate files. Nothing would fail loudly if
+    /// they drifted: the controller would simply look in a directory nobody
+    /// writes to and report an honest, useless list of places.
+    #[cfg(unix)]
+    #[test]
+    fn the_stash_the_search_looks_in_is_the_one_the_daemon_writes_to() {
+        let daemon = crate::daemon::DaemonPaths::discover().unwrap();
+        assert_eq!(daemon_stash().unwrap(), daemon.bin);
     }
 }
