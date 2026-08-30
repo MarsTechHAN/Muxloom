@@ -8,6 +8,13 @@ preserve.
 - `muxloom` is the controller. `muxloomd` owns remote PTYs, session metadata,
   append-only history, and file operations. Closing the controller or losing an
   SSH connection must not terminate a running child process.
+- The word is wrong and stays for now. `muxloom` watches and relays; it does not
+  control anything, and more than one may watch a daemon at once, so the pair is
+  really viewer and daemon. Say viewer in new prose where it costs nothing.
+  Renaming the existing 696 sites is deferred: the `controller` Cargo feature is
+  in `default`, so it cannot move without breaking build commands outside this
+  repo, and split naming reads worse than the old name used consistently. Do it
+  in one sweep, deliberately, or not at all.
 - The normal daemon data plane must not depend on target-side `tmux`, `file`,
   `ffmpeg`, or similar utilities. Transfer encoded media to the controller and
   decode it there; never stream remote RGB frames.
