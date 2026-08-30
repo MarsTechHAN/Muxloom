@@ -2144,27 +2144,195 @@ fn publish_lease(runtime: &Runtime, account: &str, binding: &str, cursor: &str) 
     }
 }
 
-/// Read the account's current leases off the board.
-fn read_leases(runtime: &Runtime, account: &str) -> Result<Vec<Leased>> {
+/// Read the newest notes one board path is carrying, from every machine.
+fn read_path_notes(
+    runtime: &Runtime,
+    path: &str,
+    limit: usize,
+) -> Result<Vec<crate::talk::TalkMessage>> {
     let filter = crate::talk::TalkFilter {
         scope: Some("path".into()),
         machines: crate::talk::TalkSelector::All,
         paths: crate::talk::TalkSelector::Only {
-            names: vec![LEASE_PATH.into()],
+            names: vec![path.into()],
         },
         kinds: vec!["note".into()],
-        limit: 64,
+        limit,
         ..Default::default()
     };
-    let page = runtime
+    Ok(runtime
         .bridge_pool()
         .talk_read(&Target::local(), filter)
-        .with_context(|| format!("reading the lease board for {account}"))?;
-    Ok(page
-        .messages
+        .with_context(|| format!("reading the board at {path}"))?
+        .messages)
+}
+
+/// Read the account's current leases off the board.
+fn read_leases(runtime: &Runtime, account: &str) -> Result<Vec<Leased>> {
+    Ok(read_path_notes(runtime, LEASE_PATH, 64)
+        .with_context(|| format!("reading the lease board for {account}"))?
         .iter()
         .filter_map(|message| lease_from(message, account))
         .collect())
+}
+
+/// The board path a chat-answered approval crosses machines on.
+///
+/// The ask and the answer take different routes, and always did. A controller
+/// sends its own ask, from the machine the gated call was relayed to; the
+/// answer comes back through the chat account, which under the WeChat lease has
+/// exactly one voice in the fleet, and that voice is whichever origin sorts
+/// smallest — not whichever machine happens to be waiting. So a person's
+/// `approve-7` is read by a machine that has never heard of ask 7, and the
+/// machine that has is silent by election. This path is how the two are joined:
+/// the voice writes down what it was told, and the machine holding the ask
+/// picks it up and answers for itself.
+pub const VERDICT_PATH: &str = "/muxloom/approvals";
+
+/// The first line of a forwarded verdict. After it come `id=` (the ledger key,
+/// `approve-N`) and `said=` (`approve`, `always` or `reject`, the words the
+/// person themselves types).
+pub const VERDICT_PREFIX: &str = "muxloom-approval-verdict v1";
+
+/// How long a forwarded verdict is worth acting on. A person answers in their
+/// own time, so this is generous; what it rules out is a note that outlived the
+/// question being replayed against an id minted since.
+pub const VERDICT_WINDOW_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Write down what a person said about an approval that is not this machine's
+/// to settle, for whichever machine parked it.
+fn forward_verdict(runtime: &Runtime, id: &str, verdict: crate::approvals::Verdict) -> Result<()> {
+    let said = match verdict {
+        crate::approvals::Verdict::Yes => "approve",
+        crate::approvals::Verdict::Always => "always",
+        crate::approvals::Verdict::No => "reject",
+    };
+    let draft = crate::talk::TalkDraft {
+        scope: crate::talk::TalkScope::Path {
+            machine: String::new(),
+            path: VERDICT_PATH.into(),
+        },
+        author: Default::default(),
+        kind: crate::talk::TalkKind::Note,
+        to: None,
+        reply_to: None,
+        text: format!("{VERDICT_PREFIX}\nid={id}\nsaid={said}"),
+    };
+    runtime
+        .bridge_pool()
+        .talk_post(&Target::local(), draft)
+        .map(|_| ())
+        .with_context(|| format!("passing {id} on to the machine that asked"))
+}
+
+/// Read one note as a forwarded verdict, or None when it is not one. A note
+/// this build cannot parse is not an error: an older muxloom never writes these
+/// and a newer one may write more, and neither is ours to act on.
+fn verdict_from(message: &crate::talk::TalkMessage) -> Option<(String, crate::approvals::Verdict)> {
+    let mut lines = message.text.lines();
+    if lines.next()? != VERDICT_PREFIX {
+        return None;
+    }
+    let mut id = String::new();
+    let mut said = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("id=") {
+            id = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("said=") {
+            said = crate::approvals::parse_verdict(value);
+        }
+    }
+    (!id.is_empty()).then(|| said.map(|said| (id, said)))?
+}
+
+/// Settle one approval in the ledger, and say what the person should be told.
+/// `None` when this machine has no such ask open, which is the whole of the
+/// question "is this one mine?".
+fn settle_approval(
+    ledger: &mut crate::approvals::Approvals,
+    id: &str,
+    verdict: crate::approvals::Verdict,
+) -> Option<String> {
+    let pending = ledger.take(id)?;
+    Some(match verdict {
+        crate::approvals::Verdict::No => "· denied".to_string(),
+        crate::approvals::Verdict::Yes => {
+            ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
+            format!(
+                "· allowed {} once — tell the agent to run it again",
+                pending.tool
+            )
+        }
+        crate::approvals::Verdict::Always => {
+            if crate::relay::reminder_allowed(&pending.tool) {
+                ledger.remember(&pending.session, &pending.machine, &pending.tool);
+                format!(
+                    "· allowed {} for the rest of this conversation",
+                    pending.tool
+                )
+            } else {
+                // Too sensitive to remember; the one-shot is the ceiling.
+                ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
+                format!(
+                    "· {} is sensitive, so allowed it once only — tell the agent to run it again",
+                    pending.tool
+                )
+            }
+        }
+    })
+}
+
+/// Apply every verdict the board is carrying for an ask parked on this machine,
+/// and return what the person is owed about each — one line per approval that
+/// was actually settled here.
+///
+/// The board is not read at all unless something is open here, so a machine
+/// that has asked nobody anything adds nothing to the round. Settling removes
+/// the pending entry, so a note that is still on the board next round finds
+/// nothing to do and the person is told once.
+fn take_forwarded_verdicts(runtime: &Runtime) -> Vec<String> {
+    let path = crate::approvals::Approvals::default_path();
+    let mut ledger = crate::approvals::Approvals::load(&path);
+    if !ledger.pending.values().any(|pending| pending.open) {
+        return Vec::new();
+    }
+    let notes = match read_path_notes(runtime, VERDICT_PATH, 64) {
+        Ok(notes) => notes,
+        Err(error) => {
+            debug::log(
+                "approval",
+                format!("the forwarded-verdict board is unreadable: {error:#}"),
+            );
+            return Vec::new();
+        }
+    };
+    let now = now_ms();
+    let mut said = Vec::new();
+    for note in notes {
+        if now.saturating_sub(note.ts) > VERDICT_WINDOW_MS {
+            continue;
+        }
+        let Some((id, verdict)) = verdict_from(&note) else {
+            continue;
+        };
+        if let Some(line) = settle_approval(&mut ledger, &id, verdict) {
+            debug::log(
+                "approval",
+                format!("{id} was answered on {} and settled here", note.origin),
+            );
+            said.push(line);
+        }
+    }
+    if said.is_empty() {
+        return said;
+    }
+    if let Err(error) = ledger.save(&path) {
+        // Nothing was recorded, so nothing may be reported: the notes stay on
+        // the board and the next round tries again.
+        debug::log("approval", format!("could not save: {error:#}"));
+        return Vec::new();
+    }
+    said
 }
 
 /// Resume where the previous voice left off.
@@ -2356,6 +2524,31 @@ pub fn run_inbox(
             }
         })
         .unwrap_or_default();
+    // An approval this machine asked about may have been answered to a machine
+    // that never heard the question — the chat account has one voice and it is
+    // not chosen by who is waiting. Settling happens here, where the ask is,
+    // and so does telling the person, which is why it does not matter that this
+    // machine may be the silent one this round: the lease governs reading the
+    // account, never speaking into it.
+    let speaking = set.pick(None).ok().or_else(|| listening.first().copied());
+    if let Some(binding) = speaking {
+        for text in take_forwarded_verdicts(runtime) {
+            let message = Outgoing {
+                title: String::new(),
+                text,
+                signature: inbox.reply_signature(&binding.id, &local_name),
+            };
+            if let Err(error) = send(binding, &message, environment) {
+                debug::log(
+                    "approval",
+                    format!(
+                        "{}: could not report a settled approval: {error:#}",
+                        binding.id
+                    ),
+                );
+            }
+        }
+    }
     let mut desk = Desk::new(runtime, targets, config);
     for binding in listening {
         if inbox
@@ -3150,34 +3343,22 @@ fn handle(
         Route::Approval { id, verdict } => {
             let path = crate::approvals::Approvals::default_path();
             let mut ledger = crate::approvals::Approvals::load(&path);
-            let Some(pending) = ledger.take(&id) else {
-                return "· that approval is already settled or was never asked".into();
-            };
-            let out = match verdict {
-                crate::approvals::Verdict::No => "· denied".to_string(),
-                crate::approvals::Verdict::Yes => {
-                    ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
-                    format!(
-                        "· allowed {} once — tell the agent to run it again",
-                        pending.tool
-                    )
-                }
-                crate::approvals::Verdict::Always => {
-                    if crate::relay::reminder_allowed(&pending.tool) {
-                        ledger.remember(&pending.session, &pending.machine, &pending.tool);
-                        format!(
-                            "· allowed {} for the rest of this conversation",
-                            pending.tool
-                        )
-                    } else {
-                        // Too sensitive to remember; the one-shot is the ceiling.
-                        ledger.grant_once(&pending.session, &pending.machine, &pending.tool);
-                        format!(
-                            "· {} is sensitive, so allowed it once only — tell the agent to run it again",
-                            pending.tool
-                        )
-                    }
-                }
+            let Some(out) = settle_approval(&mut ledger, &id, verdict) else {
+                // Nothing open here by that name, which in a connected fleet
+                // says little about whether anyone is waiting: the account has
+                // one voice and it is not chosen by who asked. Write it down
+                // where the asker will find it; that machine answers here
+                // itself once it has acted on it. If the ask really was
+                // settled, or never existed, the note is one nobody claims.
+                return match forward_verdict(desk.runtime, &id, verdict) {
+                    Ok(()) => format!(
+                        "· {id} is not open on this machine — passed it to whichever machine \
+                         asked, which answers here if it is still waiting"
+                    ),
+                    Err(error) => format!(
+                        "· {id} is not open on this machine, and passing it on failed: {error:#}"
+                    ),
+                };
             };
             if let Err(error) = ledger.save(&path) {
                 return format!("· could not record that: {error:#}");
@@ -5120,6 +5301,135 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn forwarded_verdict_notes_parse_only_their_own_shape() {
+        fn note(origin: &str, text: &str) -> crate::talk::TalkMessage {
+            crate::talk::TalkMessage {
+                id: format!("{origin}:1"),
+                origin: origin.into(),
+                seq: 1,
+                ts: 42,
+                scope: crate::talk::TalkScope::Path {
+                    machine: origin.into(),
+                    path: VERDICT_PATH.into(),
+                },
+                author: Default::default(),
+                kind: crate::talk::TalkKind::Note,
+                to: None,
+                reply_to: None,
+                text: text.into(),
+            }
+        }
+        use crate::approvals::Verdict;
+        // The three words a person may be answered with, written by the voice
+        // that heard them and read by the machine that is waiting.
+        for (said, verdict) in [
+            ("approve", Verdict::Yes),
+            ("always", Verdict::Always),
+            ("reject", Verdict::No),
+        ] {
+            let text = format!("{VERDICT_PREFIX}\nid=approve-7\nsaid={said}");
+            assert_eq!(
+                verdict_from(&note("machine-a", &text)),
+                Some(("approve-7".into(), verdict))
+            );
+        }
+        // A plain board note, a note whose first line is not ours, one with no
+        // id, one with no verdict, and one whose verdict is a word nobody says
+        // are none of them something to act on.
+        for text in [
+            "plain board note".to_string(),
+            String::new(),
+            format!("{VERDICT_PREFIX} id=approve-7 said=approve"),
+            "muxloom-approval-verdict v2\nid=approve-7\nsaid=approve".to_string(),
+            format!("{VERDICT_PREFIX}\nsaid=approve"),
+            format!("{VERDICT_PREFIX}\nid=approve-7"),
+            format!("{VERDICT_PREFIX}\nid=   \nsaid=approve"),
+            format!("{VERDICT_PREFIX}\nid=approve-7\nsaid=maybe"),
+        ] {
+            assert_eq!(verdict_from(&note("machine-b", &text)), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn settling_an_approval_answers_only_for_an_ask_parked_here() {
+        use crate::approvals::{Approvals, Pending, Verdict};
+        fn parked(tool: &str) -> Approvals {
+            let mut ledger = Approvals::default();
+            ledger.park(
+                "approve-7".into(),
+                Pending {
+                    session: "sess-1".into(),
+                    machine: "macmini".into(),
+                    tool: tool.into(),
+                    ask: "start a session".into(),
+                    at_ms: 1,
+                    open: true,
+                },
+            );
+            ledger
+        }
+        // An id this machine never asked about is not ours to settle — this
+        // `None` is exactly what makes the voice pass the answer on instead of
+        // swallowing it.
+        let mut empty = Approvals::default();
+        assert_eq!(settle_approval(&mut empty, "approve-7", Verdict::Yes), None);
+        assert!(empty.pending.is_empty());
+        // Yes grants the one shot the agent needs to retry with.
+        let mut ledger = parked("launch_session");
+        let said = settle_approval(&mut ledger, "approve-7", Verdict::Yes);
+        assert_eq!(
+            said.as_deref(),
+            Some("· allowed launch_session once — tell the agent to run it again")
+        );
+        assert!(ledger.pending.is_empty());
+        assert_eq!(
+            ledger.once,
+            vec![(
+                "sess-1".to_string(),
+                "macmini".to_string(),
+                "launch_session".to_string()
+            )]
+        );
+        // One shot only: nothing was written down for the rest of the
+        // conversation, so the next call asks again.
+        assert!(ledger.allow.is_empty());
+        // The same id a second time settles nothing, so the person hears about
+        // it once however long the note stays on the board.
+        assert_eq!(
+            settle_approval(&mut ledger, "approve-7", Verdict::Yes),
+            None
+        );
+        // Always is remembered for a tool that may be, and downgraded to a
+        // single shot for one that may not.
+        let mut ledger = parked("launch_session");
+        assert_eq!(
+            settle_approval(&mut ledger, "approve-7", Verdict::Always).as_deref(),
+            Some("· allowed launch_session for the rest of this conversation")
+        );
+        assert!(ledger.remembered("sess-1", "macmini", "launch_session"));
+        assert!(ledger.allow.contains_key("sess-1"));
+        assert!(ledger.once.is_empty());
+        let mut ledger = parked("run_shell");
+        assert_eq!(
+            settle_approval(&mut ledger, "approve-7", Verdict::Always).as_deref(),
+            Some(
+                "· run_shell is sensitive, so allowed it once only — tell the agent to run it again"
+            )
+        );
+        assert!(ledger.allow.is_empty());
+        assert_eq!(ledger.once.len(), 1);
+        // No leaves nothing behind for the agent to retry with.
+        let mut ledger = parked("launch_session");
+        assert_eq!(
+            settle_approval(&mut ledger, "approve-7", Verdict::No).as_deref(),
+            Some("· denied")
+        );
+        assert!(ledger.pending.is_empty());
+        assert!(ledger.once.is_empty());
+        assert!(ledger.allow.is_empty());
     }
 
     #[test]
