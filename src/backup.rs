@@ -25,7 +25,8 @@
 //! delta; [`BackupStore::read_blob`] stitches the frames back into one stream.
 
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -1640,11 +1641,15 @@ pub fn search_where(
     filter: &SearchFilter,
 ) -> Result<Vec<SearchHit>> {
     let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
+    if needle.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+    // A word common enough to appear in every conversation matches tens of
+    // thousands of lines, and a hit is eight strings and a snippet. Rank on the
+    // way in so the corpus is read once and only `limit` of it is ever held.
+    let mut best = TopHits::new(limit);
+    let plain = plain_needle(&needle);
     let index = store.load_index()?;
-    let mut hits: Vec<SearchHit> = Vec::new();
     for record in index.records.iter().filter(|record| filter.keeps(record)) {
         let mut matched_message = false;
         let raw = store
@@ -1653,6 +1658,12 @@ pub fn search_where(
         // Enumerated over every line, parseable or not, so an index here is the
         // same index `read_messages` pages around.
         for (position, line) in String::from_utf8_lossy(&raw).lines().enumerate() {
+            // Parsing a line costs far more than looking at it, and almost no
+            // line holds the needle. See `plain_needle` for why this is allowed
+            // to decide, and when it steps aside.
+            if plain && !line.to_lowercase().contains(&needle) {
+                continue;
+            }
             let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) else {
                 continue;
             };
@@ -1661,7 +1672,10 @@ pub fn search_where(
                 continue;
             }
             matched_message = true;
-            hits.push(SearchHit {
+            if !best.admits(count, record.created_at) {
+                continue;
+            }
+            best.offer(SearchHit {
                 target_id: record.target_id.clone(),
                 session_id: record.session_id.clone(),
                 kind: record.kind.clone(),
@@ -1676,10 +1690,10 @@ pub fn search_where(
             });
         }
         // Surface a title/recap match even when no message body matched.
-        if !matched_message {
+        if !matched_message && best.admits(1, record.created_at) {
             let haystack = format!("{} {}", record.title, record.recap).to_lowercase();
             if haystack.contains(&needle) {
-                hits.push(SearchHit {
+                best.offer(SearchHit {
                     target_id: record.target_id.clone(),
                     session_id: record.session_id.clone(),
                     kind: record.kind.clone(),
@@ -1702,9 +1716,114 @@ pub fn search_where(
             }
         }
     }
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.created_at.cmp(&a.created_at)));
-    hits.truncate(limit);
-    Ok(hits)
+    Ok(best.into_ranked())
+}
+
+/// Whether a raw jsonl line can be tested for `needle` without parsing it.
+///
+/// The blob is written by `serde_json`, which leaves everything literal except
+/// `"`, `\`, and control characters. So for a needle made of anything else, a
+/// line that does not contain it cannot hold a message that does — there is no
+/// false negative to worry about, only the odd false positive from a key name,
+/// which the parse below then throws out. A needle that does contain one of
+/// those steps aside and every line is parsed, exactly as it always was.
+fn plain_needle(needle: &str) -> bool {
+    !needle
+        .chars()
+        .any(|character| character == '"' || character == '\\' || character.is_control())
+}
+
+/// The best `limit` hits, without ever holding more than that.
+///
+/// Ranking is highest score first, then most recent, then whichever was found
+/// first — the same order the old sort-everything-then-truncate produced, since
+/// `sort_by` is stable and the corpus is walked in index order.
+struct TopHits {
+    limit: usize,
+    /// Worst first, so the one to drop is the one on top.
+    heap: BinaryHeap<Ranked>,
+    found: u64,
+}
+
+struct Ranked {
+    hit: SearchHit,
+    /// Where in the walk this was found. Only a tie-break, and only so the
+    /// same corpus and the same query always give the same answer.
+    found: u64,
+}
+
+impl Ord for Ranked {
+    /// Greater means worse, so the heap's top is the first to go.
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .hit
+            .score
+            .cmp(&self.hit.score)
+            .then(other.hit.created_at.cmp(&self.hit.created_at))
+            .then(self.found.cmp(&other.found))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl TopHits {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::new(),
+            found: 0,
+        }
+    }
+
+    /// Whether a hit ranking this well would be kept. Asked before the hit is
+    /// built, because building it — the snippet especially — is the expensive
+    /// part. A tie loses: the equally-good hit already held was found first.
+    fn admits(&self, score: usize, created_at: u64) -> bool {
+        if self.heap.len() < self.limit {
+            return true;
+        }
+        self.heap
+            .peek()
+            .is_none_or(|worst| (score, created_at) > (worst.hit.score, worst.hit.created_at))
+    }
+
+    fn offer(&mut self, hit: SearchHit) {
+        let ranked = Ranked {
+            hit,
+            found: self.found,
+        };
+        self.found += 1;
+        if self.heap.len() < self.limit {
+            self.heap.push(ranked);
+            return;
+        }
+        if self.heap.peek().is_some_and(|worst| &ranked < worst) {
+            self.heap.pop();
+            self.heap.push(ranked);
+        }
+    }
+
+    /// Best first. `into_sorted_vec` sorts ascending, and here the better hit
+    /// is the lesser one, so that is already the order a reader wants.
+    fn into_ranked(self) -> Vec<SearchHit> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ranked| ranked.hit)
+            .collect()
+    }
 }
 
 /// A window of one backed-up conversation, addressed by message index: the
@@ -2204,6 +2323,111 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.target_id == "local"));
         // Empty query yields nothing.
         assert!(search(&store, "   ", 10).unwrap().is_empty());
+    }
+
+    /// A search asked for two hits reads the whole corpus but holds two. The
+    /// two it keeps have to be the same two the old sort-then-truncate kept,
+    /// or "the best match" quietly stops meaning that.
+    #[test]
+    fn a_capped_search_keeps_the_best_matches_and_not_the_first_ones() {
+        let store = temp_store();
+        let write = |session: &str, text: &str, created: u64| {
+            let messages = vec![ExtractedMessage {
+                role: "user".into(),
+                text: text.into(),
+                ts: String::new(),
+            }];
+            store
+                .write_blob(
+                    "local",
+                    session,
+                    MESSAGES_BLOB,
+                    messages_to_jsonl(&messages).as_bytes(),
+                )
+                .unwrap();
+            let mut index = store.load_index().unwrap();
+            index.upsert(BackupRecord {
+                target_id: "local".into(),
+                session_id: session.into(),
+                kind: "claude".into(),
+                created_at: created,
+                message_count: 1,
+                ..Default::default()
+            });
+            store.save_index(&index).unwrap();
+        };
+        // Walked in index order, so the weakest match is met first.
+        write("weak", "pager", 500);
+        write("middling", "pager pager", 100);
+        write("strong", "pager pager pager", 100);
+        // Two matches of equal strength, separated only by when they started.
+        write("older", "pager pager", 50);
+
+        let hits = search(&store, "pager", 2).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.session_id.as_str(), hit.score))
+                .collect::<Vec<_>>(),
+            [("strong", 3), ("middling", 2)],
+            "the cap kept what turned up first rather than what matched best"
+        );
+        // And a cap larger than the corpus changes nothing about the order.
+        let all = search(&store, "pager", 10).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|hit| hit.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["strong", "middling", "older", "weak"]
+        );
+    }
+
+    /// The raw-line shortcut is allowed to skip work, never to lose a match.
+    /// A needle carrying a character json escapes has to fall back to parsing
+    /// every line, and still find the message that holds it.
+    #[test]
+    fn a_needle_json_would_have_escaped_is_still_found() {
+        let store = temp_store();
+        let messages = vec![
+            ExtractedMessage {
+                role: "user".into(),
+                // Quotes and a backslash: escaped in the blob, literal here.
+                text: r#"run "muxloom mcp" from C:\tools"#.into(),
+                ts: String::new(),
+            },
+            ExtractedMessage {
+                role: "assistant".into(),
+                // Non-ascii, which serde_json leaves alone.
+                text: "路由到那台机器".into(),
+                ts: String::new(),
+            },
+        ];
+        store
+            .write_blob(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&messages).as_bytes(),
+            )
+            .unwrap();
+        let mut index = store.load_index().unwrap();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "s1".into(),
+            kind: "claude".into(),
+            created_at: 1,
+            message_count: 2,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        assert!(!plain_needle(r#""muxloom mcp""#));
+        assert_eq!(search(&store, r#""muxloom mcp""#, 10).unwrap().len(), 1);
+        assert!(!plain_needle(r"c:\tools"));
+        assert_eq!(search(&store, r"C:\tools", 10).unwrap().len(), 1);
+        // And the shortcut's own path still finds what it is meant to.
+        assert!(plain_needle("那台机器"));
+        assert_eq!(search(&store, "那台机器", 10).unwrap().len(), 1);
+        assert!(search(&store, "那台机頭", 10).unwrap().is_empty());
     }
 
     #[test]
