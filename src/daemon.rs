@@ -3963,6 +3963,9 @@ mod platform {
         } else {
             resume_in_place(state, &session_id)?
         };
+        // Everything below this line can still fail, and the record is out of
+        // the index from here until the live session replaces it.
+        let rollback = RevivalRollback::new(state, resuming.as_ref());
         // A temporary session runs in a folder of its own that muxloom makes
         // here and removes with it, whatever directory the client named. A
         // scratch chat that moves into the project you happened to have
@@ -4204,20 +4207,12 @@ mod platform {
         let (stream, status) = match start_keeper(state, &spec) {
             Ok(connection) => connection,
             Err(error) => {
-                if let Some(record) = &resuming {
+                if resuming.is_some() {
                     // A revival that never got its keeper must leave the
-                    // archive exactly as it found it: the record and its
-                    // history file both predate this launch.
-                    let _ = persist_session_metadata(&metadata_path, record);
-                    if let Ok(Some((id, entry))) =
-                        load_persisted_session(&state.paths, &metadata_path)
-                    {
-                        state
-                            .persisted_sessions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(id, entry);
-                    }
+                    // archive exactly as it found it - the rollback does that
+                    // on the way out - and the record and its history file
+                    // both predate this launch, so neither is this launch's to
+                    // delete.
                     return Err(error);
                 }
                 let _ = fs::remove_file(&metadata_path);
@@ -4294,8 +4289,64 @@ mod platform {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id, Arc::clone(&session));
+        rollback.replaced();
         spawn_session_reader(state, Arc::clone(&session), stream);
         Ok(session)
+    }
+
+    /// The archived record a launch has taken out of the index, put back if
+    /// the launch does not go on to replace it.
+    ///
+    /// Taking the record is how a revival comes back as itself, but a launch
+    /// can still fail afterwards for reasons that have nothing to do with the
+    /// archive - the folder it ran in is gone, its CLI is no longer installed,
+    /// the keeper will not start - and the record is then the only copy of who
+    /// that session was. Left out of the index it is not merely invisible: the
+    /// next attempt on the same number finds nothing to revive, so it mints a
+    /// fresh conversation wearing the number and writes over the record's
+    /// metadata, and the label, the parent, the creation time and the children
+    /// hanging off it are gone for good. So the take is undone on every way
+    /// out but the one that succeeds.
+    struct RevivalRollback<'a> {
+        state: &'a DaemonState,
+        record: Option<&'a DaemonSession>,
+    }
+
+    impl<'a> RevivalRollback<'a> {
+        fn new(state: &'a DaemonState, record: Option<&'a DaemonSession>) -> Self {
+            Self { state, record }
+        }
+
+        /// The launch reached the point where the live session holds the
+        /// number, so there is nothing left to put back.
+        fn replaced(mut self) {
+            self.record = None;
+        }
+    }
+
+    impl Drop for RevivalRollback<'_> {
+        fn drop(&mut self) {
+            let Some(record) = self.record.take() else {
+                return;
+            };
+            // The file first, because a launch that got as far as writing its
+            // own metadata has already written over the record's - and then
+            // read back rather than trusted, so what returns to the index is
+            // what a restart would find there.
+            let path = self
+                .state
+                .paths
+                .sessions
+                .join(format!("{}.json", record.id));
+            let _ = persist_session_metadata(&path, record);
+            if let Ok(Some((id, entry))) = load_persisted_session(&self.state.paths, &path) {
+                self.state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id, entry);
+            }
+        }
     }
 
     /// Reclaim a session id for the record that already holds it, or say the
@@ -7735,6 +7786,121 @@ mod platform {
                     .windows(11)
                     .any(|w| w == b"marker line")
             );
+        }
+
+        #[test]
+        fn a_revival_that_cannot_start_leaves_the_archive_where_it_found_it() {
+            let state = test_state("revive-refused");
+            let id = "muxloomd-terminal-revive-refused";
+            let first = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            first.archive().unwrap();
+            drop(first);
+            // Whether the conversation is still there to come back as itself,
+            // asked of both indexes because an archive that has not been
+            // reloaded since still sits among the live records - and asked
+            // about who it was, not just that something answers to the
+            // number.
+            let still_archived = || {
+                let live = state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(id)
+                    .map(|session| session.snapshot());
+                let record = match live {
+                    Some(record) => Some(record),
+                    None => state
+                        .persisted_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(id)
+                        .map(|entry| entry.snapshot()),
+                };
+                record.is_some_and(|record| {
+                    record.archived && record.label == "coordinator" && record.created_at == 111
+                })
+            };
+            assert!(still_archived(), "the fixture never reached the archive");
+
+            // The two ways a revival of a real record is refused by something
+            // outside the record: the folder that conversation ran in is gone,
+            // and the CLI it ran is no longer installed. Both are ordinary on
+            // a machine a few months on from the conversation.
+            let missing = state.paths.scratch.join("a-folder-that-was-removed");
+            let refused = |path: String, executable: String| {
+                let outcome = launch_session(
+                    &state,
+                    id.into(),
+                    "terminal".into(),
+                    path,
+                    String::new(),
+                    false,
+                    executable,
+                    vec![],
+                    vec![],
+                    999,
+                    80,
+                    24,
+                    None,
+                    None,
+                );
+                assert!(
+                    outcome.is_err(),
+                    "a revival that cannot start must not report success"
+                );
+            };
+            refused(missing.to_string_lossy().into_owned(), "/bin/cat".into());
+            assert!(
+                still_archived(),
+                "a revival refused for its folder took the record with it"
+            );
+            refused("/tmp".into(), "muxloom-no-such-binary-anywhere".into());
+            assert!(
+                still_archived(),
+                "a revival refused for its executable took the record with it"
+            );
+
+            // Which is the whole point: the conversation is still there to
+            // come back as itself once the reason it could not start is dealt
+            // with. A record that had been dropped would come back here as a
+            // nameless session created just now.
+            let revived = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let snapshot = revived.snapshot();
+            assert_eq!(snapshot.label, "coordinator");
+            assert_eq!(snapshot.created_at, 111);
+            assert!(!still_archived());
         }
 
         #[test]
