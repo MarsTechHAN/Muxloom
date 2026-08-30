@@ -126,7 +126,10 @@ fn sessions(state: &TestState) -> Vec<DaemonSession> {
     match request(
         &mut client,
         1,
-        &DaemonRequest::ListSessions { live_only: false },
+        &DaemonRequest::ListSessions {
+            live_only: false,
+            only: None,
+        },
     )
     .0
     {

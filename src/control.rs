@@ -1249,9 +1249,10 @@ fn screen_tail(screen: &str) -> String {
 /// Find the session a wait is watching, where a wait needs it looked for.
 ///
 /// A wait polls this every second or so for up to a minute, and what it waits
-/// on is a session that is running - so that is the only list the rounds in
-/// the middle read. Asking for the archive as well carried a record per
-/// conversation the machine has ever held, sixty times over, to find one id.
+/// on is one session that is running - so that is all the rounds in the middle
+/// ask for. Asking for the list carried every session on the machine, drawn
+/// and classified, sixty times over, to keep one of them; asking for the
+/// archive as well carried a record per conversation ever held there.
 ///
 /// The archive is still asked once, on the round that ends the loop: nothing
 /// running holds that id, so the wait is over either way, and the archive is
@@ -1259,13 +1260,10 @@ fn screen_tail(screen: &str) -> String {
 /// could not name what it had been waiting on would be a worse answer.
 fn waited_session(
     session_id: &str,
-    running: impl FnOnce() -> Result<Vec<DaemonSession>>,
+    running: impl FnOnce() -> Result<Option<DaemonSession>>,
     filed: impl FnOnce() -> Result<Vec<DaemonSession>>,
 ) -> Result<Option<DaemonSession>> {
-    if let Some(session) = running()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-    {
+    if let Some(session) = running()? {
         return Ok(Some(session));
     }
     Ok(filed()?
@@ -3341,7 +3339,7 @@ impl ControllerControl {
             || {
                 waited_session(
                     &session_id,
-                    || pool.list_live_sessions(&target),
+                    || pool.live_session(&target, &session_id),
                     || pool.list_sessions(&target),
                 )
             },
@@ -4127,21 +4125,39 @@ mod daemon_surface {
         }
 
         fn sessions(&self) -> Result<Vec<DaemonSession>> {
-            self.session_list(false)
+            self.session_list(false, None)
         }
 
         /// Only what the daemon is running. A lineage walk wants the whole
         /// list — a parent can be archived — but everything that asks only
         /// what is going on now should ask for that.
         fn live_sessions(&self) -> Result<Vec<DaemonSession>> {
-            self.session_list(true)
+            self.session_list(true, None)
         }
 
-        fn session_list(&self, live_only: bool) -> Result<Vec<DaemonSession>> {
-            match self.transact(&DaemonRequest::ListSessions { live_only })?.0 {
+        fn session_list(
+            &self,
+            live_only: bool,
+            only: Option<String>,
+        ) -> Result<Vec<DaemonSession>> {
+            match self
+                .transact(&DaemonRequest::ListSessions { live_only, only })?
+                .0
+            {
                 DaemonResponse::Sessions { sessions } => Ok(sessions),
                 response => bail!("unexpected session-list response: {response:?}"),
             }
+        }
+
+        /// One running session, for a round that is about one session.
+        ///
+        /// A daemon too old to read the id answers with all of them, so the
+        /// find is here rather than assumed away.
+        fn live_session(&self, session_id: &str) -> Result<Option<DaemonSession>> {
+            Ok(self
+                .session_list(true, Some(session_id.to_string()))?
+                .into_iter()
+                .find(|session| session.id == session_id))
         }
 
         /// Weigh a write aimed at one of this machine's sessions against how
@@ -4218,7 +4234,13 @@ mod daemon_surface {
                 LOCAL_TARGET_ID,
                 // The same round the controller's wait makes, and this is the
                 // copy every agent living on the machine calls.
-                || waited_session(&session_id, || self.live_sessions(), || self.sessions()),
+                || {
+                    waited_session(
+                        &session_id,
+                        || self.live_session(&session_id),
+                        || self.sessions(),
+                    )
+                },
                 || {
                     let (text, ..) = self.screen_rows(&session_id, 0, WAIT_SCREEN_LINES)?;
                     Ok(plain_screen(&text))
@@ -5109,12 +5131,12 @@ mod tests {
             Ok(vec![ended])
         };
 
-        // The rounds in the middle: the session is running, and the machine's
-        // whole history of conversations is not what says so. Sixty of these
-        // go by in one wait.
+        // The rounds in the middle: the session is running, and neither the
+        // rest of the machine nor its whole history of conversations is what
+        // says so. Sixty of these go by in one wait.
         let running = waited_session(
             "runs",
-            || Ok(vec![probe_session("runs", true, false)]),
+            || Ok(Some(probe_session("runs", true, false))),
             archive,
         )
         .unwrap();
@@ -5127,7 +5149,7 @@ mod tests {
 
         // The round that ends it: nothing running holds the id, and the answer
         // still has to be able to say what the wait had been waiting on.
-        let over = waited_session("over", || Ok(Vec::new()), archive).unwrap();
+        let over = waited_session("over", || Ok(None), archive).unwrap();
         assert_eq!(over.map(|session| session.id).as_deref(), Some("over"));
         assert_eq!(filed.get(), 1);
     }

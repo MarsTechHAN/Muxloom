@@ -2847,7 +2847,7 @@ mod platform {
                     ports: tcp_listener_ports()?,
                 },
             ),
-            DaemonRequest::ListSessions { live_only } => {
+            DaemonRequest::ListSessions { live_only, only } => {
                 // Which sessions there are is taken under the lock; what each
                 // of them is doing is worked out after letting it go. Reading a
                 // session means drawing its screen and running the classifiers
@@ -2856,13 +2856,25 @@ mod platform {
                 // typing into one, opening its screen, handing it a message. A
                 // dashboard asking three times a second is not a reason for
                 // those to queue behind a room-full of screens being drawn.
-                let live = state
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .values()
-                    .map(Arc::clone)
-                    .collect::<Vec<_>>();
+                //
+                // Asked about one session, the lookup is the same one and the
+                // reading is the part that stops happening: a round about a
+                // single id used to draw every screen on the machine to keep
+                // one of them.
+                let live = {
+                    let guard = state
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match &only {
+                        Some(id) => guard
+                            .get(id)
+                            .map(Arc::clone)
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                        None => guard.values().map(Arc::clone).collect::<Vec<_>>(),
+                    }
+                };
                 let mut sessions: Vec<_> = live
                     .iter()
                     .map(|session| {
@@ -2881,14 +2893,19 @@ mod platform {
                 // change while the daemon runs, and there is one for every
                 // conversation the machine has ever held.
                 if !live_only {
-                    sessions.extend(
-                        state
-                            .persisted_sessions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .values()
-                            .map(|session| session.snapshot()),
-                    );
+                    let guard = state
+                        .persisted_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match &only {
+                        // A session is in one list or the other, so an id
+                        // already answered for is not looked for again.
+                        Some(id) if sessions.is_empty() => {
+                            sessions.extend(guard.get(id).map(|session| session.snapshot()));
+                        }
+                        Some(_) => {}
+                        None => sessions.extend(guard.values().map(|session| session.snapshot())),
+                    }
                 }
                 write_response(writer, request_id, &DaemonResponse::Sessions { sessions })
             }
@@ -7342,7 +7359,10 @@ mod platform {
             SESSIONS_REQUEST,
             // Only what is running: the archive is all dead and archived
             // already, so it can only add weight to the answer.
-            &DaemonRequest::ListSessions { live_only: true },
+            &DaemonRequest::ListSessions {
+                live_only: true,
+                only: None,
+            },
         )?
         .write_to(stream)?;
         let mut sole_client = None;
@@ -8729,12 +8749,15 @@ mod platform {
             let (mut client, server) = UnixStream::pair().unwrap();
             let serve = Arc::clone(&state);
             let handle = thread::spawn(move || serve_client(server, serve));
-            let mut ask = |request_id: u64, live_only: bool| {
+            let mut ask = |request_id: u64, live_only: bool, only: Option<&str>| {
                 Frame::json(
                     FrameKind::Request,
                     0,
                     request_id,
-                    &DaemonRequest::ListSessions { live_only },
+                    &DaemonRequest::ListSessions {
+                        live_only,
+                        only: only.map(str::to_string),
+                    },
                 )
                 .unwrap()
                 .write_to(&mut client)
@@ -8758,12 +8781,28 @@ mod platform {
 
             // What a dashboard asks several times a second, and what it costs:
             // one record, not one per conversation the machine has ever held.
-            assert_eq!(ask(20, true), vec![running.to_string()]);
+            assert_eq!(ask(20, true, None), vec![running.to_string()]);
             // Asked for the whole list, the answer still holds the archive - an
             // older client sends no flag at all and must keep seeing it.
-            let mut everything = ask(21, false);
+            let mut everything = ask(21, false, None);
             everything.sort();
             assert_eq!(everything, vec![put_down.to_string(), running.to_string()]);
+
+            // What a wait asks once a second for a minute: the one session it
+            // is watching, and not the rest of the machine drawn and
+            // classified to be thrown away.
+            assert_eq!(ask(22, true, Some(running)), vec![running.to_string()]);
+            // An id that is running is answered without the archive being
+            // opened, and one that is only in the archive is still found by a
+            // round that asked for it - that is the round a wait ends on.
+            assert_eq!(ask(23, true, Some(put_down)), Vec::<String>::new());
+            assert_eq!(ask(24, false, Some(put_down)), vec![put_down.to_string()]);
+            assert_eq!(ask(25, false, Some(running)), vec![running.to_string()]);
+            // An id nobody holds is nothing, not everybody.
+            assert_eq!(
+                ask(26, false, Some("no-such-session")),
+                Vec::<String>::new()
+            );
 
             drop(client);
             handle.join().unwrap().unwrap();
@@ -10180,7 +10219,10 @@ mod platform {
                 &writer,
                 &state,
                 1,
-                DaemonRequest::ListSessions { live_only: true },
+                DaemonRequest::ListSessions {
+                    live_only: true,
+                    only: None,
+                },
             )
             .unwrap();
             assert!(matches!(
@@ -10192,7 +10234,10 @@ mod platform {
                 &writer,
                 &state,
                 2,
-                DaemonRequest::ListSessions { live_only: true },
+                DaemonRequest::ListSessions {
+                    live_only: true,
+                    only: None,
+                },
             )
             .unwrap();
             assert!(matches!(

@@ -245,6 +245,21 @@ pub enum DaemonRequest {
         /// list — which is also what a daemon too old to read it will answer.
         #[serde(default)]
         live_only: bool,
+        /// One session, by id, when the round is about one session.
+        ///
+        /// Leaving the archive out saved carrying records nothing can change;
+        /// what is left is the expensive half. Answering for a running session
+        /// means drawing its screen and laying the grid out as text, which is
+        /// most of what reading one costs, and a round that wants a single id —
+        /// a wait polling for it once a second, a message asking what the
+        /// session sending it is called — paid that for every session on the
+        /// machine to throw all but one away.
+        ///
+        /// Absent means all of them, so a client too old to send this and a
+        /// daemon too old to read it both still get the list they expect and
+        /// find their id in it.
+        #[serde(default)]
+        only: Option<String>,
     },
     Launch {
         session_id: String,

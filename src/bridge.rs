@@ -659,19 +659,31 @@ impl BridgeConnection {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<DaemonSession>> {
-        self.sessions(false)
+        self.sessions(false, None)
     }
 
     /// Only what the daemon is running: the archive it loaded at startup is
     /// left out. This is what to ask on a repeating round — see
     /// [`DaemonRequest::ListSessions`] for what it saves.
     pub fn list_live_sessions(&self) -> Result<Vec<DaemonSession>> {
-        self.sessions(true)
+        self.sessions(true, None)
     }
 
-    fn sessions(&self, live_only: bool) -> Result<Vec<DaemonSession>> {
+    /// One running session, by id, for a round that is about one session.
+    ///
+    /// A daemon too old to read the id answers with all of them, so the find is
+    /// here rather than assumed away: what comes back is the session asked for
+    /// either way, and only what it cost to say so differs.
+    pub fn live_session(&self, session_id: &str) -> Result<Option<DaemonSession>> {
+        Ok(self
+            .sessions(true, Some(session_id.to_string()))?
+            .into_iter()
+            .find(|session| session.id == session_id))
+    }
+
+    fn sessions(&self, live_only: bool, only: Option<String>) -> Result<Vec<DaemonSession>> {
         match self
-            .request(DaemonRequest::ListSessions { live_only })?
+            .request(DaemonRequest::ListSessions { live_only, only })?
             .response
         {
             DaemonResponse::Sessions { sessions } => Ok(sessions),
@@ -2366,6 +2378,11 @@ impl BridgePool {
     /// Only what the daemon is running, for a caller asking over and over.
     pub fn list_live_sessions(&self, target: &Target) -> Result<Vec<DaemonSession>> {
         self.connection_for_target(target)?.list_live_sessions()
+    }
+
+    /// One running session, for a round that is about one session.
+    pub fn live_session(&self, target: &Target, session_id: &str) -> Result<Option<DaemonSession>> {
+        self.connection_for_target(target)?.live_session(session_id)
     }
 
     pub fn probe_executables(
