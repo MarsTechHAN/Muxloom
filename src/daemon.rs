@@ -1104,22 +1104,12 @@ mod platform {
             state.save_outbox(&outbox);
         }
         spawn_outbox_drainer(state);
-        // An empty prompt only queues for a `when_idle` sender, who asked for
-        // exactly this.
-        let reason = match composer {
-            Composer::Ready => "that session is mid-turn; the message goes in when it finishes",
-            Composer::Occupied => {
-                "that session's prompt already holds something unsent, and this would be submitted \
-                 together with it; it goes in as soon as the prompt clears, or in a few minutes \
-                 anyway"
-            }
-            Composer::Absent => {
-                "that session is not showing a prompt to type into — it is asking a question, \
-                 starting up, or no longer running its agent; the message goes in as soon as one \
-                 appears"
-            }
-        };
-        Ok((message, "queued".into(), Some(reason.into())))
+        let reason = queued_reason(
+            composer,
+            snapshot.needs_attention,
+            snapshot.attention_reason.as_deref(),
+        );
+        Ok((message, "queued".into(), Some(reason)))
     }
 
     /// Hold the prompt a launch carried for its own first message until the
@@ -1258,6 +1248,53 @@ mod platform {
             _ => {
                 *watch = Some((draft, now));
                 Some(0)
+            }
+        }
+    }
+
+    /// What to tell a sender whose message [`TalkQueued::due`] has just held
+    /// back, in terms of what they can do about it.
+    ///
+    /// A session sitting on a question is the case worth saying out loud, and
+    /// the one an empty prompt used to be lumped in with. `due` will not type
+    /// into a dialog for as long as one is up, so such a message is not waiting
+    /// on a turn to end or on a draft to clear — it is waiting on a person.
+    /// Saying it goes in "as soon as a prompt appears" reads as a promise that
+    /// waiting will fix it, and waiting fixes nothing: the message sits for the
+    /// full `DELIVER_EXPIRY_MS` and then comes back undelivered. Name the
+    /// question instead, so whoever sent this knows there is something for them
+    /// to go and answer.
+    ///
+    /// An empty prompt otherwise only queues for a `when_idle` sender, who
+    /// asked for exactly this.
+    fn queued_reason(composer: Composer, attention: bool, question: Option<&str>) -> String {
+        match (composer, attention) {
+            // A ready prompt is delivered into whether or not a question is up,
+            // so reaching here with one means a `when_idle` sender mid-turn.
+            (Composer::Ready, _) => {
+                "that session is mid-turn; the message goes in when it finishes".to_string()
+            }
+            (_, true) => {
+                let question = question
+                    .map(|question| format!(" ({question})"))
+                    .unwrap_or_default();
+                format!(
+                    "that session is waiting on a question{question}, and whatever is typed there \
+                     next answers it — so this is held rather than sent, and no amount of waiting \
+                     will release it. Answer the question on that session and the message \
+                     follows; leave it and this comes back undelivered."
+                )
+            }
+            (Composer::Occupied, false) => {
+                "that session's prompt already holds something unsent, and this would be submitted \
+                 together with it; it goes in as soon as the prompt clears, or in a few minutes \
+                 anyway"
+                    .to_string()
+            }
+            (Composer::Absent, false) => {
+                "that session is not showing a prompt to type into — it is starting up, or no \
+                 longer running its agent; the message goes in as soon as one appears"
+                    .to_string()
             }
         }
     }
@@ -13628,6 +13665,46 @@ mod platform {
                 false,
                 Some(DELIVER_STALE_DRAFT_MS)
             ));
+        }
+
+        #[test]
+        fn a_session_held_on_a_question_is_told_about_rather_than_promised_delivery() {
+            // The case that sent somebody looking: a session freshly launched
+            // from a chat app came up on its own onboarding question, so it
+            // shows no prompt box. `due` holds every message for as long as
+            // that is true, which means the patience never runs out and the
+            // wait ends thirty minutes later in a bounce. The answer has to
+            // say that the sender is waiting on a person, and name what for.
+            let held = queued_reason(Composer::Absent, true, Some("Security guide"));
+            assert!(
+                held.contains("waiting on a question (Security guide)"),
+                "{held}"
+            );
+            assert!(held.contains("Answer the question"), "{held}");
+            assert!(!held.contains("as soon as one appears"), "{held}");
+            // Same answer whichever way the box is unavailable.
+            assert_eq!(
+                held,
+                queued_reason(Composer::Occupied, true, Some("Security guide"))
+            );
+            // A question nobody could put a name to still gets the point across.
+            let unnamed = queued_reason(Composer::Absent, true, None);
+            assert!(unnamed.contains("waiting on a question, and"), "{unnamed}");
+
+            // With no question up, the old answers stand: these really do
+            // clear on their own, and saying so is not a false promise.
+            let starting = queued_reason(Composer::Absent, false, None);
+            assert!(starting.contains("as soon as one appears"), "{starting}");
+            let drafting = queued_reason(Composer::Occupied, false, None);
+            assert!(
+                drafting.contains("as soon as the prompt clears"),
+                "{drafting}"
+            );
+            // A ready box is typed into whether or not a question is up, so
+            // reaching the reason with one means a `when_idle` sender mid-turn.
+            let mid_turn = queued_reason(Composer::Ready, true, Some("Security guide"));
+            assert!(mid_turn.contains("goes in when it finishes"), "{mid_turn}");
+            assert_eq!(mid_turn, queued_reason(Composer::Ready, false, None));
         }
 
         #[test]
