@@ -1548,6 +1548,9 @@ pub struct App {
     /// dashboard reads a chat, so this is the only copy.
     pub inbox: crate::channel::Inbox,
     pub inbox_path: PathBuf,
+    /// The directory anything a person attaches to a message is saved into, so
+    /// an agent that is told about a picture can open it.
+    pub received_dir: PathBuf,
     /// When a chat was last read, so errands can run far more often than a
     /// chat app is polled.
     last_inbox_poll: Option<Instant>,
@@ -1797,6 +1800,7 @@ impl App {
             channels_path,
             inbox: crate::channel::Inbox::load(&inbox_path),
             inbox_path,
+            received_dir: crate::channel::received_dir_in(&state_dir),
             last_inbox_poll: None,
             channel_attempt: 0,
             channel_asleep: HashSet::new(),
@@ -6471,6 +6475,7 @@ impl App {
             channels: Box::new(self.channels.clone()),
             inbox: Box::new(self.inbox.clone()),
             read_inbox,
+            received: self.received_dir.clone(),
             board_since: self.board.cursor.clone(),
         });
     }

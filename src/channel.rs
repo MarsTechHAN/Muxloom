@@ -490,6 +490,11 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(CHANNELS_FILE)
 }
 
+/// Where files a person sends are put down, given the same directory.
+pub fn received_dir_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(RECEIVED_DIR)
+}
+
 /// Credentials found somewhere else on this machine, offered as a starting
 /// point for a new binding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -559,6 +564,23 @@ const LARK_HOST: &str = "https://open.feishu.cn";
 const LARK_LIMIT: usize = 20 * 1024;
 const WECHAT_LIMIT: usize = 4 * 1024;
 
+/// What Lark's two upload endpoints take, in bytes. Its own documented caps,
+/// checked here so an agent is told which file was too big and how big it was,
+/// rather than being handed the platform's numbered refusal.
+const LARK_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const LARK_FILE_BYTES: u64 = 30 * 1024 * 1024;
+
+/// Where a file somebody sent is put down, under the state directory of the
+/// machine that was reading the chat.
+pub const RECEIVED_DIR: &str = "channel-files";
+
+/// How long a received file is kept. Long enough that an agent woken by the
+/// message can still open what the message is about, including one that was
+/// busy for an afternoon first; short enough that a chat full of photographs is
+/// not a disk that fills up silently. Nothing else refers to these files, so
+/// nothing breaks when one goes.
+const RECEIVED_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// How long a message to a person may be, in characters.
 ///
 /// Not a platform limit — [`LARK_LIMIT`] and [`WECHAT_LIMIT`] are those, in
@@ -623,6 +645,132 @@ pub struct Outgoing {
     /// One line naming who is speaking, put under the text. A human reading
     /// this on their phone has no other way to tell one agent from another.
     pub signature: String,
+    /// Files on this machine to send along with the words: a plot, a log, a
+    /// screenshot. Each becomes its own message after the text, because a chat
+    /// message is either a card or a picture and never both.
+    ///
+    /// Read on whichever machine runs the send, which is the machine the agent
+    /// is on — the same place it just wrote the file.
+    pub files: Vec<PathBuf>,
+}
+
+/// Which of a chat app's two upload paths a file belongs on.
+///
+/// Not a guess about the bytes: the difference is what the person sees. An
+/// image arrives shown, on the screen, in the conversation; anything else
+/// arrives as a row with a download button. Sending a screenshot down the
+/// second path means a person has to tap twice to look at what an agent is
+/// showing them, which defeats the point of showing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    File,
+}
+
+impl MediaKind {
+    /// Which one a path is, by its extension. The name is all there is to go
+    /// on at the point of sending, and it is what the person named the file.
+    pub fn of(path: &Path) -> Self {
+        let extension = path
+            .extension()
+            .and_then(|it| it.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "ico" => Self::Image,
+            _ => Self::File,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Image => "an image",
+            Self::File => "a file",
+        }
+    }
+}
+
+/// What Lark calls the kind of a file, which is a fixed list and not a MIME
+/// type. Anything outside it is `stream`, which is the list's own word for "a
+/// file"; it changes the icon and nothing else.
+fn lark_file_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|it| it.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" => "mp4",
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        "opus" => "opus",
+        _ => "stream",
+    }
+}
+
+/// The name a file travels under. A path with nothing usable on the end of it
+/// still has to be called something, or the far side records an empty name and
+/// the person is shown a download button with no label.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+/// One file read off this machine, checked against what the platform will take.
+///
+/// Read whole before anything is sent. A file that is missing, unreadable or
+/// too big is the agent's mistake to hear about while it still has the message
+/// in hand — not after the words have already landed on somebody's phone with
+/// nothing to go with them.
+struct Attached {
+    kind: MediaKind,
+    name: String,
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn read_attachment(path: &Path) -> Result<Attached> {
+    let kind = MediaKind::of(path);
+    let size = fs::metadata(path)
+        .with_context(|| format!("no file to send at {}", path.display()))?
+        .len();
+    let cap = match kind {
+        MediaKind::Image => LARK_IMAGE_BYTES,
+        MediaKind::File => LARK_FILE_BYTES,
+    };
+    if size > cap {
+        bail!(
+            "{} is {} and the limit for {} is {}. Nothing was sent. Send a smaller one — a \
+             cropped screenshot, the interesting part of the log — or leave it on the machine and \
+             say where it is.",
+            path.display(),
+            human_bytes(size),
+            kind.description(),
+            human_bytes(cap),
+        );
+    }
+    Ok(Attached {
+        kind,
+        name: file_name_of(path),
+        path: path.to_path_buf(),
+        bytes: fs::read(path).with_context(|| format!("could not read {}", path.display()))?,
+    })
+}
+
+/// A size a person reads rather than counts.
+fn human_bytes(size: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    match size {
+        size if size >= MB => format!("{:.1} MB", size as f64 / MB as f64),
+        size if size >= 1024 => format!("{:.1} KB", size as f64 / 1024.0),
+        size => format!("{size} bytes"),
+    }
 }
 
 impl Outgoing {
@@ -697,6 +845,10 @@ pub struct Sent {
     /// WeChat only: the platform's verdict on this send. None for Lark, since
     /// its HTTP status alone is sufficient to know whether delivery succeeded.
     pub wechat: Option<ilink::Verdict>,
+    /// The files that went with it, by the name each arrived under. Their own
+    /// message ids are not kept: a person answers the words, and a reply quotes
+    /// the card rather than the picture under it.
+    pub files: Vec<String>,
 }
 
 impl Sent {
@@ -753,10 +905,40 @@ pub fn send_reply(
     if message.text.trim().is_empty() {
         bail!("a channel message needs something to say");
     }
-    match binding.kind {
+    // Everything the message carries is read and weighed before a word goes
+    // out, so a path that is wrong costs nothing. Sent the other way round, a
+    // bad path leaves a caption on somebody's phone pointing at a picture that
+    // never arrives, and the agent is told about it too late to say so.
+    if !message.files.is_empty() && binding.kind == ChannelKind::WeChat {
+        bail!(
+            "this channel is WeChat, which muxloom can only send words through — its files and \
+             pictures go through an encrypted CDN muxloom does not speak to yet. Nothing was \
+             sent. Say what the file shows and where it is on the machine, or send it through a \
+             Lark channel if there is one bound."
+        );
+    }
+    // Uploaded before a word goes out, for the same reason: an upload the
+    // platform refuses is an error worth having while the message is still in
+    // the agent's hand. What is left behind by a card that then fails to send
+    // is an unreferenced key on Lark's side, which nobody ever sees.
+    let mut carried = Vec::new();
+    for path in &message.files {
+        let file = read_attachment(path)?;
+        let key = lark_upload(binding, &file, environment).with_context(|| {
+            format!("nothing was sent; {} could not be uploaded", path.display())
+        })?;
+        carried.push((file, key));
+    }
+    let mut sent = match binding.kind {
         ChannelKind::Lark => send_lark(binding, message, environment),
         ChannelKind::WeChat => send_wechat(binding, message, reply_to, environment),
+    }?;
+    for (file, key) in &carried {
+        lark_send_media(binding, file, key, environment)
+            .with_context(|| format!("the message went out; {} did not", file.path.display()))?;
+        sent.files.push(file.name.clone());
     }
+    Ok(sent)
 }
 
 /// Lark answers HTTP 200 with a non-zero `code` for everything it refuses, so
@@ -883,7 +1065,115 @@ fn send_lark(
             .unwrap_or_default()
             .to_string(),
         wechat: None,
+        files: Vec::new(),
     })
+}
+
+/// Hand one file to Lark and get back the key a message refers to it by.
+///
+/// Two endpoints, because Lark keeps pictures and documents apart from each
+/// other: `images` answers with an `image_key` and `files` with a `file_key`,
+/// and a message quoting the wrong one is refused. Which is which is
+/// [`MediaKind`], and it is decided by what the person will see rather than by
+/// what the bytes are.
+fn lark_upload(
+    binding: &ChannelBinding,
+    file: &Attached,
+    environment: &[(String, String)],
+) -> Result<String> {
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let (endpoint, field, key, fields) = match file.kind {
+        MediaKind::Image => (
+            "images",
+            "image",
+            "image_key",
+            vec![("image_type", "message")],
+        ),
+        MediaKind::File => (
+            "files",
+            "file",
+            "file_key",
+            vec![
+                ("file_type", lark_file_type(&file.path)),
+                ("file_name", file.name.as_str()),
+            ],
+        ),
+    };
+    let url = format!("{LARK_HOST}/open-apis/im/v1/{endpoint}");
+    let answer = http::post_multipart(
+        &url,
+        &[("Authorization", authorization.as_str())],
+        &fields,
+        &http::FilePart {
+            field,
+            filename: &file.name,
+            content_type: content_type_of(&file.path),
+            bytes: &file.bytes,
+        },
+        environment,
+    )?;
+    lark_ok(&answer, "the upload")?;
+    Ok(answer
+        .pointer(&format!("/data/{key}"))
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .with_context(|| format!("Lark took {} and named no key for it", file.name))?
+        .to_string())
+}
+
+/// Post the message that shows an already-uploaded file.
+///
+/// Its own message rather than part of the card: a Lark message is one type,
+/// and `interactive` — the card everything else goes out as — is not a type
+/// that can hold a picture. So the words arrive first and the picture under
+/// them, which is also the order somebody reading on a phone wants them in.
+fn lark_send_media(
+    binding: &ChannelBinding,
+    file: &Attached,
+    key: &str,
+    environment: &[(String, String)],
+) -> Result<()> {
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let (msg_type, content) = match file.kind {
+        MediaKind::Image => ("image", json!({ "image_key": key })),
+        MediaKind::File => ("file", json!({ "file_key": key })),
+    };
+    let answer = http::post_json(
+        &format!("{LARK_HOST}/open-apis/im/v1/messages?receive_id_type=chat_id"),
+        &[("Authorization", authorization.as_str())],
+        &json!({
+            "receive_id": binding.route.trim(),
+            "msg_type": msg_type,
+            "content": serde_json::to_string(&content)?,
+        }),
+        environment,
+    )?;
+    lark_ok(&answer, "the attachment")
+}
+
+/// A content type for the upload's own form. Lark records what it is told and
+/// otherwise decides for itself, so this only has to be honest about the
+/// pictures — a browser opening the download later reads this and nothing else.
+fn content_type_of(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|it| it.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "tiff" | "tif" => "image/tiff",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
 }
 
 /// A reaction a human reads as "the agent has seen this". Deliberately
@@ -1173,6 +1463,7 @@ fn send_wechat(
         through: binding.describes(),
         message_id,
         wechat: Some(verdict),
+        files: Vec::new(),
     })
 }
 
@@ -1890,6 +2181,238 @@ fn lark_text(item: &Value) -> Option<String> {
     Some(text).filter(|text| !text.trim().is_empty())
 }
 
+/// One thing a person attached, as the message that carries it names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attachment {
+    /// What the resource endpoint is asked for. Lark keeps pictures under an
+    /// `image_key` and everything else under a `file_key`, and wants to be told
+    /// which of the two is being fetched — so the kind travels with the key
+    /// rather than being worked out again at the point of asking.
+    key: String,
+    kind: MediaKind,
+    /// What the person called it, when the message says. A picture usually has
+    /// no name at all, and gets one from what the bytes turn out to be.
+    name: String,
+}
+
+/// Everything attached to one Lark message.
+///
+/// A message is one type: a picture, a file, a recording, a video, or words.
+/// The exception is a rich post, which is paragraphs of runs and can hold
+/// pictures among the words — those come back here so a screenshot pasted into
+/// a sentence is not lost while the sentence survives.
+fn lark_attachments(item: &Value) -> Vec<Attachment> {
+    let Some(content) = item
+        .pointer("/body/content")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    else {
+        return Vec::new();
+    };
+    let text_at = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|found| !found.is_empty())
+            .map(str::to_string)
+    };
+    let named = |key: Option<String>, kind, name: Option<String>| {
+        key.map(|key| Attachment {
+            name: name.unwrap_or_else(|| key.clone()),
+            key,
+            kind,
+        })
+    };
+    match item.get("msg_type").and_then(Value::as_str).unwrap_or("") {
+        "image" => named(text_at(&content, "image_key"), MediaKind::Image, None)
+            .into_iter()
+            .collect(),
+        // A voice note. Unlike WeChat's, it arrives as sound with no
+        // transcription, so the file is the whole of what was said.
+        "audio" => named(
+            text_at(&content, "file_key"),
+            MediaKind::File,
+            Some("voice-message.opus".to_string()),
+        )
+        .into_iter()
+        .collect(),
+        "file" | "media" => named(
+            text_at(&content, "file_key"),
+            MediaKind::File,
+            text_at(&content, "file_name"),
+        )
+        .into_iter()
+        .collect(),
+        "post" => content
+            .get("content")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter(|run| run.get("tag").and_then(Value::as_str) == Some("img"))
+            .filter_map(|run| named(text_at(run, "image_key"), MediaKind::Image, None))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Fetch one attachment off the message it came on.
+///
+/// The message id is part of the address: Lark does not hand a key out on its
+/// own, which is what stops a bot in one chat from reading a file posted in
+/// another.
+fn lark_fetch(
+    binding: &ChannelBinding,
+    message_id: &str,
+    attachment: &Attachment,
+    environment: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
+    let kind = match attachment.kind {
+        MediaKind::Image => "image",
+        MediaKind::File => "file",
+    };
+    http::get_bytes(
+        &format!(
+            "{LARK_HOST}/open-apis/im/v1/messages/{message_id}/resources/{}?type={kind}",
+            attachment.key
+        ),
+        &[("Authorization", authorization.as_str())],
+        environment,
+    )
+}
+
+/// What a picture actually is, read off its first bytes.
+///
+/// Lark sends a picture with no name and no type, so the alternative is to
+/// guess from nothing. An extension the file does not have is worse than none:
+/// whatever the agent opens it with reads the extension first.
+fn image_extension(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "png",
+        [0xff, 0xd8, 0xff, ..] => "jpg",
+        [b'G', b'I', b'F', b'8', ..] => "gif",
+        [b'B', b'M', ..] => "bmp",
+        // A RIFF container says what is in it four bytes past its length.
+        _ if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) => "webp",
+        _ => "bin",
+    }
+}
+
+/// Put one received file down on this machine and answer with where it went.
+///
+/// The name is the person's, reduced to something that cannot be read as a
+/// path: a chat is not a place to accept `../` from. The message id in front of
+/// it keeps two photographs called `IMG_0001.jpg` from being the same file.
+fn save_received(dir: &Path, message_id: &str, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    fs::create_dir_all(dir).with_context(|| format!("could not make {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let stem: String = message_id
+        .chars()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let safe: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    let safe = safe.trim_start_matches('.').trim();
+    let path = dir.join(format!(
+        "{}-{}",
+        match stem.is_empty() {
+            true => "message",
+            false => stem.as_str(),
+        },
+        match safe.is_empty() {
+            true => "attachment",
+            false => safe,
+        }
+    ));
+    fs::write(&path, bytes).with_context(|| format!("could not write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    sweep_received(dir);
+    Ok(path)
+}
+
+/// Throw away what nobody came back for. Best effort throughout: a file that
+/// will not go is a file that stays, which is the harmless direction.
+fn sweep_received(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|it| it.modified())
+            .map(|at| at.elapsed().unwrap_or_default() > RECEIVED_TTL)
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Fetch everything one message carries, and say where each of them landed.
+///
+/// A fetch that fails still produces a line. The person attached something and
+/// is waiting; an agent told a picture arrived and could not be read can ask
+/// about it, whereas an agent told nothing answers a message with a hole in it.
+fn collect_attachments(
+    binding: &ChannelBinding,
+    item: &Value,
+    message_id: &str,
+    dir: &Path,
+    environment: &[(String, String)],
+) -> Vec<String> {
+    lark_attachments(item)
+        .into_iter()
+        .map(|attachment| {
+            let described = attachment.kind.description();
+            let landed =
+                lark_fetch(binding, message_id, &attachment, environment).and_then(|bytes| {
+                    let name = match attachment.kind {
+                        MediaKind::Image if attachment.name == attachment.key => {
+                            format!("image.{}", image_extension(&bytes))
+                        }
+                        _ => attachment.name.clone(),
+                    };
+                    save_received(dir, message_id, &name, &bytes)
+                });
+            match landed {
+                Ok(path) => format!(
+                    "(they attached {described} — it is on this machine at {})",
+                    path.display()
+                ),
+                Err(error) => {
+                    debug::log(
+                        "channel",
+                        format!("{}: could not fetch an attachment: {error:#}", binding.id),
+                    );
+                    format!("(they attached {described}, which muxloom could not fetch: {error})")
+                }
+            }
+        })
+        .collect()
+}
+
 /// Everything said in one chat since `since`, oldest first.
 ///
 /// Asked for from a second early and deduplicated by id afterwards, because the
@@ -1898,6 +2421,7 @@ fn lark_text(item: &Value) -> Option<String> {
 fn lark_inbox(
     binding: &ChannelBinding,
     since: u64,
+    files: &Path,
     environment: &[(String, String)],
 ) -> Result<Vec<Incoming>> {
     let authorization = format!("Bearer {}", tenant_token(binding, environment)?);
@@ -1926,23 +2450,39 @@ fn lark_inbox(
         {
             continue;
         }
-        let Some(text) = lark_text(item) else {
-            continue;
-        };
         let at = item
             .get("create_time")
             .and_then(Value::as_str)
             .and_then(|ms| ms.parse().ok())
             .unwrap_or_default();
+        // Before anything is read off the message, and certainly before
+        // anything hanging off it is downloaded: this window is asked for a
+        // second either side of where it got to, so it comes back holding
+        // messages already delivered.
         if at <= since {
             continue;
         }
+        let message_id = item
+            .get("message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut lines: Vec<String> = lark_text(item).into_iter().collect();
+        lines.extend(collect_attachments(
+            binding,
+            item,
+            &message_id,
+            files,
+            environment,
+        ));
+        // Words, attachments, or both. Neither is a message with nothing in it
+        // for an agent to read — a reaction, say, or a card being edited.
+        if lines.is_empty() {
+            continue;
+        }
+        let text = lines.join("\n");
         said.push(Incoming {
-            message_id: item
-                .get("message_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            message_id,
             reply_to: item
                 .get("parent_id")
                 .and_then(Value::as_str)
@@ -2021,9 +2561,14 @@ fn wechat_inbox(
 
 /// Everything said in one chat since the last round, oldest first, whichever
 /// platform it is.
+///
+/// `files` is where anything attached to a message is put down. It is passed in
+/// rather than looked up so that reading a chat can be tested without a test
+/// writing into the state directory of the machine it happens to run on.
 fn read_chat(
     binding: &ChannelBinding,
     inbox: &mut Inbox,
+    files: &Path,
     environment: &[(String, String)],
 ) -> Result<Vec<Incoming>> {
     match binding.kind {
@@ -2035,7 +2580,7 @@ fn read_chat(
                 inbox.seen.insert(binding.id.clone(), now_ms());
                 return Ok(Vec::new());
             };
-            lark_inbox(binding, since, environment)
+            lark_inbox(binding, since, files, environment)
         }
     }
 }
@@ -2707,6 +3252,7 @@ pub fn run_inbox(
     targets: &[Target],
     set: &ChannelSet,
     inbox: &mut Inbox,
+    files: &Path,
     environment: &[(String, String)],
     config: &crate::config::Config,
 ) -> InboxRound {
@@ -2752,6 +3298,7 @@ pub fn run_inbox(
                 title: String::new(),
                 text,
                 signature: inbox.reply_signature(&binding.id, &local_name),
+                ..Outgoing::default()
             };
             if let Err(error) = send(binding, &message, environment) {
                 debug::log(
@@ -2782,7 +3329,7 @@ pub fn run_inbox(
         {
             continue;
         }
-        let said = match read_chat(binding, inbox, environment) {
+        let said = match read_chat(binding, inbox, files, environment) {
             Ok(said) => said,
             Err(error) => {
                 round
@@ -2831,6 +3378,7 @@ pub fn run_inbox(
                 title: String::new(),
                 text: answer,
                 signature: inbox.reply_signature(&binding.id, &local_name),
+                ..Outgoing::default()
             };
             // When the message just handled quoted one of our own, the answer
             // quotes theirs back: the thread stays visible as the chain it is
@@ -3762,6 +4310,159 @@ mod tests {
         }
     }
 
+    /// A directory of this test's own. Nothing here may reach the state
+    /// directory of the machine the suite happens to be running on.
+    fn scratch(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("muxloom-received-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn everything_a_person_attaches_to_a_lark_message_is_found() {
+        let message = |kind: &str, content: Value| json!({ "msg_type": kind, "body": { "content": content.to_string() } });
+        assert_eq!(
+            lark_attachments(&message("image", json!({ "image_key": "img_9" }))),
+            vec![Attachment {
+                key: "img_9".into(),
+                kind: MediaKind::Image,
+                // No name on the wire: what it is called is decided later, from
+                // what the bytes turn out to be.
+                name: "img_9".into(),
+            }]
+        );
+        assert_eq!(
+            lark_attachments(&message(
+                "file",
+                json!({ "file_key": "file_9", "file_name": "报告.pdf" })
+            )),
+            vec![Attachment {
+                key: "file_9".into(),
+                kind: MediaKind::File,
+                name: "报告.pdf".into(),
+            }]
+        );
+        // A voice note arrives as sound with nothing written down, so the
+        // recording is the whole of what was said.
+        assert_eq!(
+            lark_attachments(&message("audio", json!({ "file_key": "au_9" })))
+                .into_iter()
+                .map(|at| at.name)
+                .collect::<Vec<_>>(),
+            vec!["voice-message.opus".to_string()]
+        );
+        // A screenshot pasted into a sentence must not be lost with the
+        // sentence kept: a post is the one shape that carries both.
+        let post = message(
+            "post",
+            json!({ "title": "", "content": [
+                [{ "tag": "text", "text": "看这里" }, { "tag": "img", "image_key": "img_a" }],
+                [{ "tag": "img", "image_key": "img_b" }],
+            ] }),
+        );
+        assert_eq!(
+            lark_attachments(&post)
+                .into_iter()
+                .map(|at| at.key)
+                .collect::<Vec<_>>(),
+            vec!["img_a".to_string(), "img_b".to_string()]
+        );
+        assert_eq!(lark_text(&post).as_deref(), Some("看这里"));
+        // Words alone have nothing hanging off them, and neither does a shape
+        // nobody has taught this to read.
+        assert!(lark_attachments(&message("text", json!({ "text": "在" }))).is_empty());
+        assert!(lark_attachments(&json!({ "msg_type": "sticker" })).is_empty());
+    }
+
+    #[test]
+    fn a_name_from_a_chat_cannot_reach_out_of_the_directory_it_is_saved_in() {
+        let dir = scratch("escape");
+        let path = save_received(&dir, "om_x7zq91", "../../../etc/passwd", b"not really").unwrap();
+        assert_eq!(
+            path.parent(),
+            Some(dir.as_path()),
+            "a name off a chat put a file at {}",
+            path.display()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"not really");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "what a person sent is not for the whole machine"
+            );
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        // Two photographs called the same thing on two different phones are two
+        // files, because the message they came on is part of the name.
+        let one = save_received(&dir, "om_aaaa1111", "IMG_0001.jpg", b"one").unwrap();
+        let two = save_received(&dir, "om_bbbb2222", "IMG_0001.jpg", b"two").unwrap();
+        assert_ne!(one, two);
+        assert_eq!(fs::read(&one).unwrap(), b"one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picture_is_named_for_what_its_bytes_turn_out_to_be() {
+        // Lark sends a picture with no name and no type. An extension it does
+        // not have is worse than none, because whatever opens it reads the
+        // extension before it reads the file.
+        assert_eq!(image_extension(b"\x89PNG\r\n\x1a\n"), "png");
+        assert_eq!(image_extension(b"\xff\xd8\xff\xe0 JFIF"), "jpg");
+        assert_eq!(image_extension(b"GIF89a"), "gif");
+        assert_eq!(image_extension(b"RIFF\0\0\0\0WEBPVP8 "), "webp");
+        assert_eq!(image_extension(b"BM hello"), "bmp");
+        assert_eq!(image_extension(b"who knows"), "bin");
+        assert_eq!(image_extension(b""), "bin");
+    }
+
+    #[test]
+    fn a_file_nobody_came_back_for_is_not_kept_forever() {
+        let dir = scratch("sweep");
+        let old = save_received(&dir, "om_old", "old.png", b"old").unwrap();
+        let new = save_received(&dir, "om_new", "new.png", b"new").unwrap();
+        let long_ago = std::time::SystemTime::now() - RECEIVED_TTL - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        sweep_received(&dir);
+        assert!(!old.exists(), "a week-old file is nobody's to keep");
+        assert!(
+            new.exists(),
+            "today's file is what the agent was told about"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wechat_refuses_a_send_that_carries_a_file_rather_than_half_doing_it() {
+        // WeChat's media goes through an encrypted CDN muxloom does not speak
+        // to. The refusal has to come before the words go out: an agent that
+        // sees a message delivered assumes the picture went with it.
+        let error = send_reply(
+            &wechat("wechat-1"),
+            &Outgoing {
+                title: "look".into(),
+                text: "look at this".into(),
+                files: vec!["/tmp/shot.png".into()],
+                ..Default::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("Nothing was sent"), "{error}");
+        assert!(error.contains("Lark"), "{error}");
+    }
+
     #[test]
     fn a_set_survives_the_round_trip_through_a_private_file() {
         let path = std::env::temp_dir().join(format!(
@@ -3954,6 +4655,7 @@ mod tests {
             title: String::new(),
             text: "# 构建完成\n\n42 tests passed.".into(),
             signature: "*— gpu-1 · claude*".into(),
+            ..Default::default()
         };
         let (title, body) = message.compose(LARK_LIMIT);
         assert_eq!(title, "构建完成");
@@ -3979,6 +4681,7 @@ mod tests {
             title: String::new(),
             text: "#not a heading".into(),
             signature: String::new(),
+            ..Default::default()
         };
         assert_eq!(
             plain.compose(LARK_LIMIT),
@@ -3992,6 +4695,7 @@ mod tests {
             title: "Report".into(),
             text: "あ".repeat(4096),
             signature: "*— gpu-1*".into(),
+            ..Default::default()
         };
         let (_, body) = message.compose(WECHAT_LIMIT);
         assert!(body.len() <= WECHAT_LIMIT, "{} bytes", body.len());
@@ -4014,6 +4718,7 @@ mod tests {
             title: "Report".into(),
             text: "あ".repeat(READABLE_LIMIT + 1),
             signature: "*— gpu-1*".into(),
+            ..Default::default()
         };
         let refusal = format!("{:#}", refuse_if_too_long(&message).unwrap_err());
         assert!(
@@ -4033,6 +4738,7 @@ mod tests {
             title: "报告".into(),
             text: "字".repeat(READABLE_LIMIT),
             signature: "*— gpu-1*".into(),
+            ..Default::default()
         };
         assert!(message.text.len() > READABLE_LIMIT, "three bytes each");
         refuse_if_too_long(&message).expect("as many characters as the cap allows");
@@ -4045,6 +4751,7 @@ mod tests {
             title: "x".repeat(TITLE_LIMIT + 1),
             text: "short".into(),
             signature: "*— gpu-1*".into(),
+            ..Default::default()
         };
         let refusal = format!("{:#}", refuse_if_too_long(&message).unwrap_err());
         assert!(refusal.contains("title"), "{refusal}");
@@ -4172,6 +4879,7 @@ mod tests {
             through: "WeChat · your WeChat".into(),
             message_id: "id".into(),
             wechat,
+            ..Default::default()
         };
         let verdict = |delivery_confirmed| {
             Some(ilink::Verdict {

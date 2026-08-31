@@ -190,7 +190,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 12;
+const SKILL_REVISION: u32 = 13;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -346,6 +346,36 @@ Their reply comes back to you as a direct message, so end your turn and wait:
 ```
 talk_read { scope: \"direct\", wait_seconds: 45 }
 ```
+
+### Files and pictures
+
+`files` takes absolute paths on the machine you are running on, and they go out
+after the words as their own messages:
+
+```
+send_channel_message { title: \"火焰图\", text: \"热点在 snapshot()，见图\",
+                       files: [\"/tmp/flame.svg\", \"/tmp/before-after.png\"] }
+```
+
+An image (png/jpg/gif/bmp/webp/tiff/ico) arrives shown in the conversation; a
+graph is worth the paragraph you would have spent describing it. Anything else
+arrives as a download named after the file — up to 10 MB for a picture and
+30 MB for anything else. The words still carry the point: a phone shows a
+thumbnail the size of a stamp, and an attachment nobody has opened yet has to
+be answerable from the text alone.
+
+**Lark only.** A WeChat channel takes words and refuses a send that names files
+— refuses it whole, before the words go, so a picture never goes missing from a
+message that looks delivered. WeChat carries media through an encrypted CDN
+muxloom does not speak to. If that is the only channel bound, say what the file
+shows and where it is on the machine.
+
+Coming the other way: something they attach in Lark is downloaded onto the
+machine that read the chat, and the message you are woken with names the path —
+`(they attached an image — it is on this machine at /…/channel-files/…)`. Open
+it like any other file; it is deleted after a week. On WeChat you are told what
+arrived and that it could not be fetched, which is your cue to ask what is in it
+rather than to answer around it.
 
 ### Answer them before you start
 

@@ -1459,6 +1459,7 @@ mod platform {
                 .filter(|part| !part.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join(" · "),
+            ..crate::channel::Outgoing::default()
         };
         let message_id = queued.message_id.clone();
         thread::spawn(move || {

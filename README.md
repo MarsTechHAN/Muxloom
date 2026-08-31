@@ -853,6 +853,23 @@ find its way back to, and counts as a failure on the dashboard. The only repair
 is the person saying anything at all to the bot; nothing here can hurry it, and
 sending again before then lands in the same place.
 
+**Files both ways, on Lark.** `send_channel_message { files: [...] }` takes
+absolute paths on the machine the agent is running on and sends them after the
+words, each as its own message: an image arrives shown in the conversation,
+anything else as a download named after the file, capped at 10 MB for a picture
+and 30 MB otherwise. A file that cannot be uploaded stops the send before the
+words go out, so nothing arrives looking complete with its attachment missing.
+Coming back, anything a person attaches — a picture, a file, a voice note, a
+screenshot pasted into a rich post — is downloaded onto the machine that read
+the chat, saved 0600 under `<state>/channel-files/` under a name that cannot
+reach out of that directory, and the envelope the agent is woken with names the
+path so it can simply open it. Those files are swept after a week. WeChat is
+words only in both directions: its media travels through an encrypted CDN
+muxloom does not speak, so a send naming files is refused whole rather than
+half-done, and an inbound picture arrives as a line saying a picture was sent
+and could not be fetched — something the agent can ask about, rather than the
+silence it used to be.
+
 **Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
 a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.
 `trigger` leaves a standing watch with the daemon instead, for what no

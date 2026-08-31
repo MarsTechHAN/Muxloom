@@ -226,6 +226,10 @@ pub enum Request {
         /// seconds and a chat app does not need asking that often, so most
         /// rounds only carry receipts back.
         read_inbox: bool,
+        /// Where to put down anything a person attaches to a message. Carried
+        /// rather than worked out here, because where this machine keeps its
+        /// state is the dashboard's to know.
+        received: PathBuf,
         /// What the dashboard's board already holds, so the round brings back
         /// only what was said since. Empty on the first round, which is how the
         /// board is filled the first time it is drawn.
@@ -1312,6 +1316,7 @@ impl Worker {
                                 }
                             ),
                             signature: "muxloom dashboard".into(),
+                            ..Default::default()
                         };
                         let id = binding.id.clone();
                         // This is the one send whose entire purpose is to answer
@@ -1454,6 +1459,7 @@ impl Worker {
                         channels,
                         mut inbox,
                         read_inbox,
+                        received,
                         board_since,
                     } => {
                         let result = crate::talk::run_sync(&runtime, &targets)
@@ -1485,6 +1491,7 @@ impl Worker {
                                     &targets,
                                     &channels,
                                     &mut inbox,
+                                    &received,
                                     &environment,
                                     &config,
                                 ),

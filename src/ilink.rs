@@ -38,6 +38,14 @@ const BOT_TYPE: &str = "3";
 
 /// A text item, in the protocol's numbering.
 const ITEM_TEXT: i64 = 1;
+/// The item types that are not words. muxloom sends none of these and can fetch
+/// none of them: WeChat carries media through a CDN of its own, encrypted, and
+/// the shape of that exchange is not published. They are numbered here so that
+/// a message holding one can at least be reported as having held one.
+const ITEM_IMAGE: i64 = 2;
+const ITEM_VOICE: i64 = 3;
+const ITEM_FILE: i64 = 4;
+const ITEM_VIDEO: i64 = 5;
 /// The item type the platform itself puts on the `message_item` inside a
 /// quote's `ref_msg`: 0 in every capture, inbound and outbound alike — the
 /// reference stands for someone else's message, not for a fresh text item.
@@ -526,13 +534,43 @@ fn spoken(message: &Value) -> Option<String> {
         .iter()
         .filter_map(|item| {
             // A voice note arrives transcribed, which is as good as typed.
-            item.pointer("/text_item/text")
+            let said = item
+                .pointer("/text_item/text")
                 .or_else(|| item.pointer("/voice_item/text"))
                 .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|said| !said.trim().is_empty());
+            // Anything else, the person sent and muxloom cannot open. Saying so
+            // is worth doing: the alternative is that a photograph reaches the
+            // machine as silence, and whoever sent it watches nobody answer.
+            said.or_else(|| Some(missing(item.get("type").and_then(Value::as_i64)?)?.to_string()))
         })
         .collect::<Vec<_>>()
         .join("\n");
     Some(text).filter(|text| !text.trim().is_empty())
+}
+
+/// What to say instead of an item muxloom cannot read.
+///
+/// Each one names what it is and what to do about it, because the agent reading
+/// it has to answer the person without ever seeing the thing they sent.
+fn missing(kind: i64) -> Option<&'static str> {
+    Some(match kind {
+        ITEM_IMAGE => {
+            "(they sent a picture. muxloom cannot fetch pictures from WeChat — ask them what \
+             is in it, or ask them to send it to a Lark chat if one is bound.)"
+        }
+        ITEM_VOICE => "(they sent a voice message that arrived without a transcription.)",
+        ITEM_FILE => {
+            "(they sent a file. muxloom cannot fetch files from WeChat — ask them what it is, \
+             or ask them to send it to a Lark chat if one is bound.)"
+        }
+        ITEM_VIDEO => {
+            "(they sent a video. muxloom cannot fetch videos from WeChat — ask them what is \
+             in it, or ask them to send it to a Lark chat if one is bound.)"
+        }
+        _ => return None,
+    })
 }
 
 /// The message one of these quotes, when the person replied by quoting one.
@@ -729,11 +767,23 @@ mod tests {
             spoken(&json!({ "item_list": [{ "type": 3, "voice_item": { "text": "开会去了" } }] })),
             Some("开会去了".into())
         );
-        // A picture has nothing to route.
-        assert_eq!(
-            spoken(&json!({ "item_list": [{ "type": 2, "image_item": {} }] })),
-            None
-        );
+        // A picture has nothing in it to read, but a message that reached the
+        // machine as silence is a person watching nobody answer — so it is
+        // reported as what it is, with what to do about it.
+        let picture = spoken(&json!({ "item_list": [{ "type": 2, "image_item": {} }] }))
+            .expect("a picture must not arrive as silence");
+        assert!(picture.contains("picture"), "{picture}");
+        assert!(picture.contains("Lark"), "{picture}");
+        // Words alongside it are still the message; the note only adds to them.
+        let both = spoken(&json!({ "item_list": [
+            { "type": 1, "text_item": { "text": "看这个" } },
+            { "type": 2, "image_item": {} },
+        ] }))
+        .expect("words with a picture attached are still words");
+        assert!(both.starts_with("看这个\n("), "{both}");
+        // An item type nobody has seen stays silent rather than inventing a
+        // description of something that might be structural.
+        assert_eq!(spoken(&json!({ "item_list": [{ "type": 97 }] })), None);
         assert_eq!(spoken(&json!({ "item_list": [] })), None);
         assert_eq!(spoken(&json!({})), None);
     }

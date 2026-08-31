@@ -7,7 +7,9 @@
 //! Every build gets the JSON pair, because the companion sends channel messages
 //! itself rather than borrowing the controller's network:
 //!
-//! - [`get_json`] and [`post_json`] for a chat API request and its answer.
+//! - [`get_json`] and [`post_json`] for a chat API request and its answer,
+//! - [`post_multipart`] to hand a chat API a file, and [`get_bytes`] to take
+//!   one back, both of which need the same credentials the JSON calls carry.
 //!
 //! The download shapes are the controller's, since unpacking what they fetch
 //! needs `flate2`/`tar`/`zstd`, which only the controller build carries:
@@ -45,6 +47,11 @@ const REQUEST_TIMEOUT_SECS: u64 = 60;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 /// Match the retry budget used by the former `curl --retry 3` paths.
 const ATTEMPTS: usize = 3;
+/// Deadline for a request that carries a file rather than a sentence. A chat
+/// API takes tens of megabytes, and a phone tethered over a bad connection is
+/// the ordinary case rather than the exceptional one — a minute is a limit that
+/// would only ever fire on someone who was nearly done.
+const MEDIA_TIMEOUT_SECS: u64 = 5 * 60;
 /// Download copy buffer size.
 #[cfg(feature = "controller")]
 const CHUNK: usize = 64 * 1024;
@@ -285,6 +292,120 @@ pub fn post_json(
     json(send(request, url, |_| true)?, url)
 }
 
+/// GET a body that is not text: a picture, a document, a recording.
+///
+/// Separate from [`get_json`] because those bytes must not be pushed through a
+/// UTF-8 check on the way past. A refusal still arrives as JSON, though, so a
+/// 4xx carries its body into the error the way the JSON calls do — a chat API
+/// says why in the body and nowhere else.
+pub fn get_bytes(
+    url: &str,
+    headers: &[(&str, &str)],
+    environment: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let request = headed(request(url, environment), headers).with_timeout(MEDIA_TIMEOUT_SECS);
+    let response = send(request, url, |status| status < 500)?;
+    let status = response.status_code;
+    let bytes = response.into_bytes();
+    if !(200..300).contains(&status) {
+        bail!(
+            "{url} returned HTTP {status}: {}",
+            excerpt(&String::from_utf8_lossy(&bytes))
+        );
+    }
+    Ok(bytes)
+}
+
+/// One file on its way into a multipart form.
+pub struct FilePart<'a> {
+    /// The form field it goes under, which the API names.
+    pub field: &'a str,
+    /// What the far side records it as, and shows to whoever opens it.
+    pub filename: &'a str,
+    pub content_type: &'a str,
+    pub bytes: &'a [u8],
+}
+
+/// POST `multipart/form-data`: some text fields, and one file.
+///
+/// One file, because that is the shape every chat API's upload takes — the
+/// fields say what kind of thing is arriving and the file is the thing.
+pub fn post_multipart(
+    url: &str,
+    headers: &[(&str, &str)],
+    fields: &[(&str, &str)],
+    file: &FilePart<'_>,
+    environment: &[(String, String)],
+) -> Result<serde_json::Value> {
+    let boundary = boundary_for(file.bytes);
+    let body = multipart_body(&boundary, fields, file);
+    let request = headed(prepare(minreq::post(url), url, environment), headers)
+        .with_header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .with_timeout(MEDIA_TIMEOUT_SECS)
+        .with_body(body);
+    // Not replayable, exactly like `post_json`: only a transport that never
+    // reached the server is worth a second attempt.
+    json(send(request, url, |_| true)?, url)
+}
+
+/// The separator between the parts, derived from the bytes it has to separate
+/// rather than picked at random.
+///
+/// A boundary that occurs inside the file splits it in the middle, and what the
+/// far side then reports is a malformed request rather than anything about the
+/// file — the worst kind of bug to be handed. Random is merely unlikely to
+/// collide; a digest of the content cannot, unless the file contains its own
+/// digest, which the loop covers. Half of a SHA-256 keeps the whole thing well
+/// inside the seventy characters a boundary is allowed.
+fn boundary_for(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut boundary = String::from("muxloom");
+    for byte in &digest[..16] {
+        boundary.push_str(&format!("{byte:02x}"));
+    }
+    while bytes
+        .windows(boundary.len())
+        .any(|at| at == boundary.as_bytes())
+    {
+        boundary.push('-');
+    }
+    boundary
+}
+
+/// The form as it goes on the wire. Apart from the request so the framing can
+/// be read back in a test without a server on the other end.
+fn multipart_body(boundary: &str, fields: &[(&str, &str)], file: &FilePart<'_>) -> Vec<u8> {
+    let mut body = Vec::with_capacity(file.bytes.len() + 512);
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    // A quote in a filename would end the attribute early and leave the rest of
+    // the name read as syntax. Dropped rather than escaped: the escaping rules
+    // for this header are read differently by different servers, and a name is
+    // a label on a download, not something anything depends on.
+    let filename = file.filename.replace(['"', '\r', '\n'], "");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{filename}\"\
+             \r\nContent-Type: {}\r\n\r\n",
+            file.field, file.content_type
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(file.bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
 /// POST `application/x-www-form-urlencoded`, used by the flows that take a
 /// plain form rather than JSON — Feishu's bot-registration endpoint among
 /// them.
@@ -505,6 +626,63 @@ mod tests {
         assert_eq!(
             environment_value(&environment, &["HTTPS_PROXY", "https_proxy"]).as_deref(),
             Some("http://configured:8118")
+        );
+    }
+
+    /// A boundary that occurs inside the file cuts the upload in half, and the
+    /// far side reports that as a malformed request rather than as anything to
+    /// do with the file. Taking it from the bytes themselves is what makes that
+    /// impossible rather than unlikely.
+    #[test]
+    fn a_multipart_boundary_never_occurs_in_the_file_it_separates() {
+        let png = b"\x89PNG\r\n\x1a\n---- not a boundary ----".to_vec();
+        let boundary = boundary_for(&png);
+        assert!(boundary.starts_with("muxloom"));
+        assert_eq!(boundary.len(), "muxloom".len() + 32);
+        assert!(
+            !png.windows(boundary.len())
+                .any(|at| at == boundary.as_bytes())
+        );
+
+        // The pathological file: one that contains the very boundary its own
+        // bytes would produce. Lengthening moves it out of the way.
+        let mut awkward = boundary.clone().into_bytes();
+        awkward.extend_from_slice(b" and then some");
+        let evasive = boundary_for(&awkward);
+        assert!(
+            !awkward
+                .windows(evasive.len())
+                .any(|at| at == evasive.as_bytes())
+        );
+
+        let body = multipart_body(
+            &boundary,
+            &[("image_type", "message")],
+            &FilePart {
+                field: "image",
+                filename: "a \"quoted\" name.png",
+                content_type: "image/png",
+                bytes: &png,
+            },
+        );
+        let framing = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            framing.contains("Content-Disposition: form-data; name=\"image_type\"\r\n\r\nmessage"),
+            "{framing}"
+        );
+        // The quotes are gone rather than escaped, so nothing after the name
+        // can be read as syntax.
+        assert!(
+            framing.contains("name=\"image\"; filename=\"a quoted name.png\""),
+            "{framing}"
+        );
+        assert!(
+            framing.ends_with(&format!("\r\n--{boundary}--\r\n")),
+            "{framing}"
+        );
+        assert!(
+            body.windows(png.len()).any(|at| at == png),
+            "the file did not survive the framing"
         );
     }
 
