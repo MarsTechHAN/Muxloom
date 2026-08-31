@@ -3880,7 +3880,7 @@ impl ControllerControl {
 
     #[cfg(feature = "controller")]
     fn search_conversations(&self, arguments: &Value) -> Result<String> {
-        use crate::backup::{BackupStore, SearchFilter, search_where};
+        use crate::backup::{BackupStore, SearchFilter, search_index};
 
         let query = required_str(arguments, "query")?;
         let limit = optional_u64(arguments, "limit", 20).clamp(1, 100) as usize;
@@ -3894,7 +3894,9 @@ impl ControllerControl {
             since: optional_u64(arguments, "since", 0),
             until: optional_u64(arguments, "until", 0),
         };
-        let hits = search_where(&store, query, limit, &filter)?;
+        // The index was loaded to work out which machines may be searched;
+        // the search reads the same one rather than parsing the file again.
+        let hits = search_index(&store, &index, query, limit, &filter)?;
         let rendered: Vec<Value> = hits
             .iter()
             .map(|hit| {

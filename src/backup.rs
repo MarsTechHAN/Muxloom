@@ -1643,6 +1643,22 @@ pub fn search_where(
     limit: usize,
     filter: &SearchFilter,
 ) -> Result<Vec<SearchHit>> {
+    search_index(store, &store.load_index()?, query, limit, filter)
+}
+
+/// The same search again, against an index the caller is already holding.
+///
+/// The index is a single JSON file covering every conversation on the machine
+/// and it grows with them - a few hundred kilobytes here, read and parsed in
+/// full. A caller that had to load it to work out which machines it may search
+/// was paying for that twice on every search.
+pub fn search_index(
+    store: &BackupStore,
+    index: &BackupIndex,
+    query: &str,
+    limit: usize,
+    filter: &SearchFilter,
+) -> Result<Vec<SearchHit>> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -1652,7 +1668,6 @@ pub fn search_where(
     // way in so the corpus is read once and only `limit` of it is ever held.
     let mut best = TopHits::new(limit);
     let plain = plain_needle(&needle);
-    let index = store.load_index()?;
     for record in index.records.iter().filter(|record| filter.keeps(record)) {
         let mut matched_message = false;
         let raw = store
@@ -2493,6 +2508,18 @@ mod tests {
 
         let narrow = |filter: SearchFilter| search_where(&store, "parser", 10, &filter).unwrap();
         assert_eq!(search(&store, "parser", 10).unwrap().len(), 3);
+
+        // The index a caller hands in is the one searched, not the file: a
+        // caller that already loaded it to decide what it may search should
+        // not be paying to parse the whole thing a second time.
+        let mut held = store.load_index().unwrap();
+        held.records.retain(|record| record.session_id != "s2");
+        assert_eq!(
+            search_index(&store, &held, "parser", 10, &SearchFilter::default())
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(
             narrow(SearchFilter {
                 machines: vec!["gpu".into()],
