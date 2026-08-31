@@ -18862,7 +18862,10 @@ mod tests {
         // its internal id: the moderator has to recognise it, and so does the
         // person who reads the brief back.
         form.machines[1].selected = false;
-        assert_eq!(form.chosen_machines(), vec!["This machine".to_string()]);
+        assert_eq!(
+            form.chosen_machines(),
+            vec![crate::model::own_machine_name().to_string()]
+        );
     }
 
     /// A moderator hands work to the fleet, so the agents it can be pointed at

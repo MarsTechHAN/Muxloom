@@ -3096,13 +3096,14 @@ impl ControllerControl {
 
     /// The name a machine argument goes by here. This machine is `local` to
     /// the controller, but every daemon already calls its own machine that, so
-    /// the fleet was told this one's hostname instead (see `relay::run_pump`).
-    /// A relayed call naming the hostname means here, not a machine that is
-    /// missing. An ssh alias of the same spelling wins: it is the more
-    /// deliberate answer, and it points at this host anyway.
+    /// the fleet was told this one's own name instead (see `relay::run_pump`),
+    /// and that is the name machine lists here hand out. A call naming it
+    /// means here, not a machine that is missing. An ssh alias of the same
+    /// spelling wins: it is the more deliberate answer, and it points at this
+    /// host anyway.
     fn spelled_here<'a>(&self, machine: &'a str) -> &'a str {
         if !self.state().enabled_hosts.contains(machine)
-            && machine.eq_ignore_ascii_case(&crate::talk::hostname())
+            && machine.eq_ignore_ascii_case(crate::model::own_machine_name())
         {
             return crate::model::LOCAL_TARGET_ID;
         }
@@ -3148,7 +3149,7 @@ impl ControllerControl {
     fn list_machines(&self) -> Result<String> {
         let mut machines = vec![json!({
             "id": crate::model::LOCAL_TARGET_ID,
-            "label": "This machine",
+            "label": crate::model::own_machine_name(),
             "enabled": self.state().enabled_hosts.contains(crate::model::LOCAL_TARGET_ID),
             "connected": self.runtime.bridge_pool().is_connected(crate::model::LOCAL_TARGET_ID),
         })];
@@ -4587,7 +4588,10 @@ mod daemon_surface {
             let own = peers.iter().find(|peer| peer.own);
             let mut machines = vec![json!({
                 "id": LOCAL_TARGET_ID,
-                "label": own.map_or("This machine", |peer| peer.label.as_str()),
+                "label": own.map_or_else(
+                    || crate::model::own_machine_name().to_string(),
+                    |peer| peer.label.clone(),
+                ),
                 "fleet_id": own.map(|peer| peer.id.clone()),
                 "remote": false,
                 "connected": true,

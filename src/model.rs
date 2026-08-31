@@ -1,8 +1,33 @@
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_TARGET_ID: &str = "local";
+
+/// What this machine calls itself out loud.
+///
+/// `local` is a routing word, not a name: it means "not over ssh", and it
+/// means that on every machine muxloom runs on. Once more than one of them is
+/// in the same conversation — a fleet, a chat app relaying between them,
+/// anything decentralised — a machine introducing itself as `local` has said
+/// nothing that distinguishes it from the others, and a person reading two
+/// such introductions cannot tell which is which. So the id stays `local` for
+/// routing and the name is the machine's own, which is unique across the
+/// fleet and is what the fleet already knows this one by (see
+/// `relay::run_pump`).
+///
+/// Cached: this is asked for once per machine list and never changes under a
+/// running process.
+pub fn own_machine_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let host = crate::talk::hostname();
+        match host.trim().is_empty() {
+            true => LOCAL_TARGET_ID.to_string(),
+            false => host.trim().to_string(),
+        }
+    })
+}
 
 /// Parse a semantic version into comparable numbers, ignoring any pre-release
 /// or build suffix (`0.4.3-rc1` -> `(0, 4, 3)`). `None` if it does not look
@@ -418,7 +443,7 @@ impl Target {
     pub fn local() -> Self {
         Self {
             id: LOCAL_TARGET_ID.into(),
-            label: "This machine".into(),
+            label: own_machine_name().into(),
             transport: Transport::Local,
         }
     }
@@ -803,6 +828,26 @@ impl HistoryPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine that introduces itself as "local" or "this machine" has said
+    /// only that it is not the far end of an ssh hop — which is true of every
+    /// machine muxloom runs on, and so tells a reader holding two of these
+    /// nothing about which one is speaking. The routing id stays `local`
+    /// because that is all it ever meant; the name is the machine's own.
+    #[test]
+    fn this_machine_introduces_itself_by_name_and_routes_by_local() {
+        let here = Target::local();
+        assert_eq!(here.id, LOCAL_TARGET_ID, "routing is unchanged");
+        assert_eq!(here.label_or_id(), own_machine_name());
+        assert_ne!(here.label_or_id(), "This machine");
+        // Only a machine actually called `local` may say so, and then it is
+        // its name rather than the routing word.
+        if own_machine_name() != LOCAL_TARGET_ID {
+            assert_ne!(here.label_or_id(), LOCAL_TARGET_ID);
+        }
+        // An ssh machine was already named after itself, and stays that way.
+        assert_eq!(Target::ssh("gpu").label_or_id(), "gpu");
+    }
 
     /// The one rule the whole thing rests on: whatever a child asks for, it
     /// gets no more than the agent starting it already had. Without it a chain

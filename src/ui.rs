@@ -7093,7 +7093,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("Folders on This machine"));
+        assert!(rendered.contains(&format!("Folders on {}", crate::model::own_machine_name())));
         assert!(rendered.contains("src/"));
         assert!(rendered.contains("Type to match"));
         assert!(rendered.contains("Enter use"));
@@ -7200,7 +7200,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("Files  This machine:/work"));
+        assert!(rendered.contains(&format!(
+            "Files  {}:/work",
+            crate::model::own_machine_name()
+        )));
         assert!(rendered.contains("README.md"));
         assert!(rendered.contains("File preview"));
         assert!(rendered.contains("Enter close"));
