@@ -1130,11 +1130,12 @@ fn encode_key(name: &str) -> Result<Vec<u8>> {
 /// The runtime a session is running, as far as its machine will say. `None`
 /// when the machine cannot be asked, which is the answer that changes nothing:
 /// typing raw is what muxloom has always done.
-fn session_kind(sessions: &[DaemonSession], session_id: &str) -> Option<AgentKind> {
-    sessions
-        .iter()
-        .find(|session| session.id == session_id)
-        .and_then(|session| session.kind.parse().ok())
+///
+/// One record is the whole question. Asking for the roster and picking a line
+/// out of it made every keystroke sent to a session cost a reading of every
+/// other session on the machine.
+fn session_kind(session: Option<DaemonSession>) -> Option<AgentKind> {
+    session.and_then(|session| session.kind.parse().ok())
 }
 
 /// The bytes a send_input call types: text, then named keys, then Enter.
@@ -3936,12 +3937,13 @@ impl ControlSurface for ControllerControl {
                 let session_id = required_str(arguments, "session_id")?;
                 // Only a running session can be typed into, so the archive
                 // has nothing to say about which one this is.
-                let kind = self
-                    .runtime
-                    .bridge_pool()
-                    .list_live_sessions(&target)
-                    .ok()
-                    .and_then(|sessions| session_kind(&sessions, session_id));
+                let kind = session_kind(
+                    self.runtime
+                        .bridge_pool()
+                        .live_session(&target, session_id)
+                        .ok()
+                        .flatten(),
+                );
                 let bytes = build_input(arguments, kind)?;
                 self.runtime.send_input(&target, session_id, &bytes)?;
                 Ok(format!("sent {} bytes to {session_id}", bytes.len()))
@@ -4945,10 +4947,7 @@ mod daemon_surface {
                 "send_input" => {
                     let session_id = required_str(arguments, "session_id")?;
                     // Only a running session can be typed into.
-                    let kind = self
-                        .live_sessions()
-                        .ok()
-                        .and_then(|sessions| session_kind(&sessions, session_id));
+                    let kind = session_kind(self.live_session(session_id).ok().flatten());
                     let bytes = build_input(arguments, kind)?;
                     self.expect_ack(&DaemonRequest::SendInput {
                         session_id: session_id.into(),
@@ -5123,6 +5122,26 @@ mod tests {
             resumed_from: None,
             resumed_to: None,
         }
+    }
+
+    #[test]
+    fn the_kind_a_keystroke_is_framed_for_is_read_off_one_record() {
+        // Codex and Claude Code each decide whether an arriving return submits
+        // or just breaks a line by how much came with it, so send_input has to
+        // know which runtime it is typing into. It learned that by asking for
+        // the roster and finding a line in it, which made every keystroke sent
+        // to one session cost a drawing of every session on the machine.
+        let mut claude = probe_session("muxloomd-claude-9-1-0", false, false);
+        claude.kind = "claude".into();
+        assert_eq!(session_kind(Some(claude)), Some(AgentKind::Claude));
+
+        // A machine that cannot be asked, and a runtime this build has no name
+        // for, are the same answer, and it changes nothing: typing raw is what
+        // muxloom has always done.
+        assert_eq!(session_kind(None), None);
+        let mut stranger = probe_session("muxloomd-newthing-9-1-1", false, false);
+        stranger.kind = "newthing".into();
+        assert_eq!(session_kind(Some(stranger)), None);
     }
 
     #[test]
