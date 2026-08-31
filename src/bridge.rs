@@ -785,23 +785,31 @@ impl BridgeConnection {
         }
     }
 
-    /// Every capture on this machine searched for the same word, in one round.
+    /// The machine's captures searched for the same word in one round: the
+    /// recently written ones, or every one of them when `deep`.
+    ///
+    /// Answers with what it read and what it passed over, so that a near search
+    /// coming back empty can say so rather than looking like a machine that
+    /// never heard the word.
     ///
     /// A daemon too old to answer is walked session by session the way it
-    /// always was, so an old daemon still answers a search - slowly, which is
-    /// what it did before this existed.
+    /// always was, so an old daemon still answers a search - every capture, and
+    /// slowly, which is what it did before this existed.
     pub fn search_history_all(
         &self,
         query: &str,
         max_matches: usize,
-    ) -> Result<Vec<DaemonHistorySearchHit>> {
+        deep: bool,
+    ) -> Result<(Vec<DaemonHistorySearchHit>, usize, usize)> {
         if !self.has_capability(HISTORY_SEARCH_CAPABILITY) {
             let mut hits = Vec::new();
+            let mut searched = 0usize;
             for session in self
                 .list_sessions()?
                 .into_iter()
                 .filter(|session| !session.temporary)
             {
+                searched += 1;
                 // A session that will not answer is left out rather than
                 // failing the round: it may have been put down between the
                 // list and the question.
@@ -819,16 +827,23 @@ impl BridgeConnection {
                     matches,
                 });
             }
-            return Ok(hits);
+            // Nothing skipped: a daemon this old has no pool to stop at, so it
+            // read everything whether or not that was asked for.
+            return Ok((hits, searched, 0));
         }
         match self
             .request(DaemonRequest::SearchHistoryAll {
                 query: query.into(),
                 max_matches,
+                deep,
             })?
             .response
         {
-            DaemonResponse::HistorySearch { hits } => Ok(hits),
+            DaemonResponse::HistorySearch {
+                hits,
+                searched,
+                skipped,
+            } => Ok((hits, searched, skipped)),
             response => bail!("unexpected history-search response: {response:?}"),
         }
     }
@@ -2531,16 +2546,17 @@ impl BridgePool {
             .search_history(session_id, query, max_matches)
     }
 
-    /// Every capture on one machine searched at once, without asking it for its
+    /// One machine's captures searched at once, without asking it for its
     /// sessions first.
     pub fn search_history_all(
         &self,
         target: &Target,
         query: &str,
         max_matches: usize,
-    ) -> Result<Vec<DaemonHistorySearchHit>> {
+        deep: bool,
+    ) -> Result<(Vec<DaemonHistorySearchHit>, usize, usize)> {
         self.connection_for_target(target)?
-            .search_history_all(query, max_matches)
+            .search_history_all(query, max_matches, deep)
     }
 
     pub fn list_directory(&self, target: &Target, path: String) -> Result<DirectoryListing> {

@@ -96,6 +96,7 @@ fn file_identity(path: &Path) -> Option<String> {
 mod platform {
     use super::{current_generation, stamped_executable_name};
     use std::{
+        cmp::Reverse,
         collections::{BTreeSet, HashMap},
         fs::{self, File, OpenOptions},
         io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -3371,7 +3372,11 @@ mod platform {
                     &DaemonResponse::HistoryMatches { matches },
                 )
             }
-            DaemonRequest::SearchHistoryAll { query, max_matches } => {
+            DaemonRequest::SearchHistoryAll {
+                query,
+                max_matches,
+                deep,
+            } => {
                 let max_matches = max_matches.clamp(1, 50);
                 // Handles are taken under each lock and the searching is done
                 // after letting go. A capture runs to hundreds of megabytes and
@@ -3397,33 +3402,51 @@ mod platform {
                     .values()
                     .map(Arc::clone)
                     .collect();
-                let mut hits = Vec::new();
-                for (session_id, label, matches) in live
+                // A live session is in the pool whatever its capture weighs:
+                // being open is what makes a session the one being asked about.
+                // Filed ones are taken newest first until the budget is spent.
+                let running: Vec<SearchableCapture> = live
                     .iter()
-                    .filter_map(|session| {
-                        let (id, label) = session.history_naming()?;
-                        Some((id, label, session.search_history(&query, max_matches)))
+                    .filter_map(|session| session.searchable_capture())
+                    .collect();
+                let mut resting: Vec<SearchableCapture> = filed
+                    .iter()
+                    .filter_map(|session| session.searchable_capture())
+                    .collect();
+                drop(live);
+                drop(filed);
+                let skipped = match deep {
+                    true => 0,
+                    false => narrow_to_pool(&mut resting, SEARCH_POOL_BYTES),
+                };
+                let captures: Vec<SearchableCapture> = running.into_iter().chain(resting).collect();
+                let searched = captures.len();
+                let found = search_captures(&captures, &query, max_matches);
+                let hits = captures
+                    .into_iter()
+                    .zip(found)
+                    .filter_map(|((session_id, label, _), matches)| {
+                        // A capture that cannot be read is a session the answer
+                        // is silent about, the same as one that holds no match.
+                        // The round is about the machine, and one unreadable
+                        // file is no reason to refuse the rest of it.
+                        let matches = matches.ok()?;
+                        (!matches.is_empty()).then_some(DaemonHistorySearchHit {
+                            session_id,
+                            label,
+                            matches,
+                        })
                     })
-                    .chain(filed.iter().filter_map(|session| {
-                        let (id, label) = session.history_naming()?;
-                        Some((id, label, session.search_history(&query, max_matches)))
-                    }))
-                {
-                    // A capture that cannot be read is a session the answer is
-                    // silent about, the same as one that holds no match. The
-                    // round is about the machine, and one unreadable file is no
-                    // reason to refuse the rest of it.
-                    let Ok(matches) = matches else { continue };
-                    if matches.is_empty() {
-                        continue;
-                    }
-                    hits.push(DaemonHistorySearchHit {
-                        session_id,
-                        label,
-                        matches,
-                    });
-                }
-                write_response(writer, request_id, &DaemonResponse::HistorySearch { hits })
+                    .collect();
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::HistorySearch {
+                        hits,
+                        searched,
+                        skipped,
+                    },
+                )
             }
             DaemonRequest::ListDirectory { path } => write_response(
                 writer,
@@ -5666,14 +5689,20 @@ mod platform {
                 .clone()
         }
 
-        /// How this session is named in the answer to a search, or nothing at
-        /// all when it keeps no capture to search.
-        fn history_naming(&self) -> Option<(String, String)> {
+        /// The capture to search and the name to answer with, or nothing at all
+        /// when this session keeps no capture.
+        fn searchable_capture(&self) -> Option<SearchableCapture> {
             let metadata = self
                 .metadata
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (!metadata.temporary).then(|| (metadata.id.clone(), metadata.label.clone()))
+            (!metadata.temporary).then(|| {
+                (
+                    metadata.id.clone(),
+                    metadata.label.clone(),
+                    self.history_path.clone(),
+                )
+            })
         }
 
         /// Write this record to its file, unless the file is gone on purpose.
@@ -5799,18 +5828,26 @@ mod platform {
                 .temporary
         }
 
-        /// How this session is named in the answer to a search, or nothing at
-        /// all when it keeps no capture to search.
+        /// The capture to search and the name to answer with, or nothing at all
+        /// when this session keeps no capture.
         ///
         /// Read off the metadata alone: naming a session is not a question the
         /// screen answers, and drawing one per session is what a search of the
-        /// whole machine exists to avoid.
-        fn history_naming(&self) -> Option<(String, String)> {
+        /// whole machine exists to avoid. Handing back the path rather than
+        /// doing the search is what lets the caller let go of the session
+        /// before reading hundreds of megabytes off the disk.
+        fn searchable_capture(&self) -> Option<SearchableCapture> {
             let metadata = self
                 .metadata
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (!metadata.temporary).then(|| (metadata.id.clone(), metadata.label.clone()))
+            (!metadata.temporary).then(|| {
+                (
+                    metadata.id.clone(),
+                    metadata.label.clone(),
+                    self.history_path.clone(),
+                )
+            })
         }
 
         /// The last answer visible on the session's screen, or the last one
@@ -6795,6 +6832,129 @@ mod platform {
             // the session rather than the reach of one page.
             reached_start: true,
         })
+    }
+
+    /// A capture a search can be put to: the session's id, the label to answer
+    /// with, and the file holding what it said.
+    type SearchableCapture = (String, String, PathBuf);
+
+    /// How much filed capture a near search will read before it stops.
+    ///
+    /// A machine that has been running for months keeps several gigabytes of
+    /// capture, and a search that reads all of it takes seconds - for a word
+    /// that, nearly always, was said in a session still open or lately closed.
+    /// So the near search is bounded by what it reads rather than by how many
+    /// files it opens: one enormous capture is the same cost as a hundred small
+    /// ones, and it is the bytes that make a caller wait.
+    const SEARCH_POOL_BYTES: u64 = 512 * 1024 * 1024;
+
+    /// Cut a set of filed captures down to the ones a near search reads, newest
+    /// written first, and say how many were left behind.
+    ///
+    /// Recency is taken from the capture's own modification time rather than
+    /// from the session record: it is one `stat` per file against reading the
+    /// file itself, and it answers the question actually being asked - when
+    /// something last happened in this session - for a session filed after a
+    /// resume as truthfully as for one filed once.
+    ///
+    /// A capture that cannot be stat'd sorts oldest rather than being dropped,
+    /// so a machine whose clock or filesystem is strange still searches, just
+    /// in an order it did not choose.
+    fn narrow_to_pool(captures: &mut Vec<SearchableCapture>, budget: u64) -> usize {
+        let mut by_recency: Vec<(Option<SystemTime>, u64, SearchableCapture)> = captures
+            .drain(..)
+            .map(|capture| {
+                let stat = fs::metadata(&capture.2).ok();
+                let written = stat.as_ref().and_then(|stat| stat.modified().ok());
+                let bytes = stat.as_ref().map(|stat| stat.len()).unwrap_or(0);
+                (written, bytes, capture)
+            })
+            .collect();
+        // Newest first, which puts the ones with no time at the back: nothing
+        // sorts below every time there is, and reversing that leaves it last.
+        by_recency.sort_by_key(|(written, ..)| Reverse(*written));
+        let mut budget = budget;
+        let mut skipped = 0usize;
+        for (_, bytes, capture) in by_recency {
+            // Charged after the fact, so the newest capture is always read even
+            // if it alone is bigger than the whole budget. A pool that can come
+            // back empty because one session wrote a lot is worse than one that
+            // occasionally reads more than it meant to.
+            match budget > 0 {
+                true => {
+                    budget = budget.saturating_sub(bytes);
+                    captures.push(capture);
+                }
+                false => skipped += 1,
+            }
+        }
+        skipped
+    }
+
+    /// How many captures are read at once when the whole machine is searched.
+    ///
+    /// The work is a byte scan over a file, so it wants more than one thread
+    /// and nothing like one per session: the captures on a machine that has
+    /// been running a while come to several gigabytes between them, and reading
+    /// a hundred and seventy files at once only makes the disk seek.
+    const SEARCH_READERS: usize = 8;
+
+    /// Every named capture searched for the same word, answered in the order it
+    /// was asked in.
+    ///
+    /// One thread per capture would be as many threads as the machine has ever
+    /// held conversations, and one thread for all of them leaves a search of a
+    /// multi-gigabyte machine reading files end to end while the caller waits.
+    /// So a fixed few readers take the captures in turn.
+    ///
+    /// The answers are put back where they were asked from rather than in the
+    /// order they finish, because the order captures are searched in is the
+    /// order the caller listed them - live sessions first, then filed ones -
+    /// and that is the order the answer reads best in.
+    fn search_captures(
+        captures: &[SearchableCapture],
+        query: &str,
+        max_matches: usize,
+    ) -> Vec<Result<Vec<DaemonHistoryMatch>>> {
+        let readers = SEARCH_READERS.min(captures.len());
+        if readers <= 1 {
+            return captures
+                .iter()
+                .map(|(_, _, path)| search_history_file(path, query, max_matches))
+                .collect();
+        }
+        let mut found: Vec<Option<Result<Vec<DaemonHistoryMatch>>>> =
+            (0..captures.len()).map(|_| None).collect();
+        let next = AtomicUsize::new(0);
+        let done = Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            for _ in 0..readers {
+                scope.spawn(|| {
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((_, _, path)) = captures.get(at) else {
+                            return;
+                        };
+                        let matches = search_history_file(path, query, max_matches);
+                        // The lock is taken to hand back an answer already
+                        // arrived at, never to read a file under it.
+                        done.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((at, matches));
+                    }
+                });
+            }
+        });
+        for (at, matches) in done
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            found[at] = Some(matches);
+        }
+        found
+            .into_iter()
+            .map(|matches| matches.unwrap_or_else(|| Ok(Vec::new())))
+            .collect()
     }
 
     fn search_history_file(
@@ -11404,12 +11564,24 @@ mod platform {
                 DaemonRequest::SearchHistoryAll {
                     query: "anchovy".into(),
                     max_matches: 10,
+                    deep: false,
                 },
             )
             .unwrap();
-            let DaemonResponse::HistorySearch { hits } = answer(&mut client, 1) else {
+            let DaemonResponse::HistorySearch {
+                hits,
+                searched,
+                skipped,
+            } = answer(&mut client, 1)
+            else {
                 panic!("a history search must answer with hits");
             };
+            assert_eq!(
+                (searched, skipped),
+                (3, 0),
+                "three captures kept between them, and a near search reaches all of \
+                 them when they are this small"
+            );
             let found: Vec<(String, String)> = hits
                 .iter()
                 .map(|hit| (hit.session_id.clone(), hit.label.clone()))
@@ -11433,6 +11605,47 @@ mod platform {
             // A temporary session is never filed, so it is stopped instead.
             fleeting.stop().unwrap();
             discard_root(staging.paths.root.clone());
+            discard_root(root);
+        }
+
+        #[test]
+        fn a_near_search_keeps_the_captures_written_last_and_counts_what_it_dropped() {
+            let state = test_state("search-pool");
+            let root = state.paths.root.clone();
+            let capture = |name: &str, bytes: usize| {
+                let path = state.paths.history.join(format!("{name}.ansi"));
+                fs::write(&path, "x".repeat(bytes)).unwrap();
+                // Far enough apart that no filesystem's timestamp resolution
+                // can call two of these the same moment.
+                thread::sleep(Duration::from_millis(10));
+                (name.to_string(), name.to_string(), path)
+            };
+            // Written oldest first, and handed over in that order too, so that
+            // keeping the right two proves the sort and not the input order.
+            let mut captures = vec![
+                capture("stale", 100),
+                capture("older", 100),
+                capture("newest", 100),
+            ];
+
+            let skipped = narrow_to_pool(&mut captures, 150);
+
+            assert_eq!(
+                captures
+                    .iter()
+                    .map(|(id, ..)| id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["newest", "older"],
+                "newest written first, and only as far as the budget reaches"
+            );
+            assert_eq!(skipped, 1, "the capture left unread is counted, not hidden");
+
+            // The newest is read even when it alone is over budget: a pool that
+            // can come back empty is worse than one that reads too much.
+            let mut lone = vec![capture("enormous", 100)];
+            assert_eq!(narrow_to_pool(&mut lone, 1), 0);
+            assert_eq!(lone.len(), 1, "the first capture is never the one skipped");
+
             discard_root(root);
         }
 

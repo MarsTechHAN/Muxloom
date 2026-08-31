@@ -562,6 +562,19 @@ pub struct HistorySearchHit {
     pub matches: Vec<HistoryMatch>,
 }
 
+/// What a machine-wide search found, and how much of the machine it looked at
+/// to find it.
+///
+/// A near search reads the captures written most recently and stops; carrying
+/// `skipped` is what lets the answer say it stopped, rather than reading as a
+/// machine on which the word was never said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySweep {
+    pub hits: Vec<HistorySearchHit>,
+    pub searched: usize,
+    pub skipped: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     pub id: String,

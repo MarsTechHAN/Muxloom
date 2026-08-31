@@ -361,6 +361,15 @@ pub enum DaemonRequest {
     SearchHistoryAll {
         query: String,
         max_matches: usize,
+        /// Read every capture on the machine, however many gigabytes that is,
+        /// rather than the recently written ones a search almost always wants.
+        ///
+        /// Defaulted rather than required, so that a daemon of either age
+        /// understands a client of either age: an old client's round asks for
+        /// the near pool, and an old daemon ignores the flag and reads
+        /// everything, which is what it did before the pool existed.
+        #[serde(default)]
+        deep: bool,
     },
     ListDirectory {
         path: String,
@@ -625,6 +634,17 @@ pub enum DaemonResponse {
     /// needs no session list either.
     HistorySearch {
         hits: Vec<DaemonHistorySearchHit>,
+        /// How many captures were actually read, and how many were left out of
+        /// a near search for being older than the pool reaches.
+        ///
+        /// A search that quietly stopped short reads as a machine that has
+        /// never heard of the word, so the answer carries what it did not look
+        /// at. Defaulted for a daemon too old to count: nothing skipped is what
+        /// such a daemon means, since it reads everything.
+        #[serde(default)]
+        searched: usize,
+        #[serde(default)]
+        skipped: usize,
     },
     Directory {
         listing: DirectoryListing,

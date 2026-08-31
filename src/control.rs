@@ -793,13 +793,28 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "search_history",
         description: "Full-text search over session terminal histories, live and archived. \
-                      Searches one session when session_id is given, otherwise every session."
+                      Searches one session when session_id is given — that one is read in \
+                      full, however old it is. Otherwise it searches the machine: every \
+                      running session, plus the sessions written most recently, which is \
+                      where a word said on this machine almost always is. When it stops \
+                      short of the older ones it says so, and how many it passed over."
             .into(),
         input_schema: schema_across(
             flavor,
             json!({
                 "query": { "type": "string" },
                 "session_id": { "type": "string", "description": "Limit the search to one session." },
+                "deep": {
+                    "type": "boolean",
+                    "description": "Read every capture on the machine instead of the recent \
+                                    ones. Do NOT set this by default. A machine that has been \
+                                    running a while holds several gigabytes of terminal \
+                                    capture, and reading all of it takes seconds while every \
+                                    other call to this machine waits. Search normally first; \
+                                    reach for this only when that answer came back short AND \
+                                    you have reason to think the thing you want was said in a \
+                                    session that has been closed for a long time.",
+                },
             }),
             &["query"],
         ),
@@ -3731,13 +3746,14 @@ impl ControllerControl {
 
     fn search_history(&self, arguments: &Value) -> Result<String> {
         let query = required_str(arguments, "query")?;
+        let deep = optional_bool(arguments, "deep");
         let mut results = Vec::new();
         for target in self.targets(arguments)? {
             // Asked about the whole machine, the machine is asked once. Walking
             // it from here meant fetching the session list — which draws every
             // live screen to answer — and then one round trip per session, for
             // hundreds of captures that mostly do not hold the word.
-            let hits = match optional_str(arguments, "session_id") {
+            let (hits, skipped) = match optional_str(arguments, "session_id") {
                 Some(session_id) => {
                     match self.runtime.search_history(
                         &target,
@@ -3745,28 +3761,53 @@ impl ControllerControl {
                         query,
                         SEARCH_MAX_MATCHES,
                     ) {
-                        Ok(matches) => vec![HistorySearchHit {
-                            session_id: session_id.into(),
-                            label: String::new(),
-                            matches,
-                        }],
+                        // One named session is read whole however old it is:
+                        // the pool exists to keep a search off captures nobody
+                        // asked about, and this one was asked about.
+                        Ok(matches) => (
+                            vec![HistorySearchHit {
+                                session_id: session_id.into(),
+                                label: String::new(),
+                                matches,
+                            }],
+                            0,
+                        ),
                         Err(_) => continue,
                     }
                 }
-                None => match self
-                    .runtime
-                    .search_history_all(&target, query, SEARCH_MAX_MATCHES)
-                {
-                    Ok(hits) => hits,
-                    Err(error) => {
-                        results.push(json!({
-                            "machine": target.id,
-                            "error": format!("{error:#}"),
-                        }));
-                        continue;
+                None => {
+                    match self
+                        .runtime
+                        .search_history_all(&target, query, SEARCH_MAX_MATCHES, deep)
+                    {
+                        Ok(sweep) => (sweep.hits, sweep.skipped),
+                        Err(error) => {
+                            results.push(json!({
+                                "machine": target.id,
+                                "error": format!("{error:#}"),
+                            }));
+                            continue;
+                        }
                     }
-                },
+                }
             };
+            // A search that stopped short says so. Coming back empty from a
+            // pool that never opened the file reads exactly like a machine
+            // where the word was never said, and that is the one wrong answer
+            // this is allowed to give.
+            if skipped > 0 {
+                results.push(json!({
+                    "machine": target.id,
+                    "unsearched_sessions": skipped,
+                    "note": format!(
+                        "Searched the recently written captures on {}; {skipped} older ones were \
+                         not read. Only if this answer is genuinely not enough, ask again with \
+                         deep=true - that reads every capture on the machine, which can run to \
+                         gigabytes and take seconds.",
+                        target.id,
+                    ),
+                }));
+            }
             for hit in hits {
                 if hit.matches.is_empty() {
                     continue;
@@ -4135,6 +4176,10 @@ mod daemon_surface {
         /// running agent.
         own_folder: Option<String>,
     }
+
+    /// One session a search had something to say about: its id, the label to
+    /// name it by, and the lines the word was found on.
+    type SearchedSession = (String, String, Vec<DaemonHistoryMatch>);
 
     impl DaemonControl {
         pub fn new() -> Result<Self> {
@@ -4865,7 +4910,8 @@ mod daemon_surface {
             Ok(format!("Head name set to: {name}"))
         }
 
-        /// Every capture on this machine searched in one round.
+        /// This machine's captures searched in one round, and how many were
+        /// passed over for being older than the near pool reaches.
         ///
         /// This surface negotiates no capabilities, so the fallback answers the
         /// version question instead of a handshake: a daemon too old for this
@@ -4873,17 +4919,21 @@ mod daemon_surface {
         fn searched_sessions(
             &self,
             query: &str,
-        ) -> Result<Vec<(String, String, Vec<DaemonHistoryMatch>)>> {
-            if let Ok((DaemonResponse::HistorySearch { hits }, _)) =
+            deep: bool,
+        ) -> Result<(Vec<SearchedSession>, usize)> {
+            if let Ok((DaemonResponse::HistorySearch { hits, skipped, .. }, _)) =
                 self.transact(&DaemonRequest::SearchHistoryAll {
                     query: query.into(),
                     max_matches: SEARCH_MAX_MATCHES,
+                    deep,
                 })
             {
-                return Ok(hits
-                    .into_iter()
-                    .map(|hit| (hit.session_id, hit.label, hit.matches))
-                    .collect());
+                return Ok((
+                    hits.into_iter()
+                        .map(|hit| (hit.session_id, hit.label, hit.matches))
+                        .collect(),
+                    skipped,
+                ));
             }
             let mut hits = Vec::new();
             for session in self
@@ -4902,25 +4952,44 @@ mod daemon_surface {
                 };
                 hits.push((session.id, session.label, matches));
             }
-            Ok(hits)
+            // A daemon this old has no pool to stop at: it read everything.
+            Ok((hits, 0))
         }
 
         fn search_history(&self, arguments: &Value) -> Result<String> {
             let query = required_str(arguments, "query")?;
-            let hits = match optional_str(arguments, "session_id") {
+            let (hits, skipped) = match optional_str(arguments, "session_id") {
                 Some(session_id) => match self.transact(&DaemonRequest::SearchHistory {
                     session_id: session_id.into(),
                     query: query.into(),
                     max_matches: SEARCH_MAX_MATCHES,
                 }) {
+                    // One named session is read whole however old it is: the
+                    // pool exists to keep a search off captures nobody asked
+                    // about, and this one was asked about.
                     Ok((DaemonResponse::HistoryMatches { matches }, _)) => {
-                        vec![(session_id.to_string(), String::new(), matches)]
+                        (vec![(session_id.to_string(), String::new(), matches)], 0)
                     }
-                    Ok(_) | Err(_) => Vec::new(),
+                    Ok(_) | Err(_) => (Vec::new(), 0),
                 },
-                None => self.searched_sessions(query)?,
+                None => self.searched_sessions(query, optional_bool(arguments, "deep"))?,
             };
             let mut results = Vec::new();
+            // A search that stopped short says so. Coming back empty from a
+            // pool that never opened the file reads exactly like a machine
+            // where the word was never said.
+            if skipped > 0 {
+                results.push(json!({
+                    "machine": LOCAL_TARGET_ID,
+                    "unsearched_sessions": skipped,
+                    "note": format!(
+                        "Searched the recently written captures; {skipped} older ones were not \
+                         read. Only if this answer is genuinely not enough, ask again with \
+                         deep=true - that reads every capture on the machine, which can run to \
+                         gigabytes and take seconds.",
+                    ),
+                }));
+            }
             for (session_id, label, matches) in hits {
                 if matches.is_empty() {
                     continue;
