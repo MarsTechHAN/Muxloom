@@ -159,10 +159,16 @@ mod platform {
     /// working agent report itself finished. What the bound still catches is
     /// the frame frozen by a process that died or wedged mid-turn.
     const WORKING_HELD_QUIET_MS: u64 = 10 * 60_000;
-    /// The least of a session's log to render when seeding a client's
-    /// scrollback. Enough on its own for an agent that writes its transcript
-    /// out plainly, and cheap enough to read whether or not it is.
-    const SCROLLBACK_SEED_BYTES_MIN: u64 = 16 * 1024 * 1024;
+    /// The least of a session's log to render for a page, however few rows the
+    /// page holds. Small enough that the shallowest ask pays about what it is
+    /// worth, and large enough that a plainly written transcript fills a screen
+    /// from it without reading again.
+    const SCROLLBACK_SEED_BYTES_MIN: u64 = 256 * 1024;
+    /// What one row of a page is guessed to have cost in the log, per column.
+    /// Rows are stored as what was painted, escapes and all, so this is a
+    /// starting guess and the widening below is what makes it right; it is set
+    /// high enough that a page of ordinary output is reached on the first read.
+    const SCROLLBACK_SEED_BYTES_PER_CELL: u64 = 16;
     /// The most of it to render. How much output a session spends per finished
     /// line varies by three orders of magnitude between agents, so the window is
     /// measured out in rows below and this only stops a log that has been
@@ -6391,6 +6397,28 @@ mod platform {
     /// moves the history along by nothing — so the render starts at a window of
     /// `least` bytes and widens until it holds the rows that were asked for, it
     /// has read the log from the start, or it has read `most`.
+    /// How much of a log to replay for a page that deep, before any widening.
+    ///
+    /// The window used to be one size for every caller: whatever the deepest
+    /// page anyone asks for needs, which is an attach seeding five thousand
+    /// rows of scrollback. But a wait polling a session reads eighty rows once
+    /// a round, and a screen read two hundred, and those paid the attach's
+    /// window every time -- sixteen megabytes seeked to and fed through a fresh
+    /// emulator, once a second, per waiting agent, to answer with a screen.
+    ///
+    /// So the guess is made from the page instead. It is only a guess, because
+    /// what a row costs in the log is what the agent painted it with; the
+    /// widening in [`render_history_file`] is what corrects it, and a page that
+    /// comes back short is read again from four times as far back.
+    fn seed_window(lines: usize, columns: u16, least: u64, most: u64) -> u64 {
+        let most = most.max(1);
+        u64::try_from(lines)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(columns.max(1)))
+            .saturating_mul(SCROLLBACK_SEED_BYTES_PER_CELL)
+            .clamp(least.max(1).min(most), most)
+    }
+
     fn render_history_file(
         path: &Path,
         columns: u16,
@@ -6404,7 +6432,7 @@ mod platform {
             .with_context(|| format!("failed to open history {}", path.display()))?;
         let end = file.metadata()?.len();
         let wanted = lines.max(1);
-        let mut window = least.max(1);
+        let mut window = seed_window(wanted, columns, least, most);
         loop {
             let start = end.saturating_sub(window);
             file.seek(SeekFrom::Start(start))?;
@@ -7552,6 +7580,58 @@ mod platform {
             let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
+        }
+
+        #[test]
+        fn a_page_reads_back_as_far_as_the_page_is_deep() {
+            // A wait polls eighty rows once a round, a screen read asks for two
+            // hundred, and an attach seeds five thousand. One window served all
+            // three, so the two shallow ones seeked back and replayed the
+            // attach's sixteen megabytes through a fresh emulator -- every
+            // round, for every waiting agent -- to answer with a screen the
+            // daemon was already holding.
+            const COLUMNS: u16 = 200;
+            let window = |rows| {
+                seed_window(
+                    rows,
+                    COLUMNS,
+                    SCROLLBACK_SEED_BYTES_MIN,
+                    SCROLLBACK_SEED_BYTES_MAX,
+                )
+            };
+
+            assert!(
+                window(80) * 32 < window(5_000),
+                "a poll reads a fraction of what a seed does: {} against {}",
+                window(80),
+                window(5_000)
+            );
+            assert!(
+                window(5_000) > 8 * 1024 * 1024,
+                "and the deepest page still reads back about what it always \
+                 did: {}",
+                window(5_000)
+            );
+            // Deeper pages reach further back, between the two bounds.
+            assert!(window(200) > window(80) && window(2_000) > window(200));
+            assert_eq!(
+                window(1),
+                SCROLLBACK_SEED_BYTES_MIN,
+                "one row still reads a window worth opening the file for"
+            );
+            assert_eq!(
+                seed_window(
+                    usize::MAX,
+                    u16::MAX,
+                    SCROLLBACK_SEED_BYTES_MIN,
+                    SCROLLBACK_SEED_BYTES_MAX
+                ),
+                SCROLLBACK_SEED_BYTES_MAX,
+                "and no page reads past the ceiling"
+            );
+            // A caller whose ceiling is under the floor is held to the ceiling,
+            // which is what the widening test asks for when it forbids widening.
+            assert_eq!(seed_window(1, 1, 4_096, 512), 512);
         }
 
         #[test]
