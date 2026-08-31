@@ -1668,6 +1668,7 @@ pub fn search_index(
     // way in so the corpus is read once and only `limit` of it is ever held.
     let mut best = TopHits::new(limit);
     let plain = plain_needle(&needle);
+    let shape = Needle::of(&needle);
     for record in index.records.iter().filter(|record| filter.keeps(record)) {
         let mut matched_message = false;
         let raw = store
@@ -1679,7 +1680,7 @@ pub fn search_index(
             // Parsing a line costs far more than looking at it, and almost no
             // line holds the needle. See `plain_needle` for why this is allowed
             // to decide, and when it steps aside.
-            if plain && !line.to_lowercase().contains(&needle) {
+            if plain && !shape.holds(line, &needle) {
                 continue;
             }
             let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) else {
@@ -1735,6 +1736,64 @@ pub fn search_index(
         }
     }
     Ok(best.into_ranked())
+}
+
+/// How a line has to be looked at to find a needle in it, worked out once from
+/// the needle rather than once per line.
+///
+/// This decides the innermost step of a search: every line of every
+/// conversation on the machine goes through it, thirty-odd megabytes of them,
+/// and lowercasing each line to look at it once allocated a string the length
+/// of that line. That was most of what a warm search cost.
+enum Needle {
+    /// All ASCII, so the line can be compared a byte at a time. The only
+    /// characters whose lowercase is ASCII are the ASCII capitals -- bar the
+    /// Kelvin sign and the Turkish dotted capital I, which a search of agent
+    /// transcripts can live without finding.
+    Ascii,
+    /// No small letter anywhere in it, so lowercasing a line can neither make
+    /// an occurrence of it nor unmake one: lowercasing turns capitals into
+    /// small letters and leaves everything else where it was. Chinese is this,
+    /// and on a machine whose sessions talk Chinese it is most of what anybody
+    /// searches for.
+    Written,
+    /// A small letter outside ASCII, so the line has to be lowercased after
+    /// all -- otherwise the search misses the word wherever it is written in
+    /// capitals.
+    Folded,
+}
+
+impl Needle {
+    /// Read from a needle the caller has already lowercased.
+    fn of(needle: &str) -> Self {
+        if needle.is_ascii() {
+            Self::Ascii
+        } else if needle.chars().any(char::is_lowercase) {
+            Self::Folded
+        } else {
+            Self::Written
+        }
+    }
+
+    fn holds(&self, line: &str, needle: &str) -> bool {
+        match self {
+            Self::Written => line.contains(needle),
+            Self::Folded => line.to_lowercase().contains(needle),
+            Self::Ascii => {
+                let (line, needle) = (line.as_bytes(), needle.as_bytes());
+                let Some((first, rest)) = needle.split_first() else {
+                    return true;
+                };
+                let capital = first.to_ascii_uppercase();
+                line.len().checked_sub(needle.len()).is_some_and(|last| {
+                    (0..=last).any(|start| {
+                        (line[start] == *first || line[start] == capital)
+                            && line[start + 1..start + needle.len()].eq_ignore_ascii_case(rest)
+                    })
+                })
+            }
+        }
+    }
 }
 
 /// Whether a raw jsonl line can be tested for `needle` without parsing it.
@@ -2023,6 +2082,35 @@ mod tests {
                 .unwrap(),
             (Vec::new(), false)
         );
+    }
+
+    #[test]
+    fn a_line_is_matched_without_case_and_without_being_copied() {
+        // The needle arrives lowercased, so this is what the search asks of
+        // every line of every conversation on the machine.
+        let holds = |line: &str, needle: &str| Needle::of(needle).holds(line, needle);
+
+        assert!(matches!(Needle::of("widened_in_vain"), Needle::Ascii));
+        assert!(holds(r#"{"text":"Widened_In_Vain"}"#, "widened_in_vain"));
+        assert!(holds("SHOUTING", "shouting"));
+        assert!(!holds("shout", "shouting"));
+        assert!(!holds("", "shouting"));
+        assert!(holds("", ""));
+        // A hit at either end, where an off-by-one would drop it.
+        assert!(holds("needle at the front", "needle"));
+        assert!(holds("at the back a needle", "needle"));
+
+        // CJK carries no case, so it is looked for as it is written -- and
+        // that is most of what the sessions on this machine say.
+        assert!(matches!(Needle::of("渲染问题"), Needle::Written));
+        assert!(holds(r#"{"text":"渲染问题还很多"}"#, "渲染问题"));
+        assert!(!holds("渲染问题", "通信通道"));
+
+        // A needle with a capital outside ASCII still has to find the word
+        // written in capitals, which only lowercasing the line can do.
+        assert!(matches!(Needle::of(&"Über".to_lowercase()), Needle::Folded));
+        assert!(holds("STRASSE ÜBER", &"Über".to_lowercase()));
+        assert!(holds("Ünsal", &"ÜNSAL".to_lowercase()));
     }
 
     #[test]
