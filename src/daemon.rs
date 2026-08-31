@@ -12814,16 +12814,29 @@ mod platform {
                 )
                 .unwrap()
             };
+            // The child has to be scheduled, run the script, and land the
+            // redirect before any of this is readable, and a shared CI runner
+            // takes far longer over that than a laptop does - five seconds
+            // was enough here and enough on the two launches before it right
+            // up until it was not, and the run that missed the window read an
+            // empty command line and reported it as the wrong flags rather
+            // than as a wait that ran out. Waiting for the file to appear is
+            // not the wait either: the shell creates it on the redirect and
+            // fills it a moment later, so an empty read is a read taken too
+            // early. Every command line asserted here has something in it.
             let argv = |recorded: &Path| {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !recorded.exists() && Instant::now() < deadline {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let lines = fs::read_to_string(recorded)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if !lines.is_empty() || Instant::now() >= deadline {
+                        return lines;
+                    }
                     thread::sleep(Duration::from_millis(20));
                 }
-                fs::read_to_string(recorded)
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
             };
 
             // An older client's command line: it chose a model, not a mode.
