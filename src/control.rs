@@ -29,7 +29,10 @@ use serde_json::{Value, json};
 use crate::{
     config::{Config, McpConfig, State, default_state_path},
     daemon_protocol::{DaemonSession, Trigger, TriggerAction},
-    model::{AgentKind, FilePreview, FilePreviewKind, LaunchRequest, Powers, Reach, Target},
+    model::{
+        AgentKind, FilePreview, FilePreviewKind, HistorySearchHit, LaunchRequest, Powers, Reach,
+        Target,
+    },
     relay::now_ms,
     runtime::Runtime,
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
@@ -3725,14 +3728,31 @@ impl ControllerControl {
         let query = required_str(arguments, "query")?;
         let mut results = Vec::new();
         for target in self.targets(arguments)? {
-            let sessions: Vec<(String, String)> = match optional_str(arguments, "session_id") {
-                Some(session_id) => vec![(session_id.into(), String::new())],
-                None => match self.runtime.bridge_pool().list_sessions(&target) {
-                    Ok(sessions) => sessions
-                        .into_iter()
-                        .filter(|session| !session.temporary)
-                        .map(|session| (session.id, session.label))
-                        .collect(),
+            // Asked about the whole machine, the machine is asked once. Walking
+            // it from here meant fetching the session list — which draws every
+            // live screen to answer — and then one round trip per session, for
+            // hundreds of captures that mostly do not hold the word.
+            let hits = match optional_str(arguments, "session_id") {
+                Some(session_id) => {
+                    match self.runtime.search_history(
+                        &target,
+                        session_id,
+                        query,
+                        SEARCH_MAX_MATCHES,
+                    ) {
+                        Ok(matches) => vec![HistorySearchHit {
+                            session_id: session_id.into(),
+                            label: String::new(),
+                            matches,
+                        }],
+                        Err(_) => continue,
+                    }
+                }
+                None => match self
+                    .runtime
+                    .search_history_all(&target, query, SEARCH_MAX_MATCHES)
+                {
+                    Ok(hits) => hits,
                     Err(error) => {
                         results.push(json!({
                             "machine": target.id,
@@ -3742,24 +3762,15 @@ impl ControllerControl {
                     }
                 },
             };
-            for (session_id, label) in sessions {
-                let matches = match self.runtime.search_history(
-                    &target,
-                    &session_id,
-                    query,
-                    SEARCH_MAX_MATCHES,
-                ) {
-                    Ok(matches) => matches,
-                    Err(_) => continue,
-                };
-                if matches.is_empty() {
+            for hit in hits {
+                if hit.matches.is_empty() {
                     continue;
                 }
                 results.push(json!({
                     "machine": target.id,
-                    "session_id": session_id,
-                    "label": label,
-                    "matches": matches
+                    "session_id": hit.session_id,
+                    "label": hit.label,
+                    "matches": hit.matches
                         .iter()
                         .map(|item| {
                             json!({
@@ -4069,7 +4080,8 @@ mod daemon_surface {
         config::{Config, default_config_path},
         daemon::{DaemonPaths, connect_or_start},
         daemon_protocol::{
-            DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind, Trigger, stream,
+            DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
+            Trigger, stream,
         },
         model::{AgentKind, LOCAL_TARGET_ID, Reach},
         runtime::{launch_arguments, launch_seed, new_daemon_session_id},
@@ -4839,27 +4851,63 @@ mod daemon_surface {
             Ok(format!("Head name set to: {name}"))
         }
 
+        /// Every capture on this machine searched in one round.
+        ///
+        /// This surface negotiates no capabilities, so the fallback answers the
+        /// version question instead of a handshake: a daemon too old for this
+        /// says so, and gets walked session by session the old way.
+        fn searched_sessions(
+            &self,
+            query: &str,
+        ) -> Result<Vec<(String, String, Vec<DaemonHistoryMatch>)>> {
+            if let Ok((DaemonResponse::HistorySearch { hits }, _)) =
+                self.transact(&DaemonRequest::SearchHistoryAll {
+                    query: query.into(),
+                    max_matches: SEARCH_MAX_MATCHES,
+                })
+            {
+                return Ok(hits
+                    .into_iter()
+                    .map(|hit| (hit.session_id, hit.label, hit.matches))
+                    .collect());
+            }
+            let mut hits = Vec::new();
+            for session in self
+                .sessions()?
+                .into_iter()
+                .filter(|session| !session.temporary)
+            {
+                let Ok((DaemonResponse::HistoryMatches { matches }, _)) =
+                    self.transact(&DaemonRequest::SearchHistory {
+                        session_id: session.id.clone(),
+                        query: query.into(),
+                        max_matches: SEARCH_MAX_MATCHES,
+                    })
+                else {
+                    continue;
+                };
+                hits.push((session.id, session.label, matches));
+            }
+            Ok(hits)
+        }
+
         fn search_history(&self, arguments: &Value) -> Result<String> {
             let query = required_str(arguments, "query")?;
-            let sessions: Vec<(String, String)> = match optional_str(arguments, "session_id") {
-                Some(session_id) => vec![(session_id.into(), String::new())],
-                None => self
-                    .sessions()?
-                    .into_iter()
-                    .filter(|session| !session.temporary)
-                    .map(|session| (session.id, session.label))
-                    .collect(),
-            };
-            let mut results = Vec::new();
-            for (session_id, label) in sessions {
-                let matches = match self.transact(&DaemonRequest::SearchHistory {
-                    session_id: session_id.clone(),
+            let hits = match optional_str(arguments, "session_id") {
+                Some(session_id) => match self.transact(&DaemonRequest::SearchHistory {
+                    session_id: session_id.into(),
                     query: query.into(),
                     max_matches: SEARCH_MAX_MATCHES,
                 }) {
-                    Ok((DaemonResponse::HistoryMatches { matches }, _)) => matches,
-                    Ok(_) | Err(_) => continue,
-                };
+                    Ok((DaemonResponse::HistoryMatches { matches }, _)) => {
+                        vec![(session_id.to_string(), String::new(), matches)]
+                    }
+                    Ok(_) | Err(_) => Vec::new(),
+                },
+                None => self.searched_sessions(query)?,
+            };
+            let mut results = Vec::new();
+            for (session_id, label, matches) in hits {
                 if matches.is_empty() {
                     continue;
                 }

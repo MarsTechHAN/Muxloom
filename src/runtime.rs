@@ -23,8 +23,8 @@ use crate::{
     debug,
     model::{
         AgentKind, AgentSession, Composer, DirectoryListing, FileEntry, FileEntryKind, FileListing,
-        FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, LOCAL_TARGET_ID, LaunchRequest,
-        Probe, ResumeCandidate, Target, TaskProgress, Transport,
+        FilePreview, FilePreviewKind, HistoryMatch, HistoryPage, HistorySearchHit, LOCAL_TARGET_ID,
+        LaunchRequest, Probe, ResumeCandidate, Target, TaskProgress, Transport,
     },
     recap::extract_recap,
 };
@@ -1818,6 +1818,41 @@ if [ -z "$found" ]; then exit 69; fi
             ),
         );
         Ok((working, attention, recap))
+    }
+
+    /// The same word put to every capture on one machine, in one round.
+    ///
+    /// Only daemon sessions are in here, which is what the caller was walking
+    /// anyway: a tmux session is not in the daemon's maps and is still searched
+    /// one at a time, by id, through [`Self::search_history`].
+    pub fn search_history_all(
+        &self,
+        target: &Target,
+        query: &str,
+        max_matches: usize,
+    ) -> Result<Vec<HistorySearchHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .bridges
+            .search_history_all(target, query, max_matches.clamp(1, 50))?
+            .into_iter()
+            .map(|hit| HistorySearchHit {
+                session_id: hit.session_id,
+                label: hit.label,
+                matches: hit
+                    .matches
+                    .into_iter()
+                    .map(|item| HistoryMatch {
+                        recap: item.recap,
+                        line_number: item.line_number,
+                        text: item.text,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
     pub fn search_history(

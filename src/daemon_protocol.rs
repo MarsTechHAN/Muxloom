@@ -20,6 +20,11 @@ pub const PARENT_ALERT_CAPABILITY: &str = "parent-alerts-v1";
 /// for the whole list and reads the two fields out of it, which is what this
 /// exists to stop doing.
 pub const LINEAGE_CAPABILITY: &str = "lineage-v1";
+/// A daemon that searches every capture it holds for one round, rather than
+/// being asked once per session. Additive: a client talking to a daemon too old
+/// to answer walks the sessions itself, which is what this exists to stop
+/// doing.
+pub const HISTORY_SEARCH_CAPABILITY: &str = "history-search-v1";
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const DATA_CHUNK_SIZE: usize = 64 * 1024;
@@ -347,6 +352,16 @@ pub enum DaemonRequest {
         query: String,
         max_matches: usize,
     },
+    /// The same search, put to every capture this daemon holds at once.
+    ///
+    /// Searching the machine is one question, and asking it as one round per
+    /// session made it hundreds: the list had to be fetched first — drawing
+    /// every live screen to answer it — and then every session was asked
+    /// separately for a capture that mostly does not hold the word.
+    SearchHistoryAll {
+        query: String,
+        max_matches: usize,
+    },
     ListDirectory {
         path: String,
     },
@@ -605,6 +620,12 @@ pub enum DaemonResponse {
     HistoryMatches {
         matches: Vec<DaemonHistoryMatch>,
     },
+    /// Answers `SearchHistoryAll`: only the sessions whose capture holds the
+    /// word, each named as the caller would have named it, so that answering
+    /// needs no session list either.
+    HistorySearch {
+        hits: Vec<DaemonHistorySearchHit>,
+    },
     Directory {
         listing: DirectoryListing,
     },
@@ -855,6 +876,16 @@ pub struct DaemonHistoryMatch {
     pub recap: bool,
     pub line_number: usize,
     pub text: String,
+}
+
+/// One session whose capture holds what was searched for, with the label it
+/// goes by so the answer reads the same as it did when the caller had the
+/// session list in hand.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonHistorySearchHit {
+    pub session_id: String,
+    pub label: String,
+    pub matches: Vec<DaemonHistoryMatch>,
 }
 
 pub mod stream {

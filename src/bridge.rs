@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     channel::{CHANNELS_CAPABILITY, ChannelReceipt, ChannelSet},
     daemon_protocol::{
-        DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
-        LINEAGE_CAPABILITY, OpenStream, PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert,
-        Trigger, stream,
+        DaemonHistoryMatch, DaemonHistorySearchHit, DaemonRequest, DaemonResponse, DaemonSession,
+        Frame, FrameKind, HISTORY_SEARCH_CAPABILITY, LINEAGE_CAPABILITY, OpenStream,
+        PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, Trigger, stream,
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
@@ -769,6 +769,54 @@ impl BridgeConnection {
             .response
         {
             DaemonResponse::HistoryMatches { matches } => Ok(matches),
+            response => bail!("unexpected history-search response: {response:?}"),
+        }
+    }
+
+    /// Every capture on this machine searched for the same word, in one round.
+    ///
+    /// A daemon too old to answer is walked session by session the way it
+    /// always was, so an old daemon still answers a search - slowly, which is
+    /// what it did before this existed.
+    pub fn search_history_all(
+        &self,
+        query: &str,
+        max_matches: usize,
+    ) -> Result<Vec<DaemonHistorySearchHit>> {
+        if !self.has_capability(HISTORY_SEARCH_CAPABILITY) {
+            let mut hits = Vec::new();
+            for session in self
+                .list_sessions()?
+                .into_iter()
+                .filter(|session| !session.temporary)
+            {
+                // A session that will not answer is left out rather than
+                // failing the round: it may have been put down between the
+                // list and the question.
+                let Ok(matches) =
+                    self.search_history(session.id.clone(), query.into(), max_matches)
+                else {
+                    continue;
+                };
+                if matches.is_empty() {
+                    continue;
+                }
+                hits.push(DaemonHistorySearchHit {
+                    session_id: session.id,
+                    label: session.label,
+                    matches,
+                });
+            }
+            return Ok(hits);
+        }
+        match self
+            .request(DaemonRequest::SearchHistoryAll {
+                query: query.into(),
+                max_matches,
+            })?
+            .response
+        {
+            DaemonResponse::HistorySearch { hits } => Ok(hits),
             response => bail!("unexpected history-search response: {response:?}"),
         }
     }
@@ -2459,6 +2507,18 @@ impl BridgePool {
     ) -> Result<Vec<DaemonHistoryMatch>> {
         self.connection_for_target(target)?
             .search_history(session_id, query, max_matches)
+    }
+
+    /// Every capture on one machine searched at once, without asking it for its
+    /// sessions first.
+    pub fn search_history_all(
+        &self,
+        target: &Target,
+        query: &str,
+        max_matches: usize,
+    ) -> Result<Vec<DaemonHistorySearchHit>> {
+        self.connection_for_target(target)?
+            .search_history_all(query, max_matches)
     }
 
     pub fn list_directory(&self, target: &Target, path: String) -> Result<DirectoryListing> {

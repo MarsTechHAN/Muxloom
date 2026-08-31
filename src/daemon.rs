@@ -122,10 +122,10 @@ mod platform {
     use crate::{
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
-            DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession,
-            Frame, FrameKind, INITIAL_STREAM_WINDOW, LINEAGE_CAPABILITY, OpenStream,
-            PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger,
-            TriggerAction, stream,
+            DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonHistorySearchHit, DaemonRequest,
+            DaemonResponse, DaemonSession, Frame, FrameKind, HISTORY_SEARCH_CAPABILITY,
+            INITIAL_STREAM_WINDOW, LINEAGE_CAPABILITY, OpenStream, PARENT_ALERT_CAPABILITY,
+            PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger, TriggerAction, stream,
         },
         keeper,
         model::{
@@ -2850,6 +2850,7 @@ mod platform {
                             CHANNELS_CAPABILITY.into(),
                             PARENT_ALERT_CAPABILITY.into(),
                             LINEAGE_CAPABILITY.into(),
+                            HISTORY_SEARCH_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -3369,6 +3370,60 @@ mod platform {
                     request_id,
                     &DaemonResponse::HistoryMatches { matches },
                 )
+            }
+            DaemonRequest::SearchHistoryAll { query, max_matches } => {
+                let max_matches = max_matches.clamp(1, 50);
+                // Handles are taken under each lock and the searching is done
+                // after letting go. A capture runs to hundreds of megabytes and
+                // there are as many of them as the machine has ever held
+                // conversations: holding the map shut for that long would stop
+                // every other round on the machine, and this map is the one
+                // typing into a session and opening its screen both go through.
+                //
+                // Live first and then the archive, which is the order
+                // `ListSessions` answers in - a session is in one map or the
+                // other, so nothing is searched twice.
+                let live: Vec<Arc<ManagedSession>> = state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(Arc::clone)
+                    .collect();
+                let filed: Vec<Arc<PersistedSession>> = state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(Arc::clone)
+                    .collect();
+                let mut hits = Vec::new();
+                for (session_id, label, matches) in live
+                    .iter()
+                    .filter_map(|session| {
+                        let (id, label) = session.history_naming()?;
+                        Some((id, label, session.search_history(&query, max_matches)))
+                    })
+                    .chain(filed.iter().filter_map(|session| {
+                        let (id, label) = session.history_naming()?;
+                        Some((id, label, session.search_history(&query, max_matches)))
+                    }))
+                {
+                    // A capture that cannot be read is a session the answer is
+                    // silent about, the same as one that holds no match. The
+                    // round is about the machine, and one unreadable file is no
+                    // reason to refuse the rest of it.
+                    let Ok(matches) = matches else { continue };
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    hits.push(DaemonHistorySearchHit {
+                        session_id,
+                        label,
+                        matches,
+                    });
+                }
+                write_response(writer, request_id, &DaemonResponse::HistorySearch { hits })
             }
             DaemonRequest::ListDirectory { path } => write_response(
                 writer,
@@ -5611,6 +5666,16 @@ mod platform {
                 .clone()
         }
 
+        /// How this session is named in the answer to a search, or nothing at
+        /// all when it keeps no capture to search.
+        fn history_naming(&self) -> Option<(String, String)> {
+            let metadata = self
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (!metadata.temporary).then(|| (metadata.id.clone(), metadata.label.clone()))
+        }
+
         /// Write this record to its file, unless the file is gone on purpose.
         ///
         /// A handle to a record outlives its removal from the archive index:
@@ -5732,6 +5797,20 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .temporary
+        }
+
+        /// How this session is named in the answer to a search, or nothing at
+        /// all when it keeps no capture to search.
+        ///
+        /// Read off the metadata alone: naming a session is not a question the
+        /// screen answers, and drawing one per session is what a search of the
+        /// whole machine exists to avoid.
+        fn history_naming(&self) -> Option<(String, String)> {
+            let metadata = self
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (!metadata.temporary).then(|| (metadata.id.clone(), metadata.label.clone()))
         }
 
         /// The last answer visible on the session's screen, or the last one
@@ -11176,6 +11255,183 @@ mod platform {
 
             child.archive().unwrap();
             orphan.archive().unwrap();
+            discard_root(staging.paths.root.clone());
+            discard_root(root);
+        }
+
+        /// Searching the machine is one round, and it names the sessions it
+        /// found for itself.
+        ///
+        /// Asking per session meant fetching the list first - which draws every
+        /// live screen to answer - and then one round trip per capture, for
+        /// hundreds of sessions that mostly do not hold the word. The names
+        /// have to come back with the matches or the caller needs that list
+        /// anyway and nothing is saved.
+        #[test]
+        fn a_history_search_round_asks_every_capture_at_once_and_names_what_it_found() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(server));
+            let answer = |client: &mut UnixStream, id: u64| loop {
+                let frame = Frame::read_from(client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == id {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            };
+            let append = |path: PathBuf, line: &str| {
+                // Appended rather than written: a live session's keeper holds
+                // the same file open, and truncating it under the keeper is not
+                // what a capture growing looks like.
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(line.as_bytes())
+                    .unwrap();
+            };
+
+            // A session put down before this daemon started, which is the only
+            // way a record reaches the archive index. The archive is most of
+            // what a machine has ever held, so a search that skipped it would
+            // answer about the last few hours only.
+            let filed = "muxloomd-terminal-search-filed";
+            let staging = test_state("search-all-stage");
+            let elder = launch_session(
+                &staging,
+                filed.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "the filed one".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                222,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            elder.archive().unwrap();
+            let record = elder.snapshot();
+            drop(elder);
+
+            let state = test_state("search-all");
+            persist_session_metadata(&state.paths.sessions.join(format!("{filed}.json")), &record)
+                .unwrap();
+            fs::write(
+                state.paths.history.join(format!("{filed}.ansi")),
+                b"an anchovy was filed here\n",
+            )
+            .unwrap();
+            let root = state.paths.root.clone();
+            let state = Arc::new(DaemonState::new(state.paths.clone(), KeeperMode::InProcess));
+
+            let holder = launch_child_with_parent(&state, "search-holder", None);
+            let quiet = launch_child_with_parent(&state, "search-quiet", None);
+            append(
+                state
+                    .paths
+                    .history
+                    .join(format!("{}.ansi", holder.snapshot().id)),
+                "an anchovy swam past\n",
+            );
+            append(
+                state
+                    .paths
+                    .history
+                    .join(format!("{}.ansi", quiet.snapshot().id)),
+                "nothing of the sort\n",
+            );
+
+            // A temporary session leaves no transcript by design, so a capture
+            // sitting at its name is not the machine's history and is not
+            // searched. Written anyway, because the skip has to be the reason
+            // it stays out of the answer.
+            let fleeting = launch_session(
+                &state,
+                "muxloomd-codex-search-fleeting".into(),
+                "codex".into(),
+                "/tmp".into(),
+                "the fleeting one".into(),
+                true,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            append(
+                state
+                    .paths
+                    .history
+                    .join(format!("{}.ansi", fleeting.snapshot().id)),
+                "an anchovy in passing\n",
+            );
+
+            // A client too old to know the question walks the sessions itself,
+            // and it decides which by this string: a daemon that answers
+            // without saying so leaves every client paying the old price.
+            handle_request(
+                &writer,
+                &state,
+                0,
+                DaemonRequest::Hello {
+                    client_version: env!("CARGO_PKG_VERSION").into(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .unwrap();
+            let DaemonResponse::Hello { capabilities, .. } = answer(&mut client, 0) else {
+                panic!("a hello must answer with a hello");
+            };
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|it| it == HISTORY_SEARCH_CAPABILITY),
+                "the daemon must say it can search every capture at once: {capabilities:?}"
+            );
+
+            handle_request(
+                &writer,
+                &state,
+                1,
+                DaemonRequest::SearchHistoryAll {
+                    query: "anchovy".into(),
+                    max_matches: 10,
+                },
+            )
+            .unwrap();
+            let DaemonResponse::HistorySearch { hits } = answer(&mut client, 1) else {
+                panic!("a history search must answer with hits");
+            };
+            let found: Vec<(String, String)> = hits
+                .iter()
+                .map(|hit| (hit.session_id.clone(), hit.label.clone()))
+                .collect();
+            assert_eq!(
+                found,
+                vec![
+                    (holder.snapshot().id, "search-holder".into()),
+                    (filed.into(), "the filed one".into()),
+                ],
+                "the live session then the archived one, each carrying its label"
+            );
+            assert_eq!(
+                hits[1].matches.first().map(|item| item.text.as_str()),
+                Some("an anchovy was filed here"),
+                "the matching line comes back with the hit"
+            );
+
+            holder.archive().unwrap();
+            quiet.archive().unwrap();
+            // A temporary session is never filed, so it is stopped instead.
+            fleeting.stop().unwrap();
             discard_root(staging.paths.root.clone());
             discard_root(root);
         }

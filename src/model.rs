@@ -553,6 +553,15 @@ pub struct HistoryMatch {
     pub text: String,
 }
 
+/// One session a machine-wide search had something to say about, named the way
+/// the session list would have named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySearchHit {
+    pub session_id: String,
+    pub label: String,
+    pub matches: Vec<HistoryMatch>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     pub id: String,
