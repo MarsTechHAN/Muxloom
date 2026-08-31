@@ -6861,12 +6861,34 @@ mod platform {
             });
         }
         let start = end.saturating_sub(lines);
-        let file = File::open(path)
+        let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
+        // From whichever end of the log the page is nearer to. Counting
+        // newlines from the top is the only way to find a line by its number,
+        // but it costs every byte before it, and the page nearly always asked
+        // for is the newest one - the bottom of a log that on this machine
+        // reaches six hundred megabytes. That read walked all of it to hand
+        // back the last few rows. Counted from the end instead, the same page
+        // costs the rows it returns.
+        let begin = match total_lines.saturating_sub(start) < end {
+            true => line_start_from_the_end(&mut file, total_lines, start)?,
+            false => None,
+        };
+        let mut line = match begin {
+            Some(offset) => {
+                file.seek(SeekFrom::Start(offset))?;
+                start
+            }
+            // The log is shorter than it was said to be, so the page it holds
+            // begins at the top. Rewound because looking may have moved it.
+            None => {
+                file.rewind()?;
+                0
+            }
+        };
         let mut reader = BufReader::new(file);
         let mut output = Vec::new();
         let mut buffer = Vec::new();
-        let mut line = 0usize;
         while line < end {
             buffer.clear();
             if reader.read_until(b'\n', &mut buffer)? == 0 {
@@ -6885,6 +6907,52 @@ mod platform {
             // the session rather than the reach of one page.
             reached_start: true,
         })
+    }
+
+    /// Where line `start` begins, found by counting back from the end of the
+    /// log rather than forward from the top of it.
+    ///
+    /// `None` for a log holding fewer lines than that, whose page begins at
+    /// byte zero — either because the line asked for is the first one, or
+    /// because the count handed in reaches past what is on the disk.
+    ///
+    /// This only buys anything from a log with newlines in it. A session that
+    /// paints its screen rather than ending its lines can hold hundreds of
+    /// megabytes between two of them, and one line is one line from either
+    /// end; the read is bounded there by the line, not by the direction.
+    fn line_start_from_the_end(
+        file: &mut File,
+        total_lines: usize,
+        start: usize,
+    ) -> Result<Option<u64>> {
+        if start == 0 {
+            return Ok(None);
+        }
+        // Line `start` begins just past the newline that ended the line before
+        // it. Counting back from the end of the log, that is the `wanted`-th:
+        // the last newline in the file ends the last line, so the one ending
+        // line `start - 1` has every line from `start` on behind it.
+        let wanted = total_lines.saturating_sub(start) + 1;
+        let mut position = file.seek(SeekFrom::End(0))?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut seen = 0usize;
+        while position > 0 {
+            let span = position.min(buffer.len() as u64);
+            position -= span;
+            file.seek(SeekFrom::Start(position))?;
+            let chunk = &mut buffer[..span as usize];
+            file.read_exact(chunk)?;
+            for (offset, byte) in chunk.iter().enumerate().rev() {
+                if *byte != b'\n' {
+                    continue;
+                }
+                seen += 1;
+                if seen == wanted {
+                    return Ok(Some(position + offset as u64 + 1));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// A capture a search can be put to: the session's id, the label to answer
@@ -8300,6 +8368,50 @@ mod platform {
             // A read that does ask for a line still gets the newest one.
             let page = read_history_file(&path, 5, 5, 0, 1).unwrap();
             assert_eq!(String::from_utf8_lossy(&page.rows), "line5\r\n");
+        }
+
+        #[test]
+        fn a_page_near_the_end_of_a_log_is_read_from_the_end() {
+            // Finding a line by its number means counting newlines, and counted
+            // from the top that costs every byte before the page. The page
+            // nearly every read asks for is the newest one, so the read that
+            // was cheapest to write was the one that walked the whole session
+            // to hand back its last few rows -- six hundred megabytes of log,
+            // on this machine, for a screen of history.
+            let state = test_state("history-from-the-end");
+            let path = state.paths.history.join("log.ansi");
+            let line = |number: usize| format!("line{number}\r\n");
+            let log: String = (1..=200).map(line).collect();
+            fs::write(&path, &log).unwrap();
+
+            // The page begins where the page is, rather than at byte zero.
+            let mut file = File::open(&path).unwrap();
+            let before: String = (1..=199).map(line).collect();
+            assert_eq!(
+                line_start_from_the_end(&mut file, 200, 199).unwrap(),
+                Some(before.len() as u64),
+                "the last line begins after the ones before it"
+            );
+            // Except for the one page that really does begin there.
+            assert_eq!(line_start_from_the_end(&mut file, 200, 0).unwrap(), None);
+            // And a count reaching past what is on the disk falls back to it,
+            // rather than to a byte offset the file does not hold.
+            assert_eq!(line_start_from_the_end(&mut file, 500, 300).unwrap(), None);
+
+            // The rows themselves do not change: every offset a client can
+            // scroll to reads what walking from the top would have given. Both
+            // directions are in here -- the near end for the newest pages, the
+            // top for the oldest -- and they have to agree.
+            for offset in 0..=176 {
+                let page = read_history_file(&path, 200, 24, offset, 3).unwrap();
+                let end = 200 - offset;
+                let expected: String = ((end - 2)..=end).map(line).collect();
+                assert_eq!(
+                    String::from_utf8_lossy(&page.rows),
+                    expected,
+                    "the page {offset} rows up from the bottom"
+                );
+            }
         }
 
         #[test]
