@@ -189,7 +189,10 @@ pub struct SessionFacts {
 ///    own first recorded words contradicting what this session was asked to
 ///    do. That is the crossed claim - two siblings started together each
 ///    matched to the other's conversation, which timing cannot see and the
-///    first messages can.
+///    first messages can. A session that has no account of what it was asked
+///    can never raise that contradiction, so its claim yields to one thing
+///    only: a sibling whose own opening words are the ones the transcript
+///    recorded. Ownership shown outranks ownership inherited.
 /// 2. A session launched to resume a thread gets that thread, or - for a CLI
 ///    that opens a fresh file when it resumes - the newest fork descended from
 ///    it.
@@ -229,6 +232,31 @@ pub fn assign_threads(sessions: &[SessionFacts], threads: &[NativeThread]) -> Ve
             session.first_prompt.as_deref(),
             threads[found].first_message.as_deref(),
         ) == FirstText::Contradict
+        {
+            released[index] = Some(found);
+            continue;
+        }
+        // A session that never recorded what it was asked cannot produce the
+        // contradiction above, whatever it is holding. Adoption produces
+        // exactly that session every time - the daemon that hears a child's
+        // opening words is the one that spawned it, so a session inherited
+        // from an earlier generation carries a claim it has no account of.
+        // Unfalsifiable and taken on timing, it is the claim likeliest to be
+        // wrong, and the one that stays wrong: nothing here can ever move it.
+        //
+        // It still holds the thread against all comers but one - a sibling
+        // whose own opening words are the words this transcript opens with.
+        // That is ownership shown rather than assumed, and it has to outrank
+        // an inherited guess, or the session that really is writing the
+        // conversation never gets it while another wears its name for good.
+        if session.first_prompt.is_none()
+            && sessions.iter().enumerate().any(|(other, sibling)| {
+                other != index
+                    && first_text_agreement(
+                        sibling.first_prompt.as_deref(),
+                        threads[found].first_message.as_deref(),
+                    ) == FirstText::Match
+            })
         {
             released[index] = Some(found);
             continue;
@@ -1940,6 +1968,62 @@ mod tests {
             assign_threads(&sessions, &[render.clone(), quote.clone()]),
             [Some(1), Some(0)]
         );
+    }
+
+    #[test]
+    fn an_inherited_claim_yields_to_the_session_that_can_show_the_thread_is_its_own() {
+        // Found on this machine: a session adopted from an earlier daemon was
+        // listed under another agent's title and recap - the survey it was
+        // shown as running appeared nowhere in its own capture - while the
+        // session actually writing that conversation was matched to nothing
+        // and fell back to reading its screen. Adoption disarms the recorder,
+        // so the adopted session has no first prompt, so nothing it holds can
+        // ever be contradicted and the crossing was permanent.
+        let survey = thread_opening("survey", 900_000, Some("survey the arm datasets"));
+        let adopted = SessionFacts {
+            created_at: 100_000,
+            claimed: Some("survey".into()),
+            // Adopted: this daemon never heard it open.
+            first_prompt: None,
+            ..Default::default()
+        };
+        let writing_it = SessionFacts {
+            created_at: 890_000,
+            claimed: None,
+            first_prompt: Some("survey the arm datasets".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            assign_threads(
+                &[adopted.clone(), writing_it.clone()],
+                std::slice::from_ref(&survey)
+            ),
+            [None, Some(0)],
+            "the session that can show the words are its own gets the thread, and the one that \
+             cannot gets nothing rather than somebody else's name"
+        );
+        // Order must not decide it.
+        assert_eq!(
+            assign_threads(
+                &[writing_it, adopted.clone()],
+                std::slice::from_ref(&survey)
+            ),
+            [Some(0), None]
+        );
+
+        // With nobody proving anything, the inherited claim still stands:
+        // this loosens lock-in for proof alone, not for doubt.
+        let stranger = SessionFacts {
+            created_at: 890_000,
+            claimed: None,
+            first_prompt: Some("something else entirely".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            assign_threads(&[adopted.clone(), stranger], std::slice::from_ref(&survey)),
+            [Some(0), None]
+        );
+        assert_eq!(assign_threads(&[adopted], &[survey]), [Some(0)]);
     }
 
     #[test]
