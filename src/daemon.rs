@@ -110,7 +110,7 @@ mod platform {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{
-            Arc, Condvar, Mutex, OnceLock,
+            Arc, Condvar, Mutex, OnceLock, RwLock,
             atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
@@ -362,7 +362,18 @@ mod platform {
     struct DaemonState {
         started: Instant,
         clients: AtomicUsize,
-        client_gate: Mutex<()>,
+        /// Held for reading by everything that starts work the drain must not
+        /// cut in half -- taking a client, launching a session -- and for
+        /// writing by the decision to drain. Readers do not exclude each
+        /// other: a launch is slow, and it used to keep every connection
+        /// arriving behind it waiting on the fork, the seeding and the
+        /// metadata sync, which on a machine full of agents is every MCP call
+        /// made while somebody starts a session.
+        client_gate: RwLock<()>,
+        /// One launch at a time. A session id is checked for being free and
+        /// then taken, and two launches naming the same one both have to be
+        /// able to see the other's answer.
+        launch_gate: Mutex<()>,
         draining: AtomicBool,
         /// Whether a newer build has asked for this daemon's place and is
         /// waiting for a moment when taking it costs nothing.
@@ -703,7 +714,8 @@ mod platform {
             Self {
                 started: Instant::now(),
                 clients: AtomicUsize::new(0),
-                client_gate: Mutex::new(()),
+                client_gate: RwLock::new(()),
+                launch_gate: Mutex::new(()),
                 draining: AtomicBool::new(false),
                 retiring: AtomicBool::new(false),
                 in_flight: AtomicUsize::new(0),
@@ -2205,18 +2217,24 @@ mod platform {
         }
     }
 
-    fn serve_client(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-        {
-            let _registration = state
-                .client_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.draining.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            state.clients.fetch_add(1, Ordering::Relaxed);
+    /// Take a client onto the daemon's books. `None` is this daemon standing
+    /// down: the connection belongs to the next generation, not to this one.
+    fn register_client(state: &Arc<DaemonState>) -> Option<ClientGuard> {
+        let _registration = state
+            .client_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.draining.load(Ordering::Acquire) {
+            return None;
         }
-        let _client_guard = ClientGuard(Arc::clone(&state));
+        state.clients.fetch_add(1, Ordering::Relaxed);
+        Some(ClientGuard(Arc::clone(state)))
+    }
+
+    fn serve_client(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
+        let Some(_client_guard) = register_client(&state) else {
+            return Ok(());
+        };
         let outbound = stream.try_clone()?;
         // Nothing the daemon writes to a client may wait on that client for
         // ever - see [`CLIENT_WRITE_TIMEOUT`]. The option belongs to the socket
@@ -2975,8 +2993,12 @@ mod platform {
                 powers,
                 initial_prompt,
             } => {
-                let _launch_guard = state
+                let _drain_guard = state
                     .client_gate
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _launch_guard = state
+                    .launch_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if state.draining.load(Ordering::Acquire) {
@@ -3444,7 +3466,7 @@ mod platform {
     fn prepare_handover(state: &Arc<DaemonState>) -> bool {
         let _registration = state
             .client_gate
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.draining.load(Ordering::Acquire) {
             return false;
@@ -3491,7 +3513,7 @@ mod platform {
                 }
                 let _registration = state
                     .client_gate
-                    .lock()
+                    .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if state.draining.swap(true, Ordering::AcqRel) {
                     return;
@@ -8913,6 +8935,43 @@ mod platform {
             assert_eq!(notice().as_deref(), Some("it said ready"));
 
             discard_root(state.paths.root.clone());
+        }
+
+        #[test]
+        fn a_launch_in_flight_lets_a_client_in_but_not_a_handover() {
+            let state = test_state("gate-split");
+            // What a launch holds while it forks a keeper, seeds the screen and
+            // syncs the record to disk.
+            let drain_guard = state
+                .client_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let launch_guard = state
+                .launch_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // A connection arriving in the middle of that is taken at once.
+            let arriving = Arc::clone(&state);
+            let taken = thread::spawn(move || register_client(&arriving));
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                taken.is_finished(),
+                "a client arriving during a launch waited for the launch"
+            );
+            let admitted = taken.join().unwrap();
+            assert!(admitted.is_some(), "the client was turned away");
+
+            // The drain still waits for it. Standing down halfway through a
+            // launch is the whole reason the gate is there.
+            let draining = Arc::clone(&state);
+            let handover = thread::spawn(move || prepare_handover(&draining));
+            thread::sleep(Duration::from_millis(200));
+            assert!(!handover.is_finished(), "a handover cut into a launch");
+            drop(launch_guard);
+            drop(drain_guard);
+            assert!(handover.join().unwrap(), "the handover never went through");
+            drop(admitted);
         }
 
         #[test]
