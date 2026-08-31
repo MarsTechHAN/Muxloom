@@ -1236,15 +1236,24 @@ mod tests {
     #[test]
     fn a_directory_the_user_has_already_ruled_on_keeps_their_answer() {
         let home = scratch("trust-said");
+        // Under the scratch home rather than spelled out: what counts as an
+        // absolute path is the platform's business, and a directory that is
+        // not one is refused before any of this is reached.
+        let theirs = home.join("theirs");
+        let ours = home.join("ours");
+        let key = |directory: &Path| toml_string(directory.to_string_lossy().as_ref());
         fs::create_dir_all(home.join(".codex")).unwrap();
         fs::write(
             home.join(".codex/config.toml"),
-            "# mine\nmodel = \"o3\"\n\n[projects.\"/work/theirs\"]\ntrust_level = \"untrusted\"\n",
+            format!(
+                "# mine\nmodel = \"o3\"\n\n[projects.{}]\ntrust_level = \"untrusted\"\n",
+                key(&theirs)
+            ),
         )
         .unwrap();
 
         assert!(
-            trust_directory(&home, AgentKind::Codex, Path::new("/work/theirs"))
+            trust_directory(&home, AgentKind::Codex, &theirs)
                 .unwrap()
                 .is_empty()
         );
@@ -1253,13 +1262,13 @@ mod tests {
         assert!(text.contains("# mine"), "the comment survives: {text}");
 
         // A different directory is appended without disturbing either.
-        trust_directory(&home, AgentKind::Codex, Path::new("/work/ours")).unwrap();
+        trust_directory(&home, AgentKind::Codex, &ours).unwrap();
         let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
         assert!(text.contains("# mine"), "{text}");
         assert!(text.contains("untrusted"), "{text}");
         let codex: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(
-            codex["projects"]["/work/ours"]["trust_level"].as_str(),
+            codex["projects"][ours.to_string_lossy().as_ref()]["trust_level"].as_str(),
             Some("trusted")
         );
         assert_eq!(codex["model"].as_str(), Some("o3"));
