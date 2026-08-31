@@ -4883,6 +4883,12 @@ mod platform {
             .map(Arc::clone)
             .collect::<Vec<_>>();
         live.iter()
+            // Asked of the flags before a snapshot is taken, because the test
+            // just below throws out every session that is still running and
+            // running is what most of them are -- so this was laying out the
+            // screen of every session on the machine, on every resume, to
+            // discard all but the few that had stopped.
+            .filter(|session| session.stopped())
             .map(|session| session.snapshot())
             .chain(persisted.iter().map(|entry| entry.snapshot()))
             // Stopped, however it stopped. What must never be matched is a
@@ -4917,17 +4923,11 @@ mod platform {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(successor)
             .map(Arc::clone)?;
-        // Then asked of the two flags that say whether it still runs, rather
-        // than of a snapshot. Taking a snapshot lays the session's screen out
-        // as text, which is most of what one costs and none of what a resume
-        // wants to know here -- and it was being paid for with the map held.
-        let archived = session.archived.load(Ordering::Relaxed);
-        let dead = session
-            .metadata
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .dead;
-        (!archived && !dead).then(|| successor.to_string())
+        // Then asked whether it still runs, rather than snapshotted. Taking a
+        // snapshot lays the session's screen out as text, which is most of
+        // what one costs and none of what a resume wants to know here -- and
+        // it was being paid for with the map held.
+        (!session.stopped()).then(|| successor.to_string())
     }
 
     /// Record on the retired side where its conversation moved to, in both
@@ -6099,6 +6099,22 @@ mod platform {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (metadata.id.clone(), metadata.parent.clone())
+        }
+
+        /// Whether this session has stopped, however it stopped: retired, or
+        /// simply over.
+        ///
+        /// Read from the two flags that say so rather than from a snapshot,
+        /// because taking a snapshot of a session that has not stopped lays
+        /// its screen out as text -- and a caller asking this question is
+        /// usually about to throw the running ones away.
+        fn stopped(&self) -> bool {
+            self.archived.load(Ordering::Relaxed)
+                || self
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .dead
         }
 
         fn snapshot(&self) -> DaemonSession {
