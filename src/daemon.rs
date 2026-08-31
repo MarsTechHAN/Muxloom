@@ -1965,7 +1965,7 @@ mod platform {
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
+                        wait_for_connection(&listener, ACCEPT_RECHECK)?;
                     }
                     Err(error) => return Err(error).context("muxloomd accept failed"),
                 }
@@ -1975,6 +1975,43 @@ mod platform {
         // Sessions are not retired here: their keepers own them, keep writing
         // their histories, and hand them to whichever daemon serves next.
         result
+    }
+
+    /// How long the accept loop waits on the socket before looking up to see
+    /// whether it is still the generation serving this directory. Nobody waits
+    /// on this: a connection arriving inside it is handed over as it lands.
+    const ACCEPT_RECHECK: Duration = Duration::from_millis(200);
+
+    /// Wait until a connection is pending, or until the timeout passes.
+    ///
+    /// The listener is non-blocking so the loop can look at [`still_serving`]
+    /// between connections, and it used to do that by sleeping twenty
+    /// milliseconds at a time. Nothing was waiting on that sleep except every
+    /// client: a connection is queued by the kernel the moment it is made, and
+    /// then sat in the backlog until the loop next woke, so an agent's request
+    /// paid ten milliseconds of it on average before the daemon had looked at
+    /// the socket at all — and the surface every agent uses opens a fresh
+    /// connection per request.
+    ///
+    /// Waiting on the socket itself re-checks just as often and costs the
+    /// waiting client nothing.
+    fn wait_for_connection(listener: &UnixListener, timeout: Duration) -> io::Result<()> {
+        let mut watched = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one initialised pollfd, and a count that says so.
+        if unsafe { libc::poll(&mut watched, 1, millis) } < 0 {
+            let error = io::Error::last_os_error();
+            // A signal is what the loop is looking up to notice, so waking for
+            // one is the wait doing its job, not failing at it.
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Whether this generation is still serving, latching a signal into the
@@ -7580,6 +7617,42 @@ mod platform {
             let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
+        }
+
+        #[test]
+        fn a_waiting_accept_loop_takes_a_connection_as_it_lands() {
+            let state = test_state("accept-wait");
+            let listener = UnixListener::bind(&state.paths.socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+
+            // With nothing connecting, the wait is its own timeout: this is the
+            // loop looking up to see whether it still serves the directory.
+            let started = Instant::now();
+            wait_for_connection(&listener, Duration::from_millis(150)).unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "waited {:?}",
+                started.elapsed()
+            );
+            assert!(listener.accept().is_err(), "and nothing had connected");
+
+            // A client already in the backlog is handed over at once. Sleeping
+            // the interval instead -- which is what the loop used to do, and
+            // what any wait that does not watch the socket does -- would sit on
+            // this connection for the whole five seconds.
+            let client = UnixStream::connect(&state.paths.socket).unwrap();
+            let started = Instant::now();
+            wait_for_connection(&listener, Duration::from_secs(5)).unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "a queued connection waited {:?}",
+                started.elapsed()
+            );
+            assert!(
+                listener.accept().is_ok(),
+                "and it is the one that connected"
+            );
+            drop(client);
         }
 
         #[test]
