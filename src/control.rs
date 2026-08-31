@@ -1645,6 +1645,24 @@ fn check_may_message(
     }
 }
 
+/// Whether the same weighing comes out yes with no records at all.
+///
+/// Most of what it is asked needs none: a session speaking to the agent that
+/// started it, or to the task it belongs to, or a process running in no session
+/// and so outside nobody's. Fetching the records to answer those is a round
+/// trip to a daemon that hands back every conversation the machine has ever
+/// held — and across a relay, a round trip to another machine, before a
+/// keystroke goes anywhere.
+///
+/// Asking with nothing in hand can only be stricter than asking with them. The
+/// walk in [`descends_from`] recognises the target on its first hop, before it
+/// consults anything, and otherwise follows only parents it was given: records
+/// can add a path to the answer and never take one away. So a yes here is a yes
+/// there, and a no here settles nothing and goes on to ask properly.
+fn reaches_without_records(own: &Powers, target: &str) -> bool {
+    check_may_message(own, target, &[]).is_ok()
+}
+
 /// The session a call would put words into, when it is one of the calls that
 /// does.
 ///
@@ -3912,7 +3930,7 @@ impl ControlSurface for ControllerControl {
         // because this surface can aim at any of them.
         if let Some(session_id) = written_to(name, arguments) {
             let own = own_powers();
-            if own.reach != Reach::Fleet {
+            if own.reach != Reach::Fleet && !reaches_without_records(&own, session_id) {
                 let sessions = self
                     .runtime
                     .bridge_pool()
@@ -4019,10 +4037,11 @@ mod daemon_surface {
         fleet_already_back, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
         fleet_resume_target, granted_powers, instructions, launch_path_within, launching_session,
         lineage, lineage_of_answer, message_author, native_resume_id, optional_bool, optional_str,
-        optional_usize, own_powers, plain_screen, pretty, preview_text, required_str, screen_page,
-        send_channel, session_env, session_json, session_kind, session_name_now, shell_report,
-        stamp_powers, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
-        trigger_json, trigger_spec, wait_loop, waited_session, written_to,
+        optional_usize, own_powers, plain_screen, pretty, preview_text, reaches_without_records,
+        required_str, screen_page, send_channel, session_env, session_json, session_kind,
+        session_name_now, shell_report, stamp_powers, synthetic_child_prompt, talk_draft,
+        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop, waited_session,
+        written_to,
     };
     use crate::{
         channel::ChannelSet,
@@ -4174,7 +4193,7 @@ mod daemon_surface {
         /// which asks nothing of a lineage — never pays for it.
         fn check_reach(&self, session_id: &str) -> Result<()> {
             let own = own_powers();
-            if own.reach == Reach::Fleet {
+            if own.reach == Reach::Fleet || reaches_without_records(&own, session_id) {
                 return Ok(());
             }
             check_may_message(&own, session_id, &lineage(&self.sessions()?))
@@ -4904,7 +4923,7 @@ mod daemon_surface {
                 // not lifting a limit the agent's own parent set.
                 if let Some(target) = written_to(name, arguments) {
                     let own = own_powers();
-                    if own.reach != Reach::Fleet {
+                    if own.reach != Reach::Fleet && !reaches_without_records(&own, target) {
                         let machine = elsewhere.clone().unwrap_or_default();
                         let over_there =
                             self.relay("list_sessions", &json!({ "machine": machine }))?;
@@ -6427,6 +6446,82 @@ mod tests {
             check_may_message(&own_powers(), mine, &here).unwrap();
         }
         assert!(check_may_message(&own_powers(), "muxloomd-claude-lead", &here).is_err());
+    }
+
+    /// Fetching the records to weigh a reach is a round trip that hands back
+    /// every conversation the machine has ever held — and across a relay, a
+    /// round trip to another machine — before a keystroke goes anywhere. Most
+    /// of what is asked does not turn on them.
+    #[cfg(unix)]
+    #[test]
+    fn a_reach_settled_without_records_is_settled_the_same_way_with_them() {
+        let _lock = daemon_env_lock();
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-hand"));
+        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", Some("muxloomd-claude-lead"));
+        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", Some("muxloomd-claude-lead"));
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
+        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
+        let here = lineage(&[
+            fleet_row("muxloomd-claude-lead", None),
+            fleet_row("muxloomd-claude-hand", Some("muxloomd-claude-lead")),
+            fleet_row("muxloomd-claude-grandchild", Some("muxloomd-claude-hand")),
+            fleet_row("muxloomd-claude-stranger", None),
+        ]);
+        let everyone = [
+            "muxloomd-claude-lead",
+            "muxloomd-claude-hand",
+            "muxloomd-claude-grandchild",
+            "muxloomd-claude-stranger",
+            "muxloomd-claude-nowhere",
+        ];
+
+        // Reporting to the agent that started this one, and speaking to this
+        // session itself, are recognised on the first hop of the walk, before
+        // it has consulted anything.
+        let own = own_powers();
+        for close in ["muxloomd-claude-lead", "muxloomd-claude-hand"] {
+            assert!(reaches_without_records(&own, close), "{close}");
+        }
+        // Anything further down is only reachable by following a parent, so
+        // that one does send for the records — and is allowed once it has them.
+        assert!(!reaches_without_records(&own, "muxloomd-claude-grandchild"));
+        check_may_message(&own, "muxloomd-claude-grandchild", &here).unwrap();
+
+        // The same split holds for the narrowest reach: the agent that asked is
+        // named in the environment, and only the subtree needs looking up.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
+        let narrow = own_powers();
+        assert!(reaches_without_records(&narrow, "muxloomd-claude-lead"));
+        assert!(!reaches_without_records(
+            &narrow,
+            "muxloomd-claude-grandchild"
+        ));
+        check_may_message(&narrow, "muxloomd-claude-grandchild", &here).unwrap();
+
+        // Whatever is waved through with nothing in hand has to be waved
+        // through with everything in hand as well, or the saving is a hole.
+        for powers in [&own, &narrow] {
+            for target in everyone {
+                if reaches_without_records(powers, target) {
+                    assert!(
+                        check_may_message(powers, target, &here).is_ok(),
+                        "{target} was let through with no records"
+                    );
+                }
+            }
+        }
+        assert!(!reaches_without_records(&own, "muxloomd-claude-stranger"));
+
+        // A process running in no session is outside nobody's work, and settles
+        // that way rather than by recognising anyone: no records there either.
+        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", None);
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", None);
+        assert!(reaches_without_records(
+            &own_powers(),
+            "muxloomd-claude-stranger"
+        ));
     }
 
     /// Every door into another agent's prompt box is the same door as far as
