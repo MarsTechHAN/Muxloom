@@ -344,7 +344,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             input_schema: schema(
                 false,
                 json!({
-                    "machine": { "type": "string", "description": "\"local\" or an SSH alias." },
+                    "machine": { "type": "string", "description": "A machine id from list_machines: this machine's own name, or an SSH alias." },
                     "enabled": { "type": "boolean", "description": "Whether muxloom may reach it." },
                 }),
                 &["machine", "enabled"],
@@ -1249,7 +1249,7 @@ fn trigger_json(machine: &str, trigger: &Trigger) -> Value {
     };
     json!({
         "id": trigger.id,
-        "machine": machine,
+        "machine": spelled_out(machine),
         "session_id": trigger.session_id,
         "pattern": trigger.pattern,
         "action_kind": action_kind,
@@ -2761,10 +2761,28 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// The machine an answer names itself by.
+///
+/// `local` is the routing key — the word the config, the state file and the
+/// backup index all use for "this machine, not one over ssh" — and it is the
+/// same word on every machine muxloom runs on. It is fine to be addressed by
+/// and useless to be told: an agent that reads `machine: "local"` off a session
+/// record and repeats it to a person, or writes it onto a board another machine
+/// reads, has named nothing. Every other machine here already answers by its
+/// own name; this makes that true of this one too. Both spellings go back in —
+/// see `spelled_here`, `searchable_machines` and the daemon surface's
+/// `elsewhere` — so an answer stays as addressable as the word it replaced.
+fn spelled_out(machine: &str) -> &str {
+    match machine == crate::model::LOCAL_TARGET_ID {
+        true => crate::model::own_machine_name(),
+        false => machine,
+    }
+}
+
 fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) -> Value {
     json!({
         "session_id": session.id,
-        "machine": machine,
+        "machine": spelled_out(machine),
         "kind": session.kind,
         "path": session.path,
         "label": session.label,
@@ -3148,7 +3166,11 @@ impl ControllerControl {
 
     fn list_machines(&self) -> Result<String> {
         let mut machines = vec![json!({
-            "id": crate::model::LOCAL_TARGET_ID,
+            // Its own name, not `local`: an id is what gets copied into the
+            // next call and quoted back to a person, and `local` names a
+            // different machine on every node that says it. `local` still
+            // addresses this one - `spelled_here` takes either.
+            "id": crate::model::own_machine_name(),
             "label": crate::model::own_machine_name(),
             "enabled": self.state().enabled_hosts.contains(crate::model::LOCAL_TARGET_ID),
             "connected": self.runtime.bridge_pool().is_connected(crate::model::LOCAL_TARGET_ID),
@@ -3169,7 +3191,11 @@ impl ControllerControl {
     /// is read again first: the dashboard owns the same file, and an MCP
     /// process that started an hour ago must not write back a stale view.
     fn set_machine_enabled(&self, arguments: &Value) -> Result<String> {
-        let machine = required_str(arguments, "machine")?.to_string();
+        // Spelled here first: machine lists hand this one out under its own
+        // name, and the name they printed has to be the name that works.
+        let machine = self
+            .spelled_here(required_str(arguments, "machine")?)
+            .to_string();
         let enabled = arguments
             .get("enabled")
             .and_then(Value::as_bool)
@@ -3194,10 +3220,15 @@ impl ControllerControl {
         }
         *self.state() = state;
         Ok(pretty(&json!({
-            "machine": machine,
+            "machine": spelled_out(&machine),
             "enabled": enabled,
             "changed": changed,
-            "enabled_machines": self.state().enabled_hosts.iter().collect::<Vec<_>>(),
+            "enabled_machines": self
+                .state()
+                .enabled_hosts
+                .iter()
+                .map(|host| spelled_out(host))
+                .collect::<Vec<_>>(),
         })))
     }
 
@@ -3366,7 +3397,7 @@ impl ControllerControl {
                         .map(|session| session_json(&target.id, session)),
                 ),
                 Err(error) => rendered.push(json!({
-                    "machine": target.id,
+                    "machine": spelled_out(&target.id),
                     "error": format!("{error:#}"),
                 })),
             }
@@ -3546,7 +3577,7 @@ impl ControllerControl {
         let session_id = self.runtime.launch(&request, &command, &environment)?;
         Ok(pretty(&json!({
             "session_id": session_id,
-            "machine": target.id,
+            "machine": spelled_out(&target.id),
             "kind": kind.as_str(),
             "path": request.path,
             "parent": request.parent,
@@ -3702,7 +3733,7 @@ impl ControllerControl {
             })?;
         Ok(pretty(&json!({
             "session_id": session.id,
-            "machine": target.id,
+            "machine": spelled_out(&target.id),
             "kind": session.kind,
             "path": session.path,
             "label": session.label,
@@ -3784,7 +3815,7 @@ impl ControllerControl {
                         Ok(sweep) => (sweep.hits, sweep.skipped),
                         Err(error) => {
                             results.push(json!({
-                                "machine": target.id,
+                                "machine": spelled_out(&target.id),
                                 "error": format!("{error:#}"),
                             }));
                             continue;
@@ -3798,7 +3829,7 @@ impl ControllerControl {
             // this is allowed to give.
             if skipped > 0 {
                 results.push(json!({
-                    "machine": target.id,
+                    "machine": spelled_out(&target.id),
                     "unsearched_sessions": skipped,
                     "note": format!(
                         "Searched the recently written captures on {}; {skipped} older ones were \
@@ -3814,7 +3845,7 @@ impl ControllerControl {
                     continue;
                 }
                 results.push(json!({
-                    "machine": target.id,
+                    "machine": spelled_out(&target.id),
                     "session_id": hit.session_id,
                     "label": hit.label,
                     "matches": hit.matches
@@ -3886,7 +3917,7 @@ impl ControllerControl {
             .iter()
             .map(|hit| {
                 json!({
-                    "machine": hit.target_id,
+                    "machine": spelled_out(&hit.target_id),
                     "session_id": hit.session_id,
                     "kind": hit.kind,
                     "path": hit.cwd,
@@ -3953,7 +3984,7 @@ impl ControllerControl {
             .filter(|resume| *resume < total)
             .or((after < total).then_some(after));
         Ok(pretty(&json!({
-            "machine": record.target_id,
+            "machine": spelled_out(&record.target_id),
             "session_id": record.session_id,
             "kind": record.kind,
             "path": record.cwd,
@@ -4501,15 +4532,16 @@ mod daemon_surface {
         }
 
         /// Whether these arguments name a machine other than this one, in
-        /// which case the call is the controller's to make. `local` is what
-        /// this surface calls the machine it runs on, so it never travels.
-        /// Past that the board knows both names this machine goes by: the key
-        /// it mints messages under and the label the controller calls it. Not
+        /// which case the call is the controller's to make. Neither this
+        /// machine's own name - which is what its answers hand out - nor
+        /// `local`, which every daemon calls itself, ever travels. Past that
+        /// the board knows both names this machine goes by: the key it mints
+        /// messages under and the label the controller calls it. Not
         /// knowing them is not fatal — the errand comes back to this daemon
         /// and is answered here, one hop later than it needed to be.
         fn elsewhere(&self, arguments: &Value) -> Option<String> {
             let machine = optional_str(arguments, "machine")?;
-            if machine == LOCAL_TARGET_ID {
+            if machine == LOCAL_TARGET_ID || machine == crate::model::own_machine_name() {
                 return None;
             }
             let here = match self.transact(&DaemonRequest::TalkStatus { label: None }) {
@@ -4587,7 +4619,9 @@ mod daemon_surface {
             }
             let own = peers.iter().find(|peer| peer.own);
             let mut machines = vec![json!({
-                "id": LOCAL_TARGET_ID,
+                // As above: the name is the id here too, and `elsewhere`
+                // knows it as this machine.
+                "id": crate::model::own_machine_name(),
                 "label": own.map_or_else(
                     || crate::model::own_machine_name().to_string(),
                     |peer| peer.label.clone(),
@@ -4703,7 +4737,7 @@ mod daemon_surface {
             match response {
                 DaemonResponse::Launched { session } => Ok(pretty(&json!({
                     "session_id": session.id,
-                    "machine": LOCAL_TARGET_ID,
+                    "machine": crate::model::own_machine_name(),
                     "kind": session.kind,
                     "path": session.path,
                     "parent": session.parent,
@@ -4876,7 +4910,7 @@ mod daemon_surface {
             match response {
                 DaemonResponse::Launched { session } => Ok(pretty(&json!({
                     "session_id": session.id,
-                    "machine": LOCAL_TARGET_ID,
+                    "machine": crate::model::own_machine_name(),
                     "kind": session.kind,
                     "path": session.path,
                     "label": session.label,
@@ -4984,7 +5018,7 @@ mod daemon_surface {
             // where the word was never said.
             if skipped > 0 {
                 results.push(json!({
-                    "machine": LOCAL_TARGET_ID,
+                    "machine": crate::model::own_machine_name(),
                     "unsearched_sessions": skipped,
                     "note": format!(
                         "Searched the recently written captures; {skipped} older ones were not \
@@ -4999,7 +5033,7 @@ mod daemon_surface {
                     continue;
                 }
                 results.push(json!({
-                    "machine": LOCAL_TARGET_ID,
+                    "machine": crate::model::own_machine_name(),
                     "session_id": session_id,
                     "label": label,
                     "matches": matches
@@ -6065,7 +6099,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} missing from list_machines"))
                 .clone()
         };
-        assert_eq!(machine("local")["enabled"], true);
+        // Listed under its own name rather than `local` - and enabled, which
+        // is read off the `local` key the state file still uses.
+        assert_eq!(machine(crate::model::own_machine_name())["enabled"], true);
         assert_eq!(machine("gpu")["enabled"], false);
 
         control
@@ -6106,6 +6142,38 @@ mod tests {
             control
                 .target(&json!({ "machine": format!("{host}-elsewhere") }))
                 .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_name_an_answer_hands_out_is_a_name_the_next_call_takes() {
+        let (control, root) = controller_over_temp("named");
+        let name = crate::model::own_machine_name();
+
+        // Nothing here says `local` back at whoever asked: a session record
+        // read on one machine and repeated on another has to name a machine,
+        // and every node calls itself `local`.
+        let listed: Value = serde_json::from_str(&control.list_machines().unwrap()).unwrap();
+        assert_eq!(listed[0]["id"], name);
+        let switched: Value = serde_json::from_str(
+            &control
+                .set_machine_enabled(&json!({ "machine": name, "enabled": true }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(switched["machine"], name);
+        assert_eq!(switched["enabled_machines"], json!([name]));
+
+        // And the word it replaced still addresses this machine, because the
+        // config and the state file are written in it.
+        assert_eq!(
+            control.target(&json!({ "machine": name })).unwrap().id,
+            "local"
+        );
+        assert_eq!(
+            control.target(&json!({ "machine": "local" })).unwrap().id,
+            "local"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7618,9 +7686,10 @@ mod tests {
             let machines = listed.as_array().unwrap();
             assert_eq!(machines.len(), 2);
 
-            // This machine answers as itself, under the id every tool here
-            // takes, and carries the name the fleet knows it by as well.
-            assert_eq!(machines[0]["id"], "local");
+            // This machine answers as itself, under its own name rather than
+            // `local` — which out here is the machine the asking agent is
+            // sitting on — and carries the label the fleet knows it by too.
+            assert_eq!(machines[0]["id"], crate::model::own_machine_name());
             assert_eq!(machines[0]["remote"], false);
             assert_eq!(machines[0]["fleet_id"], "seed");
             assert_eq!(machines[0]["label"], "seed");
