@@ -29,6 +29,23 @@ pub fn own_machine_name() -> &'static str {
     })
 }
 
+/// A machine id as it is said out loud, rather than as a call addresses it.
+///
+/// `local` is the routing key — what the config, the state file and the backup
+/// index all call "this machine, not one over ssh" — and it is the same word on
+/// every machine muxloom runs on. Fine to be addressed by; useless to be told.
+/// An id read off an answer gets repeated: to a person, onto a board another
+/// machine reads, into a sentence about somebody else's session. At that point
+/// `local` points at whoever is reading. Every other machine already answers by
+/// its own name, so this makes that true of the one running the call, and both
+/// spellings still go back in.
+pub fn machine_read_as(machine: &str) -> &str {
+    match machine == LOCAL_TARGET_ID {
+        true => own_machine_name(),
+        false => machine,
+    }
+}
+
 /// Parse a semantic version into comparable numbers, ignoring any pre-release
 /// or build suffix (`0.4.3-rc1` -> `(0, 4, 3)`). `None` if it does not look
 /// like one.

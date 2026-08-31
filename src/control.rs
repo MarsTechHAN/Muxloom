@@ -1249,7 +1249,7 @@ fn trigger_json(machine: &str, trigger: &Trigger) -> Value {
     };
     json!({
         "id": trigger.id,
-        "machine": spelled_out(machine),
+        "machine": crate::model::machine_read_as(machine),
         "session_id": trigger.session_id,
         "pattern": trigger.pattern,
         "action_kind": action_kind,
@@ -2761,28 +2761,10 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-/// The machine an answer names itself by.
-///
-/// `local` is the routing key — the word the config, the state file and the
-/// backup index all use for "this machine, not one over ssh" — and it is the
-/// same word on every machine muxloom runs on. It is fine to be addressed by
-/// and useless to be told: an agent that reads `machine: "local"` off a session
-/// record and repeats it to a person, or writes it onto a board another machine
-/// reads, has named nothing. Every other machine here already answers by its
-/// own name; this makes that true of this one too. Both spellings go back in —
-/// see `spelled_here`, `searchable_machines` and the daemon surface's
-/// `elsewhere` — so an answer stays as addressable as the word it replaced.
-fn spelled_out(machine: &str) -> &str {
-    match machine == crate::model::LOCAL_TARGET_ID {
-        true => crate::model::own_machine_name(),
-        false => machine,
-    }
-}
-
 fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) -> Value {
     json!({
         "session_id": session.id,
-        "machine": spelled_out(machine),
+        "machine": crate::model::machine_read_as(machine),
         "kind": session.kind,
         "path": session.path,
         "label": session.label,
@@ -3220,14 +3202,14 @@ impl ControllerControl {
         }
         *self.state() = state;
         Ok(pretty(&json!({
-            "machine": spelled_out(&machine),
+            "machine": crate::model::machine_read_as(&machine),
             "enabled": enabled,
             "changed": changed,
             "enabled_machines": self
                 .state()
                 .enabled_hosts
                 .iter()
-                .map(|host| spelled_out(host))
+                .map(|host| crate::model::machine_read_as(host))
                 .collect::<Vec<_>>(),
         })))
     }
@@ -3397,7 +3379,7 @@ impl ControllerControl {
                         .map(|session| session_json(&target.id, session)),
                 ),
                 Err(error) => rendered.push(json!({
-                    "machine": spelled_out(&target.id),
+                    "machine": crate::model::machine_read_as(&target.id),
                     "error": format!("{error:#}"),
                 })),
             }
@@ -3577,7 +3559,7 @@ impl ControllerControl {
         let session_id = self.runtime.launch(&request, &command, &environment)?;
         Ok(pretty(&json!({
             "session_id": session_id,
-            "machine": spelled_out(&target.id),
+            "machine": crate::model::machine_read_as(&target.id),
             "kind": kind.as_str(),
             "path": request.path,
             "parent": request.parent,
@@ -3733,7 +3715,7 @@ impl ControllerControl {
             })?;
         Ok(pretty(&json!({
             "session_id": session.id,
-            "machine": spelled_out(&target.id),
+            "machine": crate::model::machine_read_as(&target.id),
             "kind": session.kind,
             "path": session.path,
             "label": session.label,
@@ -3815,7 +3797,7 @@ impl ControllerControl {
                         Ok(sweep) => (sweep.hits, sweep.skipped),
                         Err(error) => {
                             results.push(json!({
-                                "machine": spelled_out(&target.id),
+                                "machine": crate::model::machine_read_as(&target.id),
                                 "error": format!("{error:#}"),
                             }));
                             continue;
@@ -3829,7 +3811,7 @@ impl ControllerControl {
             // this is allowed to give.
             if skipped > 0 {
                 results.push(json!({
-                    "machine": spelled_out(&target.id),
+                    "machine": crate::model::machine_read_as(&target.id),
                     "unsearched_sessions": skipped,
                     "note": format!(
                         "Searched the recently written captures on {}; {skipped} older ones were \
@@ -3845,7 +3827,7 @@ impl ControllerControl {
                     continue;
                 }
                 results.push(json!({
-                    "machine": spelled_out(&target.id),
+                    "machine": crate::model::machine_read_as(&target.id),
                     "session_id": hit.session_id,
                     "label": hit.label,
                     "matches": hit.matches
@@ -3917,7 +3899,7 @@ impl ControllerControl {
             .iter()
             .map(|hit| {
                 json!({
-                    "machine": spelled_out(&hit.target_id),
+                    "machine": crate::model::machine_read_as(&hit.target_id),
                     "session_id": hit.session_id,
                     "kind": hit.kind,
                     "path": hit.cwd,
@@ -3984,7 +3966,7 @@ impl ControllerControl {
             .filter(|resume| *resume < total)
             .or((after < total).then_some(after));
         Ok(pretty(&json!({
-            "machine": spelled_out(&record.target_id),
+            "machine": crate::model::machine_read_as(&record.target_id),
             "session_id": record.session_id,
             "kind": record.kind,
             "path": record.cwd,

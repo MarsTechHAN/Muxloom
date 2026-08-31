@@ -1701,7 +1701,7 @@ fn drain_parent_alerts(runtime: &Runtime, targets: &[Target], config: &Config) {
                     session_id: alert.parent_session_id.clone(),
                 }),
                 reply_to: None,
-                text: parent_alert_text(&alert, &target.id),
+                text: parent_alert_text(&alert, crate::model::machine_read_as(&target.id)),
             };
             // `Auto`, not `Now`: an alert is an announcement, and a parent
             // mid-turn reads it at the end of the turn like any other direct.
@@ -2018,6 +2018,21 @@ mod tests {
             // them have to be readable without asking anything else first.
             assert!(text.contains(wanted), "{wanted} missing from: {text}");
         }
+    }
+
+    /// The alert exists to be acted on somewhere else: a parent reads it, and
+    /// often relays it. `local` is the machine of whoever is reading by then,
+    /// which is the one thing this sentence must not get wrong.
+    #[test]
+    fn a_parent_alert_names_this_machine_rather_than_calling_it_local() {
+        let text = parent_alert_text(
+            &waiting_child(),
+            crate::model::machine_read_as(crate::model::LOCAL_TARGET_ID),
+        );
+        assert!(text.contains(crate::model::own_machine_name()), "{text}");
+        assert!(!text.contains("on machine local,"), "{text}");
+        // Anywhere else keeps the name it was reached by.
+        assert!(parent_alert_text(&waiting_child(), "atlas").contains("on machine atlas,"));
     }
 
     #[test]
