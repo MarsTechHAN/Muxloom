@@ -7292,12 +7292,46 @@ mod platform {
     /// a client that connects in between reads a missing or superseded stamp
     /// and puts a daemon that just started through a handover it does not
     /// need. Look once more before believing the stamp.
+    /// How long a stamp that reads as superseded is given to turn out to be a
+    /// daemon still writing it.
+    const GENERATION_SETTLE: Duration = Duration::from_millis(100);
+
+    /// The running stamp this process has already waited out. Settling asks
+    /// whether a stamp that reads as old is a daemon still starting, and that
+    /// is a question about one particular stamp: asking it again on every
+    /// request cost a tenth of a second a time for the whole of a deferred
+    /// handover, which on a machine with agents attached is minutes.
+    static SETTLED_GENERATION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
     fn generation_is_current_after_settling(paths: &DaemonPaths) -> bool {
         if running_generation_is_current(paths) {
             return true;
         }
-        thread::sleep(Duration::from_millis(100));
-        running_generation_is_current(paths)
+        let settled = SETTLED_GENERATION.get_or_init(|| Mutex::new(None));
+        // No stamp at all is a daemon that has not written one yet, which is
+        // the very case the wait is for and never an answer to remember.
+        let running = fs::read_to_string(&paths.generation).unwrap_or_default();
+        if !running.trim().is_empty()
+            && settled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref()
+                == Some(running.as_str())
+        {
+            return false;
+        }
+        thread::sleep(GENERATION_SETTLE);
+        if running_generation_is_current(paths) {
+            return true;
+        }
+        if let Ok(stamp) = fs::read_to_string(&paths.generation)
+            && !stamp.trim().is_empty()
+        {
+            *settled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stamp);
+        }
+        false
     }
 
     /// The end of the daemon's log, phrased to sit inside an error message.
@@ -9046,6 +9080,50 @@ mod platform {
             assert!(
                 waited < Duration::from_secs(5),
                 "a forward nobody answers held the frame loop for {waited:?}"
+            );
+        }
+
+        #[test]
+        fn a_stamp_already_waited_out_is_not_waited_out_again() {
+            let root = PathBuf::from("/tmp").join(format!(
+                "mxl-settle-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+            ));
+            let paths = DaemonPaths::under(root);
+            paths.prepare().unwrap();
+            // A stamp this build outranks, so the answer is always "not
+            // current" and what is being measured is only the waiting.
+            let old = format!("0.0.1:protocol-1:local:local:settle-{}", std::process::id());
+            fs::write(&paths.generation, &old).unwrap();
+
+            let asked = |paths: &DaemonPaths| {
+                let started = Instant::now();
+                let current = generation_is_current_after_settling(paths);
+                assert!(!current, "a stamp this build outranks read as current");
+                started.elapsed()
+            };
+
+            let first = asked(&paths);
+            assert!(
+                first >= GENERATION_SETTLE,
+                "the first ask did not wait for the stamp to settle: {first:?}"
+            );
+            let second = asked(&paths);
+            assert!(
+                second < GENERATION_SETTLE,
+                "a stamp already waited out was waited out again: {second:?}"
+            );
+
+            // A different stamp is a different question, and gets the wait.
+            fs::write(&paths.generation, format!("{old}-again")).unwrap();
+            let third = asked(&paths);
+            assert!(
+                third >= GENERATION_SETTLE,
+                "a stamp nobody has waited out was answered from memory: {third:?}"
             );
         }
 
