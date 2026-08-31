@@ -1393,6 +1393,17 @@ fn vt_color(color: vt100::Color) -> Color {
     }
 }
 
+/// Deep history laid out as text: colour kept, everything else the terminal
+/// would have acted on rather than shown left out.
+///
+/// This is not an emulator and cannot be one - it is reading a byte log at
+/// whatever width the pane happens to be now, not the width the session was
+/// when it wrote them, so cursor addressing has nothing true to address. What
+/// it can do is not put on screen the things that were never meant to be seen.
+/// An escape it does not act on is an escape it swallows whole: a window title
+/// is not session output, and one agent's capture here carries four hundred and
+/// sixty thousand of them, a spinner written into the title bar twenty times a
+/// second. Printing their payloads is what made deep history unreadable.
 fn ansi_history_text(value: &str) -> Text<'static> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
@@ -1417,6 +1428,46 @@ fn ansi_history_text(value: &str) -> Text<'static> {
             if final_byte == Some('m') {
                 apply_sgr(&mut style, &parameters);
             }
+        } else if character == '\x1b'
+            && matches!(characters.peek(), Some(&next) if is_string_escape(next))
+        {
+            // A window title, a colour query, a shell-integration mark, an
+            // inline image: a run of bytes addressed to the terminal itself,
+            // ended by a bell or by a string terminator. None of it was ever on
+            // the screen, so none of it belongs in a picture of the screen.
+            characters.next();
+            while let Some(next) = characters.next() {
+                if next == '\x07' {
+                    break;
+                }
+                if next == '\x1b' {
+                    // ESC \ ends the string; any other ESC is a sequence that
+                    // was never terminated, and swallowing the rest of the
+                    // capture over one stray byte would be worse than stopping.
+                    if characters.peek() == Some(&'\\') {
+                        characters.next();
+                    }
+                    break;
+                }
+            }
+        } else if character == '\x1b' {
+            // Two- and three-byte escapes - charset designations, keypad modes,
+            // save and restore cursor. Nothing to show either way; the point is
+            // to eat the byte that follows so it is not mistaken for text.
+            if let Some(&next) = characters.peek() {
+                characters.next();
+                if matches!(next, '(' | ')' | '*' | '+' | '%' | '#') {
+                    characters.next();
+                }
+            }
+        } else if character == '\r' {
+            // The carriage return that ends a line is the line ending; on its
+            // own it means the line is about to be written again. Keeping what
+            // it overwrote is how one spinner became a thousand lines of it.
+            if characters.peek() != Some(&'\n') {
+                buffer.clear();
+                spans.clear();
+            }
         } else if character == '\n' {
             if !buffer.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut buffer), style));
@@ -1435,6 +1486,12 @@ fn ansi_history_text(value: &str) -> Text<'static> {
         lines.push(Line::from(spans));
     }
     Text::from(lines)
+}
+
+/// Whether this byte after an ESC opens a run that ends at a string
+/// terminator rather than at a final byte: OSC, DCS, SOS, PM, APC.
+fn is_string_escape(intro: char) -> bool {
+    matches!(intro, ']' | 'P' | 'X' | '^' | '_')
 }
 
 fn apply_sgr(style: &mut Style, parameters: &str) {
@@ -6072,6 +6129,53 @@ mod tests {
             running_agent_effect(AgentKind::Codex, 0),
             running_agent_effect(AgentKind::Codex, 20)
         );
+    }
+
+    /// The shapes here are taken off real captures on this machine: Codex
+    /// writes its spinner into the window title, and one session's capture
+    /// carries 464,500 of those. Every one of them used to be printed.
+    #[test]
+    fn ansi_history_shows_what_was_on_the_screen_and_not_what_was_said_to_the_terminal() {
+        let flat = |text: &Text<'_>| {
+            text.lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A title, ended by a bell, and one ended by a string terminator.
+        let titled = ansi_history_text("\x1b]0;\u{2839} m5stack-tools\x07real output\n");
+        assert_eq!(flat(&titled), vec!["real output"]);
+        let marked = ansi_history_text("\x1b]133;A\x1b\\prompt\n");
+        assert_eq!(flat(&marked), vec!["prompt"]);
+
+        // A charset designation and a keypad mode: the byte after the escape is
+        // part of the escape, not a letter that belongs on the line.
+        let designated = ansi_history_text("\x1b(B\x1b=text\n");
+        assert_eq!(flat(&designated), vec!["text"]);
+
+        // A line written over is the line as it was left, and a carriage
+        // return that only ends a line does not eat it.
+        let spun = ansi_history_text("50%\r100% done\n");
+        assert_eq!(flat(&spun), vec!["100% done"]);
+        let dos = ansi_history_text("kept\r\nalso kept\r\n");
+        assert_eq!(flat(&dos), vec!["kept", "also kept"]);
+
+        // Colour still survives all of that, and survives being written over.
+        let coloured = ansi_history_text("\x1b[31mgone\r\x1b[32mstayed\n");
+        assert!(
+            coloured.lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content == "stayed" && span.style.fg == Some(Color::Green)),
+            "the line rewrote its text, not the terminal's colour"
+        );
+        assert_eq!(flat(&coloured), vec!["stayed"]);
     }
 
     #[test]
