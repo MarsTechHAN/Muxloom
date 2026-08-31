@@ -6002,8 +6002,10 @@ mod platform {
                     self.rows,
                     offset_from_bottom,
                     lines,
-                    SCROLLBACK_SEED_BYTES_MIN,
-                    SCROLLBACK_SEED_BYTES_MAX,
+                    SCROLLBACK_SEED_BYTES_MIN..=SCROLLBACK_SEED_BYTES_MAX,
+                    // Nothing runs behind this one, so the log is the only
+                    // account of its screen there is.
+                    None,
                 );
             }
             read_history_file(
@@ -6831,6 +6833,20 @@ mod platform {
             let _ = self.persist_metadata();
         }
 
+        /// The grid this session would paint to somebody attaching right now.
+        ///
+        /// This is the emulator the daemon has been feeding every byte the
+        /// session wrote, so it is the screen itself rather than a rendering of
+        /// some window of the log — the same picture an attach is served.
+        fn screen_rows(&self, columns: u16) -> Vec<Vec<u8>> {
+            self.screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .screen()
+                .rows_formatted(0, columns)
+                .collect()
+        }
+
         fn read_history(
             &self,
             offset_from_bottom: usize,
@@ -6842,14 +6858,16 @@ mod platform {
             }
             let rows = self.rows.load(Ordering::Relaxed);
             if rendered {
+                let columns = self.columns.load(Ordering::Relaxed);
+                let screen = self.screen_rows(columns.max(20));
                 return render_history_file(
                     &self.history_path,
-                    self.columns.load(Ordering::Relaxed),
+                    columns,
                     rows,
                     offset_from_bottom,
                     lines,
-                    SCROLLBACK_SEED_BYTES_MIN,
-                    SCROLLBACK_SEED_BYTES_MAX,
+                    SCROLLBACK_SEED_BYTES_MIN..=SCROLLBACK_SEED_BYTES_MAX,
+                    Some(&screen),
                 );
             }
             read_history_file(
@@ -6960,6 +6978,12 @@ mod platform {
     /// moves the history along by nothing — so the render starts at a window of
     /// `least` bytes and widens until it holds the rows that were asked for, it
     /// has read the log from the start, or it has read `most`.
+    ///
+    /// `bytes` is that span: where a window starts, and how far it may widen.
+    ///
+    /// `screen` is the live grid for a session the daemon still runs, laid over
+    /// the bottom of the replay so the newest rows come from the emulator that
+    /// saw every byte rather than from a guess at how far back to start.
     /// How much of a log to replay for a page that deep, before any widening.
     ///
     /// The window used to be one size for every caller: whatever the deepest
@@ -6988,9 +7012,10 @@ mod platform {
         rows: u16,
         offset_from_bottom: usize,
         lines: usize,
-        least: u64,
-        most: u64,
+        bytes: std::ops::RangeInclusive<u64>,
+        screen: Option<&[Vec<u8>]>,
     ) -> Result<HistoryRead> {
+        let (least, most) = (*bytes.start(), *bytes.end());
         let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
         let end = file.metadata()?.len();
@@ -7006,6 +7031,7 @@ mod platform {
                 rows,
                 offset_from_bottom,
                 wanted,
+                screen,
             )?;
             // A page with nothing on it is not a picture of the screen, it is
             // a window that failed to draw one. An agent repainting in place
@@ -8479,8 +8505,8 @@ mod platform {
             // Small enough that reaching 300 rows back takes several widenings.
             let window = (log.len() / 8) as u64;
 
-            let read =
-                render_history_file(&path, 20, 5, 300, 40, window, log.len() as u64).unwrap();
+            let read = render_history_file(&path, 20, 5, 300, 40, window..=log.len() as u64, None)
+                .unwrap();
             let page = String::from_utf8_lossy(&read.rows).into_owned();
 
             assert_eq!(read.offset_from_bottom, 300, "the row that was asked for");
@@ -8492,7 +8518,8 @@ mod platform {
             );
 
             // A window that may not widen answers with what it could reach.
-            let shallow = render_history_file(&path, 20, 5, 300, 40, window, window).unwrap();
+            let shallow =
+                render_history_file(&path, 20, 5, 300, 40, window..=window, None).unwrap();
             assert!(
                 shallow.offset_from_bottom < 300,
                 "as far back as one window reaches: {}",
@@ -8528,7 +8555,8 @@ mod platform {
             // The seed reaches 12,800 bytes and quadruples from there, so the
             // first two looks both land inside the repaint; the third would
             // span the whole log and reach the rows at the top of it.
-            let read = render_history_file(&path, 20, 5, 0, 40, 4 * 1024, 1024 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 0, 40, 4 * 1024..=1024 * 1024, None).unwrap();
 
             assert!(
                 !read.reached_start,
@@ -8579,7 +8607,8 @@ mod platform {
             // the page the old read stopped on. Asking for more than the screen
             // holds happened to escape it: the blanks could not fill a page
             // deeper than they were.
-            let read = render_history_file(&path, 20, 5, 0, 5, 4 * 1024, 1024 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 0, 5, 4 * 1024..=1024 * 1024, None).unwrap();
 
             let page = String::from_utf8_lossy(&read.rows).into_owned();
             assert!(
@@ -8605,14 +8634,16 @@ mod platform {
             let log: String = (1..=30).map(|line| format!("line{line}\r\n")).collect();
             fs::write(&path, &log).unwrap();
 
-            let read = render_history_file(&path, 20, 5, 0, 500, 16 * 1024, 64 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 0, 500, 16 * 1024..=64 * 1024, None).unwrap();
             assert!(read.reached_start, "a 30-row log is read whole");
             assert_eq!(read.offset_from_bottom, 0);
             // The rows above the screen are the ones a client may scroll to.
             assert!(read.total_lines >= 30, "rows in all: {}", read.total_lines);
 
             // Asking past the oldest row answers with the oldest row there is.
-            let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024..=64 * 1024, None).unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
         }

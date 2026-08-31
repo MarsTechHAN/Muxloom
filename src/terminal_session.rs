@@ -876,6 +876,15 @@ fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<Vec
 /// in the unit an attached emulator scrolls in, so a client can page out of its
 /// own buffer and into these without the view jumping somewhere unrelated.
 ///
+/// `screen` is the session's grid as the daemon itself holds it, for a session
+/// still running. Where it is on offer it is laid over the bottom of the
+/// replay, which is trying to reconstruct that same grid from a window of the
+/// log and cannot always get there: an agent that repaints in place never
+/// re-emits what it has already drawn, so a window opening after its last full
+/// paint replays a few cursor moves onto an empty grid and reconstructs a
+/// screen that was never blank. What scrolled off the top is still the log's to
+/// tell, and is left as it was replayed.
+///
 /// Returns the rows, how many the render reached in all (its scrollback plus
 /// the screen), and the offset it could honour — the caller only gets as far
 /// back as the window it handed over reaches.
@@ -886,6 +895,7 @@ pub(crate) fn render_history_rows(
     rows: u16,
     offset_from_bottom: usize,
     wanted: usize,
+    screen: Option<&[Vec<u8>]>,
 ) -> Result<(Vec<u8>, usize, usize)> {
     let columns = columns.max(20);
     let rows = rows.max(5);
@@ -901,7 +911,7 @@ pub(crate) fn render_history_rows(
     // before it opened. Its screen *is* the newest history, so read it off
     // first and step off afterwards to reach what scrolled by underneath;
     // rendering the primary alone hands back a screenful of blanks.
-    let rendered = if parser.screen().alternate_screen() {
+    let mut rendered = if parser.screen().alternate_screen() {
         let application: Vec<Vec<u8>> = parser.screen().rows_formatted(0, columns).collect();
         parser.process(b"\x1b[?1049l");
         let mut history = buffered_rows(&mut parser, columns, rows);
@@ -915,6 +925,13 @@ pub(crate) fn render_history_rows(
     } else {
         buffered_rows(&mut parser, columns, rows)
     };
+    // Both branches end on the screen, so the overlay replaces exactly that and
+    // leaves the scrollback above it alone. A log holding less than a screenful
+    // is wholly the screen and gets replaced outright.
+    if let Some(screen) = screen {
+        rendered.truncate(rendered.len().saturating_sub(screen.len()));
+        rendered.extend(screen.iter().cloned());
+    }
     let total = rendered.len();
     let actual_offset = offset_from_bottom.min(total.saturating_sub(usize::from(rows)));
     let end = total - actual_offset;
@@ -1265,7 +1282,7 @@ mod tests {
         log.extend_from_slice(b"Do you want to create hello.txt?\r\n");
         log.extend_from_slice(b" 1. Yes\r\n 2. No");
 
-        let (page, total, offset) = render_history_rows(&log[..], 40, 6, 0, 6).unwrap();
+        let (page, total, offset) = render_history_rows(&log[..], 40, 6, 0, 6, None).unwrap();
         let newest = String::from_utf8_lossy(&page).into_owned();
         assert!(
             newest.contains("Do you want to create hello.txt?"),
@@ -1278,7 +1295,7 @@ mod tests {
 
         // That line stays reachable above the agent's screen rather than being
         // buried under the screenful of blanks the alternate screen replaced.
-        let (page, _, offset) = render_history_rows(&log[..], 40, 6, 1, 6).unwrap();
+        let (page, _, offset) = render_history_rows(&log[..], 40, 6, 1, 6, None).unwrap();
         let older = String::from_utf8_lossy(&page).into_owned();
         assert_eq!(offset, 1);
         assert!(older.contains("$ claude"), "{older}");
@@ -1290,13 +1307,13 @@ mod tests {
     /// telling those two apart.
     #[test]
     fn a_page_of_blank_rows_reads_as_nothing_drawn() {
-        let blank = render_history_rows(&b"\r\n\r\n\r\n"[..], 40, 6, 0, 6)
+        let blank = render_history_rows(&b"\r\n\r\n\r\n"[..], 40, 6, 0, 6, None)
             .unwrap()
             .0;
         assert!(!blank.is_empty(), "the rows are there: {blank:?}");
         assert!(!page_has_content(&blank), "but nothing is on them");
 
-        let drawn = render_history_rows(&b"\r\n\r\nhello\r\n"[..], 40, 6, 0, 6)
+        let drawn = render_history_rows(&b"\r\n\r\nhello\r\n"[..], 40, 6, 0, 6, None)
             .unwrap()
             .0;
         assert!(page_has_content(&drawn));
@@ -1317,7 +1334,7 @@ mod tests {
         log.extend_from_slice(b"\x1b[?1049h\x1b[Hagent screen\x1b[?1049l");
         log.extend_from_slice(b"$ echo done\r\ndone\r\n");
 
-        let (page, _, _) = render_history_rows(&log[..], 40, 6, 0, 6).unwrap();
+        let (page, _, _) = render_history_rows(&log[..], 40, 6, 0, 6, None).unwrap();
         let text = String::from_utf8_lossy(&page).into_owned();
         assert!(text.contains("$ echo done"), "{text}");
         assert!(text.contains("done"), "{text}");
@@ -1717,6 +1734,7 @@ mod tests {
                 SEED_ROWS,
                 offset,
                 usize::from(SEED_ROWS),
+                None,
             )
             .expect("page");
 
@@ -1744,6 +1762,7 @@ mod tests {
             SEED_ROWS,
             500,
             usize::from(SEED_ROWS),
+            None,
         )
         .expect("page");
 
@@ -1753,6 +1772,73 @@ mod tests {
             page_text(&page).trim_start().starts_with("line1\n"),
             "the oldest rows: {:?}",
             page_text(&page)
+        );
+    }
+
+    #[test]
+    fn a_live_screen_is_laid_over_the_screen_the_window_reconstructed() {
+        // What the bottom of a page is trying to reconstruct is the screen, and
+        // for a running session the daemon is already holding it, drawn by an
+        // emulator that saw every byte rather than a window guessed at from the
+        // end of the log. Hand that over and it wins; the rows that scrolled
+        // off the top stay the log's to tell.
+        let stream = transcript(1..=30);
+        let wanted = usize::from(SEED_ROWS) + 2;
+        let (replayed, replayed_total, _) =
+            render_history_rows(stream.as_bytes(), SEED_COLUMNS, SEED_ROWS, 0, wanted, None)
+                .expect("page");
+        let live: Vec<Vec<u8>> = (0..usize::from(SEED_ROWS))
+            .map(|row| format!("live{row}").into_bytes())
+            .collect();
+        let (page, total, actual) = render_history_rows(
+            stream.as_bytes(),
+            SEED_COLUMNS,
+            SEED_ROWS,
+            0,
+            wanted,
+            Some(&live),
+        )
+        .expect("page");
+
+        assert_eq!(actual, 0);
+        assert_eq!(
+            total, replayed_total,
+            "the screen was replaced, not appended to the history"
+        );
+        let overlaid = page_text(&page);
+        let overlaid: Vec<&str> = overlaid.lines().collect();
+        let underneath = page_text(&replayed);
+        let underneath: Vec<&str> = underneath.lines().collect();
+        assert_eq!(overlaid.len(), wanted, "a full page either way");
+        assert_eq!(
+            overlaid[..2],
+            underneath[..2],
+            "the rows above the screen are still the log's"
+        );
+        assert_eq!(
+            overlaid[2..],
+            (0..usize::from(SEED_ROWS))
+                .map(|row| format!("live{row}"))
+                .collect::<Vec<_>>(),
+            "the screenful is the one that was handed over"
+        );
+    }
+
+    #[test]
+    fn a_log_shorter_than_a_screen_is_wholly_the_live_screen() {
+        // Nothing has scrolled off yet, so there is no history to keep: the
+        // truncation must not run off the front and leave replayed blanks
+        // stranded under the screen that replaces them.
+        let live: Vec<Vec<u8>> = vec![b"only".to_vec(); usize::from(SEED_ROWS)];
+        let (page, total, _) =
+            render_history_rows(&b""[..], SEED_COLUMNS, SEED_ROWS, 0, 8, Some(&live))
+                .expect("page");
+
+        assert_eq!(total, usize::from(SEED_ROWS));
+        assert_eq!(
+            page_text(&page).lines().collect::<Vec<_>>(),
+            vec!["only"; 8],
+            "every row is the screen's"
         );
     }
 
