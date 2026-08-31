@@ -1720,14 +1720,7 @@ pub fn search_index(
                     created_at: record.created_at,
                     title: record.title.clone(),
                     role: "title".into(),
-                    snippet: make_snippet(
-                        if record.title.is_empty() {
-                            &record.recap
-                        } else {
-                            &record.title
-                        },
-                        &needle,
-                    ),
+                    snippet: make_snippet(matched_side(record, &needle), &needle),
                     score: 1,
                     message_index: usize::MAX,
                     ts: String::new(),
@@ -1930,6 +1923,27 @@ pub fn read_messages(
         }
     }
     Ok((window, total))
+}
+
+/// Which of a record's two lines of description to cut a hit's excerpt from.
+///
+/// A conversation with no matching message can still be surfaced by its title
+/// or its recap, and that match is looked for across the pair of them. The
+/// excerpt was always cut from the title regardless, so a conversation matched
+/// on its recap came back showing a title with nothing in it that the search
+/// had asked for -- and the recap is the longer and more particular of the
+/// two, so it is the one that usually holds the match.
+///
+/// A needle lying across the join belongs to neither side; then there is no
+/// better answer than the one line a person reads first.
+fn matched_side<'a>(record: &'a BackupRecord, needle: &str) -> &'a str {
+    [record.title.as_str(), record.recap.as_str()]
+        .into_iter()
+        .find(|side| side.to_lowercase().contains(needle))
+        .unwrap_or(match record.title.is_empty() {
+            true => &record.recap,
+            false => &record.title,
+        })
 }
 
 /// A one-line excerpt of `text` centered on the first match of `needle`
@@ -2429,6 +2443,49 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.target_id == "local"));
         // Empty query yields nothing.
         assert!(search(&store, "   ", 10).unwrap().is_empty());
+    }
+
+    /// A conversation whose messages hold nothing can still be found by its
+    /// title or its recap, and the pair is searched together. The excerpt then
+    /// has to be cut from whichever of the two actually matched, or the hit
+    /// comes back showing a line with no trace of what was searched for.
+    #[test]
+    fn a_hit_found_in_a_recap_is_excerpted_from_the_recap() {
+        let store = temp_store();
+        let messages = vec![ExtractedMessage {
+            role: "user".into(),
+            text: "nothing of interest in here".into(),
+            ts: String::new(),
+        }];
+        store
+            .write_blob(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&messages).as_bytes(),
+            )
+            .unwrap();
+        let mut index = store.load_index().unwrap();
+        index.upsert(BackupRecord {
+            target_id: "local".into(),
+            session_id: "s1".into(),
+            kind: "claude".into(),
+            created_at: 100,
+            message_count: messages.len(),
+            title: "a quiet afternoon".into(),
+            recap: "worked out why the scrollback came back blank".into(),
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+
+        let hits = search(&store, "scrollback", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, "title");
+        assert!(
+            hits[0].snippet.contains("scrollback"),
+            "the excerpt is cut from a line the search never matched: {:?}",
+            hits[0].snippet
+        );
     }
 
     /// A search asked for two hits reads the whole corpus but holds two. The
