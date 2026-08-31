@@ -1319,6 +1319,19 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("refused, not\ntrimmed"), "{text}");
+        // The upload caps too: a number written out beside a constant is a
+        // number that drifts from it, and an agent told the wrong one finds out
+        // by having a send refused.
+        for cap in [
+            crate::channel::LARK_IMAGE_BYTES,
+            crate::channel::LARK_FILE_BYTES,
+        ] {
+            let said = format!("{} MB", crate::channel::cap_in_mb(cap));
+            assert!(text.contains(&said), "the skill must name {said}: {text}");
+        }
+        // And the one thing that is not a cap but is just as easy to get
+        // wrong: which platform can carry a file at all.
+        assert!(text.contains("**Lark only.**"), "{text}");
         assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
     }
 

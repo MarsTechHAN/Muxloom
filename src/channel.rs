@@ -567,8 +567,8 @@ const WECHAT_LIMIT: usize = 4 * 1024;
 /// What Lark's two upload endpoints take, in bytes. Its own documented caps,
 /// checked here so an agent is told which file was too big and how big it was,
 /// rather than being handed the platform's numbered refusal.
-const LARK_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-const LARK_FILE_BYTES: u64 = 30 * 1024 * 1024;
+pub const LARK_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+pub const LARK_FILE_BYTES: u64 = 30 * 1024 * 1024;
 
 /// Where a file somebody sent is put down, under the state directory of the
 /// machine that was reading the chat.
@@ -761,6 +761,13 @@ fn read_attachment(path: &Path) -> Result<Attached> {
         path: path.to_path_buf(),
         bytes: fs::read(path).with_context(|| format!("could not read {}", path.display()))?,
     })
+}
+
+/// One of the upload caps in whole megabytes, for the places that quote it: the
+/// tool's own schema and the skill. Said from the constant rather than written
+/// out beside it, so what an agent is told and what it is held to cannot drift.
+pub fn cap_in_mb(size: u64) -> u64 {
+    size / (1024 * 1024)
 }
 
 /// A size a person reads rather than counts.
