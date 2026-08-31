@@ -1526,6 +1526,20 @@ fn default_true() -> bool {
     true
 }
 
+/// A machine as a person reads it, rather than as a call addresses it.
+///
+/// A correspondent carries the routing id, and for the machine this runs on
+/// that id is `local` — a word that picks out no machine in particular and
+/// means a different one on every node relaying into the same chat. A person
+/// reading `WeChat · local` on their phone has been told nothing about where
+/// that agent is. Everything else is already named after itself.
+fn machine_read_as(machine: &str) -> &str {
+    match machine == crate::model::LOCAL_TARGET_ID {
+        true => crate::model::own_machine_name(),
+        false => machine,
+    }
+}
+
 impl Correspondent {
     /// How the human reads it, machine and all.
     ///
@@ -1538,7 +1552,7 @@ impl Correspondent {
         if self.machine.is_empty() {
             return called;
         }
-        format!("{called} · {}", self.machine)
+        format!("{called} · {}", machine_read_as(&self.machine))
     }
 
     /// The same session without the machine qualifier — for a list that is
@@ -1592,7 +1606,15 @@ impl Correspondent {
             .split_once('/')
             .map(|(machine, session)| (machine.trim(), session.trim()))
             .unwrap_or(("", needle.trim()));
-        if !machine.is_empty() && !self.machine.to_lowercase().starts_with(machine) {
+        // Matched against the name the lists printed, since that is the word
+        // the person is typing back — and against the routing id too, which
+        // is what an agent relaying a `/select` has to hand.
+        if !machine.is_empty()
+            && !self.machine.to_lowercase().starts_with(machine)
+            && !machine_read_as(&self.machine)
+                .to_lowercase()
+                .starts_with(machine)
+        {
             return false;
         }
         session.is_empty()
@@ -5313,6 +5335,29 @@ mod tests {
     }
 
     #[test]
+    fn a_session_on_this_machine_is_read_back_under_the_machines_own_name() {
+        // `local` is how the session is addressed, not what it is called: on a
+        // phone reading messages relayed from a whole fleet, every one of them
+        // would sign off as `local`.
+        let here = crate::model::own_machine_name();
+        let session = Correspondent {
+            machine: crate::model::LOCAL_TARGET_ID.into(),
+            session_id: "a7f3c1".into(),
+            label: "WeChat".into(),
+            ..Default::default()
+        };
+        assert_eq!(session.name(), format!("WeChat · {here}"));
+        // Which means the machine word a person now reads has to be a machine
+        // word `/select` still takes...
+        let typed = here.to_lowercase();
+        assert!(session.answers_to(&format!("{typed}/WeChat")), "{typed}");
+        // ...without dropping the id, which is what an agent relaying a
+        // `/select` on somebody's behalf has.
+        assert!(session.answers_to("local/WeChat"));
+        assert!(!session.answers_to("elsewhere/WeChat"));
+    }
+
+    #[test]
     fn only_what_a_person_typed_comes_back_out_of_a_lark_message() {
         let text =
             |kind: &str, content: &str| json!({ "msg_type": kind, "body": { "content": content } });
@@ -5469,7 +5514,13 @@ mod tests {
         // There is only one of them to aim at, so it is not a choice to put
         // back to the human.
         let answer = handle(&mut desk, &binding, &said("/select arena"), &mut inbox);
-        assert_eq!(answer, "· aimed at arena runner · local");
+        assert_eq!(
+            answer,
+            format!(
+                "· aimed at arena runner · {}",
+                crate::model::own_machine_name()
+            )
+        );
         assert_eq!(
             inbox
                 .aimed
@@ -5495,7 +5546,10 @@ mod tests {
         // count of the rest so nothing is dropped in silence.
         let roster = handle(&mut desk, &binding, &said("/who"), &mut inbox);
         assert!(
-            roster.contains("- arena runner · local · working"),
+            roster.contains(&format!(
+                "- arena runner · {} · working",
+                crate::model::own_machine_name()
+            )),
             "{roster}"
         );
         assert!(!roster.contains("seo"), "{roster}");
@@ -5676,8 +5730,15 @@ mod tests {
             },
             &mut inbox,
         );
-        assert!(roster.contains("- the arena · local"), "{roster}");
-        assert!(roster.contains("- the seo run · local"), "{roster}");
+        let here = crate::model::own_machine_name();
+        assert!(
+            roster.contains(&format!("- the arena · {here}")),
+            "{roster}"
+        );
+        assert!(
+            roster.contains(&format!("- the seo run · {here}")),
+            "{roster}"
+        );
         assert!(!roster.contains("reviewing the"), "{roster}");
         assert!(roster.contains("(2 working under them)"), "{roster}");
 
