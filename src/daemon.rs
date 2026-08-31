@@ -488,6 +488,14 @@ mod platform {
         attention_patterns: Arc<Mutex<Vec<String>>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
+        /// How many times the grid has been changed. Bumped under [`Self::screen`]
+        /// by the only two things that can change it -- output arriving and a
+        /// resize -- so a count read while holding that lock names the picture
+        /// the lock is holding.
+        screen_seq: AtomicU64,
+        /// The last laying-out of the grid as text, and the count it was taken
+        /// at. See [`ManagedSession::visible_screen`].
+        screen_text: Mutex<Option<(u64, Arc<str>)>>,
         /// Tracks the scroll region the session has, so an attach snapshot can
         /// hand the client the same `DECSTBM` the app left behind.
         inline: Mutex<InlineScrollback>,
@@ -850,11 +858,7 @@ mod platform {
         // waits for its pattern to arrive, so text that is there when it is
         // armed counts as seen rather than as an immediate match.
         let matched = session
-            .screen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .screen()
-            .contents()
+            .visible_screen()
             .to_lowercase()
             .contains(&trigger.pattern.to_lowercase());
         let mut triggers = state
@@ -926,13 +930,7 @@ mod platform {
         // session's reader thread walks it, and so does every arm, list and
         // delete. Laying one session's screen out as text while holding it is
         // how one busy session's output comes to wait on another's.
-        let screen = session
-            .screen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .screen()
-            .contents()
-            .to_lowercase();
+        let screen = session.visible_screen().to_lowercase();
         let rendered_at = now_ms();
         let mut fired = Vec::new();
         {
@@ -1240,12 +1238,7 @@ mod platform {
     /// text to read (an absent or empty composer is the patience constants' to
     /// wait on, not the draft's).
     fn draft_age_ms(session: &ManagedSession, kind: &AgentKind, now: u64) -> Option<u64> {
-        let visible_screen = session
-            .screen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .screen()
-            .contents();
+        let visible_screen = session.visible_screen();
         let draft = composer_text(*kind, &visible_screen)?;
         let mut watch = session
             .draft_watch
@@ -4340,6 +4333,8 @@ mod platform {
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
+            screen_seq: AtomicU64::new(0),
+            screen_text: Mutex::new(None),
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             draft_watch: Mutex::new(None),
@@ -5205,6 +5200,8 @@ mod platform {
             attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
+            screen_seq: AtomicU64::new(0),
+            screen_text: Mutex::new(None),
             inline: Mutex::new(InlineScrollback::default()),
             codex_activity: Mutex::new(CodexActivity::default()),
             draft_watch: Mutex::new(None),
@@ -5754,13 +5751,7 @@ mod platform {
                 let visible_screen =
                     match stopped && self.screen_settled.swap(true, Ordering::Relaxed) {
                         true => None,
-                        false => Some(
-                            self.screen
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .screen()
-                                .contents(),
-                        ),
+                        false => Some(self.visible_screen()),
                     };
                 // What the runtime wrote down about itself beats anything read
                 // off its screen: it is the turn as the agent meant it, not
@@ -5797,7 +5788,7 @@ mod platform {
                 } else {
                     // A running session is never the settled one, so the screen
                     // was drawn above and every reading below has it.
-                    let visible_screen = visible_screen.unwrap_or_default();
+                    let visible_screen = visible_screen.unwrap_or_else(|| Arc::from(""));
                     snapshot.composer = composer(kind, &visible_screen);
                     let patterns = self
                         .attention_patterns
@@ -6097,14 +6088,16 @@ mod platform {
             }
             self.columns.store(columns, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
-            resize_parser(
-                &mut self
+            {
+                let mut screen = self
                     .screen
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                rows,
-                columns,
-            );
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // A reflow rewrites every row, so it counts as changing the
+                // grid every bit as much as output does.
+                self.screen_seq.fetch_add(1, Ordering::AcqRel);
+                resize_parser(&mut screen, rows, columns);
+            }
             let mut payload = [0u8; 4];
             payload[..2].copy_from_slice(&columns.to_be_bytes());
             payload[2..].copy_from_slice(&rows.to_be_bytes());
@@ -6287,6 +6280,49 @@ mod platform {
         /// over - an agent repainting its window does so a few hundred bytes at
         /// a time, tens of times a second. So this runs on the critical path of
         /// the child's own output, and work proportional to anything but
+        /// The screen laid out as text. Walking the grid is most of what
+        /// classifying a session costs, and only output and a resize can change
+        /// what the walk would find -- so a reading taken since the last of
+        /// those is that reading again. Without this a machine full of sessions
+        /// sitting still laid the same unchanged pictures out over and over:
+        /// once per listing round, once per trigger pass, once per draft check,
+        /// each of them taking the screen lock away from the reader thread that
+        /// wants it to paint.
+        fn visible_screen(&self) -> Arc<str> {
+            let wanted = self.screen_seq.load(Ordering::Acquire);
+            if let Some((taken_at, text)) = self
+                .screen_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                && *taken_at == wanted
+            {
+                return Arc::clone(text);
+            }
+            let (taken_at, drawn) = {
+                let screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Read while holding the lock the mutators bump it under, so
+                // the count and the picture are the same moment.
+                (
+                    self.screen_seq.load(Ordering::Acquire),
+                    Arc::<str>::from(screen.screen().contents()),
+                )
+            };
+            let mut kept = self
+                .screen_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Two readings can race past each other on the way here; the older
+            // one must not be the one that stays.
+            if kept.as_ref().is_none_or(|(seen, _)| *seen < taken_at) {
+                *kept = Some((taken_at, Arc::clone(&drawn)));
+            }
+            drawn
+        }
+
         /// `bytes` does not belong in it.
         fn record_output(&self, bytes: &[u8]) {
             self.line_count.fetch_add(
@@ -6302,6 +6338,10 @@ mod platform {
                     .inline
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Before the grid moves, so a reading that has not yet taken
+                // this lock cannot mistake the picture it is about to get for
+                // the one it already has.
+                self.screen_seq.fetch_add(1, Ordering::AcqRel);
                 // Route through the same InlineScrollback the client uses so the
                 // daemon's screen state stays consistent with what a client
                 // would render (scroll-region rewriting included).
@@ -9010,6 +9050,72 @@ mod platform {
         }
 
         #[test]
+        fn a_screen_that_has_not_moved_is_laid_out_as_text_once() {
+            let state = test_state("screen-cache");
+            let id = "muxloomd-terminal-cache-1";
+            launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "still".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                224,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let session = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .map(Arc::clone)
+                .unwrap();
+
+            // Holding the screen is how the question gets asked: a reading that
+            // walks the grid has to wait here, and one served from the last
+            // walk does not.
+            let read_while = |session: &Arc<ManagedSession>| {
+                let held = session
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let probe = Arc::clone(session);
+                let reading = thread::spawn(move || probe.visible_screen());
+                thread::sleep(Duration::from_millis(200));
+                let walked = !reading.is_finished();
+                drop(held);
+                (walked, reading.join().unwrap())
+            };
+
+            let first = session.visible_screen();
+            let (walked, again) = read_while(&session);
+            assert!(!walked, "a screen that had not moved was walked again");
+            assert_eq!(&*first, &*again, "and the second reading differed");
+
+            // Output moves the grid, and the next reading has to go and look.
+            session.record_output(b"cached-screen-probe\r\n");
+            let (walked, after) = read_while(&session);
+            assert!(walked, "a screen that moved was served from the last walk");
+            assert!(
+                after.contains("cached-screen-probe"),
+                "the fresh reading missed what arrived: {after:?}"
+            );
+
+            // And a reflow rewrites every row, so it counts as moving the grid
+            // every bit as much as output does.
+            session.resize(100, 30).ok();
+            let (walked, _) = read_while(&session);
+            assert!(walked, "a reflowed screen was served from the last walk");
+        }
+
+        #[test]
         fn a_stopped_session_is_read_off_its_screen_once_and_never_again() {
             let state = test_state("settled-screen");
             let id = "muxloomd-terminal-settled-1";
@@ -9038,9 +9144,13 @@ mod platform {
                 .map(Arc::clone)
                 .unwrap();
 
-            // Holding the screen is how the question gets asked: a reading that
-            // draws the grid has to wait here, and one that does not, does not.
-            let drawn_while = |session: &Arc<ManagedSession>| {
+            // Move the grid, then hold the screen: a reading that has to go and
+            // look waits here, and one that will not look does not. Moving it
+            // first is what rules out the other reason not to look, which is
+            // that the last walk is still good -- see
+            // [`a_screen_that_has_not_moved_is_laid_out_as_text_once`].
+            let drawn_after_moving = |session: &Arc<ManagedSession>, mark: &[u8]| {
+                session.record_output(mark);
                 let held = session
                     .screen
                     .lock()
@@ -9054,19 +9164,22 @@ mod platform {
                 waited
             };
 
-            // A running session is read off its screen every time, because its
-            // screen is what it is doing now.
-            assert!(drawn_while(&session), "a running session is drawn");
+            // A running session is read off its screen every time it moves,
+            // because its screen is what it is doing now.
+            assert!(
+                drawn_after_moving(&session, b"one\r\n"),
+                "a running session is drawn"
+            );
 
             // Stopped, nothing will paint it again. The next reading still
             // takes the picture -- and it is the last one that ever will.
             session.archived.store(true, Ordering::Relaxed);
             assert!(
-                drawn_while(&session),
+                drawn_after_moving(&session, b"two\r\n"),
                 "the final reading is still taken off the screen"
             );
             assert!(
-                !drawn_while(&session),
+                !drawn_after_moving(&session, b"three\r\n"),
                 "a session nothing can paint was laid out as text again"
             );
 
@@ -9099,7 +9212,7 @@ mod platform {
                 .unwrap();
             other.mark_dead();
             assert!(
-                !drawn_while(&other),
+                !drawn_after_moving(&other, b"four\r\n"),
                 "a dead session was laid out as text again"
             );
             assert!(other.snapshot().dead, "and it is still the same record");
