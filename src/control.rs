@@ -3575,7 +3575,16 @@ impl ControllerControl {
         // parent, history - and everything that still hangs off it by parent
         // link comes back with it. A resume_id that names an agent-native
         // conversation instead stays the ordinary relaunch below.
-        if let Some(resume_id) = optional_str(arguments, "resume_id") {
+        //
+        // Which of the two it is, is read off the id before the machine is
+        // asked for anything. Listing the sessions draws the screen of every
+        // one of them, and a resume_id naming an agent-native conversation
+        // walks straight past that list without looking at it -- so an
+        // ordinary relaunch was paying for a fleet listing it never read, and
+        // failing outright if the listing failed.
+        if let Some(resume_id) = optional_str(arguments, "resume_id")
+            && crate::runtime::is_daemon_session_id(resume_id)
+        {
             let sessions = self.runtime.bridge_pool().list_sessions(&target)?;
             if let Some(master) = fleet_resume_target(&sessions, resume_id)? {
                 return self.resume_fleet(&target, master, arguments);
@@ -4722,8 +4731,12 @@ mod daemon_surface {
             // is an id-stable fleet resume, answered before the ordinary
             // launch's rules - the folder rule below is re-checked inside it
             // for every session it would relaunch. A resume_id naming an
-            // agent-native conversation stays the ordinary relaunch.
-            if let Some(resume_id) = optional_str(arguments, "resume_id") {
+            // agent-native conversation stays the ordinary relaunch, and is
+            // told apart before the sessions are asked for: that listing draws
+            // every session's screen, and the ordinary relaunch never reads it.
+            if let Some(resume_id) = optional_str(arguments, "resume_id")
+                && crate::runtime::is_daemon_session_id(resume_id)
+            {
                 let sessions = self.sessions()?;
                 if let Some(master) = fleet_resume_target(&sessions, resume_id)? {
                     return self.resume_fleet(master, arguments);
@@ -6596,6 +6609,10 @@ mod tests {
                 .map(|record| record.id.clone()),
             None::<String>
         );
+        // And passes it without the list being consulted at all, which is what
+        // lets the caller decide off the id alone and not go asking the machine
+        // for every session it has just to walk past the answer.
+        assert!(fleet_resume_target(&[], "ses-native").unwrap().is_none());
         // The same number, still lived in: refused, never shadowed.
         let error = fleet_resume_target(&[running], "muxloomd-claude-target")
             .err()
