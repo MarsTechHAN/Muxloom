@@ -206,6 +206,7 @@ fn a_live_session_survives_a_generation_handover_with_its_process() {
                 parent: None,
                 powers: None,
                 initial_prompt: None,
+                first_prompt: None,
             },
         );
         let DaemonResponse::Launched { session } = response else {

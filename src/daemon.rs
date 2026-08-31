@@ -3152,6 +3152,7 @@ mod platform {
                 parent,
                 powers,
                 initial_prompt,
+                first_prompt,
             } => {
                 let _drain_guard = state
                     .client_gate
@@ -3179,6 +3180,7 @@ mod platform {
                     rows,
                     parent.clone(),
                     powers,
+                    first_prompt,
                 )?;
                 if let Some(prompt) = initial_prompt.as_deref() {
                     queue_seed_prompt(state, &session_id, parent, prompt);
@@ -4230,6 +4232,7 @@ mod platform {
         rows: u16,
         parent: Option<String>,
         powers: Option<crate::model::Powers>,
+        opening: Option<String>,
     ) -> Result<Arc<ManagedSession>> {
         validate_session_id(&session_id)?;
         // Nobody is in front of a session at the moment it starts, so it starts
@@ -4532,13 +4535,17 @@ mod platform {
                 .and_then(|record| record.thread.clone()),
             seed: seed.clone(),
             // A launch that reopens a thread reopens the conversation that
-            // opened with those words too; one that starts fresh has heard
-            // nothing yet, and the recorder will fill this in on the first
-            // substantial submission.
+            // opened with those words too. One that starts fresh is being
+            // told here what it was started with, because the caller wrote
+            // the command line and so knows - and only where it has not been
+            // told does the recorder fill this in from the first substantial
+            // submission, which by then is whatever somebody said to the
+            // session rather than what the session was opened with.
             first_prompt: resuming
                 .as_ref()
                 .filter(|_| seed.is_some())
-                .and_then(|record| record.first_prompt.clone()),
+                .and_then(|record| record.first_prompt.clone())
+                .or(opening),
             working: false,
             needs_attention: false,
             attention_reason: None,
@@ -8947,6 +8954,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             first.write_input(b"marker line\r").unwrap();
@@ -8978,6 +8986,7 @@ mod platform {
                 999,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9034,6 +9043,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             first.archive().unwrap();
@@ -9086,6 +9096,7 @@ mod platform {
                     24,
                     None,
                     None,
+                    None,
                 );
                 assert!(
                     outcome.is_err(),
@@ -9122,6 +9133,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let snapshot = revived.snapshot();
@@ -9150,6 +9162,7 @@ mod platform {
                     24,
                     None,
                     None,
+                    None,
                 );
                 assert!(outcome.is_err(), "the folder is gone; the launch cannot be");
             };
@@ -9170,6 +9183,7 @@ mod platform {
                 111,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9227,6 +9241,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -9275,6 +9290,7 @@ mod platform {
                     24,
                     None,
                     None,
+                    None,
                 )
                 .unwrap();
                 let snapshot = revived.snapshot();
@@ -9314,6 +9330,7 @@ mod platform {
                 333,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9357,6 +9374,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .expect("a session that only ended could not come back on its own number");
             let snapshot = revived.snapshot();
@@ -9381,6 +9399,7 @@ mod platform {
                 111,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9431,6 +9450,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             first.archive().unwrap();
@@ -9456,6 +9476,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -9475,6 +9496,7 @@ mod platform {
                 999,
                 80,
                 24,
+                None,
                 None,
                 None,
             ) {
@@ -9516,6 +9538,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let error = match launch_session(
@@ -9531,6 +9554,7 @@ mod platform {
                 999,
                 80,
                 24,
+                None,
                 None,
                 None,
             ) {
@@ -9561,6 +9585,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let child = launch_session(
@@ -9577,6 +9602,7 @@ mod platform {
                 80,
                 24,
                 Some(master.into()),
+                None,
                 None,
             )
             .unwrap();
@@ -9603,6 +9629,7 @@ mod platform {
                 200,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9641,6 +9668,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let live_child = launch_session(
@@ -9658,6 +9686,7 @@ mod platform {
                 24,
                 Some(master.into()),
                 None,
+                None,
             )
             .unwrap();
             let archived_child = launch_session(
@@ -9674,6 +9703,7 @@ mod platform {
                 80,
                 24,
                 Some(master.into()),
+                None,
                 None,
             )
             .unwrap();
@@ -9702,6 +9732,7 @@ mod platform {
                 200,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9783,6 +9814,7 @@ mod platform {
                 333,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -9973,6 +10005,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let session = state
@@ -10037,6 +10070,7 @@ mod platform {
                 222,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -10106,6 +10140,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let other = state
@@ -10169,6 +10204,7 @@ mod platform {
                 222,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -10380,6 +10416,7 @@ mod platform {
                     24,
                     parent.map(Into::into),
                     None,
+                    None,
                 )
                 .unwrap()
             };
@@ -10475,6 +10512,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -10612,6 +10650,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )
             .unwrap()
@@ -11102,6 +11141,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -11145,6 +11185,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -11227,6 +11268,7 @@ mod platform {
                 80,
                 24,
                 parent.map(str::to_string),
+                None,
                 None,
             )
             .unwrap()
@@ -11660,6 +11702,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             elder.archive().unwrap();
@@ -11780,6 +11823,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             elder.archive().unwrap();
@@ -11831,6 +11875,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12097,6 +12142,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -12178,6 +12224,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -12195,6 +12242,72 @@ mod platform {
                 session_facts(1, &session).first_prompt.as_deref(),
                 Some("fix the render glitch in the pty reader"),
                 "the live recording reaches the matching"
+            );
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// Every runtime but OpenCode is handed its prompt in its command
+        /// line, so the daemon never hears that opening typed and used to have
+        /// no account of it at all - and would then record whatever was said
+        /// to the session days later as the words it opened with. Those words
+        /// appear in no transcript, so the session could not show which
+        /// conversation was its own, and could be barred from it outright by
+        /// its own false opening. The caller wrote that command line and now
+        /// says what was in it.
+        #[test]
+        fn a_prompt_that_travelled_in_the_command_line_is_still_the_opening() {
+            let state = test_state("native-argv");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-native-argv".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+                Some("survey the open arm datasets and write it up".into()),
+            )
+            .unwrap();
+
+            assert_eq!(
+                session_facts(1, &session).first_prompt.as_deref(),
+                Some("survey the open arm datasets and write it up"),
+                "the matching is told what the command line asked for"
+            );
+            // Persisted with the record, so the opening outlives the daemon
+            // generation that was told it.
+            let stored: DaemonSession =
+                serde_json::from_slice(&fs::read(&session.metadata_path).unwrap()).unwrap();
+            assert_eq!(
+                stored.first_prompt.as_deref(),
+                Some("survey the open arm datasets and write it up")
+            );
+
+            // And the sentence somebody relays it afterwards is theirs, not
+            // the conversation's opening - which is the whole failure this
+            // closes, because a relayed message contradicts the transcript
+            // and costs the session the thread it is actually writing.
+            session
+                .write_input(b"[muxloom] Message from claude: how far have you got?\r")
+                .unwrap();
+            assert_eq!(
+                session
+                    .first_prompt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_deref(),
+                Some("survey the open arm datasets and write it up"),
+                "a later message does not displace the opening"
             );
 
             session.archive().unwrap();
@@ -12222,6 +12335,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12280,6 +12394,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             burst.write_input(b"hi\r").unwrap();
@@ -12321,6 +12436,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12409,6 +12525,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12518,6 +12635,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -12557,6 +12675,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12615,6 +12734,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -12688,6 +12808,7 @@ mod platform {
                     1,
                     80,
                     24,
+                    None,
                     None,
                     None,
                 )
@@ -12772,6 +12893,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(session.snapshot().path, scratch.to_string_lossy());
@@ -12827,6 +12949,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -13228,6 +13351,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -13275,6 +13399,7 @@ mod platform {
                 5,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -13390,6 +13515,7 @@ mod platform {
                 24,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -13470,6 +13596,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )
             .unwrap()
@@ -13601,6 +13728,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -14034,6 +14162,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -14136,6 +14265,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )
             .unwrap()
@@ -14263,6 +14393,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )
             .unwrap()
@@ -14411,6 +14542,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )?
             .write_to(client)?;
@@ -14453,6 +14585,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -14622,6 +14755,7 @@ mod platform {
                 1,
                 80,
                 24,
+                None,
                 None,
                 None,
             )
@@ -15222,6 +15356,7 @@ mod platform {
                     parent: None,
                     powers: None,
                     initial_prompt: None,
+                    first_prompt: None,
                 },
             )
             .unwrap();

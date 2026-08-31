@@ -312,6 +312,18 @@ pub enum DaemonRequest {
         /// direct message takes. Absent from a client too old to send one.
         #[serde(default)]
         initial_prompt: Option<String>,
+        /// What this session was asked to begin with, wherever that reached it.
+        /// Every runtime but OpenCode takes the prompt in its command line, so
+        /// the daemon never hears it typed and ends up with no account of what
+        /// the conversation opened with — and then records the first message
+        /// somebody relays it as its opening words instead. Those words are in
+        /// no transcript, so the session cannot show which conversation is its
+        /// own, and a sibling holding it on nothing better than timing keeps
+        /// it. Said here, the session starts out knowing. Absent from a client
+        /// too old to send one, and from a resume, whose prompt is a re-entry
+        /// note rather than the words the thread begins with.
+        #[serde(default)]
+        first_prompt: Option<String>,
     },
     Resize {
         session_id: String,

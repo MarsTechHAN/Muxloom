@@ -908,6 +908,7 @@ impl BridgeConnection {
         parent: Option<String>,
         powers: Option<crate::model::Powers>,
         initial_prompt: Option<String>,
+        first_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         match self
             .request(DaemonRequest::Launch {
@@ -925,6 +926,7 @@ impl BridgeConnection {
                 parent,
                 powers,
                 initial_prompt,
+                first_prompt,
             })?
             .response
         {
@@ -2588,6 +2590,7 @@ impl BridgePool {
         parent: Option<String>,
         powers: Option<crate::model::Powers>,
         initial_prompt: Option<String>,
+        first_prompt: Option<String>,
     ) -> Result<DaemonSession> {
         let connection = self.connection_for_target(target)?;
         let error = match connection.launch(
@@ -2603,6 +2606,7 @@ impl BridgePool {
             parent.clone(),
             powers.clone(),
             initial_prompt.clone(),
+            first_prompt.clone(),
         ) {
             Ok(session) => return Ok(session),
             Err(error) => error,
@@ -2649,6 +2653,7 @@ impl BridgePool {
             parent,
             powers,
             initial_prompt,
+            first_prompt,
         )
     }
 

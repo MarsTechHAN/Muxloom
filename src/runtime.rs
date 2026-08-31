@@ -612,6 +612,16 @@ impl Runtime {
                 request.resume_id.as_deref(),
                 request.initial_prompt.as_deref(),
             ),
+            // The command line above is where the prompt goes for every
+            // runtime but OpenCode, so this is the only chance the daemon
+            // gets to hear what the session was opened with. Only a launch
+            // that opens the conversation has that to give: a resume's prompt
+            // is a re-entry note, and the words the thread really begins with
+            // are already on the record it revives.
+            request
+                .initial_prompt
+                .clone()
+                .filter(|_| request.resume_id.is_none()),
         );
         if let Err(daemon_error) = daemon_launch {
             debug::log(

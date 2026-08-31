@@ -3712,6 +3712,11 @@ impl ControllerControl {
                 // session cannot come back holding more than it died with.
                 None,
                 synthetic,
+                // Nothing to tell it: a member coming back on its own thread
+                // already carries the words that thread opened with, and one
+                // coming back without a thread is typed the caption above,
+                // which the recorder hears for itself.
+                None,
             );
             match launched {
                 Ok(_) => outcomes.push(outcome(
@@ -3759,6 +3764,9 @@ impl ControllerControl {
                 relayed_caller(arguments),
                 None,
                 Some(caption),
+                // A resume, so the same as its members: the caption is typed
+                // in and the record already holds the opening.
+                None,
             )
             .map_err(|error| match fleet_already_back(&master.id, &outcomes) {
                 Some(note) => error.context(note),
@@ -4767,6 +4775,15 @@ mod daemon_surface {
                     parent: launching_session(),
                     powers: Some(powers),
                     initial_prompt: seed,
+                    // What this session is being started to do, handed over
+                    // so it can show which conversation is its own later.
+                    // The prompt travels in the command line for every
+                    // runtime but OpenCode, so unless it is said here the
+                    // daemon never hears it. Withheld on a resume, whose
+                    // prompt reopens a thread rather than beginning one.
+                    first_prompt: optional_str(arguments, "initial_prompt")
+                        .filter(|_| optional_str(arguments, "resume_id").is_none())
+                        .map(str::to_string),
                 })?
                 .0;
             match response {
@@ -4886,6 +4903,12 @@ mod daemon_surface {
                     // with.
                     powers: None,
                     initial_prompt: synthetic,
+                    // Nothing to tell it: a member coming back on its own
+                    // thread already carries the words that thread opened
+                    // with, and one coming back without a thread is typed
+                    // the caption above, which the recorder hears for
+                    // itself.
+                    first_prompt: None,
                 };
                 match self.transact(&request) {
                     Ok((DaemonResponse::Launched { .. }, _)) => outcomes.push(outcome(
@@ -4936,6 +4959,9 @@ mod daemon_surface {
                     parent: launching_session(),
                     powers: None,
                     initial_prompt: Some(caption),
+                    // A resume, so the same as its members: the caption is
+                    // typed in and the record already holds the opening.
+                    first_prompt: None,
                 })
                 .map_err(|error| match fleet_already_back(&master.id, &outcomes) {
                     Some(note) => error.context(note),
