@@ -145,7 +145,9 @@ mod platform {
             TalkKind, TalkMessage, TalkPage, TalkQueued, TalkScope, TalkStore, TalkUndelivered,
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
-        terminal_session::{CodexActivity, InlineScrollback, render_history_rows, resize_parser},
+        terminal_session::{
+            CodexActivity, InlineScrollback, page_has_content, render_history_rows, resize_parser,
+        },
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -6972,11 +6974,26 @@ mod platform {
                 offset_from_bottom,
                 wanted,
             )?;
+            // A page with nothing on it is not a picture of the screen, it is
+            // a window that failed to draw one. An agent repainting in place
+            // writes only what changed and puts the cursor back where it was,
+            // so a window opening after the last full paint replays those moves
+            // over a blank grid: it renders a screenful of blanks, and a
+            // screenful is what the read is looking for, so it used to answer
+            // with that and stop. A session then reads as empty to every agent
+            // asking after it while a person is looking straight at its screen.
+            //
+            // Only where the window scrolled nothing off either, though. That
+            // is what tells a window which reached nothing from a screen which
+            // is genuinely blank -- a shell just after `clear` renders an empty
+            // page over a scrollback that is full, and widening for that would
+            // read the whole log back on every screen read.
+            let barren = total_lines <= usize::from(rows.max(5)) && !page_has_content(&page);
             // Reaching the row that was asked for is not enough: the rows above
             // it have to be there too. A page that arrives short cannot be
             // scrolled through, and the request for the next one rounds back to
             // this same offset and asks for it again.
-            let filled = total_lines.saturating_sub(actual_offset) >= wanted;
+            let filled = !barren && total_lines.saturating_sub(actual_offset) >= wanted;
             // Widening is how the read reaches rows it has not seen yet, so a
             // window that quadrupled and came back holding no more of them has
             // reached every row the log has to give.
@@ -6988,7 +7005,12 @@ mod platform {
             // is a hundred and twenty-eight megabytes seeked to and fed through
             // a fresh emulator to answer with that same screenful -- per screen
             // read, and once a second for every agent sitting in a wait.
-            let widened_in_vain = reached.is_some_and(|before| total_lines <= before);
+            //
+            // A barren window is the one case where finding no more rows says
+            // nothing: it did not find the first screenful either, so there is
+            // no screenful here to answer with and stopping only fixes the
+            // blanks in place.
+            let widened_in_vain = !barren && reached.is_some_and(|before| total_lines <= before);
             if (actual_offset >= offset_from_bottom && filled)
                 || widened_in_vain
                 || start == 0
@@ -8486,6 +8508,55 @@ mod platform {
             );
             let page = String::from_utf8_lossy(&read.rows).into_owned();
             assert!(page.contains("paint8000"), "the newest paint: {page:?}");
+        }
+
+        #[test]
+        fn a_history_page_keeps_reading_back_while_it_has_reconstructed_nothing() {
+            // What Claude Code's log looks like once it has settled: the screen
+            // painted once, and then hours of a spinner walking the cursor up,
+            // redrawing the one cell that turns, and walking back down. None of
+            // that repaints the screen and none of it scrolls, so a window
+            // opening inside it replays cursor moves over a blank grid and
+            // renders a screenful of blanks -- which the read took for the
+            // screen and answered with, leaving every agent asking after that
+            // session an empty picture of a window somebody was reading.
+            let path = test_state("render-history-barren")
+                .paths
+                .history
+                .join("log.ansi");
+            let mut log = String::new();
+            for row in 1..=5 {
+                log.push_str(&format!("\x1b[{row};1H\x1b[Kpainted{row}"));
+            }
+            // Walk from the home row down to the one above the last, which
+            // draws nothing and scrolls nothing, until the walking alone is
+            // several times the window the read starts with.
+            for _ in 0..2_400 {
+                log.push_str("\x1b[H\r\n\r\n\r\n");
+            }
+            fs::write(&path, &log).unwrap();
+            assert!(
+                log.len() > 4 * 4 * 1024,
+                "the walking has to outlast two widenings: {}",
+                log.len()
+            );
+
+            // Asked for a screenful, which is what reading a session's screen
+            // asks for -- and what a screenful of blanks answers, so this is
+            // the page the old read stopped on. Asking for more than the screen
+            // holds happened to escape it: the blanks could not fill a page
+            // deeper than they were.
+            let read = render_history_file(&path, 20, 5, 0, 5, 4 * 1024, 1024 * 1024).unwrap();
+
+            let page = String::from_utf8_lossy(&read.rows).into_owned();
+            assert!(
+                page.contains("painted1") && page.contains("painted5"),
+                "the screen the session is showing: {page:?}"
+            );
+            assert!(
+                read.reached_start,
+                "which is only reachable from the top of the log"
+            );
         }
 
         #[test]

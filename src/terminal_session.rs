@@ -932,6 +932,48 @@ pub(crate) fn render_history_rows(
     Ok((page, total, actual_offset))
 }
 
+/// Whether a page from [`render_history_rows`] has anything drawn on it.
+///
+/// Rows come back carrying their attributes, so a page of blank rows is not an
+/// empty one: it is a separator and a reset per row and nothing else. A caller
+/// asking whether a replay reconstructed a screen at all has to look past
+/// those, which means stepping over the escapes rather than trimming them off.
+#[cfg(any(unix, test))]
+pub(crate) fn page_has_content(page: &[u8]) -> bool {
+    let mut rest = page;
+    while let Some((byte, tail)) = rest.split_first() {
+        if *byte == 0x1b {
+            rest = past_escape(tail);
+        } else if byte.is_ascii_whitespace() {
+            rest = tail;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// What follows the escape sequence whose bytes after the `ESC` are `body`.
+///
+/// A control sequence runs to its final byte and anything else is two bytes
+/// long; neither leaves a mark on the screen, so the only question here is
+/// where the next byte that might is.
+#[cfg(any(unix, test))]
+fn past_escape(body: &[u8]) -> &[u8] {
+    let Some((introducer, rest)) = body.split_first() else {
+        return body;
+    };
+    if *introducer != b'[' {
+        return rest;
+    }
+    match rest.iter().position(|byte| (0x40..=0x7e).contains(byte)) {
+        Some(final_byte) => &rest[final_byte + 1..],
+        // An unterminated sequence runs off the end of the page, so there is
+        // nothing after it to find.
+        None => &[],
+    }
+}
+
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
     let (previous_height, previous_width) = parser.screen().size();
     if height < previous_height && !parser.screen().alternate_screen() {
@@ -1240,6 +1282,31 @@ mod tests {
         let older = String::from_utf8_lossy(&page).into_owned();
         assert_eq!(offset, 1);
         assert!(older.contains("$ claude"), "{older}");
+    }
+
+    /// A page of blank rows still carries a reset per row, so a caller cannot
+    /// ask whether the replay drew anything by asking whether the page is
+    /// empty. Reading a session whose window reconstructed nothing turns on
+    /// telling those two apart.
+    #[test]
+    fn a_page_of_blank_rows_reads_as_nothing_drawn() {
+        let blank = render_history_rows(&b"\r\n\r\n\r\n"[..], 40, 6, 0, 6)
+            .unwrap()
+            .0;
+        assert!(!blank.is_empty(), "the rows are there: {blank:?}");
+        assert!(!page_has_content(&blank), "but nothing is on them");
+
+        let drawn = render_history_rows(&b"\r\n\r\nhello\r\n"[..], 40, 6, 0, 6)
+            .unwrap()
+            .0;
+        assert!(page_has_content(&drawn));
+
+        // Colour is not content: an agent painting a blank row in its own
+        // background leaves a sequence behind and no cell anybody can read.
+        assert!(!page_has_content(b"\x1b[38;2;153;153;153m\x1b[m\n\x1b[m"));
+        // Nor is a sequence the page was cut off in the middle of.
+        assert!(!page_has_content(b"\x1b[38;2;153"));
+        assert!(page_has_content(b"\x1b[mx"));
     }
 
     /// An agent that closes the alternate screen leaves the shell's own
