@@ -4224,6 +4224,22 @@ mod platform {
         if !Path::new(&path).is_dir() {
             bail!("working directory does not exist: {path}");
         }
+        // Nobody is in front of a session at the moment it starts, and before
+        // a runtime will run at all it wants to know whether this directory
+        // may be worked in. Asked on a screen no one is watching, that
+        // question does not get answered: the session shows a dialog instead
+        // of a prompt box, and a message sent to it waits for an input box
+        // that never appears. The directory is the one this launch named -
+        // muxloom's own scratch, or a path a person typed into a form - so
+        // recording it as trusted says back what starting a session there
+        // already said. Best effort: a config that cannot be written leaves
+        // the launch exactly where it was, stopped on a dialog.
+        if let Ok(kind) = kind.parse::<AgentKind>()
+            && let Err(error) =
+                crate::mcp_register::trust_directory_for_this_daemon(kind, Path::new(&path))
+        {
+            eprintln!("muxloomd could not record {path} as trusted for {kind}: {error:#}");
+        }
         // A launch under a *new* id can still be somebody's resume: until
         // dashboards ask for the archived id itself, reopening a conversation
         // minted a fresh number, and that split is what orphaned fleets onto

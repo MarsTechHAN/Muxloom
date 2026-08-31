@@ -354,7 +354,13 @@ Reporting 的程序。
 never`、OpenCode `--auto`（Pi 本来就不问）。在 `args` 里指定了模式——哪怕是更严格的——就用
 指定的那个。Daemon 在真正拉起进程时会再确认一次，所以即使发起启动的是升级前遗留的旧
 Controller，会话也不会停在第一个确认框上；它只会把某个 Runtime 的参数加到该 Runtime 自己的
-可执行文件上，不会加到 Wrapper 上。环境变量使用下面的非 JSON 格式，并默认注入 Install 和 Launch；legacy
+可执行文件上，不会加到 Wrapper 上。出于同样的原因，启动时指定的工作目录会在进程拉起之前
+先记为受信任——Claude 写 `~/.claude.json` 的 `hasTrustDialogAccepted`，Codex 写
+`~/.codex/config.toml` 里 `[projects]` 下的 `trust_level = "trusted"`。否则 Runtime 一上来
+就问"你信任这个目录里的文件吗"，而这个问题没有人可问：会话显示的是对话框而不是输入框，
+发给它的消息会一直等一个永远不会出现的输入框。你已经表过态的目录保留你的答案，包括拒绝。
+在 daemon 环境里设 `MUXLOOM_TRUST_DIRECTORY=0` 可以完全不碰这两个文件，自己去点对话框。
+环境变量使用下面的非 JSON 格式，并默认注入 Install 和 Launch；legacy
 Shell Probe 也会注入，但 daemon-native executable probe 不会：
 
 ```text

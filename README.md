@@ -650,6 +650,15 @@ args = ["--sandbox", "read-only"]
   a session started through a muxloom left over from an older build still comes
   up unattended rather than stopping at its first prompt; it only ever adds a
   runtime's flags to that runtime's own executable, never to a wrapper.
+- For the same reason, the working directory a launch names is recorded as
+  trusted for that runtime before it starts — `hasTrustDialogAccepted` in
+  `~/.claude.json`, `trust_level = "trusted"` under `[projects]` in
+  `~/.codex/config.toml`. Otherwise the runtime opens on "do you trust the files
+  in this folder?", which is a question to nobody: the session shows a dialog
+  instead of a prompt box and everything sent to it waits for an input box that
+  never appears. A directory you have already ruled on keeps your answer,
+  including a refusal. Set `MUXLOOM_TRUST_DIRECTORY=0` in the daemon's
+  environment to leave both files alone and answer the dialogs yourself.
 - `environment` uses shell-style assignments
   (`HTTP_PROXY=http://proxy:8118 TOKEN='two words'`). Global values merge with
   the selected machine's overrides.

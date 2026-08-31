@@ -20,6 +20,11 @@
 //! else, a file that does not parse is left exactly as it is, and
 //! `MUXLOOM_MCP_REGISTER=0` turns the whole thing off (`MUXLOOM_SKILL=0` turns
 //! off just the skill, `MUXLOOM_PI=0` turns off just the Pi extension).
+//!
+//! The same care covers the one other thing muxloom writes into an agent's own
+//! configuration: the record that a working directory may be worked in, which
+//! a session started by somebody who is not sitting in front of it would
+//! otherwise stop and ask about. `MUXLOOM_TRUST_DIRECTORY=0` turns that off.
 
 use std::{
     collections::BTreeMap,
@@ -30,8 +35,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::model::AgentKind;
+
 /// The name the entry carries in every agent's configuration.
 const SERVER_NAME: &str = "muxloom";
+
+/// Claude Code's own name for "this directory has been vouched for".
+const CLAUDE_TRUSTED: &str = "hasTrustDialogAccepted";
 
 /// The agents the daemon registers a skill with. Each is the relative path from
 /// `home` to that agent's `SKILL.md` under its own `skills` directory.
@@ -951,6 +961,160 @@ fn toml_string(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// Record that a working directory may be worked in, in whichever way the
+/// runtime about to open it asks.
+///
+/// The counterpart to `runtime::unattended_mode`, for the question that comes
+/// before any of those: Claude Code's "do you trust the files in this folder",
+/// Codex's project trust. Both are asked once per directory, before the agent
+/// will do anything at all — and a runtime stopped on one is showing a dialog
+/// rather than a prompt box, which is not a state waiting fixes. A message
+/// sent to the session waits for an input box that never appears and comes
+/// back undelivered half an hour later; the person who started the session
+/// from a chat app never sees the question, because it is on a screen they are
+/// not looking at.
+///
+/// The directory is not one an agent went and found. It is the one the launch
+/// named: muxloom's own scratch directory, or a path a person typed into a
+/// launch form. Recording it as trusted answers, on their behalf, a question
+/// they answered by starting a session there.
+///
+/// Only for the runtimes that keep such a record. OpenCode keeps none — its
+/// permissions ride on `--auto` — and Pi asks nothing to begin with.
+///
+/// Every failure here is the caller's to shrug off: an unwritable config makes
+/// the first launch stop on a dialog, which is where it stopped before.
+pub fn trust_directory_for_this_daemon(kind: AgentKind, directory: &Path) -> Result<Vec<PathBuf>> {
+    if switched_off("MUXLOOM_TRUST_DIRECTORY") {
+        return Ok(Vec::new());
+    }
+    let Some(home) = home_directory() else {
+        bail!("no home directory to record a trusted directory in");
+    };
+    trust_directory(&home, kind, directory)
+}
+
+/// The same, for a named home directory. See
+/// [`trust_directory_for_this_daemon`].
+pub fn trust_directory(home: &Path, kind: AgentKind, directory: &Path) -> Result<Vec<PathBuf>> {
+    // Only an absolute path names one directory. A relative one would be
+    // recorded against whatever the agent's own cwd turns out to be, which is
+    // a trust record for a directory nobody chose.
+    if !directory.is_absolute() {
+        bail!("{} is not an absolute path", directory.display());
+    }
+    let directory = directory.to_string_lossy();
+    let mut written = Vec::new();
+    match kind {
+        AgentKind::Claude => {
+            let path = home.join(".claude.json");
+            if trust_with_claude(&path, &directory)? {
+                written.push(path);
+            }
+        }
+        AgentKind::Codex => {
+            let path = home.join(".codex").join("config.toml");
+            if trust_with_codex(&path, &directory)? {
+                written.push(path);
+            }
+        }
+        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => {}
+    }
+    Ok(written)
+}
+
+/// Claude Code keeps a per-directory record under `projects` in
+/// `~/.claude.json`, the same file its own state lives in, so it is read,
+/// amended and written back whole. Only the one flag is set: everything else
+/// under that directory's entry is the agent's, including whatever it has
+/// already recorded about this directory.
+fn trust_with_claude(path: &Path, directory: &str) -> Result<bool> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => json!({}),
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let Some(object) = root.as_object_mut() else {
+        bail!("{} does not hold a JSON object", path.display());
+    };
+    let projects = object
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .with_context(|| format!("projects in {} is not an object", path.display()))?;
+    let project = projects
+        .entry(directory)
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .with_context(|| format!("{directory} in {} is not an object", path.display()))?;
+    // Already trusted is the usual case after the first launch, and a file
+    // this size is one every running agent is also writing: not rewriting it
+    // is worth the read.
+    if project.get(CLAUDE_TRUSTED) == Some(&json!(true)) {
+        return Ok(false);
+    }
+    project.insert(CLAUDE_TRUSTED.into(), json!(true));
+    let mut text = serde_json::to_string_pretty(&root).context("failed to encode the config")?;
+    text.push('\n');
+    write_atomically(path, text.as_bytes())?;
+    Ok(true)
+}
+
+/// Codex keeps the same record as a `[projects."<dir>"]` table in
+/// `~/.codex/config.toml`. That file is hand-written and commented, so the
+/// table is appended textually rather than the file regenerated, and the
+/// result has to parse before it is allowed to replace what the user had.
+fn trust_with_codex(path: &Path, directory: &str) -> Result<bool> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let parsed: toml::Value = toml::from_str(&existing)
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    // A directory the user has already said something about is left saying it,
+    // even when what they said is that they do not trust it.
+    if parsed
+        .get("projects")
+        .and_then(|projects| projects.get(directory))
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let mut text = existing;
+    while text.ends_with("\n\n") {
+        text.pop();
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "[projects.{}]\ntrust_level = \"trusted\"\n",
+        toml_string(directory)
+    ));
+    if toml::from_str::<toml::Value>(&text).is_err() {
+        bail!(
+            "leaving {} alone: rewriting it would not have parsed",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    write_atomically(path, text.as_bytes())?;
+    Ok(true)
+}
+
 /// Replace a file the user also writes to without ever leaving a half-written
 /// one behind: the new text lands beside it and is renamed over it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1017,6 +1181,89 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// A session started from a chat app has nobody in front of it to answer
+    /// "do you trust the files in this folder", and a runtime waiting on that
+    /// shows no prompt box at all — so the message it was started for is
+    /// undeliverable for as long as the question stands.
+    #[test]
+    fn the_directory_a_launch_names_is_trusted_before_the_runtime_asks_about_it() {
+        let home = scratch("trust");
+        let work = home.join("scratch/muxloomd-temporal-claude-1");
+
+        let written = trust_directory(&home, AgentKind::Claude, &work).unwrap();
+        assert_eq!(written, vec![home.join(".claude.json")]);
+        let claude: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            claude["projects"][work.to_string_lossy().as_ref()][CLAUDE_TRUSTED],
+            json!(true)
+        );
+        // Said once. The file is one every running agent also writes, so a
+        // launch into a directory already trusted rewrites nothing.
+        assert!(
+            trust_directory(&home, AgentKind::Claude, &work)
+                .unwrap()
+                .is_empty()
+        );
+
+        let written = trust_directory(&home, AgentKind::Codex, &work).unwrap();
+        assert_eq!(written, vec![home.join(".codex/config.toml")]);
+        let codex: toml::Value =
+            toml::from_str(&fs::read_to_string(home.join(".codex/config.toml")).unwrap()).unwrap();
+        assert_eq!(
+            codex["projects"][work.to_string_lossy().as_ref()]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert!(
+            trust_directory(&home, AgentKind::Codex, &work)
+                .unwrap()
+                .is_empty()
+        );
+
+        // The runtimes that keep no such record are not given one invented for
+        // them, and a relative path names no directory in particular.
+        for kind in [AgentKind::OpenCode, AgentKind::Pi, AgentKind::Terminal] {
+            assert!(trust_directory(&home, kind, &work).unwrap().is_empty());
+        }
+        assert!(trust_directory(&home, AgentKind::Claude, Path::new("rel")).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// What a person put in these files is theirs. A directory they have
+    /// already ruled on keeps their answer, including when it is "no".
+    #[test]
+    fn a_directory_the_user_has_already_ruled_on_keeps_their_answer() {
+        let home = scratch("trust-said");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "# mine\nmodel = \"o3\"\n\n[projects.\"/work/theirs\"]\ntrust_level = \"untrusted\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            trust_directory(&home, AgentKind::Codex, Path::new("/work/theirs"))
+                .unwrap()
+                .is_empty()
+        );
+        let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(text.contains("untrusted"), "{text}");
+        assert!(text.contains("# mine"), "the comment survives: {text}");
+
+        // A different directory is appended without disturbing either.
+        trust_directory(&home, AgentKind::Codex, Path::new("/work/ours")).unwrap();
+        let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(text.contains("# mine"), "{text}");
+        assert!(text.contains("untrusted"), "{text}");
+        let codex: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            codex["projects"]["/work/ours"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(codex["model"].as_str(), Some("o3"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
