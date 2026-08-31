@@ -175,6 +175,13 @@ mod platform {
     /// growing for days from being read back to its beginning: the render costs
     /// roughly two seconds here, and an attach waits for it.
     const SCROLLBACK_SEED_BYTES_MAX: u64 = 128 * 1024 * 1024;
+    /// How much of one log line a search holds at a time. A capture is not
+    /// really made of lines: an agent that paints its screen puts the cursor
+    /// back where it wants it instead of ending a line, so a whole session can
+    /// arrive as a single line hundreds of megabytes long. Reading such a line
+    /// whole to look for a word in it means holding all of it at once, and case
+    /// folding it means holding it twice over again.
+    const SEARCH_LINE_CHUNK: usize = 256 * 1024;
     static METADATA_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     /// Opening a TCP stream to a host the far end can reach. Served by the
     /// daemon, or by the bridge when it talks to a daemon too old to have it.
@@ -6672,50 +6679,117 @@ mod platform {
         // fresh allocation per line, and a capture runs to hundreds of
         // megabytes: it costs about ten times what the byte scan does.
         let folding = query_needs_unicode_folding(&query);
+        // A word can fall across the seam between one stretch of a line and the
+        // next, so this much of the stretch before is searched again with the
+        // one after. Folding can lengthen what it folds, so the seam is
+        // measured generously rather than exactly.
+        let seam_bytes = query.len().saturating_mul(4).min(SEARCH_LINE_CHUNK);
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
+        let mut seam: Vec<u8> = Vec::new();
         let mut line_number = 0usize;
         let mut matches = Vec::new();
-        loop {
-            buffer.clear();
-            if reader.read_until(b'\n', &mut buffer)? == 0 {
-                break;
+        // Whether this stretch carries on the line the last one held, and
+        // whether that line has already been answered with. A line is reported
+        // once however many stretches it takes to read.
+        let mut continuing = false;
+        let mut reported = false;
+        while let Some(ended) = read_line_stretch(&mut reader, &mut buffer, SEARCH_LINE_CHUNK)? {
+            if !continuing {
+                line_number += 1;
+                reported = false;
             }
-            line_number += 1;
-            let hit = if folding {
-                String::from_utf8_lossy(&buffer)
-                    .to_lowercase()
-                    .contains(&query)
-            } else {
-                line_contains_folded(&buffer, query.as_bytes())
-            };
-            if !hit {
-                continue;
+            continuing = !ended;
+            if !reported {
+                let hit = search_stretch(&buffer, &query, folding) || {
+                    !seam.is_empty() && {
+                        seam.extend_from_slice(&buffer[..seam_bytes.min(buffer.len())]);
+                        search_stretch(&seam, &query, folding)
+                    }
+                };
+                // The text answered with is the stretch the word was found in,
+                // which for a line that fits in one is the line itself.
+                if hit && let Some(found) = history_match(&buffer, line_number) {
+                    matches.push(found);
+                    reported = true;
+                    if matches.len() > max_matches {
+                        matches.remove(0);
+                    }
+                }
             }
-            let text = String::from_utf8_lossy(&buffer);
-            let text = text
-                .trim()
-                .chars()
-                .filter(|character| !character.is_control())
-                .take(500)
-                .collect::<String>();
-            if text.is_empty() {
-                continue;
-            }
-            let lower = text.to_lowercase();
-            matches.push(DaemonHistoryMatch {
-                recap: lower.contains("※ recap:")
-                    || lower.contains("※ recap：")
-                    || lower.starts_with("recap:"),
-                line_number,
-                text,
-            });
-            if matches.len() > max_matches {
-                matches.remove(0);
+            seam.clear();
+            if !ended {
+                seam.extend_from_slice(&buffer[buffer.len().saturating_sub(seam_bytes)..]);
             }
         }
         Ok(matches)
+    }
+
+    /// Read the next stretch of a log line into `buffer`: at most `cap` bytes,
+    /// or through the newline that ends the line, whichever comes first.
+    ///
+    /// `None` is the end of the file. `Some(true)` means the line ended inside
+    /// what was read, `Some(false)` that it runs on into the next stretch.
+    fn read_line_stretch(
+        reader: &mut impl BufRead,
+        buffer: &mut Vec<u8>,
+        cap: usize,
+    ) -> io::Result<Option<bool>> {
+        buffer.clear();
+        while buffer.len() < cap {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // The end of the file ends the line it was in the middle of.
+                return Ok(match buffer.is_empty() {
+                    true => None,
+                    false => Some(true),
+                });
+            }
+            let room = (cap - buffer.len()).min(available.len());
+            match available[..room].iter().position(|&byte| byte == b'\n') {
+                Some(at) => {
+                    buffer.extend_from_slice(&available[..=at]);
+                    reader.consume(at + 1);
+                    return Ok(Some(true));
+                }
+                None => {
+                    buffer.extend_from_slice(&available[..room]);
+                    reader.consume(room);
+                }
+            }
+        }
+        Ok(Some(false))
+    }
+
+    fn search_stretch(bytes: &[u8], query: &str, folding: bool) -> bool {
+        match folding {
+            true => String::from_utf8_lossy(bytes)
+                .to_lowercase()
+                .contains(query),
+            false => line_contains_folded(bytes, query.as_bytes()),
+        }
+    }
+
+    fn history_match(bytes: &[u8], line_number: usize) -> Option<DaemonHistoryMatch> {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text
+            .trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(500)
+            .collect::<String>();
+        if text.is_empty() {
+            return None;
+        }
+        let lower = text.to_lowercase();
+        Some(DaemonHistoryMatch {
+            recap: lower.contains("※ recap:")
+                || lower.contains("※ recap：")
+                || lower.starts_with("recap:"),
+            line_number,
+            text,
+        })
     }
 
     /// Whether a query can only be answered by case folding the text it is
@@ -7881,6 +7955,57 @@ mod platform {
             // A read that does ask for a line still gets the newest one.
             let page = read_history_file(&path, 5, 5, 0, 1).unwrap();
             assert_eq!(String::from_utf8_lossy(&page.rows), "line5\r\n");
+        }
+
+        #[test]
+        fn a_search_reads_a_line_longer_than_a_screen_in_stretches() {
+            // A capture is not made of lines. An agent that paints its screen
+            // puts the cursor back where it wants it rather than ending a line,
+            // so a whole session arrives as one line -- four hundred megabytes
+            // of it on this machine, holding two newlines. The search read a
+            // line whole before looking at it: one allocation the size of the
+            // session, and two more that size again to case fold it.
+            let state = test_state("search-long-line");
+            let path = state.paths.history.join("paint.ansi");
+            let mut log = String::from("first line of the log\r\n");
+            while log.len() < SEARCH_LINE_CHUNK * 3 {
+                log.push_str("\x1b[1;1H\x1b[Kpaint");
+            }
+            log.push_str("the needle we are after");
+            fs::write(&path, &log).unwrap();
+
+            // Finding it at all means the scan carried on past the first
+            // stretch, and found it once rather than once per stretch.
+            let found = search_history_file(&path, "needle we are after", 12).unwrap();
+            assert_eq!(found.len(), 1, "the line that held it: {found:?}");
+            assert_eq!(found[0].line_number, 2, "the line after the first");
+
+            // And no stretch of that line was ever held whole.
+            let mut reader = BufReader::new(File::open(&path).unwrap());
+            let mut buffer = Vec::new();
+            let ended = read_line_stretch(&mut reader, &mut buffer, SEARCH_LINE_CHUNK).unwrap();
+            assert_eq!(ended, Some(true), "the first line ends where it ends");
+            assert_eq!(buffer, b"first line of the log\r\n");
+            let ended = read_line_stretch(&mut reader, &mut buffer, SEARCH_LINE_CHUNK).unwrap();
+            assert_eq!(ended, Some(false), "and the one after it runs on");
+            assert_eq!(
+                buffer.len(),
+                SEARCH_LINE_CHUNK,
+                "a stretch of the line, not the line"
+            );
+
+            // A word lying across the seam between two stretches is in neither
+            // of them, so the tail of one is searched again with the next.
+            let seam = state.paths.history.join("seam.ansi");
+            let needle = "straddling-the-seam";
+            let mut log = String::new();
+            while log.len() < SEARCH_LINE_CHUNK - 5 {
+                log.push('x');
+            }
+            log.push_str(needle);
+            fs::write(&seam, &log).unwrap();
+            let found = search_history_file(&seam, needle, 12).unwrap();
+            assert_eq!(found.len(), 1, "a word split across the seam: {found:?}");
         }
 
         #[test]
