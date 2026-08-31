@@ -510,6 +510,13 @@ mod platform {
         /// before it stops being the last word on the session, so the reading
         /// is kept rather than taken again from whatever is on screen now.
         screen_recap: Mutex<Option<String>>,
+        /// Whether the final reading has been taken off a stopped session's
+        /// screen. Nothing paints a session that has died or been archived, so
+        /// the picture is finished and one reading of it is every reading of
+        /// it — but the record stays in the map for as long as the daemon
+        /// lives, and every round that lists it used to lay that same grid out
+        /// as text again.
+        screen_settled: AtomicBool,
         /// What a `notify` trigger left for whoever looks next. It reads as an
         /// attention reason until someone types into the session, which is the
         /// one signal that the message was seen.
@@ -4325,6 +4332,7 @@ mod platform {
             first_prompt_armed: AtomicBool::new(seed.is_none()),
             screen_rebuilt: AtomicBool::new(false),
             screen_recap: Mutex::new(None),
+            screen_settled: AtomicBool::new(false),
             notice: Mutex::new(None),
             alert_pending: AtomicBool::new(false),
             alert_edge: Mutex::new(None),
@@ -5189,6 +5197,7 @@ mod platform {
             // differential-renders, so its first attach forces a repaint.
             screen_rebuilt: AtomicBool::new(true),
             screen_recap: Mutex::new(None),
+            screen_settled: AtomicBool::new(false),
             notice: Mutex::new(None),
             // A child that fell onto its question while no daemon was watching
             // gets its edge marked on the first look: no edge is recorded yet,
@@ -5671,8 +5680,11 @@ mod platform {
         /// keystroke at a time, each repaint appended to the last. Rendering
         /// first is what makes the difference between reading a sentence and
         /// reading the pixels it was written with.
-        fn recap_on_screen(&self, kind: AgentKind, visible_screen: &str) -> Option<String> {
-            let drawn = extract_recap(kind, visible_screen);
+        /// `visible_screen` is `None` for a screen nothing will paint again:
+        /// the final reading has already been taken and kept, and drawing the
+        /// grid a second time could only reach the same answer.
+        fn recap_on_screen(&self, kind: AgentKind, visible_screen: Option<&str>) -> Option<String> {
+            let drawn = visible_screen.and_then(|screen| extract_recap(kind, screen));
             let mut kept = self
                 .screen_recap
                 .lock()
@@ -5708,12 +5720,26 @@ mod platform {
                 // below wants the same picture of the same moment - so taking
                 // it twice would not only cost twice, it would let the screen
                 // move in between and answer two questions about two screens.
-                let visible_screen = self
-                    .screen
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .screen()
-                    .contents();
+                //
+                // A stopped session is where that stops being true. Nothing
+                // paints one, so its picture is finished: the recap is the only
+                // reading still wanted from it, and once that has been taken it
+                // has been taken for good. The record stays in the map for as
+                // long as the daemon runs, so without this the share of every
+                // listing spent redrawing screens that cannot move grows with
+                // uptime -- a third of them here, after a night.
+                let stopped = snapshot.dead || snapshot.archived;
+                let visible_screen =
+                    match stopped && self.screen_settled.swap(true, Ordering::Relaxed) {
+                        true => None,
+                        false => Some(
+                            self.screen
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .screen()
+                                .contents(),
+                        ),
+                    };
                 // What the runtime wrote down about itself beats anything read
                 // off its screen: it is the turn as the agent meant it, not
                 // the frame the terminal happened to be painting.
@@ -5739,14 +5765,17 @@ mod platform {
                 // had. What it wrote down is the turn as the agent meant it;
                 // the screen is a guess at the same thing.
                 snapshot.recap =
-                    native_recap.or_else(|| self.recap_on_screen(kind, &visible_screen));
-                if snapshot.dead || snapshot.archived {
+                    native_recap.or_else(|| self.recap_on_screen(kind, visible_screen.as_deref()));
+                if stopped {
                     snapshot.pid = None;
                     snapshot.working = false;
                     snapshot.needs_attention = false;
                     snapshot.attention_reason = None;
                     snapshot.composer = None;
                 } else {
+                    // A running session is never the settled one, so the screen
+                    // was drawn above and every reading below has it.
+                    let visible_screen = visible_screen.unwrap_or_default();
                     snapshot.composer = composer(kind, &visible_screen);
                     let patterns = self
                         .attention_patterns
@@ -8846,6 +8875,102 @@ mod platform {
             assert_eq!(notice().as_deref(), Some("it said ready"));
 
             discard_root(state.paths.root.clone());
+        }
+
+        #[test]
+        fn a_stopped_session_is_read_off_its_screen_once_and_never_again() {
+            let state = test_state("settled-screen");
+            let id = "muxloomd-terminal-settled-1";
+            launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "over".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                222,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let session = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .map(Arc::clone)
+                .unwrap();
+
+            // Holding the screen is how the question gets asked: a reading that
+            // draws the grid has to wait here, and one that does not, does not.
+            let drawn_while = |session: &Arc<ManagedSession>| {
+                let held = session
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let probe = Arc::clone(session);
+                let reading = thread::spawn(move || probe.snapshot());
+                thread::sleep(Duration::from_millis(200));
+                let waited = !reading.is_finished();
+                drop(held);
+                reading.join().unwrap();
+                waited
+            };
+
+            // A running session is read off its screen every time, because its
+            // screen is what it is doing now.
+            assert!(drawn_while(&session), "a running session is drawn");
+
+            // Stopped, nothing will paint it again. The next reading still
+            // takes the picture -- and it is the last one that ever will.
+            session.archived.store(true, Ordering::Relaxed);
+            assert!(
+                drawn_while(&session),
+                "the final reading is still taken off the screen"
+            );
+            assert!(
+                !drawn_while(&session),
+                "a session nothing can paint was laid out as text again"
+            );
+
+            // Death is the same door, and marking it walks through the final
+            // reading itself: persisting the record is what takes it.
+            let other = "muxloomd-terminal-settled-2";
+            launch_session(
+                &state,
+                other.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "over".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                223,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            let other = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(other)
+                .map(Arc::clone)
+                .unwrap();
+            other.mark_dead();
+            assert!(
+                !drawn_while(&other),
+                "a dead session was laid out as text again"
+            );
+            assert!(other.snapshot().dead, "and it is still the same record");
         }
 
         #[test]
