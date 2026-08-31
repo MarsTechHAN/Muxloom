@@ -682,6 +682,18 @@ impl BridgeConnection {
             .find(|session| session.id == session_id))
     }
 
+    /// One session by name, running or filed.
+    ///
+    /// For the questions an archived session still answers - what it was, and
+    /// whether it ended - where reaching for the list to answer them carries
+    /// every conversation the machine has ever held.
+    pub fn known_session(&self, session_id: &str) -> Result<Option<DaemonSession>> {
+        Ok(self
+            .sessions(false, Some(session_id.to_string()))?
+            .into_iter()
+            .find(|session| session.id == session_id))
+    }
+
     /// Who begat whom on this machine, for a round that only weighs whether one
     /// session may write into another.
     ///
@@ -2453,6 +2465,16 @@ impl BridgePool {
     /// One running session, for a round that is about one session.
     pub fn live_session(&self, target: &Target, session_id: &str) -> Result<Option<DaemonSession>> {
         self.connection_for_target(target)?.live_session(session_id)
+    }
+
+    /// One session by name, running or filed.
+    pub fn known_session(
+        &self,
+        target: &Target,
+        session_id: &str,
+    ) -> Result<Option<DaemonSession>> {
+        self.connection_for_target(target)?
+            .known_session(session_id)
     }
 
     /// Who begat whom, without the sessions themselves.

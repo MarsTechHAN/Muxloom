@@ -2553,7 +2553,7 @@ fn talk_wait(
     arguments: &Value,
     mut filter: TalkFilter,
     mut read: impl FnMut(&TalkFilter) -> Result<TalkPage>,
-    sessions: impl FnOnce() -> Vec<DaemonSession>,
+    holder: impl FnMut(&str) -> Option<DaemonSession>,
 ) -> Result<String> {
     let wait =
         Duration::from_secs(optional_u64(arguments, "wait_seconds", 0).min(TALK_MAX_WAIT_SECONDS));
@@ -2567,7 +2567,7 @@ fn talk_wait(
             // the sessions holding them are doing, so the next move is a fact
             // rather than a guess.
             let outstanding = if page.messages.is_empty() && !wait.is_zero() {
-                unanswered(&filter, &mut read, sessions)
+                unanswered(&filter, &mut read, holder)
             } else {
                 Vec::new()
             };
@@ -2609,7 +2609,7 @@ fn talk_wait(
 fn unanswered(
     filter: &TalkFilter,
     read: &mut impl FnMut(&TalkFilter) -> Result<TalkPage>,
-    sessions: impl FnOnce() -> Vec<DaemonSession>,
+    mut holder: impl FnMut(&str) -> Option<DaemonSession>,
 ) -> Vec<Value> {
     let Some(me) = filter.session_id.clone() else {
         return Vec::new();
@@ -2673,13 +2673,18 @@ fn unanswered(
     if waiting.is_empty() {
         return Vec::new();
     }
-    let sessions = sessions();
     let now = now_ms();
     waiting
         .into_iter()
         .map(|message| {
             let to = message.to.as_ref().expect("filtered to addressed messages");
-            let session = sessions.iter().find(|session| session.id == to.session_id);
+            // Asked for by name, one at a time. There is rarely more than a
+            // message or two outstanding, and the list these used to be found
+            // in carries every conversation the machine has ever held, each
+            // running one drawn and classified to answer - fetched at the end
+            // of every wait that came back empty, which is most of them.
+            let session = holder(&to.session_id);
+            let session = session.as_ref();
             json!({
                 "message_id": message.id,
                 "to": { "machine": to.machine, "session_id": to.session_id },
@@ -3439,7 +3444,7 @@ impl ControllerControl {
             arguments,
             talk_filter(arguments)?,
             |filter| pool.talk_read(&target, filter.clone()),
-            || pool.list_sessions(&target).unwrap_or_default(),
+            |session_id| pool.known_session(&target, session_id).ok().flatten(),
         )
     }
 
@@ -4219,6 +4224,15 @@ mod daemon_surface {
                 .find(|session| session.id == session_id))
         }
 
+        /// One session by name, running or filed, for the questions an
+        /// archived session still answers.
+        fn known_session(&self, session_id: &str) -> Result<Option<DaemonSession>> {
+            Ok(self
+                .session_list(false, Some(session_id.to_string()))?
+                .into_iter()
+                .find(|session| session.id == session_id))
+        }
+
         /// Who begat whom, without the sessions themselves.
         ///
         /// This surface negotiates no capabilities, so the fallback answers the
@@ -4401,7 +4415,7 @@ mod daemon_surface {
                     DaemonResponse::Talk { page } => Ok(page),
                     response => bail!("unexpected talk response: {response:?}"),
                 },
-                || self.sessions().unwrap_or_default(),
+                |session_id| self.known_session(session_id).ok().flatten(),
             )
         }
 
@@ -5328,7 +5342,7 @@ mod tests {
                         truncated: false,
                     })
                 },
-                Vec::new,
+                |_| None,
             )
             .unwrap(),
         )
@@ -5338,6 +5352,7 @@ mod tests {
         assert_eq!(answer["waiting_on"], Value::Null);
         assert_eq!(answer["note"], Value::Null);
 
+        let looked_up = std::cell::Cell::new(0usize);
         let filter = TalkFilter {
             session_id: Some("me".into()),
             ..TalkFilter::default()
@@ -5357,11 +5372,16 @@ mod tests {
                         truncated: false,
                     })
                 },
-                || {
-                    vec![
-                        probe_session("thinking", true, false),
-                        probe_session("gone-quiet", false, false),
-                    ]
+                // Looked up by name: only the sessions actually holding an
+                // unanswered message are asked about, and a wait that ends
+                // empty with nothing outstanding asks about none of them.
+                |session_id| {
+                    looked_up.set(looked_up.get() + 1);
+                    match session_id {
+                        "thinking" => Some(probe_session("thinking", true, false)),
+                        "gone-quiet" => Some(probe_session("gone-quiet", false, false)),
+                        _ => None,
+                    }
                 },
             )
             .unwrap(),
@@ -5385,6 +5405,12 @@ mod tests {
         let note = answer["note"].as_str().unwrap();
         assert!(note.contains("2 messages"), "{note}");
         assert!(note.contains("mid-turn"), "{note}");
+        assert_eq!(
+            looked_up.get(),
+            2,
+            "one lookup per session actually being waited on, and the machine's list for none \
+             of them"
+        );
     }
 
     #[test]
