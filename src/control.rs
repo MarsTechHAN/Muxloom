@@ -1592,6 +1592,11 @@ fn descends_from(lineage: &[(String, Option<String>)], target: &str, mine: &[Str
 }
 
 /// Who begat whom, taken from session records.
+///
+/// Only the fallback for a daemon too old to answer a lineage round still reads
+/// it out of whole session records, and that surface is this platform's — the
+/// same reason [`lineage_of_answer`] below is spelled the same way.
+#[cfg(unix)]
 fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
     sessions
         .iter()
