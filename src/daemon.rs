@@ -123,8 +123,9 @@ mod platform {
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession,
-            Frame, FrameKind, INITIAL_STREAM_WINDOW, OpenStream, PARENT_ALERT_CAPABILITY,
-            PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger, TriggerAction, stream,
+            Frame, FrameKind, INITIAL_STREAM_WINDOW, LINEAGE_CAPABILITY, OpenStream,
+            PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger,
+            TriggerAction, stream,
         },
         keeper,
         model::{
@@ -2848,6 +2849,7 @@ mod platform {
                             RELAY_CAPABILITY.into(),
                             CHANNELS_CAPABILITY.into(),
                             PARENT_ALERT_CAPABILITY.into(),
+                            LINEAGE_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -2977,6 +2979,30 @@ mod platform {
                     }
                 }
                 write_response(writer, request_id, &DaemonResponse::Sessions { sessions })
+            }
+            DaemonRequest::Lineage => {
+                // Read straight off the metadata under each lock: no screen is
+                // drawn and no recap is classified, because a parent link
+                // cannot be read off a screen. Both maps, because the chain
+                // from a live session up to the one that started it can pass
+                // through an ancestor that has since been put down — leaving
+                // the archive out here would refuse messages that are allowed.
+                let mut parents: Vec<(String, Option<String>)> = state
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(|session| session.parentage())
+                    .collect();
+                parents.extend(
+                    state
+                        .persisted_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .values()
+                        .map(|session| session.parentage()),
+                );
+                write_response(writer, request_id, &DaemonResponse::Parents { parents })
             }
             DaemonRequest::Launch {
                 session_id,
@@ -5567,6 +5593,17 @@ mod platform {
     }
 
     impl PersistedSession {
+        /// This session's id and the one that started it. A chain from a live
+        /// session up to the one that started it can pass through an ancestor
+        /// that has since been put down, so the archive answers this too.
+        fn parentage(&self) -> (String, Option<String>) {
+            let metadata = self
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (metadata.id.clone(), metadata.parent.clone())
+        }
+
         fn snapshot(&self) -> DaemonSession {
             self.metadata
                 .lock()
@@ -5721,6 +5758,21 @@ mod platform {
                 return drawn;
             }
             kept.clone()
+        }
+
+        /// This session's id and the one that started it, read off the
+        /// metadata alone.
+        ///
+        /// The cheap half of [`Self::snapshot`], for the callers that only ever
+        /// wanted the parent link: nothing here touches the screen lock, so
+        /// asking the whole machine costs a map walk rather than a room full of
+        /// grids laid out as text.
+        fn parentage(&self) -> (String, Option<String>) {
+            let metadata = self
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (metadata.id.clone(), metadata.parent.clone())
         }
 
         fn snapshot(&self) -> DaemonSession {
@@ -11015,6 +11067,116 @@ mod platform {
             }
 
             child.archive().unwrap();
+            discard_root(root);
+        }
+
+        /// Weighing whether one agent may write into another is a question
+        /// about parent links, and it is asked before every message and every
+        /// keystroke one sends the other. It used to be asked with
+        /// `ListSessions`, which draws every screen on the machine and carries
+        /// back every conversation it has ever held, to read two fields off
+        /// each record and throw the rest away.
+        ///
+        /// The archive is in the answer on purpose: the chain from a live
+        /// session up to the one that started it can pass through an ancestor
+        /// that has since been put down, and a lineage missing that link reads
+        /// as "somebody else's session" and refuses a message that is allowed.
+        #[test]
+        fn a_lineage_round_carries_the_parent_links_and_not_the_sessions() {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(server));
+            let answer = |client: &mut UnixStream, id: u64| loop {
+                let frame = Frame::read_from(client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == id {
+                    return frame.decode_json::<DaemonResponse>().unwrap();
+                }
+            };
+
+            // An ancestor that was put down before this daemon started, which
+            // is the only way a record reaches the archive index rather than
+            // being adopted.
+            let filed = "muxloomd-terminal-lineage-filed";
+            let staging = test_state("lineage-stage");
+            let elder = launch_session(
+                &staging,
+                filed.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "the elder".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                111,
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+            elder.archive().unwrap();
+            let record = elder.snapshot();
+            drop(elder);
+
+            let state = test_state("lineage");
+            persist_session_metadata(&state.paths.sessions.join(format!("{filed}.json")), &record)
+                .unwrap();
+            fs::write(state.paths.history.join(format!("{filed}.ansi")), b"").unwrap();
+            let root = state.paths.root.clone();
+            let state = Arc::new(DaemonState::new(state.paths.clone(), KeeperMode::InProcess));
+
+            let child = launch_child_with_parent(&state, "lineage-child", Some(filed));
+            let orphan = launch_child_with_parent(&state, "lineage-orphan", None);
+
+            // A client too old to know the question falls back to the whole
+            // list, and it decides which by this string: a daemon that answers
+            // `Lineage` without saying so leaves every client paying the old
+            // price forever.
+            handle_request(
+                &writer,
+                &state,
+                0,
+                DaemonRequest::Hello {
+                    client_version: env!("CARGO_PKG_VERSION").into(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .unwrap();
+            let DaemonResponse::Hello { capabilities, .. } = answer(&mut client, 0) else {
+                panic!("a hello must answer with a hello");
+            };
+            assert!(
+                capabilities.iter().any(|it| it == LINEAGE_CAPABILITY),
+                "the daemon must say it can answer a lineage round: {capabilities:?}"
+            );
+
+            handle_request(&writer, &state, 1, DaemonRequest::Lineage).unwrap();
+            let DaemonResponse::Parents { parents } = answer(&mut client, 1) else {
+                panic!("a lineage round must answer with parents");
+            };
+            let parent_of = |id: &str| {
+                parents
+                    .iter()
+                    .find(|(session, _)| session == id)
+                    .unwrap_or_else(|| panic!("{id} is missing from the lineage: {parents:?}"))
+                    .1
+                    .clone()
+            };
+            assert_eq!(
+                parent_of(&child.snapshot().id),
+                Some(filed.to_string()),
+                "a live session's link to the one that started it"
+            );
+            assert_eq!(
+                parent_of(filed),
+                None,
+                "the archived ancestor is in the answer, or the chain through it breaks"
+            );
+            assert_eq!(parent_of(&orphan.snapshot().id), None);
+
+            child.archive().unwrap();
+            orphan.archive().unwrap();
+            discard_root(staging.paths.root.clone());
             discard_root(root);
         }
 

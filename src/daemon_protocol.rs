@@ -15,6 +15,11 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// subagent's parent's notice, and will hand those moments to a controller
 /// that asks. Additive: a daemon too old to have it simply never gets asked.
 pub const PARENT_ALERT_CAPABILITY: &str = "parent-alerts-v1";
+/// A daemon that can say who begat whom without being asked for the sessions
+/// themselves. Additive: a client talking to a daemon too old to answer asks
+/// for the whole list and reads the two fields out of it, which is what this
+/// exists to stop doing.
+pub const LINEAGE_CAPABILITY: &str = "lineage-v1";
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const DATA_CHUNK_SIZE: usize = 64 * 1024;
@@ -261,6 +266,14 @@ pub enum DaemonRequest {
         #[serde(default)]
         only: Option<String>,
     },
+    /// Who begat whom, and nothing else.
+    ///
+    /// Weighing whether one session may write into another is a question about
+    /// parent links alone, and it is asked before every message and every
+    /// keystroke one agent sends another. Asking `ListSessions` for it drew
+    /// every screen on the machine and carried every conversation it has ever
+    /// held, to keep two fields per record and throw the rest away.
+    Lineage,
     Launch {
         session_id: String,
         kind: String,
@@ -562,6 +575,11 @@ pub enum DaemonResponse {
     },
     Sessions {
         sessions: Vec<DaemonSession>,
+    },
+    /// Answers `Lineage`: every session this daemon knows of, running or
+    /// archived, paired with the session that started it.
+    Parents {
+        parents: Vec<(String, Option<String>)>,
     },
     Launched {
         session: Box<DaemonSession>,

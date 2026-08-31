@@ -20,7 +20,8 @@ use crate::{
     channel::{CHANNELS_CAPABILITY, ChannelReceipt, ChannelSet},
     daemon_protocol::{
         DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
-        OpenStream, PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, Trigger, stream,
+        LINEAGE_CAPABILITY, OpenStream, PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert,
+        Trigger, stream,
     },
     debug,
     model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
@@ -679,6 +680,27 @@ impl BridgeConnection {
             .sessions(true, Some(session_id.to_string()))?
             .into_iter()
             .find(|session| session.id == session_id))
+    }
+
+    /// Who begat whom on this machine, for a round that only weighs whether one
+    /// session may write into another.
+    ///
+    /// A daemon too old to answer is asked the expensive way and read down to
+    /// the same two fields, because a lineage that came back empty is not the
+    /// same as one with no links in it: the check reads a missing chain as
+    /// "somebody else's session" and refuses.
+    pub fn lineage(&self) -> Result<Vec<(String, Option<String>)>> {
+        if !self.has_capability(LINEAGE_CAPABILITY) {
+            return Ok(self
+                .list_sessions()?
+                .into_iter()
+                .map(|session| (session.id, session.parent))
+                .collect());
+        }
+        match self.request(DaemonRequest::Lineage)?.response {
+            DaemonResponse::Parents { parents } => Ok(parents),
+            response => bail!("unexpected lineage response: {response:?}"),
+        }
     }
 
     fn sessions(&self, live_only: bool, only: Option<String>) -> Result<Vec<DaemonSession>> {
@@ -2383,6 +2405,11 @@ impl BridgePool {
     /// One running session, for a round that is about one session.
     pub fn live_session(&self, target: &Target, session_id: &str) -> Result<Option<DaemonSession>> {
         self.connection_for_target(target)?.live_session(session_id)
+    }
+
+    /// Who begat whom, without the sessions themselves.
+    pub fn lineage(&self, target: &Target) -> Result<Vec<(String, Option<String>)>> {
+        self.connection_for_target(target)?.lineage()
     }
 
     pub fn probe_executables(

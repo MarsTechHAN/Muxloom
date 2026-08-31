@@ -3941,11 +3941,17 @@ impl ControlSurface for ControllerControl {
         if let Some(session_id) = written_to(name, arguments) {
             let own = own_powers();
             if own.reach != Reach::Fleet && !reaches_without_records(&own, session_id) {
-                let sessions = self
+                // Parent links alone, and asked for as such. This runs before
+                // every message and every keystroke one agent sends another,
+                // and asking for the sessions instead drew every screen on the
+                // machine and carried its whole archive back to read two fields
+                // off each record — which is what made talking to a sibling the
+                // slowest thing an agent could do.
+                let parents = self
                     .runtime
                     .bridge_pool()
-                    .list_sessions(&self.target(arguments)?)?;
-                check_may_message(&own, session_id, &lineage(&sessions))?;
+                    .lineage(&self.target(arguments)?)?;
+                check_may_message(&own, session_id, &parents)?;
             }
         }
         match name {
@@ -4196,17 +4202,33 @@ mod daemon_surface {
                 .find(|session| session.id == session_id))
         }
 
+        /// Who begat whom, without the sessions themselves.
+        ///
+        /// This surface negotiates no capabilities, so the fallback answers the
+        /// version question instead of a handshake: a daemon too old for this
+        /// says so, and gets asked the old expensive way.
+        fn parentage(&self) -> Result<Vec<(String, Option<String>)>> {
+            match self.transact(&DaemonRequest::Lineage) {
+                Ok((DaemonResponse::Parents { parents }, _)) => Ok(parents),
+                _ => Ok(lineage(&self.sessions()?)),
+            }
+        }
+
         /// Weigh a write aimed at one of this machine's sessions against how
         /// far this session may speak.
         ///
         /// Reading the list is a round trip to the daemon, so the full reach —
-        /// which asks nothing of a lineage — never pays for it.
+        /// which asks nothing of a lineage — never pays for it. What the rest
+        /// pay is two fields per session: this runs before every message one
+        /// agent sends another, and asking for the sessions themselves drew
+        /// every screen on the machine and carried its whole archive back to
+        /// throw all but the parent links away.
         fn check_reach(&self, session_id: &str) -> Result<()> {
             let own = own_powers();
             if own.reach == Reach::Fleet || reaches_without_records(&own, session_id) {
                 return Ok(());
             }
-            check_may_message(&own, session_id, &lineage(&self.sessions()?))
+            check_may_message(&own, session_id, &self.parentage()?)
         }
 
         fn expect_ack(&self, request: &DaemonRequest) -> Result<()> {
