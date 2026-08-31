@@ -105,6 +105,17 @@ const WAIT_ERROR_TOLERANCE: usize = 3;
 /// call open until the transport gives up on it.
 const TALK_MAX_WAIT_SECONDS: u64 = WAIT_MAX_TIMEOUT_SECONDS;
 const TALK_POLL: Duration = Duration::from_secs(2);
+/// How much of the board one read may hand back at once.
+///
+/// `limit` bounds the page in messages, and a message has no length of its
+/// own: fifty of them are a handful of lines on a quiet board and sixty
+/// thousand characters on one where agents have been handing work to each
+/// other. Past what the MCP client will accept the whole reply is refused, so
+/// a caller who asked for the default page learns nothing at all — the worst
+/// answer available, and the one a busy board gives most reliably. A page
+/// that leaves its oldest few behind and says so is worth more than one that
+/// does not arrive.
+const TALK_MAX_RESPONSE_BYTES: usize = 32 * 1024;
 /// How far back a timed-out wait looks for messages of its own still waiting
 /// on an answer. Longer than anyone reasonably waits in one call, so the
 /// question "is anything of mine outstanding" is answered from the whole
@@ -557,8 +568,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              how you wait to be answered. A wait that ends with nothing is not an answer of no: \
              it comes back with `waiting_on`, listing which of your own messages are still \
              unanswered and what the sessions holding them are doing, and calling it again is \
-             usually right. `before` pages into the past. scope \"task\" is narrower than any of \
-             that: just you, whoever started you, and the subagents any of you started."
+             usually right. `before` pages into the past — which is also how you pick up what a \
+             busy board left out: a reply too large to deliver keeps its newest messages, drops \
+             the older ones, and says so in `truncated` and `note`. scope \"task\" is narrower \
+             than any of that: just you, whoever started you, and the subagents any of you \
+             started."
         ),
         input_schema: schema(
             multi,
@@ -566,7 +580,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "scope": { "type": "string", "enum": ["path", "machine", "task", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
                 "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
                 "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
-                "limit": { "type": "integer", "description": "Newest N messages. Default 50." },
+                "limit": { "type": "integer", "description": "Newest N messages. Default 50. A page too large to hand back is cut to its newest whatever this says." },
                 "before": { "type": "integer", "description": "Epoch ms: read backwards from here, for paging into the past." },
                 "kinds": { "type": "array", "items": { "type": "string", "enum": ["message", "note", "direct"] } },
                 "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
@@ -2586,13 +2600,29 @@ fn talk_wait(
             } else {
                 Vec::new()
             };
+            // Weighed only now that the page is going out, never before the
+            // decision above: a wait whose page were emptied here would read
+            // as nothing-was-said and go round again, waiting out its whole
+            // timeout on messages it had already been handed.
+            let matched = page.messages.len();
+            let mut messages: Vec<Value> = page.messages.iter().map(talk_json).collect();
+            let overflowed = fit_within(&mut messages, TALK_MAX_RESPONSE_BYTES);
             return Ok(pretty(&json!({
-                "messages": page.messages.iter().map(talk_json).collect::<Vec<_>>(),
+                "messages": messages,
                 "cursor": page.cursor,
-                "truncated": page.truncated,
+                "truncated": page.truncated || overflowed,
                 "waited_ms": elapsed.as_millis() as u64,
                 "waiting_on": (!outstanding.is_empty()).then_some(&outstanding),
-                "note": if page.truncated {
+                "note": if overflowed {
+                    Some(format!(
+                        "too much matched to hand back at once, so the oldest was left out: \
+                         {} of {} messages shown, newest kept. Read again with `before` set to \
+                         the oldest ts you got to page further back, or narrow the read with \
+                         `query`, `scope`, or a smaller `limit`.",
+                        messages.len(),
+                        matched,
+                    ))
+                } else if page.truncated {
                     Some(
                         "more messages matched than fit: read again with `before` set to the \
                          oldest ts you got to page further back"
@@ -2609,6 +2639,27 @@ fn talk_wait(
         filter.before = None;
         thread::sleep(TALK_POLL.min(wait - elapsed));
     }
+}
+
+/// Drop messages off the front of a rendered page — the oldest — until what
+/// is left fits `budget`, and say whether any went.
+///
+/// Whole messages, never a cut through the middle of one: half a handover
+/// reads as a complete one that ends oddly, and an agent acting on it has no
+/// way to tell. The newest are the ones kept, because catching up is what the
+/// board is read for, and `before` pages back to the rest. The last message
+/// stays whatever it weighs — a page emptied to respect a ceiling answers a
+/// question nobody asked.
+fn fit_within(messages: &mut Vec<Value>, budget: usize) -> bool {
+    let weigh = |message: &Value| message.to_string().len();
+    let mut total: usize = messages.iter().map(weigh).sum();
+    let mut cut = 0;
+    while cut + 1 < messages.len() && total > budget {
+        total -= weigh(&messages[cut]);
+        cut += 1;
+    }
+    messages.drain(..cut);
+    cut > 0
 }
 
 /// The caller's own direct messages that nobody has answered, newest first,
@@ -5502,6 +5553,126 @@ mod tests {
             "one lookup per session actually being waited on, and the machine's list for none \
              of them"
         );
+    }
+
+    #[test]
+    fn a_page_too_large_to_deliver_keeps_its_newest_and_says_what_it_dropped() {
+        // A board carrying handovers between agents, which is what makes a
+        // fifty-message page sixty thousand characters long.
+        let long = "x".repeat(4 * 1024);
+        let board: Vec<TalkMessage> = (1..=40)
+            .map(|seq| direct(seq, "someone", "me", 1_000 + seq, &format!("{seq}:{long}")))
+            .collect();
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({}),
+                TalkFilter::default(),
+                |_| {
+                    Ok(TalkPage {
+                        messages: board.clone(),
+                        cursor: "c".into(),
+                        truncated: false,
+                    })
+                },
+                |_| None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let messages = answer["messages"].as_array().unwrap();
+        assert!(
+            !messages.is_empty() && messages.len() < board.len(),
+            "the page should be cut, not emptied and not passed through: {}",
+            messages.len()
+        );
+        // Cut to the newest, because catching up is what the board is read
+        // for. The oldest kept and everything after it are contiguous.
+        let first = messages[0]["text"].as_str().unwrap();
+        let last = messages[messages.len() - 1]["text"].as_str().unwrap();
+        assert!(last.starts_with("40:"), "{last:.16}");
+        let kept_from: u64 = first.split(':').next().unwrap().parse().unwrap();
+        assert_eq!(kept_from as usize, 40 - messages.len() + 1);
+        // Under the ceiling with room for one more message than fits, so the
+        // cut is the ceiling's doing and not an off-by-one somewhere else.
+        let weight: usize = messages.iter().map(|m| m.to_string().len()).sum();
+        assert!(weight <= TALK_MAX_RESPONSE_BYTES, "{weight}");
+        assert!(weight + long.len() > TALK_MAX_RESPONSE_BYTES, "{weight}");
+
+        assert_eq!(answer["truncated"], json!(true));
+        let note = answer["note"].as_str().unwrap();
+        assert!(
+            note.contains(&format!("{} of 40 messages", messages.len())),
+            "{note}"
+        );
+        assert!(note.contains("before"), "{note}");
+
+        // A page that already fits is handed back whole, untruncated, and
+        // without a note inventing a problem it does not have.
+        let small = vec![direct(1, "someone", "me", 1_000, "short enough")];
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({}),
+                TalkFilter::default(),
+                |_| {
+                    Ok(TalkPage {
+                        messages: small.clone(),
+                        cursor: "c".into(),
+                        truncated: false,
+                    })
+                },
+                |_| None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(answer["truncated"], json!(false));
+        assert_eq!(answer["note"], Value::Null);
+    }
+
+    #[test]
+    fn one_message_past_the_ceiling_is_still_handed_over() {
+        // Cutting to fit must never cut to nothing: an empty page would read
+        // as "nobody said anything", which is the one thing that is not true.
+        let mut only = vec![json!({ "text": "y".repeat(TALK_MAX_RESPONSE_BYTES * 2) })];
+        assert!(!fit_within(&mut only, TALK_MAX_RESPONSE_BYTES));
+        assert_eq!(only.len(), 1);
+
+        // And a wait must decide on the untrimmed page: were it emptied
+        // before the check, the caller would sit out the whole timeout on
+        // messages already in hand.
+        let board = vec![direct(
+            1,
+            "someone",
+            "me",
+            1_000,
+            &"z".repeat(TALK_MAX_RESPONSE_BYTES * 2),
+        )];
+        let reads = std::cell::Cell::new(0usize);
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({ "wait_seconds": 30 }),
+                TalkFilter::default(),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(TalkPage {
+                        messages: board.clone(),
+                        cursor: "c".into(),
+                        truncated: false,
+                    })
+                },
+                |_| None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reads.get(),
+            1,
+            "it answered on the first look, not after waiting"
+        );
+        assert_eq!(answer["messages"].as_array().unwrap().len(), 1);
     }
 
     #[test]
