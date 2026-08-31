@@ -6561,6 +6561,7 @@ mod platform {
         let end = file.metadata()?.len();
         let wanted = lines.max(1);
         let mut window = seed_window(wanted, columns, least, most);
+        let mut reached: Option<usize> = None;
         loop {
             let start = end.saturating_sub(window);
             file.seek(SeekFrom::Start(start))?;
@@ -6576,7 +6577,23 @@ mod platform {
             // scrolled through, and the request for the next one rounds back to
             // this same offset and asks for it again.
             let filled = total_lines.saturating_sub(actual_offset) >= wanted;
-            if (actual_offset >= offset_from_bottom && filled) || start == 0 || window >= most {
+            // Widening is how the read reaches rows it has not seen yet, so a
+            // window that quadrupled and came back holding no more of them has
+            // reached every row the log has to give.
+            //
+            // Without this the only other way out is the ceiling, and an agent
+            // that paints its screen in place always takes it: on the alternate
+            // screen nothing ever scrolls off, so the render finds a screenful
+            // however far back it reads and `filled` can never come true. That
+            // is a hundred and twenty-eight megabytes seeked to and fed through
+            // a fresh emulator to answer with that same screenful -- per screen
+            // read, and once a second for every agent sitting in a wait.
+            let widened_in_vain = reached.is_some_and(|before| total_lines <= before);
+            if (actual_offset >= offset_from_bottom && filled)
+                || widened_in_vain
+                || start == 0
+                || window >= most
+            {
                 return Ok(HistoryRead {
                     rows: page,
                     total_lines,
@@ -6584,6 +6601,7 @@ mod platform {
                     reached_start: start == 0,
                 });
             }
+            reached = Some(total_lines);
             window = window.saturating_mul(4).min(most);
         }
     }
@@ -7755,6 +7773,45 @@ mod platform {
                 !shallow.reached_start,
                 "and says it never got to the top of the log"
             );
+        }
+
+        #[test]
+        fn a_history_page_stops_widening_once_widening_stops_finding_rows() {
+            // The paired case to the test above, where every frame ends in a
+            // newline so widening keeps turning up rows. An agent on the
+            // alternate screen paints without one: the cursor is put back and
+            // the row overwritten, so nothing ever scrolls off and no window,
+            // however far back it reaches, holds more than a screenful. The
+            // read used to widen through that all the way to its ceiling before
+            // answering with the screenful it already had on its first look.
+            let path = test_state("render-history-still")
+                .paths
+                .history
+                .join("log.ansi");
+            let mut log: String = (1..=200)
+                .map(|line| format!("scrolled{line}\r\n"))
+                .collect();
+            for frame in 1..=8_000 {
+                log.push_str(&format!("\x1b[1;1H\x1b[Kpaint{frame}"));
+            }
+            fs::write(&path, &log).unwrap();
+
+            // The seed reaches 12,800 bytes and quadruples from there, so the
+            // first two looks both land inside the repaint; the third would
+            // span the whole log and reach the rows at the top of it.
+            let read = render_history_file(&path, 20, 5, 0, 40, 4 * 1024, 1024 * 1024).unwrap();
+
+            assert!(
+                !read.reached_start,
+                "the read ran to the top of the log to find rows it had already found"
+            );
+            assert!(
+                read.total_lines < 40,
+                "and a screenful is all there was: {}",
+                read.total_lines
+            );
+            let page = String::from_utf8_lossy(&read.rows).into_owned();
+            assert!(page.contains("paint8000"), "the newest paint: {page:?}");
         }
 
         #[test]
