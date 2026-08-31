@@ -5637,13 +5637,18 @@ mod platform {
 
     /// Who started a session, as this daemon has it recorded. A session it has
     /// never heard of has no parent it can name, which ends a walk.
+    ///
+    /// Asked of the session's parentage rather than of a snapshot of it: a
+    /// snapshot of a live session lays its screen out as text, and this is one
+    /// step of a walk up a fleet, so a snapshot each would draw the screen of
+    /// every session between here and the top to read one field off each.
     fn session_parent(state: &DaemonState, session_id: &str) -> Option<String> {
         if let Ok(session) = daemon_session(state, session_id) {
-            return session.snapshot().parent;
+            return session.parentage().1;
         }
         persisted_session(state, session_id)
             .ok()
-            .and_then(|session| session.snapshot().parent)
+            .and_then(|session| session.parentage().1)
     }
 
     fn persisted_session(state: &DaemonState, session_id: &str) -> Result<Arc<PersistedSession>> {
