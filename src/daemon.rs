@@ -4908,14 +4908,26 @@ mod platform {
     /// conversation in two places at once.
     fn resumed_successor(state: &DaemonState, record: &DaemonSession) -> Option<String> {
         let successor = record.resumed_to.as_deref()?;
-        let live = state
+        // Lifted out from under the lock rather than read through it. That map
+        // is how every request on the daemon finds a session at all, so what is
+        // done while holding it is done in front of all of them.
+        let session = state
             .sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        live.get(successor)
-            .map(|session| session.snapshot())
-            .filter(|snapshot| !snapshot.dead && !snapshot.archived)
-            .map(|_| successor.to_string())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(successor)
+            .map(Arc::clone)?;
+        // Then asked of the two flags that say whether it still runs, rather
+        // than of a snapshot. Taking a snapshot lays the session's screen out
+        // as text, which is most of what one costs and none of what a resume
+        // wants to know here -- and it was being paid for with the map held.
+        let archived = session.archived.load(Ordering::Relaxed);
+        let dead = session
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dead;
+        (!archived && !dead).then(|| successor.to_string())
     }
 
     /// Record on the retired side where its conversation moved to, in both
@@ -9727,6 +9739,90 @@ mod platform {
                     .contains_key(previous),
                 "a refused revival took the record with it"
             );
+            drop(running);
+        }
+
+        #[test]
+        fn a_record_whose_successor_has_stopped_too_is_let_back() {
+            let state = test_state("moved-successor-stopped");
+            let previous = "muxloomd-terminal-moved-on-again";
+            let successor = "muxloomd-terminal-moved-to-and-stopped";
+            let first = launch_session(
+                &state,
+                previous.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                444,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            first.archive().unwrap();
+            let mut record = first.snapshot();
+            drop(first);
+            record.dead = true;
+            record.pid = None;
+            record.resumed_to = Some(successor.into());
+
+            let restarted = restarted_around("moved-successor-stopped-read-back", &record);
+            let running = launch_session(
+                &restarted,
+                successor.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/echo".into(),
+                vec![],
+                vec![],
+                555,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // The conversation moved on, and then the session it moved to
+            // ended of its own accord -- which nobody archived, so it is still
+            // sitting in the live map for the resume to walk into. Nothing
+            // holds the conversation in two places any more, so what the move
+            // was evidence of is over and the record is free to come back.
+            // Only a successor still running may refuse one.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !running.snapshot().dead {
+                assert!(Instant::now() < deadline, "the successor never ended");
+                thread::sleep(Duration::from_millis(20));
+            }
+
+            let revived = launch_session(
+                &restarted,
+                previous.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                999,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .expect("a record was held shut by a successor that had itself stopped");
+            assert_eq!(revived.snapshot().id, previous);
+            drop(revived);
             drop(running);
         }
 
