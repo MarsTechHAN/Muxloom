@@ -99,7 +99,7 @@ mod platform {
         collections::{BTreeSet, HashMap},
         fs::{self, File, OpenOptions},
         io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
-        net::{Shutdown, TcpStream},
+        net::{Shutdown, TcpStream, ToSocketAddrs},
         os::unix::{
             fs::PermissionsExt,
             io::AsRawFd,
@@ -2520,7 +2520,7 @@ mod platform {
                                     write_stream_opened(&writer, &frame, Some(size))?;
                                 }
                                 OpenStream::Tcp { host, port } => {
-                                    match TcpStream::connect((host.as_str(), port)) {
+                                    match connect_forward(host.as_str(), port) {
                                         Ok(socket) => {
                                             socket.set_nodelay(true)?;
                                             let reader = socket.try_clone()?;
@@ -7021,6 +7021,44 @@ mod platform {
         }
     }
 
+    /// How long a forwarded connection may spend reaching its far end before
+    /// the client that asked for it is told no. The connect is made on the
+    /// frame loop that reads that client, so waiting out the operating
+    /// system's own patience -- over a minute for an address that answers
+    /// nothing at all -- holds up that client's heartbeats, its window updates
+    /// and every request queued behind it for the whole of it.
+    const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Reach `host:port` inside `budget`, trying each address the name resolves
+    /// to and spending the one budget across all of them rather than granting
+    /// each its own.
+    fn connect_forward_within(host: &str, port: u16, budget: Duration) -> io::Result<TcpStream> {
+        let deadline = Instant::now() + budget;
+        let mut refusal = None;
+        for address in (host, port).to_socket_addrs()? {
+            // Never zero: a zero timeout is rejected outright, which would
+            // turn a spent budget into an error about the argument rather
+            // than about the address.
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            match TcpStream::connect_timeout(&address, left) {
+                Ok(socket) => return Ok(socket),
+                Err(error) => refusal = Some(error),
+            }
+        }
+        Err(refusal.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no address for {host}:{port}"),
+            )
+        }))
+    }
+
+    fn connect_forward(host: &str, port: u16) -> io::Result<TcpStream> {
+        connect_forward_within(host, port, FORWARD_CONNECT_TIMEOUT)
+    }
+
     fn open_bridge_tcp<W: Write + Send + 'static>(
         frame: &Frame,
         forwarding: &Arc<BridgeForwarding>,
@@ -7028,7 +7066,7 @@ mod platform {
         host: &str,
         port: u16,
     ) -> Result<()> {
-        let socket = match TcpStream::connect((host, port)) {
+        let socket = match connect_forward(host, port) {
             Ok(socket) => socket,
             Err(error) => {
                 return write_stream_error(
@@ -8875,6 +8913,41 @@ mod platform {
             assert_eq!(notice().as_deref(), Some("it said ready"));
 
             discard_root(state.paths.root.clone());
+        }
+
+        #[test]
+        fn a_forward_to_an_address_that_answers_nothing_gives_up_on_its_own_budget() {
+            use std::net::TcpListener;
+
+            // The working path first: a forward that can be made is still made.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let bound = listener.local_addr().unwrap();
+            let reached = connect_forward_within(
+                &bound.ip().to_string(),
+                bound.port(),
+                FORWARD_CONNECT_TIMEOUT,
+            );
+            assert!(
+                reached.is_ok(),
+                "a reachable forward was refused: {reached:?}"
+            );
+
+            // And one that cannot be made comes back on the budget it was
+            // given. 192.0.2.1 is TEST-NET-1, which is documentation address
+            // space and is routed nowhere: the connect either hangs until the
+            // budget runs out, or -- where the host has no route for it at all
+            // -- is refused sooner. Either is an answer; what this rules out is
+            // the third case, waiting out the operating system's own patience,
+            // which is over a minute here and blocks the frame loop for all of
+            // it.
+            let started = Instant::now();
+            let answer = connect_forward_within("192.0.2.1", 9, Duration::from_millis(150));
+            let waited = started.elapsed();
+            assert!(answer.is_err(), "an address routed nowhere was reached");
+            assert!(
+                waited < Duration::from_secs(5),
+                "a forward nobody answers held the frame loop for {waited:?}"
+            );
         }
 
         #[test]
