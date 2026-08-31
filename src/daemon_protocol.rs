@@ -316,6 +316,11 @@ pub enum DaemonRequest {
     ReadHistory {
         session_id: String,
         offset_from_bottom: usize,
+        /// How many lines to answer with. Zero asks for none of them, which is
+        /// how a caller that only wants
+        /// [`DaemonResponse::HistoryComplete::total_lines`] says so; a raw read
+        /// then does no file work at all. A daemon that predates this answers
+        /// with one line instead, and the count it reports is the same.
         lines: usize,
         /// Ask for the rows a terminal would have shown instead of raw log
         /// lines, so `offset_from_bottom` and `lines` count rendered rows. A

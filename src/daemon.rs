@@ -6616,7 +6616,22 @@ mod platform {
         let scrollback = total_lines.saturating_sub(usize::from(rows));
         let actual_offset = offset_from_bottom.min(scrollback);
         let end = total_lines.saturating_sub(actual_offset);
-        let start = end.saturating_sub(lines.max(1));
+        // A raw read walks the log from the top counting newlines, because the
+        // line it is asked for is only findable that way. Asking for none of
+        // them is asking how long the log is, and the answer is already in
+        // hand: the count is an atomic on a live session and read once per
+        // process on a stopped one. Reading the file to say nothing back is how
+        // the backup came to lift every byte of every session off the disk,
+        // every five minutes, to learn a number per session.
+        if lines == 0 {
+            return Ok(HistoryRead {
+                rows: Vec::new(),
+                total_lines,
+                offset_from_bottom: actual_offset,
+                reached_start: true,
+            });
+        }
+        let start = end.saturating_sub(lines);
         let file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
         let mut reader = BufReader::new(file);
@@ -7837,6 +7852,35 @@ mod platform {
             let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
+        }
+
+        #[test]
+        fn a_history_read_that_asks_for_no_lines_does_not_touch_the_log() {
+            // A raw read finds the line it was asked for by counting newlines
+            // from the top of the log, so asking for one line of a session that
+            // paints its screen -- whose few newlines are all at the end -- reads
+            // the whole session. The backup asks every session on the machine how
+            // long its log is once every five minutes, and asked for one line to
+            // find out: every byte of every log lifted off the disk, per pass,
+            // for a number the daemon already holds.
+            let state = test_state("history-count-only");
+            let path = state.paths.history.join("log.ansi");
+            let log: String = (1..=5).map(|line| format!("line{line}\r\n")).collect();
+            fs::write(&path, &log).unwrap();
+
+            let counted = read_history_file(&path, 5, 5, 0, 0).unwrap();
+            assert!(counted.rows.is_empty(), "no lines were asked for");
+            assert_eq!(counted.total_lines, 5, "and the count came back anyway");
+
+            // Nothing opens the log, so it does not have to be there: this stops
+            // holding the moment the read walks a file again.
+            let absent = state.paths.history.join("never-written.ansi");
+            let counted = read_history_file(&absent, 5_000_000, 24, 0, 0).unwrap();
+            assert_eq!(counted.total_lines, 5_000_000, "the count it was handed");
+
+            // A read that does ask for a line still gets the newest one.
+            let page = read_history_file(&path, 5, 5, 0, 1).unwrap();
+            assert_eq!(String::from_utf8_lossy(&page.rows), "line5\r\n");
         }
 
         #[test]

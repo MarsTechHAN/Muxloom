@@ -859,8 +859,11 @@ fn sync_capture(
     let bridges = runtime.bridge_pool();
     let total = bridges
         // The backup mirrors the append-only log itself, so it asks for raw
-        // lines rather than rendered rows.
-        .read_history(target, session_id.to_string(), 0, 1, false)?
+        // lines rather than rendered rows. This first read only asks how long
+        // the log is, so it asks for none of them: a raw read walks the log
+        // from the top counting newlines, and asking for one line of a session
+        // whose newlines are all at the end reads the session.
+        .read_history(target, session_id.to_string(), 0, 0, false)?
         .total_lines;
     if total < record.ansi_lines_synced {
         // Source rotated/shrank → restart the capture blob.
