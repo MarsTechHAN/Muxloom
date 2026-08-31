@@ -1762,6 +1762,97 @@ mod platform {
         );
     }
 
+    /// The size a stopped session's capture is cut back to once it has passed
+    /// [`CAPTURE_MAX_BYTES`].
+    ///
+    /// Nothing has ever taken output out of a capture, so one was bounded only
+    /// by the disk. On the machine this was written for they had reached four
+    /// point nine gigabytes between them and six hundred megabytes in the
+    /// largest, and almost none of that was output anyone would read: an agent
+    /// that spins a title bar writes the same escape sequence a hundred
+    /// thousand times.
+    const CAPTURE_KEEP_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The size at which a stopped capture is cut back. Well above what is
+    /// kept, so a capture sitting near the line is not rewritten every pass.
+    const CAPTURE_MAX_BYTES: u64 = 192 * 1024 * 1024;
+
+    /// Drop the oldest output from captures that have outgrown the ceiling.
+    ///
+    /// Only from captures nobody is writing to. A keeper holds its log open
+    /// and appending, and it is the one process here that is never updated —
+    /// it outlives daemon generations by design, so it cannot be asked to
+    /// reopen a file that was replaced underneath it, and replacing one anyway
+    /// would leave it appending to an inode with no name and the session's
+    /// output going nowhere. A socket on disk is what says a keeper owns a
+    /// session, the same thing adoption reads, so a capture with one is left
+    /// alone until the session it belongs to has stopped.
+    fn trim_stopped_captures(paths: &DaemonPaths) {
+        let Ok(entries) = fs::read_dir(&paths.history) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("ansi")
+                || !entry
+                    .metadata()
+                    .is_ok_and(|file| file.is_file() && file.len() > CAPTURE_MAX_BYTES)
+            {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if keeper::socket_path_for(&paths.keepers, id).exists() {
+                continue;
+            }
+            match trim_capture(&path, CAPTURE_KEEP_BYTES) {
+                Ok(0) => {}
+                Ok(dropped) => eprintln!(
+                    "muxloomd dropped {dropped} bytes of the oldest output in {}",
+                    path.display()
+                ),
+                Err(error) => {
+                    eprintln!("muxloomd could not trim {}: {error:#}", path.display())
+                }
+            }
+        }
+    }
+
+    /// Rewrite a capture keeping only its newest `keep` bytes, and say how many
+    /// went.
+    ///
+    /// The cut is moved forward to the first line boundary inside what is kept,
+    /// so a replay never begins halfway through an escape sequence — one that
+    /// does paints the rest of the sequence across the screen as text. A kept
+    /// part holding no boundary at all is one enormous line, which is what a
+    /// session that paints its screen rather than ending its lines writes;
+    /// there is nothing to cut on, so it is kept as it stands.
+    fn trim_capture(path: &Path, keep: u64) -> Result<u64> {
+        let mut file = File::open(path)
+            .with_context(|| format!("failed to open capture {}", path.display()))?;
+        let size = file.seek(SeekFrom::End(0))?;
+        if size <= keep {
+            return Ok(0);
+        }
+        file.seek(SeekFrom::Start(size - keep))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        let cut = tail
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(0, |boundary| boundary + 1);
+        let kept = &tail[cut..];
+        // Written beside the capture and renamed over it, so a reader holding
+        // the old one reads all of it rather than watching it change underfoot.
+        let writing = path.with_extension("ansi.trimming");
+        fs::write(&writing, kept)
+            .with_context(|| format!("failed to write {}", writing.display()))?;
+        fs::rename(&writing, path)
+            .with_context(|| format!("failed to rename into {}", path.display()))?;
+        Ok(size - kept.len() as u64)
+    }
+
     /// Rebuild records for logs whose metadata did not survive.
     ///
     /// The log is the session; the JSON beside it only describes it. Metadata
@@ -1972,6 +2063,9 @@ mod platform {
         // can a leftover scratch folder be told apart from the folder a live
         // temporary session is sitting in.
         sweep_scratch_dirs(&state);
+        // And only now is it settled which captures still have a keeper
+        // writing to them, which is the whole of what makes one safe to cut.
+        trim_stopped_captures(paths);
         // Messages the last generation was still holding for a busy session
         // are this one's to deliver now that it owns the sessions.
         spawn_outbox_drainer(&state);
@@ -8368,6 +8462,56 @@ mod platform {
             // A read that does ask for a line still gets the newest one.
             let page = read_history_file(&path, 5, 5, 0, 1).unwrap();
             assert_eq!(String::from_utf8_lossy(&page.rows), "line5\r\n");
+        }
+
+        #[test]
+        fn an_overgrown_capture_is_cut_back_to_a_line_and_only_where_no_keeper_writes() {
+            // Nothing ever took output out of a capture, so one grew until the
+            // disk was full: four point nine gigabytes across this machine's
+            // sessions, six hundred megabytes in the largest of them.
+            let state = test_state("capture-trim");
+            let path = state.paths.history.join("muxloomd-claude-1-2-3.ansi");
+            // The oldest half is what goes; the newest is what a reader wants.
+            let old: String = (1..=400).map(|line| format!("old{line}\r\n")).collect();
+            let new: String = (1..=400).map(|line| format!("new{line}\r\n")).collect();
+            fs::write(&path, format!("{old}{new}")).unwrap();
+            let whole = fs::metadata(&path).unwrap().len();
+
+            let dropped = trim_capture(&path, new.len() as u64).unwrap();
+            let kept = fs::read_to_string(&path).unwrap();
+            assert_eq!(dropped, whole - kept.len() as u64);
+            assert!(kept.ends_with("new400\r\n"), "the newest output stays");
+            assert!(!kept.contains("old1\r\n"), "the oldest goes");
+            // Cut on a line, never inside one: a replay that starts halfway
+            // through an escape sequence paints the rest of it as text.
+            assert!(kept.starts_with("new"), "{}", &kept[..12.min(kept.len())]);
+            // Nothing is left lying beside it.
+            assert!(
+                !state
+                    .paths
+                    .history
+                    .join("muxloomd-claude-1-2-3.ansi.trimming")
+                    .exists()
+            );
+            // A capture already inside the ceiling is left exactly as it is.
+            assert_eq!(trim_capture(&path, whole).unwrap(), 0);
+            assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+
+            // A capture whose keeper socket is on disk belongs to a session
+            // still writing to it. The keeper is the one process here that is
+            // never updated, so it cannot be told its file was replaced: cut
+            // that one and its output goes to an inode with no name.
+            let held = state.paths.history.join("muxloomd-claude-4-5-6.ansi");
+            fs::write(&held, format!("{old}{new}")).unwrap();
+            fs::create_dir_all(&state.paths.keepers).unwrap();
+            fs::write(
+                keeper::socket_path_for(&state.paths.keepers, "muxloomd-claude-4-5-6"),
+                "",
+            )
+            .unwrap();
+            let before = fs::read(&held).unwrap();
+            trim_stopped_captures(&state.paths);
+            assert_eq!(fs::read(&held).unwrap(), before, "a keeper owns this one");
         }
 
         #[test]
