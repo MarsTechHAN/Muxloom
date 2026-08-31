@@ -569,7 +569,22 @@ mod platform {
         /// [`ManagedSession::persist_metadata`].
         discarded: Mutex<bool>,
         archived: AtomicBool,
+        /// Lines this daemon has counted itself, one per newline it recorded.
         line_count: AtomicUsize,
+        /// How much log the session already had before this daemon started
+        /// counting, and how many lines were in it once anybody has needed to
+        /// know. A daemon adopts a running session across a handover, and
+        /// revives an archived one onto the log it left behind; either way the
+        /// count above begins at nothing while the log behind it may be six
+        /// hundred megabytes long, and a raw page reports and bounds itself by
+        /// the total. Under-report it and the scrollback ends a screen or two
+        /// above the bottom - everything older than the handover unreachable,
+        /// on a session that plainly has it.
+        ///
+        /// Counting it costs a pass over those bytes, so it waits until a read
+        /// asks, and is kept once taken: nothing appends before this mark.
+        inherited_bytes: u64,
+        inherited_lines: OnceLock<usize>,
         columns: AtomicU16,
         rows: AtomicU16,
     }
@@ -4584,6 +4599,23 @@ mod platform {
         };
         metadata.pid = status.child_pid;
         let first_prompt = metadata.first_prompt.clone();
+        // Output the child produced before the keeper connection existed - the
+        // first prompt of a fast-starting agent - is only in the history file,
+        // and a revival's file holds the whole of the conversation before it.
+        // The greeting's byte count splits the transcript exactly, so replaying
+        // that prefix leaves the screen gapless and duplicate-free. Taken here
+        // rather than after the session is built, because how much of the log
+        // this hands to the line counter is what the rest of the log has to be
+        // measured around.
+        let replay = (!temporary)
+            .then(|| {
+                history_prefix_tail(
+                    &history_path,
+                    status.history_bytes,
+                    RECENT_OUTPUT_LIMIT as u64,
+                )
+            })
+            .flatten();
         let session = Arc::new(ManagedSession {
             metadata: Mutex::new(metadata),
             keeper: Mutex::new(
@@ -4623,6 +4655,14 @@ mod platform {
                 seed,
                 ..NativeLink::default()
             }),
+            // Everything the log held that the replay below will not hand to
+            // the counter: nothing at all for a fresh launch, and for a
+            // revival the whole of the log its session left behind, bar the
+            // tail being replayed onto the screen.
+            inherited_bytes: status
+                .history_bytes
+                .saturating_sub(replay.as_ref().map_or(0, |bytes| bytes.len() as u64)),
+            inherited_lines: OnceLock::new(),
             history_path,
             metadata_path,
             discarded: Mutex::new(false),
@@ -4631,17 +4671,7 @@ mod platform {
             columns: AtomicU16::new(columns.max(20)),
             rows: AtomicU16::new(rows.max(5)),
         });
-        // Output the child produced before the keeper connection existed —
-        // the first prompt of a fast-starting agent — is only in the history
-        // file. The greeting's byte count splits the transcript exactly, so
-        // replaying that prefix leaves the screen gapless and duplicate-free.
-        if !temporary
-            && let Some(head) = history_prefix_tail(
-                &session.history_path,
-                status.history_bytes,
-                RECENT_OUTPUT_LIMIT as u64,
-            )
-        {
+        if let Some(head) = replay {
             session.record_output(&head);
         }
         session.persist_metadata()?;
@@ -5445,6 +5475,21 @@ mod platform {
         let first_prompt = metadata.first_prompt.clone();
         let columns = status.columns.max(20);
         let rows = status.rows.max(5);
+        // Rebuilds the screen, and with it the working/attention
+        // classification, from the transcript the keeper kept appending while
+        // no daemon was watching. The greeting's byte count bounds the read so
+        // nothing streaming in now is doubled. Taken here rather than after
+        // the session is built, because how much of the log this hands to the
+        // line counter is what the rest of the log has to be measured around.
+        let replay = (!temporary)
+            .then(|| {
+                history_prefix_tail(
+                    &history_path,
+                    status.history_bytes,
+                    RECENT_OUTPUT_LIMIT as u64,
+                )
+            })
+            .flatten();
         let session = Arc::new(ManagedSession {
             metadata: Mutex::new(metadata),
             keeper: Mutex::new(
@@ -5497,6 +5542,13 @@ mod platform {
                 seed,
                 ..NativeLink::default()
             }),
+            // Everything the keeper wrote while no daemon was watching, bar
+            // the tail being replayed below - which is to say nearly the whole
+            // of a log this generation never saw a byte of.
+            inherited_bytes: status
+                .history_bytes
+                .saturating_sub(replay.as_ref().map_or(0, |bytes| bytes.len() as u64)),
+            inherited_lines: OnceLock::new(),
             history_path,
             metadata_path,
             discarded: Mutex::new(false),
@@ -5505,17 +5557,7 @@ mod platform {
             columns: AtomicU16::new(columns),
             rows: AtomicU16::new(rows),
         });
-        // Rebuild the screen, and with it the working/attention
-        // classification, from the transcript the keeper kept appending while
-        // no daemon was watching. The greeting's byte count bounds the read so
-        // nothing streaming in now is doubled.
-        if !temporary
-            && let Some(tail) = history_prefix_tail(
-                &session.history_path,
-                status.history_bytes,
-                RECENT_OUTPUT_LIMIT as u64,
-            )
-        {
+        if let Some(tail) = replay {
             session.record_output(&tail);
         }
         session.persist_metadata()?;
@@ -5920,7 +5962,7 @@ mod platform {
             if let Some(count) = self.line_count.get() {
                 return Ok(*count);
             }
-            let count = count_history_lines(&self.history_path)?;
+            let count = count_history_lines(&self.history_path, u64::MAX)?;
             let _ = self.line_count.set(count);
             Ok(count)
         }
@@ -6653,6 +6695,22 @@ mod platform {
             drawn
         }
 
+        /// How long the log is, in lines: what was in it before this daemon
+        /// began counting, plus everything counted since.
+        fn total_lines(&self) -> usize {
+            let inherited = *self.inherited_lines.get_or_init(|| {
+                if self.inherited_bytes == 0 {
+                    return 0;
+                }
+                // A log that cannot be read is not a log with nothing in it,
+                // but the read below is the same read that is about to fail
+                // and say so properly. Reporting the part this daemon did
+                // count is the honest floor.
+                count_history_lines(&self.history_path, self.inherited_bytes).unwrap_or(0)
+            });
+            inherited.saturating_add(self.line_count.load(Ordering::Relaxed))
+        }
+
         /// `bytes` does not belong in it.
         fn record_output(&self, bytes: &[u8]) {
             self.line_count.fetch_add(
@@ -6761,7 +6819,7 @@ mod platform {
             }
             read_history_file(
                 &self.history_path,
-                self.line_count.load(Ordering::Relaxed),
+                self.total_lines(),
                 rows,
                 offset_from_bottom,
                 lines,
@@ -6800,16 +6858,28 @@ mod platform {
         result
     }
 
-    fn count_history_lines(path: &Path) -> Result<usize> {
+    /// Newlines in the first `upto` bytes of the log, or in all of it when
+    /// that is [`u64::MAX`].
+    ///
+    /// The bound is what a live session wants. It counts its own output as it
+    /// records it, so the only part it cannot account for is the log that was
+    /// already there when it started counting - and reading a byte past that
+    /// mark would count it twice.
+    fn count_history_lines(path: &Path, upto: u64) -> Result<usize> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
         let mut buffer = vec![0_u8; 64 * 1024];
         let mut lines = 0usize;
-        loop {
-            let read = file.read(&mut buffer)?;
+        let mut left = upto;
+        while left > 0 {
+            let want = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let read = file.read(&mut buffer[..want])?;
             if read == 0 {
                 break;
             }
+            left -= read as u64;
             lines =
                 lines.saturating_add(buffer[..read].iter().filter(|&&byte| byte == b'\n').count());
         }
@@ -6949,9 +7019,10 @@ mod platform {
         // A raw read walks the log from the top counting newlines, because the
         // line it is asked for is only findable that way. Asking for none of
         // them is asking how long the log is, and the answer is already in
-        // hand: the count is an atomic on a live session and read once per
-        // process on a stopped one. Reading the file to say nothing back is how
-        // the backup came to lift every byte of every session off the disk,
+        // hand: whatever the caller counted, which is an atomic and at most one
+        // pass over an inherited log on a live session, and one pass read once
+        // per process on a stopped one. Reading the file to say nothing back is
+        // how the backup came to lift every byte of every session off the disk,
         // every five minutes, to learn a number per session.
         if lines == 0 {
             return Ok(HistoryRead {
@@ -8933,6 +9004,75 @@ mod platform {
                 true,
                 6_000
             ));
+        }
+
+        /// A raw page is found by line number and bounded by how many lines
+        /// the log is said to hold, and a daemon only ever counted the lines
+        /// it recorded itself. Both of the ways a session outlives a daemon -
+        /// revived onto the log it left behind, adopted mid-conversation by
+        /// the next generation - hand it a log it counted none of. Reported
+        /// short, the scrollback stops dead a screen below where the daemon
+        /// came in, with the whole conversation before that sitting in the
+        /// file, unreachable.
+        #[test]
+        fn a_log_this_daemon_did_not_write_still_counts_towards_the_scrollback() {
+            let state = test_state("inherited-lines");
+            let root = state.paths.root.clone();
+            let id = "muxloomd-terminal-inherited-lines";
+            let start = |created_at: u64| {
+                launch_session(
+                    &state,
+                    id.into(),
+                    "terminal".into(),
+                    "/tmp".into(),
+                    String::new(),
+                    false,
+                    "/bin/cat".into(),
+                    vec![],
+                    vec![],
+                    created_at,
+                    80,
+                    24,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let first = start(1);
+            let history = first.history_path.clone();
+            first.archive().unwrap();
+            drop(first);
+
+            // A conversation longer than the tail any replay carries, so that
+            // most of it is log the reviving daemon never sees a byte of.
+            let mut log = Vec::new();
+            let mut lines = 0usize;
+            while log.len() < RECENT_OUTPUT_LIMIT + 512 * 1024 {
+                log.extend_from_slice(format!("line {lines}\r\n").as_bytes());
+                lines += 1;
+            }
+            fs::write(&history, &log).unwrap();
+
+            let revived = start(1);
+            assert_eq!(
+                revived.read_history(0, 1, false).unwrap().total_lines,
+                lines,
+                "the log it came back to is part of how long the log is"
+            );
+            // And the number is not just reported: it is what the paging is
+            // measured against, so a page from before the revival is asked
+            // for by an offset the old count would have clamped away.
+            let deep = revived.read_history(lines - 100, 1, false).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&deep.rows).trim_end(),
+                "line 99",
+                "a page from before the revival is still reachable"
+            );
+
+            revived.archive().unwrap();
+            fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
