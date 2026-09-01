@@ -390,10 +390,36 @@ pub struct TalkPage {
 /// A page is the tail of what matched, so the walk that finds it never needs
 /// more than a page in hand. Holding only that is what keeps reading the board
 /// costing a page rather than a copy of everything on it.
+///
+/// This is the right end to keep for someone arriving at the board and asking
+/// what is on it. It is the wrong end for someone following a cursor - see
+/// [`OldestFirst`], which is what such a read gets instead.
 struct NewestFirst {
     limit: usize,
     /// Oldest first, so the one to drop is the one on top.
     heap: BinaryHeap<Oldest>,
+    dropped: bool,
+}
+
+/// The oldest `limit` messages of however many are offered, oldest first.
+///
+/// What a caller following a cursor must be given. Such a caller hands the
+/// cursor back and is told only what has happened since, so anything a page
+/// leaves out is not paged past - it is lost, and the cursor is what loses it.
+/// Keeping the newest end is what did that: the page was the tail of a burst,
+/// the cursor was everything the board held, and the messages in between were
+/// dropped and then skipped. The one they were most likely to be was an answer
+/// somebody was waiting on, because an answer arrives before the noise that
+/// buries it.
+///
+/// Keeping the oldest end instead makes the window walk forwards: each read
+/// hands back a contiguous run and a cursor that reaches no further than the
+/// end of it, so a backlog drains in order over as many reads as it takes and
+/// nothing falls between two of them.
+struct OldestFirst {
+    limit: usize,
+    /// Newest first, so the one to drop is the one on top.
+    heap: BinaryHeap<Newest>,
     dropped: bool,
 }
 
@@ -420,6 +446,69 @@ impl PartialEq for Oldest {
 }
 
 impl Eq for Oldest {}
+
+/// A message ordered the plain way round, so the *newest* is on top of a
+/// [`BinaryHeap`] and first out of a full page.
+struct Newest(TalkMessage);
+
+impl Ord for Newest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.0.ts, &self.0.origin, self.0.seq).cmp(&(other.0.ts, &other.0.origin, other.0.seq))
+    }
+}
+
+impl PartialOrd for Newest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Newest {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Newest {}
+
+impl OldestFirst {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            heap: BinaryHeap::new(),
+            dropped: false,
+        }
+    }
+
+    /// Take `message` if the page has room or if it is older than the newest
+    /// the page is holding.
+    fn offer(&mut self, message: &TalkMessage) {
+        if self.heap.len() == self.limit {
+            let newer_than_held = self.heap.peek().is_some_and(|newest| {
+                (message.ts, &message.origin, message.seq)
+                    >= (newest.0.ts, &newest.0.origin, newest.0.seq)
+            });
+            self.dropped = true;
+            if newer_than_held {
+                return;
+            }
+            self.heap.pop();
+        }
+        self.heap.push(Newest(message.clone()));
+    }
+
+    fn dropped(&self) -> bool {
+        self.dropped
+    }
+
+    fn into_page(self) -> Vec<TalkMessage> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|held| held.0)
+            .collect()
+    }
+}
 
 impl NewestFirst {
     fn new(limit: usize) -> Self {
@@ -681,12 +770,20 @@ impl TalkStore {
             filter.limit.min(MAX_PAGE)
         };
         // A board holds up to [`RETAIN_PER_ORIGIN`] messages per machine and a
-        // page carries at most a few dozen, so the walk keeps only the newest
-        // it has seen rather than collecting every match to sort and throw
-        // away. What that saves is a copy of each message it looked at - and a
-        // read of the whole board is what a caller waiting for an answer does
-        // every couple of seconds.
-        let mut page = NewestFirst::new(limit);
+        // page carries at most a few dozen, so the walk keeps only the end it
+        // is going to hand back rather than collecting every match to sort and
+        // throw away. What that saves is a copy of each message it looked at -
+        // and a read of the whole board is what a caller waiting for an answer
+        // does every couple of seconds.
+        //
+        // Which end depends on what the caller is doing. Arriving at the board
+        // and asking what is on it wants the newest, with `before` to page
+        // back. Following a cursor wants the oldest of what is new, because
+        // that caller will hand the cursor back and never be offered anything
+        // this page left out.
+        let following = !filter.since.is_empty();
+        let mut newest = NewestFirst::new(limit);
+        let mut oldest = OldestFirst::new(limit);
         for message in inner.logs.values().flat_map(|log| log.messages.iter()) {
             if message.seq <= filter.since.get(&message.origin).copied().unwrap_or(0)
                 || !filter.before.is_none_or(|before| message.ts < before)
@@ -717,20 +814,43 @@ impl TalkStore {
             {
                 continue;
             }
-            page.offer(message);
+            if following {
+                oldest.offer(message);
+            } else {
+                newest.offer(message);
+            }
         }
-        let truncated = page.dropped();
-        let matched = page.into_page();
-        let cursor = encode_cursor(
-            &inner
+        let (truncated, matched) = if following {
+            (oldest.dropped(), oldest.into_page())
+        } else {
+            (newest.dropped(), newest.into_page())
+        };
+        // Everything the board holds is what the caller has been shown, unless
+        // the page had to leave some of it out. Then the cursor may reach no
+        // further than the newest message actually in hand: the page is the
+        // oldest end of what matched, so every message at or below that point
+        // either went out with it or was filtered out on the way, and the ones
+        // left behind are all above it and will be offered again next read.
+        // An origin this page says nothing about keeps the caller's own mark,
+        // which costs a second look at messages that matched nothing and loses
+        // none that did.
+        let vector = if truncated {
+            let mut vector = filter.since.clone();
+            for message in &matched {
+                let mark = vector.entry(message.origin.clone()).or_default();
+                *mark = (*mark).max(message.seq);
+            }
+            vector
+        } else {
+            inner
                 .logs
                 .iter()
                 .map(|(origin, log)| (origin.clone(), log.highest()))
-                .collect(),
-        );
+                .collect()
+        };
         TalkPage {
             messages: matched,
-            cursor,
+            cursor: encode_cursor(&vector),
             truncated,
         }
     }
@@ -1736,6 +1856,87 @@ mod tests {
         );
         // Exactly enough room is not a page that dropped anything.
         assert!(!texts(8).1);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    /// A cursor is a promise: hand it back and you are told what has happened
+    /// since. Keeping the newest end of an oversized page broke that promise -
+    /// the page was the tail of a burst and the cursor was everything the board
+    /// held, so the messages in between were dropped and then skipped, and the
+    /// one they were most likely to be was the answer somebody was waiting on.
+    #[test]
+    fn a_cursor_is_given_every_message_it_was_not_shown() {
+        let store = store("cursor");
+        let far = |seq: u64| TalkMessage {
+            id: format!("cccc-9012abcd:{seq}"),
+            origin: "cccc-9012abcd".into(),
+            seq,
+            ts: seq * 100,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: "cccc-9012abcd".into(),
+                machine_label: "elsewhere".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("said {seq}"),
+        };
+        // The answer comes first and the noise that buries it comes after,
+        // which is the order that made this lose the answer.
+        assert_eq!(store.merge((1..=9).map(far).collect()).unwrap(), 9);
+
+        // Someone arriving at the board still gets the newest end: catching up
+        // is what that read is for.
+        let arriving = store.read(&TalkFilter {
+            limit: 3,
+            ..TalkFilter::default()
+        });
+        assert_eq!(
+            arriving
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert!(arriving.truncated);
+
+        // Someone following a cursor gets the oldest end, and the cursor stops
+        // where the page stops rather than where the board does.
+        let mut cursor = encode_cursor(&BTreeMap::from([("cccc-9012abcd".to_string(), 0)]));
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let page = store.read(&TalkFilter {
+                since: decode_cursor(&cursor),
+                limit: 3,
+                ..TalkFilter::default()
+            });
+            if page.messages.is_empty() {
+                break;
+            }
+            seen.extend(page.messages.iter().map(|message| message.seq));
+            cursor = page.cursor;
+        }
+        assert_eq!(
+            seen,
+            (1..=9).collect::<Vec<_>>(),
+            "a poll that follows its cursor is handed every message once, in order"
+        );
+
+        // And the cursor of a truncated page really is held back: reading with
+        // the first one again gives the second page, not the board's tail.
+        let first = store.read(&TalkFilter {
+            since: decode_cursor(&encode_cursor(&BTreeMap::from([(
+                "cccc-9012abcd".to_string(),
+                0,
+            )]))),
+            limit: 3,
+            ..TalkFilter::default()
+        });
+        assert_eq!(decode_cursor(&first.cursor).get("cccc-9012abcd"), Some(&3));
 
         fs::remove_dir_all(&store.root).ok();
     }

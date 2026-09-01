@@ -39,7 +39,7 @@ use crate::{
     talk::{
         MAX_TEXT, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind,
         TalkMessage, TalkPage, TalkScope, TalkSelector, TalkState, TalkVector, TalkVoice,
-        decode_cursor, hostname, paste_bytes,
+        decode_cursor, encode_cursor, hostname, paste_bytes,
     },
 };
 
@@ -115,7 +115,15 @@ const TALK_POLL: Duration = Duration::from_secs(2);
 /// answer available, and the one a busy board gives most reliably. A page
 /// that leaves its oldest few behind and says so is worth more than one that
 /// does not arrive.
-const TALK_MAX_RESPONSE_BYTES: usize = 32 * 1024;
+///
+/// Counted in characters, not bytes. A board these agents actually use is
+/// written in whatever language the people around it speak, and a byte ceiling
+/// is three times tighter on a board written in Chinese than on the same board
+/// written in English - so the cut fell on the boards that most needed not to
+/// be cut. Thirty thousand characters is past any page a board worth reading
+/// produces, which is the point: this is the ceiling that stops a reply being
+/// refused outright, not a page size.
+const TALK_MAX_RESPONSE_CHARS: usize = 30_000;
 /// How far back a timed-out wait looks for messages of its own still waiting
 /// on an answer. Longer than anyone reasonably waits in one call, so the
 /// question "is anything of mine outstanding" is answered from the whole
@@ -2588,7 +2596,7 @@ fn talk_wait(
         Duration::from_secs(optional_u64(arguments, "wait_seconds", 0).min(TALK_MAX_WAIT_SECONDS));
     let started = Instant::now();
     loop {
-        let page = read(&filter)?;
+        let mut page = read(&filter)?;
         let elapsed = started.elapsed();
         if !page.messages.is_empty() || elapsed >= wait {
             // A wait that ends empty is the one that needs explaining. Say
@@ -2605,27 +2613,47 @@ fn talk_wait(
             // as nothing-was-said and go round again, waiting out its whole
             // timeout on messages it had already been handed.
             let matched = page.messages.len();
-            let mut messages: Vec<Value> = page.messages.iter().map(talk_json).collect();
-            let overflowed = fit_within(&mut messages, TALK_MAX_RESPONSE_BYTES);
+            // A caller following a cursor is handed the oldest end of what is
+            // new, so the end to give up here is the other one - and the cursor
+            // has to come back with it. Trimming the far end and handing back a
+            // cursor that reached past it would lose exactly what the page
+            // ordering was changed to stop losing.
+            let keep = if filter.since.is_empty() {
+                Keep::Newest
+            } else {
+                Keep::Oldest
+            };
+            let held = fit_within(&mut page.messages, TALK_MAX_RESPONSE_CHARS, keep);
+            let overflowed = held < matched;
+            if overflowed && keep == Keep::Oldest {
+                page.cursor = encode_cursor(&cursor_through(&page.messages, &filter.since));
+            }
+            let messages: Vec<Value> = page.messages.iter().map(talk_json).collect();
             return Ok(pretty(&json!({
                 "messages": messages,
                 "cursor": page.cursor,
                 "truncated": page.truncated || overflowed,
                 "waited_ms": elapsed.as_millis() as u64,
                 "waiting_on": (!outstanding.is_empty()).then_some(&outstanding),
-                "note": if overflowed {
+                "note": if overflowed && keep == Keep::Oldest {
+                    Some(format!(
+                        "too much matched to hand back at once: {held} of {matched} messages \
+                         shown, oldest kept. The cursor stops where they stop, so read again \
+                         with it to be given the rest, or narrow the read with `query`, \
+                         `scope`, or a smaller `limit`."
+                    ))
+                } else if overflowed {
                     Some(format!(
                         "too much matched to hand back at once, so the oldest was left out: \
-                         {} of {} messages shown, newest kept. Read again with `before` set to \
-                         the oldest ts you got to page further back, or narrow the read with \
-                         `query`, `scope`, or a smaller `limit`.",
-                        messages.len(),
-                        matched,
+                         {held} of {matched} messages shown, newest kept. Read again with \
+                         `before` set to the oldest ts you got to page further back, or \
+                         narrow the read with `query`, `scope`, or a smaller `limit`."
                     ))
                 } else if page.truncated {
                     Some(
-                        "more messages matched than fit: read again with `before` set to the \
-                         oldest ts you got to page further back"
+                        "more messages matched than fit: read again with the cursor to be \
+                         given the rest, or with `before` set to the oldest ts you got to \
+                         page further back"
                             .to_string(),
                     )
                 } else {
@@ -2641,25 +2669,58 @@ fn talk_wait(
     }
 }
 
-/// Drop messages off the front of a rendered page — the oldest — until what
-/// is left fits `budget`, and say whether any went.
+/// Which end of a page survives a page that weighs too much.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// Drop the oldest. What someone arriving at the board wants: catching up
+    /// is what the board is read for, and `before` pages back to the rest.
+    Newest,
+    /// Drop the newest. What someone following a cursor needs, so the run they
+    /// are given stays contiguous with the one before it and the cursor can be
+    /// pulled back to the end of it.
+    Oldest,
+}
+
+/// Drop whole messages off one end of a page until what is left fits `budget`
+/// characters,
+/// and say how many were kept.
 ///
 /// Whole messages, never a cut through the middle of one: half a handover
 /// reads as a complete one that ends oddly, and an agent acting on it has no
-/// way to tell. The newest are the ones kept, because catching up is what the
-/// board is read for, and `before` pages back to the rest. The last message
-/// stays whatever it weighs — a page emptied to respect a ceiling answers a
-/// question nobody asked.
-fn fit_within(messages: &mut Vec<Value>, budget: usize) -> bool {
-    let weigh = |message: &Value| message.to_string().len();
-    let mut total: usize = messages.iter().map(weigh).sum();
+/// way to tell. The last message stays whatever it weighs — a page emptied to
+/// respect a ceiling answers a question nobody asked.
+fn fit_within(messages: &mut Vec<TalkMessage>, budget: usize, keep: Keep) -> usize {
+    let weights: Vec<usize> = messages
+        .iter()
+        .map(|message| talk_json(message).to_string().chars().count())
+        .collect();
+    let mut total: usize = weights.iter().sum();
     let mut cut = 0;
     while cut + 1 < messages.len() && total > budget {
-        total -= weigh(&messages[cut]);
+        total -= match keep {
+            Keep::Newest => weights[cut],
+            Keep::Oldest => weights[messages.len() - 1 - cut],
+        };
         cut += 1;
     }
-    messages.drain(..cut);
-    cut > 0
+    match keep {
+        Keep::Newest => messages.drain(..cut),
+        Keep::Oldest => messages.drain(messages.len() - cut..),
+    };
+    messages.len()
+}
+
+/// How far a cursor may reach when it describes a run of messages rather than
+/// the whole board: to the newest of each origin actually in hand, and no
+/// further, with an origin the run says nothing about left where the caller
+/// already was.
+fn cursor_through(messages: &[TalkMessage], floor: &TalkVector) -> TalkVector {
+    let mut vector = floor.clone();
+    for message in messages {
+        let mark = vector.entry(message.origin.clone()).or_default();
+        *mark = (*mark).max(message.seq);
+    }
+    vector
 }
 
 /// The caller's own direct messages that nobody has answered, newest first,
@@ -5635,8 +5696,8 @@ mod tests {
         // Under the ceiling with room for one more message than fits, so the
         // cut is the ceiling's doing and not an off-by-one somewhere else.
         let weight: usize = messages.iter().map(|m| m.to_string().len()).sum();
-        assert!(weight <= TALK_MAX_RESPONSE_BYTES, "{weight}");
-        assert!(weight + long.len() > TALK_MAX_RESPONSE_BYTES, "{weight}");
+        assert!(weight <= TALK_MAX_RESPONSE_CHARS, "{weight}");
+        assert!(weight + long.len() > TALK_MAX_RESPONSE_CHARS, "{weight}");
 
         assert_eq!(answer["truncated"], json!(true));
         let note = answer["note"].as_str().unwrap();
@@ -5670,13 +5731,88 @@ mod tests {
         assert_eq!(answer["note"], Value::Null);
     }
 
+    /// The ceiling is the second place a page can be cut, and it loses what the
+    /// first one does if it cuts the same end. A caller following a cursor is
+    /// given the oldest of what is new; trimming the newest off that and still
+    /// handing back the board's own cursor would skip the middle, which is
+    /// where an answer sits when it arrives ahead of the noise.
+    #[test]
+    fn a_page_too_large_for_a_cursor_keeps_its_oldest_and_holds_the_cursor_back() {
+        let long = "x".repeat(4 * 1024);
+        let board: Vec<TalkMessage> = (1..=40)
+            .map(|seq| direct(seq, "someone", "me", 1_000 + seq, &format!("{seq}:{long}")))
+            .collect();
+        let origin = board[0].origin.clone();
+        let filter = TalkFilter {
+            since: TalkVector::from([(origin.clone(), 0)]),
+            ..TalkFilter::default()
+        };
+        let answer: Value = serde_json::from_str(
+            &talk_wait(
+                &json!({}),
+                filter,
+                |_| {
+                    Ok(TalkPage {
+                        messages: board.clone(),
+                        // What the board holds, which is what the old cursor
+                        // was and what made this lose messages.
+                        cursor: encode_cursor(&TalkVector::from([(origin.clone(), 40)])),
+                        truncated: false,
+                    })
+                },
+                |_| None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let messages = answer["messages"].as_array().unwrap();
+        assert!(
+            !messages.is_empty() && messages.len() < board.len(),
+            "the page should be cut, not emptied and not passed through: {}",
+            messages.len()
+        );
+        let first = messages[0]["text"].as_str().unwrap();
+        let last = messages[messages.len() - 1]["text"].as_str().unwrap();
+        assert!(
+            first.starts_with("1:"),
+            "the oldest is the end kept: {first:.16}"
+        );
+        let kept_to: u64 = last.split(':').next().unwrap().parse().unwrap();
+        assert_eq!(kept_to as usize, messages.len());
+
+        // And the cursor stops on the last one handed over, so the next read
+        // with it begins on the one after.
+        let cursor = decode_cursor(answer["cursor"].as_str().unwrap());
+        assert_eq!(
+            cursor.get(&origin),
+            Some(&kept_to),
+            "the cursor may not reach past the page: {cursor:?}"
+        );
+        assert_eq!(answer["truncated"], json!(true));
+        let note = answer["note"].as_str().unwrap();
+        assert!(note.contains("oldest kept"), "{note}");
+    }
+
     #[test]
     fn one_message_past_the_ceiling_is_still_handed_over() {
         // Cutting to fit must never cut to nothing: an empty page would read
         // as "nobody said anything", which is the one thing that is not true.
-        let mut only = vec![json!({ "text": "y".repeat(TALK_MAX_RESPONSE_BYTES * 2) })];
-        assert!(!fit_within(&mut only, TALK_MAX_RESPONSE_BYTES));
-        assert_eq!(only.len(), 1);
+        let mut only = vec![direct(
+            1,
+            "someone",
+            "me",
+            1_000,
+            &"y".repeat(TALK_MAX_RESPONSE_CHARS * 2),
+        )];
+        assert_eq!(
+            fit_within(&mut only, TALK_MAX_RESPONSE_CHARS, Keep::Newest),
+            1
+        );
+        assert_eq!(
+            fit_within(&mut only, TALK_MAX_RESPONSE_CHARS, Keep::Oldest),
+            1
+        );
 
         // And a wait must decide on the untrimmed page: were it emptied
         // before the check, the caller would sit out the whole timeout on
@@ -5686,7 +5822,7 @@ mod tests {
             "someone",
             "me",
             1_000,
-            &"z".repeat(TALK_MAX_RESPONSE_BYTES * 2),
+            &"z".repeat(TALK_MAX_RESPONSE_CHARS * 2),
         )];
         let reads = std::cell::Cell::new(0usize);
         let answer: Value = serde_json::from_str(
