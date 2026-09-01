@@ -9197,7 +9197,7 @@ mod platform {
             );
 
             revived.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         #[test]
@@ -10966,7 +10966,7 @@ mod platform {
             session.archive().unwrap();
             drop(client);
             handle.join().unwrap().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         #[test]
@@ -11593,7 +11593,7 @@ mod platform {
             );
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         /// Launch a quiet `/bin/cat` child under a parent, for tests about
@@ -12548,7 +12548,7 @@ mod platform {
             );
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         /// The matching can only tell a claim from a guess if the facts it is
@@ -12594,7 +12594,7 @@ mod platform {
             );
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         /// Every runtime but OpenCode is handed its prompt in its command
@@ -12660,7 +12660,7 @@ mod platform {
             );
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         /// A second launch into the same folder is a second conversation, not
@@ -12962,7 +12962,7 @@ mod platform {
             assert_eq!(snapshot.thread, None);
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         #[test]
@@ -12999,7 +12999,7 @@ mod platform {
             assert!(!session.snapshot().working);
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         /// A recap has to come off the screen the agent drew, not the bytes it
@@ -13062,7 +13062,7 @@ mod platform {
             );
 
             session.archive().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         #[test]
@@ -15555,7 +15555,7 @@ mod platform {
             }
             drop(client);
             daemon_handle.join().unwrap().unwrap();
-            fs::remove_dir_all(root).unwrap();
+            discard_root(root);
         }
 
         fn hello_frame(capabilities: &[&str]) -> Frame {
