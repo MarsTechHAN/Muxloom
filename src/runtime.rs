@@ -914,7 +914,15 @@ impl Runtime {
             }
         }
 
-        if installed_source.is_none() && remote && built_in {
+        // The controller fetches the release and puts it in place. Unlike the
+        // two routes above - a target pulling for itself, and handing over a
+        // copy of our own binary - this one is not ssh-only: it has an arm for
+        // every kind on `Transport::Local`, and for Codex and Claude, which
+        // ship no fallback install command at all, it is the only way they are
+        // ever installed. Requiring a remote here left `Install Claude` on this
+        // machine falling straight through to that empty command and reporting
+        // that none was configured, having tried nothing.
+        if installed_source.is_none() && built_in {
             match self.download_and_install_runtime(
                 target,
                 kind,
@@ -6035,6 +6043,50 @@ mod tests {
                 ("HTTPS_PROXY".into(), "http://127.0.0.1:8118".into()),
                 ("NO_PROXY".into(), "localhost".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_local_install_takes_the_controller_download_route() {
+        // Codex and Claude ship no fallback install command, so the controller
+        // download is the only way either of them is ever installed - on this
+        // machine as much as on a remote. Gating that route on the target being
+        // remote left a local "Install Claude" falling straight through to the
+        // empty command and reporting that none was configured, having tried
+        // nothing at all.
+        //
+        // A dead proxy stands in for the release server, so the test resolves
+        // nothing and reaches the network no further than a refused connection
+        // to a closed port. What is being asserted is which route the install
+        // took, and the error naming the download is what proves a local target
+        // now reaches it. Nothing is written: the failure lands in release
+        // resolution, before any cache path is even built.
+        let runtime = Runtime::new(&Config::default());
+        let command = CommandConfig {
+            command: "claude".into(),
+            args: Vec::new(),
+            install: String::new(),
+            sync_files: Vec::new(),
+        };
+        let environment = vec![("HTTPS_PROXY".into(), "http://127.0.0.1:1".into())];
+        let error = runtime
+            .install_runtime_with_progress(
+                &Target::local(),
+                AgentKind::Claude,
+                &command,
+                &environment,
+                false,
+                |_| {},
+            )
+            .expect_err("a dead proxy resolves no release");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("every built-in install failed"),
+            "a local install must report the download it attempted: {error}"
+        );
+        assert!(
+            !error.contains("no install command is configured"),
+            "and must not fall through to an install command it never needed: {error}"
         );
     }
 
