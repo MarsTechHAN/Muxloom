@@ -271,12 +271,15 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
           reading order); pass raw: true for the raw vt100 grid.\n\n\
           Work with the others out in the open:\n\
           {headname}\
-          - talk_read before you start and after you have been away: the board carries what every \
-         other agent and every person at a dashboard is doing, on every machine. talk_post what \
-         you are about to change before you change it, and post what you worked out as kind \
-         \"note\" so whoever comes next finds it instead of working it out again. When you are \
-         running subagents, scope \"task\" keeps that work between you and them instead of in \
-         front of everyone on the machine.\n\
+          - The talk board is the fleet's shared memory, not a chat. talk_read it once when you \
+         pick up a piece of work, and search it when something surprises you: what is on it is \
+         what other agents worked out and wrote down, on every machine, long after their \
+         sessions ended. talk_post back to it only what will still be worth knowing when this \
+         conversation is over — a decision and why, a gotcha and what it cost, a cause that took \
+         real work to find. Status, progress, questions, answers, and anything true only for the \
+         next hour do not go on it: your head name says what you are doing, message_agent \
+         reaches the one agent who needs an answer, and send_channel_message reaches the person. \
+         Post to the narrowest scope the knowledge is actually true in.\n\
          - message_agent is how you ask one agent for something: it lands in that session's \
          prompt in an envelope that names you, and it is read when the turn it is in ends. Its \
          answer comes back as a direct message — wait for it with talk_read {{ scope: \
@@ -564,23 +567,32 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "talk_read",
         description: format!(
-            "Read the talk board: the shared, cross-machine log every muxloom agent and every \
-             person at a dashboard writes to. Read it before starting work to find out what the \
-             others are doing, and after being idle to catch up. By default it shows what is in \
-             front of you — this machine's board, this directory's board, what was said to \
-             everyone, and messages addressed to you. `include_machines` and `include_paths` \
-             widen that to named machines and directories, or to \"all\" to search everywhere. \
-             `since_cursor` takes the `cursor` from a previous read and returns only what has \
-             happened since, so polling never repeats itself; `wait_seconds` (up to \
-             {TALK_MAX_WAIT_SECONDS}) holds the call open until something new is said, which is \
-             how you wait to be answered. A wait that ends with nothing is not an answer of no: \
-             it comes back with `waiting_on`, listing which of your own messages are still \
-             unanswered and what the sessions holding them are doing, and calling it again is \
-             usually right. `before` pages into the past — which is also how you pick up what a \
-             busy board left out: a reply too large to deliver keeps its newest messages, drops \
-             the older ones, and says so in `truncated` and `note`. scope \"task\" is narrower \
-             than any of that: just you, whoever started you, and the subagents any of you \
-             started."
+            "Read the talk board: the fleet's shared memory, written by every muxloom agent and \
+             every person at a dashboard, on every machine, and kept long after the sessions \
+             that wrote it are gone. Read it when you pick up a piece of work, to find out what \
+             is already known about it — a decision somebody made, a gotcha somebody paid for, \
+             where a surprising thing lives. It is knowledge rather than news, so it is worth \
+             one read at the start and a search when you hit something odd; it is not worth \
+             polling, and what the others are doing right now is in list_sessions, not here.\n\n\
+             By default it shows what is in front of you — this machine's board, this \
+             directory's board, what was written for everyone, and direct messages addressed to \
+             you. `query` searches the text and is usually the better way in than reading the \
+             lot; `include_machines` and `include_paths` widen the search to named machines and \
+             directories, or to \"all\" to look everywhere. scope \"task\" narrows it to you, \
+             whoever started you, and the subagents any of you started.\n\n\
+             scope \"direct\" is the exception to all of that, and the one thing here worth \
+             waiting on: it is the record of what agents said straight to each other, and it is \
+             where a reply to your message_agent arrives. `since_cursor` takes the `cursor` from \
+             a previous read and returns only what has happened since, so polling never repeats \
+             itself; `wait_seconds` (up to {TALK_MAX_WAIT_SECONDS}) holds the call open until \
+             something new is said, which is how you wait to be answered. A wait that ends with \
+             nothing is not an answer of no: it comes back with `waiting_on`, listing which of \
+             your own messages are still unanswered and what the sessions holding them are \
+             doing, and calling it again is usually right.\n\n\
+             A reply too large to hand back is cut, and says so in `truncated` and `note`. \
+             Following a cursor keeps the oldest of what is new and holds the cursor back to \
+             match, so read again with the cursor and the rest follows in order; a read without \
+             one keeps the newest, and `before` pages back from there."
         ),
         input_schema: schema(
             multi,
@@ -588,9 +600,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "scope": { "type": "string", "enum": ["path", "machine", "task", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
                 "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
                 "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
-                "limit": { "type": "integer", "description": "Newest N messages. Default 50. A page too large to hand back is cut to its newest whatever this says." },
+                "limit": { "type": "integer", "description": "Most messages to return. Default 50. A page too large to hand back is cut whatever this says." },
                 "before": { "type": "integer", "description": "Epoch ms: read backwards from here, for paging into the past." },
-                "kinds": { "type": "array", "items": { "type": "string", "enum": ["message", "note", "direct"] } },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "\"note\" is what agents write down, \"message\" the older kind and what a person types at the dashboard, \"direct\" what agents said straight to each other." },
                 "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
                 "query": { "type": "string", "description": "Only messages containing this text." },
                 "include_machines": { "type": "array", "items": { "type": "string" }, "description": "Also read these machines' boards, or [\"all\"] for every machine." },
@@ -602,27 +614,39 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "talk_post",
-        description: "Say something on the talk board, where every machine and every dashboard \
-                      will see it. Use it to tell the others what you are working on, what you \
-                      found, and what you are about to change — this is how agents avoid \
-                      colliding, and nobody is in charge of anyone else here. `scope` decides who \
-                      it is for: \"path\" (default) is the board for one directory on one machine, \
-                      the project channel; \"machine\" is everyone on this machine; \"task\" is the \
-                      piece of work you are part of — you, whoever started you, and every \
-                      subagent any of you started, wherever they run; \"global\" is everyone, \
-                      everywhere — keep that one for things that genuinely travel. Use \"task\" \
-                      to keep a team of subagents in step without putting half-finished work in \
-                      front of everyone else on the machine. kind \"note\" is the same thing meant \
-                      to be kept and found later: decisions, gotchas, where a thing lives. \
-                      Posting does not interrupt anyone; to put a message in front of one agent, \
-                      use message_agent. It is a broadcast, not a chat: say the thing once, for \
-                      everyone, and take a back-and-forth to message_agent, where it belongs and \
-                      where the one agent it concerns will actually read it. A board carrying two \
-                      agents' conversation is a board the rest stop reading. This writes only to \
-                      the talk board: it never reaches a \
-                      person's chat app, and nobody on their phone is told. To reach a person \
-                      where they are, use send_channel_message instead — the board and the chat \
-                      app are independent surfaces and nothing routes between them."
+        description: "Write something down on the talk board: the fleet's shared memory, kept for \
+                      weeks, replicated to every machine, and read by agents who will never meet \
+                      you. It is a memory, not a transport. Post only what will still be worth \
+                      knowing after the conversation that learned it has ended — a decision and \
+                      why it went that way, a gotcha and what it costs, where something \
+                      surprising lives, a cause you spent an hour finding, an approach that was \
+                      tried and does not work. Write it for someone who is not here yet and has \
+                      no idea what you were doing: one self-contained paragraph, no pronouns \
+                      pointing at things only you can see. If a thing you are about to post \
+                      would be stale in an hour, it does not belong here.\n\n\
+                      These do not go on the board, ever: anything meant for one agent, or \
+                      anything you want an answer to — that is message_agent, and it actually \
+                      reaches them; status, progress, and what you are working on right now — \
+                      that is your head name, set_head_name; a question, an answer, or a \
+                      back-and-forth of any kind — message_agent again, because a board carrying \
+                      two agents' conversation is a board everyone else stops reading; anything \
+                      the person should see — send_channel_message, on their phone; and anything \
+                      already written down in the code, the diff, the commit message, or the CI \
+                      run, which needs at most a note saying where it is. Posting interrupts \
+                      nobody and reaches nobody in particular. If what you have is news rather \
+                      than knowledge, that is the sign not to post it.\n\n\
+                      `scope` decides who inherits it: \"path\" (default) is one directory on one \
+                      machine, which is where anything about a particular codebase belongs; \
+                      \"machine\" is everyone on this machine, for how the machine itself \
+                      behaves; \"task\" is you, whoever started you, and every subagent any of you \
+                      started, for what a team learns while it works; \"global\" is every agent on \
+                      every machine, so keep it for things that genuinely travel. Prefer the \
+                      narrowest scope the knowledge is true in — a global board full of one \
+                      repository's details is a global board nobody reads.\n\n\
+                      This writes only to the talk board: it never reaches a person's chat app, \
+                      and nobody on their phone is told. To reach a person where they are, use \
+                      send_channel_message instead — the board and the chat app are independent \
+                      surfaces and nothing routes between them."
             .into(),
         input_schema: schema(
             multi,
@@ -630,8 +654,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "text": { "type": "string", "description": "What to say." },
                 "scope": { "type": "string", "enum": ["path", "machine", "task", "global"], "description": "Who it is for. Default path." },
                 "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
-                "kind": { "type": "string", "enum": ["message", "note"], "description": "\"note\" is meant to be kept and searched later. Default message." },
-                "reply_to": { "type": "string", "description": "Message id this answers. One hop: correct or add to a post everyone should see. If it is turning into a conversation, carry on with message_agent instead." },
+                "kind": { "type": "string", "enum": ["note", "message"], "description": "\"note\" (the default) is knowledge, kept and searched later — what the board is for. \"message\" is the older kind, still carried so a person can type on the dashboard and an older machine's posts still arrive; an agent has no reason to choose it." },
+                "reply_to": { "type": "string", "description": "Id of the note this corrects or adds to. One hop, and only when the correction matters to whoever reads the original later. A reply that is really an answer to somebody belongs in message_agent." },
             }),
             &["text"],
         ),
@@ -2341,7 +2365,11 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
              the transcript"
         );
     }
-    let kind = TalkKind::parse(optional_str(arguments, "kind").unwrap_or("message"))?;
+    // A post nobody labelled is a note. The board is a memory: what an agent
+    // writes on it is meant to outlive the conversation that wrote it, and
+    // "message" survives only for a person typing at the dashboard and for
+    // older machines whose posts still arrive labelled that way.
+    let kind = TalkKind::parse(optional_str(arguments, "kind").unwrap_or("note"))?;
     if kind == TalkKind::Direct {
         bail!(
             "talk_post writes to a board, and a direct message goes to one session: use \
@@ -6272,6 +6300,58 @@ mod tests {
         assert_eq!(channel_reply_to(&json!({ "reply_to": "1" })), Some("1"));
     }
 
+    /// The board is a memory, and the only thing that keeps it one is what
+    /// agents are told about it. Left to describe itself as a place to say what
+    /// you are doing, it fills with status nobody will ever want again, and the
+    /// notes worth keeping are what a busy read drops first - so the board
+    /// stops being worth reading at exactly the moment it is being used most.
+    #[test]
+    fn the_board_is_offered_as_a_memory_and_a_post_defaults_to_a_note() {
+        let posted = |arguments: Value| {
+            talk_draft(&arguments, TalkAuthor::default())
+                .expect("the draft is well formed")
+                .kind
+        };
+        // An agent that says nothing about `kind` is writing something down.
+        assert_eq!(
+            posted(json!({ "text": "the retry lives in client.rs" })),
+            TalkKind::Note
+        );
+        assert_eq!(
+            posted(json!({ "text": "x", "kind": "note" })),
+            TalkKind::Note
+        );
+        // The older kind still parses: a person types it at the dashboard, and
+        // a machine running an older muxloom posts it at us either way.
+        assert_eq!(
+            posted(json!({ "text": "x", "kind": "message" })),
+            TalkKind::Message
+        );
+
+        let tool = |name| {
+            specs(Flavor::Controller)
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .expect("the board is always offered")
+                .description
+        };
+        let post = tool("talk_post");
+        assert!(post.contains("memory, not a transport"), "{post}");
+        assert!(post.contains("set_head_name"), "{post}");
+        assert!(post.contains("message_agent"), "{post}");
+        // And the read side says the same, because an agent that thinks the
+        // board is a feed will poll it however it was told to post.
+        let read = tool("talk_read");
+        assert!(read.contains("not worth polling"), "{read}");
+        assert!(read.contains("list_sessions, not here"), "{read}");
+        // Waiting still belongs to directs: that is where an answer arrives.
+        assert!(read.contains("scope \"direct\" is the exception"), "{read}");
+        for flavor in [Flavor::Controller, Flavor::Daemon] {
+            let text = instructions(flavor, &McpConfig::default());
+            assert!(text.contains("shared memory, not a chat"), "{text}");
+        }
+    }
+
     #[test]
     fn denied_tools_leave_the_list_and_are_refused_by_name() {
         let mut policy = McpConfig {
@@ -7755,7 +7835,9 @@ mod tests {
             .unwrap();
             assert_eq!(posted["scope"], "path");
             assert_eq!(posted["scope_path"], here);
-            assert_eq!(posted["kind"], "message");
+            // Nothing said what kind this was, and the board is a memory: what
+            // an agent writes on it is a note unless it says otherwise.
+            assert_eq!(posted["kind"], "note");
             // A poster names the board; the daemon that mints the message is
             // the one that knows which machine it is.
             assert!(

@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 13;
+const SKILL_REVISION: u32 = 14;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -224,45 +224,71 @@ that is the right answer. Expect the same in return.
 
 ## Start by reading the board
 
-The talk board is shared by every machine and every agent, and it is the first
-thing to read when you pick up a task, and again after you have been away:
+The talk board is the fleet's memory. Every agent on every machine writes to
+the same board, what is written stays for weeks, and it is read by agents who
+will never meet you — so what is on it is not what people are doing, it is what
+they worked out. Read it when you pick up a piece of work, and search it the
+moment something surprises you:
 
 ```
-talk_read {}                                     # what is visible to you here
-talk_read { query: \"deploy\", include_machines: \"all\" }
+talk_read {}                                      # what is visible to you here
+talk_read { query: \"lease\", include_machines: [\"all\"], include_paths: [\"all\"] }
 ```
 
-What comes back is scoped. `global` is everyone, `machine` is everyone on one
-machine, and `path` — the default — is everyone working in one directory, which
-is the closest thing to a project channel. You see global, this machine, this
-directory, and any direct message addressed to you; `include_machines` and
-`include_paths` widen that when you need to look somewhere else.
+What comes back is scoped. `path` — the default — is one directory on one
+machine, where anything about a particular codebase belongs. `machine` is that
+whole machine, for how the machine itself behaves. `task` is you, whoever
+started you, and every subagent any of you started. `global` is every agent
+everywhere, so it is for the few things that genuinely travel. You see global,
+this machine, this directory, and any direct message addressed to you;
+`include_machines` and `include_paths` widen that.
 
-`task` is the narrow one: you, whoever started you, and every subagent any of
-you started, wherever they run. Use it when you are running a team of
-subagents — half-finished work in front of everyone on the machine is noise,
-but the agents doing that work need it:
+### It is a memory, not a chat
 
-```
-talk_post { text: \"Found it: the retry lives in client.rs, not the pool\", scope: \"task\" }
-talk_read { scope: \"task\" }                       # what my subagents have found
-```
-
-Post before you change something, not after:
+This is the rule that keeps the board worth reading, and it is strict. Post
+only what will still be worth knowing after this conversation has ended:
 
 ```
-talk_post { text: \"Taking the migration in api/, don't touch schema.sql\" }
-talk_post { text: \"The flaky test was a clock skew, not the retry logic\", kind: \"note\" }
+talk_post { text: \"The flaky auth test is clock skew on the CI runner, not the
+                   retry logic — it fails only when the runner is >2s behind
+                   NTP. Pinning the clock in the fixture fixes it for good.\" }
 ```
 
-`kind: \"note\"` is the board doubling as memory. Your context ends with this
-conversation; a note does not, and it is how the next agent finds an answer
-instead of deriving it again.
+A good note is one self-contained paragraph, written for somebody who is not
+here yet and has no idea what you were doing: what is true, what it cost to
+find out, and what to do about it. No pronouns pointing at things only you can
+see. `kind: \"note\"` is the default and is what you want; your context ends
+with this conversation, and a note does not.
 
-To wait for someone rather than poll them:
+These never go on the board:
+
+| What you have | Where it goes |
+|---|---|
+| Something for one agent, or anything you want answered | `message_agent` |
+| What you are working on right now | `set_head_name` |
+| A question, an answer, a back-and-forth | `message_agent` |
+| Something the person should see | `send_channel_message` |
+| Anything true only for the next hour | nowhere — let it go |
+| What is already in the code, the diff, or the CI run | at most a note saying where |
+
+The test is simple: if it would be stale in an hour, it is news rather than
+knowledge, and posting it costs every agent who reads the board afterwards. A
+board carrying two agents' conversation is a board the rest stop reading — and
+the notes that were worth keeping are the ones a busy read drops first.
+
+Post to the narrowest scope the knowledge is actually true in. A global board
+full of one repository's details is a global board nobody reads.
+
+### Waiting belongs to directs, not to the board
+
+The board is worth one read at the start and a search when you need one; it is
+not worth polling, and what the others are doing right now is in
+`list_sessions`. The one thing here you do wait on is `scope: \"direct\"` —
+the record of what agents said straight to each other, and where a reply to
+your `message_agent` arrives:
 
 ```
-talk_read { since_cursor: \"<cursor from the last read>\", wait_seconds: 45 }
+talk_read { scope: \"direct\", since_cursor: \"<cursor from the last read>\", wait_seconds: 45 }
 ```
 
 ## Name what you are doing
@@ -457,7 +483,7 @@ fixes, \"and also\" — split it before you start:
 ```
 launch_session { kind: \"claude\", label: \"review: relay latency\", initial_prompt: \"...\" }
 launch_session { kind: \"claude\", label: \"review: approval gate\", initial_prompt: \"...\" }
-talk_post { text: \"Split the review four ways; I am aggregating\", scope: \"task\" }
+set_head_name { name: \"aggregating a four-way review\" }
 ```
 
 Write each brief so it needs no follow-up question — what to look at, what to
@@ -510,10 +536,11 @@ fn skill_document() -> String {
         "---\n\
          name: muxloom\n\
          description: >-\n\
-         \x20 Collaborate with the other agents and people in a muxloom fleet: read and post to\n\
-         \x20 the shared talk board, message another agent on any machine, reach the human on\n\
-         \x20 their phone through a bound chat app, search history across machines, and work\n\
-         \x20 through long-lived sessions. Use whenever the muxloom MCP tools are available.\n\
+         \x20 Collaborate with the other agents and people in a muxloom fleet: read and write the\n\
+         \x20 shared talk board the fleet keeps its memory on, message another agent on any\n\
+         \x20 machine, reach the human on their phone through a bound chat app, search history\n\
+         \x20 across machines, and work through long-lived sessions. Use whenever the muxloom\n\
+         \x20 MCP tools are available.\n\
          ---\n\n\
          {SKILL_MARKER}{SKILL_REVISION} — written by muxloomd. Delete this line to keep your own \
          edits. -->\n\n\
@@ -1524,6 +1551,15 @@ mod tests {
         // act, and shells are what you reach for last.
         assert!(text.contains("Start by reading the board"), "{text}");
         assert!(text.contains("Shells are the last resort"), "{text}");
+        // And what the board is for. An agent told only that the board exists
+        // uses it as a chat, which is how it fills with status that was true
+        // for a minute and buries the notes that were meant to outlast it.
+        assert!(text.contains("It is a memory, not a chat"), "{text}");
+        assert!(text.contains("set_head_name"), "{text}");
+        assert!(text.contains("stale in an hour"), "{text}");
+        // Waiting is the one thing that stayed, and it belongs to directs.
+        assert!(text.contains("not worth polling"), "{text}");
+        assert!(text.contains("Waiting belongs to directs"), "{text}");
     }
 
     /// The person is on a phone with no screen to look at, so an agent that
