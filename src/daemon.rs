@@ -2492,13 +2492,16 @@ mod platform {
                                     // adoption (the screen was rebuilt by replaying a bounded
                                     // history tail that starts mid-stream, so most cells were
                                     // never painted at all). In both, a full-screen TUI agent
-                                    // repaints itself on SIGWINCH: send only the mode preamble
-                                    // (alt buffer, scroll region, clear), nudge the child with
-                                    // a two-frame resize, and let the app's own repaint —
-                                    // already streaming as live frames — paint the screen. That
-                                    // optimization only applies to agent kinds that are
-                                    // full-screen TUIs: a plain terminal (or any unknown kind)
-                                    // has no such repaint, so it keeps the snapshot.
+                                    // repaints itself on SIGWINCH: send the snapshot behind the
+                                    // mode preamble (alt buffer, scroll region, clear), nudge
+                                    // the child with a two-frame resize, and let the app's own
+                                    // repaint — already streaming as live frames — paint over
+                                    // it. The nudge is what corrects the stale frame; the
+                                    // snapshot is what the client has to look at until it
+                                    // arrives, and if it never arrives. That nudge only applies
+                                    // to agent kinds that are full-screen TUIs: a plain terminal
+                                    // (or any unknown kind) has no such repaint, so it is sent
+                                    // the snapshot on its own.
                                     //
                                     // No scrollback seed goes out here any more: rendering a
                                     // redraw-heavy session's history costs seconds, and while it
@@ -2561,9 +2564,27 @@ mod platform {
                                         // already wiped behind it - leaving the client
                                         // fed only later diffs, which a cached terminal
                                         // then preserves across every switch back.
+                                        //
+                                        // The snapshot goes out behind that clear
+                                        // rather than the preamble alone, because the
+                                        // nudge is not a promise. Two resizes back to
+                                        // back end on the size the app already has, and
+                                        // an app that compares the size it is given
+                                        // against the size it holds has nothing to
+                                        // redraw and redraws nothing - so a path that
+                                        // sent a clear and waited left the client
+                                        // holding an emptied screen, recoverable only by
+                                        // a real resize the person did by hand. Both
+                                        // payloads are written while the gate is still
+                                        // shut, so the repaint, when it does come, lands
+                                        // after them and paints over. The screen it
+                                        // paints over is a bounded replay's account of
+                                        // the session rather than a guaranteed blank
+                                        // one, and being behind is worth more here than
+                                        // being empty.
                                         write_stream_opened(&writer, &frame, None)?;
                                         for chunk in
-                                            session.screen_preamble().chunks(DATA_CHUNK_SIZE)
+                                            session.screen_snapshot().chunks(DATA_CHUNK_SIZE)
                                         {
                                             write_frame(
                                                 &writer,
@@ -14116,11 +14137,15 @@ mod platform {
         }
 
         #[test]
-        fn an_alt_screen_attach_at_a_new_size_sends_only_the_preamble() {
+        fn an_alt_screen_attach_at_a_new_size_sends_the_reflow_behind_the_preamble() {
             // The pane changed size and the child sits in the alt screen: the
-            // parser just reflowed the old-size screen, so attach must not
-            // commit that intermediate frame. It sends the mode preamble
-            // (alt enter + clear) and leaves the repaint to the app.
+            // parser just reflowed the old-size screen, so what attach sends is
+            // an intermediate frame the app has not painted. It goes out
+            // anyway, behind the mode preamble (alt enter + clear), because the
+            // resize nudge that is meant to replace it only provokes a repaint
+            // from an app that reacts to SIGWINCH at all - and the reflowed
+            // rows are a far better thing to hand someone whose app does not
+            // than the bare clear, which reads as a solid-colour pane.
             let (mut client, server) = UnixStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -14143,8 +14168,13 @@ mod platform {
                 "preamble must clear the screen: {payload:?}"
             );
             assert!(
-                !payload.contains("TASKCMARKER"),
-                "a size-changed alt-screen attach must not dump the reflowed rows: {payload:?}"
+                payload.contains("TASKCMARKER"),
+                "the reflowed rows are what the client reads until the app's \
+                 own repaint lands, and if it never lands: {payload:?}"
+            );
+            assert!(
+                payload.find("\x1b[2J") < payload.find("TASKCMARKER"),
+                "and they must sit behind the clear, never ahead of it: {payload:?}"
             );
             Frame::json(
                 FrameKind::Request,
@@ -14903,8 +14933,16 @@ mod platform {
         fn an_adopted_alt_screen_session_forces_a_repaint_on_a_same_size_attach() {
             // Adoption rebuilds the screen from a bounded tail of history: for
             // a differential-rendering TUI that is a partial frame. The first
-            // attach must not ship it — it sends the preamble and forces the
-            // child to repaint — even though the size did not change.
+            // attach forces the child to repaint over it — sending preamble,
+            // snapshot, then the nudge — even though the size did not change.
+            // The partial frame is shipped rather than withheld because the
+            // nudge is not a promise: this child traps WINCH and answers, but
+            // an app that only compares the size it is given against the size
+            // it holds sees no change across an out-and-back resize and
+            // redraws nothing, and withholding left that client on a screen
+            // the preamble had just cleared. What must hold is the order:
+            // the stale frame goes out behind the clear and ahead of every
+            // live byte, so a repaint can only ever paint over it.
             let state = test_state("adoptwinch");
             let paths = state.paths.clone();
             let session_id = "muxloomd-opencode-adoptwinch";
@@ -14973,8 +15011,8 @@ mod platform {
             .unwrap();
             // Judge a window, not the first frame: the child's repaint arrives
             // as live broadcast, so read until the whole exchange is in. The
-            // preamble must be in it, the partial snapshot must not be, and the
-            // child must have felt the nudge.
+            // preamble must be in it, the rebuilt snapshot must sit behind the
+            // clear, and the child must have felt the nudge.
             let mut window = String::new();
             let mut first_data: Option<String> = None;
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -15004,12 +15042,20 @@ mod platform {
                 "the preamble must clear the screen: {window:?}"
             );
             assert!(
-                !window.contains("WINCHSCREEN"),
-                "the partial rebuilt frame must not be committed: {window:?}"
+                window.contains("WINCHSCREEN"),
+                "the rebuilt frame is what the client reads until the repaint \
+                 lands, and if it never lands: {window:?}"
             );
             assert!(
                 window.contains("WINCHMARKER"),
                 "the repaint nudge must SIGWINCH the child: {window:?}"
+            );
+            assert!(
+                window.find("\x1b[2J") < window.find("WINCHSCREEN")
+                    && window.find("WINCHSCREEN") < window.find("WINCHMARKER"),
+                "clear, then the rebuilt frame, then the repaint over it: \
+                 a stale frame written after live output would overwrite the \
+                 good screen with the old one: {window:?}"
             );
             // And the order is the contract, not just the presence: the
             // preamble is the first payload out - the broadcast gate opens
@@ -15019,7 +15065,7 @@ mod platform {
             let first_data = first_data.expect("the attach sends a payload");
             assert!(
                 first_data.starts_with("\x1b[?1049h") && first_data.contains("\x1b[2J"),
-                "the preamble alone opens the stream: {first_data:?}"
+                "the snapshot opens the stream, preamble first: {first_data:?}"
             );
             assert!(
                 window.find("\x1b[2J") < window.find("WINCHMARKER"),
@@ -15029,6 +15075,128 @@ mod platform {
             assert_eq!(adopted.columns.load(Ordering::Relaxed), 80);
             assert_eq!(adopted.rows.load(Ordering::Relaxed), 24);
             // The flag is consumed: the next attach is an ordinary one.
+            assert!(!adopted.screen_rebuilt.load(Ordering::Relaxed));
+
+            Frame::json(
+                FrameKind::Request,
+                0,
+                2,
+                &DaemonRequest::Archive {
+                    session_id: session_id.into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            loop {
+                let frame = Frame::read_from(&mut client).unwrap().unwrap();
+                if frame.kind == FrameKind::Response && frame.request_id == 2 {
+                    assert_eq!(
+                        frame.decode_json::<DaemonResponse>().unwrap(),
+                        DaemonResponse::Ack
+                    );
+                    break;
+                }
+            }
+            drop(client);
+            handle.join().unwrap().unwrap();
+            discard_root(paths.root);
+        }
+
+        #[test]
+        fn an_adopted_alt_screen_attach_still_shows_a_child_that_ignores_the_nudge() {
+            // The nudge is a bet, and this is the child that does not take it:
+            // no WINCH trap at all, which is how an app behaves when it
+            // compares the size it is handed against the size it holds and
+            // finds an out-and-back resize ended where it started. Nothing is
+            // ever broadcast on this stream. Whatever the attach itself wrote
+            // is the whole of what the person sees, so it has to be the
+            // screen - sending only the preamble left them looking at its
+            // clear, a solid-colour pane recoverable only by dragging the
+            // window to force a real resize.
+            let state = test_state("adoptquiet");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-opencode-adoptquiet";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "opencode".into(),
+                "/tmp".into(),
+                "adoptquiet".into(),
+                false,
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\033[?1049h'; printf 'QUIETSCREEN\\n'; \
+                     while :; do sleep 0.1; done"
+                        .into(),
+                ],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(750));
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            adopt_keeper_sessions(&restarted);
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper session must be adopted, not archived");
+            assert!(adopted.screen_rebuilt.load(Ordering::Relaxed));
+
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let serve = Arc::clone(&restarted);
+            let handle = thread::spawn(move || serve_client(server, serve));
+            Frame::json(
+                FrameKind::OpenStream,
+                stream::PTY_BASE,
+                1,
+                &OpenStream::Pty {
+                    session_id: session_id.into(),
+                    columns: 80,
+                    rows: 24,
+                    scrollback_rows: 0,
+                },
+            )
+            .unwrap()
+            .write_to(&mut client)
+            .unwrap();
+            // Read until the child has had every chance to answer the nudge and
+            // has not: the read timeout ends this, and what accumulated is
+            // everything the client will ever get.
+            let mut window = String::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match Frame::read_from(&mut client) {
+                    Ok(Some(frame))
+                        if frame.kind == FrameKind::Data && frame.stream_id == stream::PTY_BASE =>
+                    {
+                        window
+                            .push_str(&String::from_utf8_lossy(&frame.decoded_payload().unwrap()));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            assert!(
+                window.contains("\x1b[?1049h") && window.contains("\x1b[2J"),
+                "the alt-buffer preamble still opens the stream: {window:?}"
+            );
+            assert!(
+                window.contains("QUIETSCREEN"),
+                "a child that ignores the nudge must still leave the client a \
+                 screen to read, not the preamble's bare clear: {window:?}"
+            );
             assert!(!adopted.screen_rebuilt.load(Ordering::Relaxed));
 
             Frame::json(
