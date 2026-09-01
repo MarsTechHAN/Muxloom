@@ -13349,8 +13349,7 @@ mod tests {
         // margin, and took the copy-a-selection column maths with it.
         let log = b"\x1b[1;1Hname\x1b[1;12Hstatus\r\n\x1b[2;3Hclaude\x1b[2;12Hworking\r\n";
         let (page, _total, _offset) =
-            crate::terminal_session::render_history_rows(&log[..], 24, 4, 0, 6, None)
-                .expect("render");
+            crate::terminal_session::render_history_rows(&log[..], 24, 4, 0, 6).expect("render");
         let page = String::from_utf8(page).expect("utf-8 rows");
 
         let text = sanitize_terminal_text(&page);
