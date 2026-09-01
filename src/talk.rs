@@ -739,23 +739,28 @@ impl TalkStore {
 
     /// Everything held past a peer's vector, oldest first, so a peer that is
     /// far behind catches up over several fetches rather than one huge one.
+    ///
+    /// A batch is at most [`MAX_PAGE`] and the board may hold tens of
+    /// thousands, so the walk keeps only the end it is going to hand back
+    /// rather than copying every message it looked at to sort and throw away.
+    /// This runs on every sync round against every reachable machine, which is
+    /// the one place on the board where the cost of the whole board is paid
+    /// over and over.
     pub fn since(&self, from: &TalkVector, limit: usize) -> Vec<TalkMessage> {
         let inner = self.inner();
-        let mut out = Vec::new();
+        let mut page = OldestFirst::new(limit.clamp(1, MAX_PAGE));
         for (origin, log) in &inner.logs {
             let held = from.get(origin).copied().unwrap_or(0);
-            out.extend(
-                log.messages
-                    .iter()
-                    .filter(|message| message.seq > held)
-                    .cloned(),
-            );
+            // An origin is sorted by seq, so where the peer's knowledge ends
+            // is found rather than walked to. The common case by far is a peer
+            // that is already up to date, and that case should not cost a pass
+            // over everything the origin has ever said.
+            let fresh = log.messages.partition_point(|message| message.seq <= held);
+            for message in &log.messages[fresh..] {
+                page.offer(message);
+            }
         }
-        out.sort_by(|left, right| {
-            (left.ts, &left.origin, left.seq).cmp(&(right.ts, &right.origin, right.seq))
-        });
-        out.truncate(limit.clamp(1, MAX_PAGE));
-        out
+        page.into_page()
     }
 
     /// Read the board as someone standing on this machine sees it.
@@ -1782,6 +1787,86 @@ mod tests {
             .map(|message| message.seq)
             .collect();
         assert_eq!(from_two, vec![3]);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    /// A catch-up batch is capped, and what it drops has to be the newest -
+    /// otherwise a peer that is far behind is handed a batch, tells us it is
+    /// still missing the older half, and is handed the same batch again. The
+    /// cap is applied across the whole board rather than per origin, so this
+    /// puts two machines' messages in front of it interleaved in time and asks
+    /// for fewer than either alone.
+    #[test]
+    fn a_catch_up_batch_is_the_oldest_the_peer_is_missing_across_every_origin() {
+        let store = store("catch-up");
+        let far = |origin: &str, seq: u64, ts: u64| TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.into(),
+            seq,
+            ts,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: origin.into(),
+                machine_label: origin.into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("{origin} {seq}"),
+        };
+        let (alpha, bravo) = ("alpha-1234abcd", "bravo-1234abcd");
+        assert_eq!(
+            store
+                .merge(vec![
+                    far(alpha, 1, 100),
+                    far(bravo, 1, 150),
+                    far(alpha, 2, 200),
+                    far(bravo, 2, 250),
+                    far(alpha, 3, 300),
+                ])
+                .unwrap(),
+            5
+        );
+
+        let named = |from: &TalkVector, limit: usize| -> Vec<String> {
+            store
+                .since(from, limit)
+                .iter()
+                .map(|message| message.id.clone())
+                .collect()
+        };
+
+        // Oldest first and across both origins: taking three from alpha alone
+        // would leave bravo's oldest behind forever.
+        assert_eq!(
+            named(&TalkVector::new(), 3),
+            vec![
+                format!("{alpha}:1"),
+                format!("{bravo}:1"),
+                format!("{alpha}:2")
+            ]
+        );
+
+        // What the peer already holds is skipped per origin, not globally.
+        assert_eq!(
+            named(&TalkVector::from([(alpha.into(), 2)]), 10),
+            vec![
+                format!("{bravo}:1"),
+                format!("{bravo}:2"),
+                format!("{alpha}:3")
+            ]
+        );
+
+        // A peer that is up to date is handed nothing at all.
+        assert!(
+            named(
+                &TalkVector::from([(alpha.into(), 3), (bravo.into(), 2)]),
+                10
+            )
+            .is_empty()
+        );
 
         fs::remove_dir_all(&store.root).ok();
     }
