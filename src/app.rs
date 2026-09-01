@@ -10746,13 +10746,27 @@ impl App {
                     form.selected = clamped_index(form.selected, form.results.len(), 1);
                     self.modal = Some(Modal::Search(form));
                 }
+                // Enter opens the hit under the cursor. A search is not one
+                // answer but a run of them: names and recaps come back at once
+                // and the fleet's scrollback arrives in batches over the
+                // seconds after, so `loading` stays set while perfectly
+                // openable rows are already on screen. Requiring it to be clear
+                // meant Enter, pressed on a visible result, fell through to
+                // re-running the very search that produced it - and each rerun
+                // started the wait again, so the list could never be entered at
+                // all. The query is compared trimmed, the way the debounced
+                // auto-submit compares it, so a trailing space is not treated
+                // as a different search either.
                 KeyCode::Enter
-                    if !form.loading
-                        && !form.results.is_empty()
-                        && form.submitted_query == form.query =>
+                    if !form.results.is_empty() && form.submitted_query == form.query.trim() =>
                 {
                     let result = form.results[form.selected].clone();
                     self.open_search_result(result);
+                }
+                // This query is already running and has turned up nothing yet.
+                // Submitting it again would only restart it, so let it finish.
+                KeyCode::Enter if form.loading && form.submitted_query == form.query.trim() => {
+                    self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Enter => self.submit_search(form),
                 KeyCode::Backspace => {
@@ -19937,6 +19951,103 @@ mod tests {
             "with the old cursor gone, back to the top"
         );
         drop(request_rx);
+    }
+
+    /// The list arrives in instalments, so it is on screen and openable long
+    /// before the search is finished. Enter has to open the row the cursor is
+    /// on for the whole of that window: making it wait for the search to finish
+    /// meant Enter fell through to re-running the search that produced the row,
+    /// and since every rerun started the wait over, the list could not be
+    /// entered at all.
+    #[test]
+    fn enter_opens_a_listed_hit_while_the_rest_of_the_search_is_still_running() {
+        use crate::model::SearchMatchKind;
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        // An archived hit, and archives already on show: opening it is then
+        // pure bookkeeping, with no attach and no state file written.
+        app.state.show_archived = true;
+        app.sessions = vec![AgentSession {
+            id: "muxloomd-codex-alpha".into(),
+            dead: true,
+            ..waiting_agent("")
+        }];
+        let searched = |results: Vec<crate::model::SearchResult>, reading| Event::Searched {
+            query: "needle".into(),
+            results,
+            unreachable: Vec::new(),
+            reading,
+        };
+        app.open_search();
+        let Some(Modal::Search(form)) = app.modal.as_mut() else {
+            panic!("the search modal should be open");
+        };
+        form.query = "needle".into();
+        form.submitted_query = "needle".into();
+        form.loading = true;
+
+        // Nothing back yet. Enter here has nothing to open, and re-asking would
+        // only restart the wait, so the query it is already running stands.
+        app.handle_worker_event(searched(Vec::new(), Some((0, 2))));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::Search(_))),
+            "an empty running search stays open on Enter"
+        );
+
+        // The names are in; the scrollback is still being read, so the search
+        // is still running. The row on screen opens all the same.
+        app.handle_worker_event(searched(
+            vec![crate::model::SearchResult {
+                session_id: "muxloomd-codex-alpha".into(),
+                target_id: "local".into(),
+                kind: AgentKind::Codex,
+                label: "alpha".into(),
+                path: "/work".into(),
+                match_kind: SearchMatchKind::Name,
+                snippet: "needle".into(),
+                line_number: None,
+                created_at: 1,
+                dead: true,
+            }],
+            Some((1, 2)),
+        ));
+        let Some(Modal::Search(form)) = app.modal.as_ref() else {
+            panic!("the search modal should still be open");
+        };
+        assert!(form.loading, "the fleet's scrollback is still being read");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.modal.is_none(), "Enter leaves the search for the hit");
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some("muxloomd-codex-alpha")
+        );
+        assert!(
+            app.status_message.starts_with("Opened"),
+            "the hit is what was opened: {:?}",
+            app.status_message
+        );
+        assert!(
+            !request_rx
+                .try_iter()
+                .any(|request| matches!(request, Request::Search { .. })),
+            "neither Enter may re-run the search that is already running"
+        );
     }
 
     /// The archive a resume supersedes is removed from its machine, and the
