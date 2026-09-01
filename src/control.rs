@@ -6307,7 +6307,14 @@ mod tests {
     /// stops being worth reading at exactly the moment it is being used most.
     #[test]
     fn the_board_is_offered_as_a_memory_and_a_post_defaults_to_a_note() {
-        let posted = |arguments: Value| {
+        // Every draft names its own path. The default scope is "path", which
+        // otherwise falls back to the calling session's directory - so a test
+        // that left it out would pass on a developer's machine, where it is
+        // running inside a muxloom session, and fail on any builder that is
+        // not. What is under test here is `kind`, and it should not depend on
+        // where the test happens to be run from.
+        let posted = |mut arguments: Value| {
+            arguments["path"] = json!("/work");
             talk_draft(&arguments, TalkAuthor::default())
                 .expect("the draft is well formed")
                 .kind
