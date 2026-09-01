@@ -9,12 +9,21 @@ repository = "https://github.com/MarsTechHAN/Muxloom"
 readme = "README.md"
 
 [dependencies]
+# WeChat carries a picture or a document through a CDN of its own and will only
+# take it encrypted: AES-128-ECB under a key minted per file, with the file's
+# MD5 declared up front so the far side can tell it arrived whole. Hence three
+# small primitives that nothing else here needs — `aes` and `md-5` from the same
+# RustCrypto family as `sha2` below, and `getrandom` for the key itself, which
+# has to come from the OS rather than from the clock the nonces use.
+aes = "0.8"
 anyhow = "1.0"
 crossterm = "0.28"
 csv = "1.4"
 flate2 = { version = "1.1.9", optional = true }
+getrandom = "0.2"
 image = { version = "=0.25.5", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tiff", "webp"] }
 libc = "0.2"
+md-5 = "0.10"
 lz4_flex = "0.11"
 minreq = { version = "3.0.0", default-features = false, features = ["https-rustls", "proxy"] }
 portable-pty = "0.8"

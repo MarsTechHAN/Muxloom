@@ -351,6 +351,65 @@ pub fn post_multipart(
     json(send(request, url, |_| true)?, url)
 }
 
+/// What a POST answered with, when the answer is not JSON.
+///
+/// Both halves matter to the one caller that needs this: WeChat's CDN takes the
+/// file in the body and hands back the handle for it in a *header*, leaving the
+/// body empty. A shape that only returned bytes would throw away the entire
+/// point of the call.
+pub struct Posted {
+    pub bytes: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Posted {
+    /// One response header by name, matched without regard to case — which is
+    /// the only correct way to read one, since a server may spell it however it
+    /// likes and some spell it differently from their own documentation.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// POST a body that is not text and read the answer without assuming it is
+/// JSON: a file going up to a CDN that stores bytes and describes them in
+/// headers.
+///
+/// Separate from [`post_multipart`] because there is no form here — the body is
+/// the file, whole, and the metadata went ahead of it in an earlier call. Not
+/// retried past a transport failure, for the same reason as [`post_json`]: a
+/// 5xx may still have stored the object.
+pub fn post_bytes(
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: &str,
+    body: &[u8],
+    environment: &[(String, String)],
+) -> Result<Posted> {
+    let request = headed(prepare(minreq::post(url), url, environment), headers)
+        .with_header("Content-Type", content_type)
+        .with_timeout(MEDIA_TIMEOUT_SECS)
+        .with_body(body.to_vec());
+    let response = send(request, url, |_| true)?;
+    let status = response.status_code;
+    let headers = response
+        .headers
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let bytes = response.into_bytes();
+    if !(200..300).contains(&status) {
+        bail!(
+            "{url} returned HTTP {status}: {}",
+            excerpt(&String::from_utf8_lossy(&bytes))
+        );
+    }
+    Ok(Posted { bytes, headers })
+}
+
 /// The separator between the parts, derived from the bytes it has to separate
 /// rather than picked at random.
 ///

@@ -38,14 +38,15 @@ const BOT_TYPE: &str = "3";
 
 /// A text item, in the protocol's numbering.
 const ITEM_TEXT: i64 = 1;
-/// The item types that are not words. muxloom sends none of these and can fetch
-/// none of them: WeChat carries media through a CDN of its own, encrypted, and
-/// the shape of that exchange is not published. They are numbered here so that
-/// a message holding one can at least be reported as having held one.
+/// The item types that are not words. Pictures and documents muxloom now both
+/// sends and names; a voice note or a video it can only name, because those
+/// arrive already encoded in formats (silk, in particular) nothing here can
+/// produce.
 const ITEM_IMAGE: i64 = 2;
 const ITEM_VOICE: i64 = 3;
 const ITEM_FILE: i64 = 4;
 const ITEM_VIDEO: i64 = 5;
+
 /// The item type the platform itself puts on the `message_item` inside a
 /// quote's `ref_msg`: 0 in every capture, inbound and outbound alike — the
 /// reference stands for someone else's message, not for a fresh text item.
@@ -54,6 +55,25 @@ const QUOTED_REF: i64 = 0;
 const FROM_BOT: i64 = 2;
 /// A complete message rather than one still being streamed in.
 const FINISHED: i64 = 2;
+
+/// Where the encrypted bytes of a picture or a document actually live. Distinct
+/// from [`HOST`]: the API says who may upload and the CDN holds what they
+/// uploaded, and the two are not the same machine.
+const CDN: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+/// `media_type` on an upload, which is numbered differently from the item type
+/// the finished message carries — 1/2/3/4 here against 2/5/4/3 there. Two
+/// numberings for four things is exactly the sort of detail that is silently
+/// wrong forever, so neither is ever written as a literal at a call site.
+const UPLOAD_IMAGE: i64 = 1;
+const UPLOAD_FILE: i64 = 3;
+
+/// The one encryption the CDN offers, named in the message so the phone on the
+/// other end knows how to undo it.
+const ENCRYPT_AES: i64 = 1;
+
+/// AES works a block at a time, and this is the block.
+const BLOCK: usize = 16;
 
 /// The conversation has been quiet too long and WeChat has closed it. Only the
 /// person can open it again, by saying something.
@@ -355,6 +375,295 @@ fn text_item(text: &str, quoted_id: Option<&str>) -> Value {
         });
     }
     item
+}
+
+/// The kind of thing being sent, which decides both of the protocol's two
+/// numberings for it and how the finished item is shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Medium {
+    /// Shown inline on the phone.
+    Image,
+    /// Arrives as a document with a name on it, to be tapped and saved.
+    File,
+}
+
+impl Medium {
+    /// What `getuploadurl` calls it.
+    fn upload_type(self) -> i64 {
+        match self {
+            Medium::Image => UPLOAD_IMAGE,
+            Medium::File => UPLOAD_FILE,
+        }
+    }
+
+    /// What the item in the finished message calls it.
+    fn item_type(self) -> i64 {
+        match self {
+            Medium::Image => ITEM_IMAGE,
+            Medium::File => ITEM_FILE,
+        }
+    }
+}
+
+/// Send a picture or a document.
+///
+/// Three round trips, in an order that is not negotiable: ask the API where to
+/// put it, put it there, then tell the conversation it exists. The bytes go up
+/// encrypted under a key this side mints and then hands over in the message
+/// itself — WeChat's CDN never sees the key, and the phone gets it by being in
+/// the conversation. That is the whole of the scheme, and it means the key is
+/// worth generating properly: [`nonce`] is drawn from the clock, which is fine
+/// for a replay guard and would be a real weakness here, so this one comes from
+/// the OS.
+///
+/// `caption` goes as a separate text message before the media, because the
+/// protocol takes one item per send — a caption bundled into the same
+/// `item_list` is dropped rather than refused, which is the worst way to lose
+/// one.
+pub fn send_media(
+    account: &Account,
+    context_token: &str,
+    medium: Medium,
+    file_name: &str,
+    bytes: &[u8],
+    environment: &[(String, String)],
+) -> Result<(String, Verdict)> {
+    if context_token.trim().is_empty() {
+        bail!("say anything to this bot in WeChat first — it can only answer a conversation");
+    }
+    if bytes.is_empty() {
+        bail!("{file_name} is empty, and WeChat will not carry an empty file");
+    }
+    let uploaded = upload(account, medium, bytes, environment)?;
+    let id = client_id();
+    let nonce = nonce();
+    let bearer = format!("Bearer {}", account.token.trim());
+    let answer = http::post_json(
+        &endpoint(&account.base_url, "sendmessage"),
+        &headers(&bearer, &nonce),
+        &media_body(
+            &account.user_id,
+            &id,
+            context_token,
+            medium,
+            file_name,
+            &uploaded,
+        ),
+        environment,
+    )?;
+    capture_raw("send-media", &answer);
+    let verdict = verdict_of(&answer, &id);
+    crate::debug::log(
+        "ilink",
+        format!(
+            "sendmedia verdict: kind={medium:?} bytes={} code={} reason={} delivery_confirmed={}",
+            bytes.len(),
+            verdict.code,
+            if verdict.reason.is_empty() {
+                "none"
+            } else {
+                verdict.reason.as_str()
+            },
+            verdict.delivery_confirmed,
+        ),
+    );
+    refused_send(&answer)?;
+    Ok((id, verdict))
+}
+
+/// What an upload leaves behind: everything the message then has to name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Uploaded {
+    /// The CDN's handle for the stored object, which is what a download asks
+    /// for.
+    query_param: String,
+    /// The key the bytes were encrypted under, base64 of the raw sixteen. The
+    /// phone cannot read the file without it.
+    aes_key: String,
+    /// The file as the sender sees it.
+    raw_size: usize,
+    /// The file as the CDN stores it, which is longer: PKCS#7 always adds at
+    /// least one byte. The image item reports this one, and getting it wrong
+    /// truncates the picture.
+    stored_size: usize,
+}
+
+/// Put the bytes on the CDN and come back with the handle for them.
+fn upload(
+    account: &Account,
+    medium: Medium,
+    bytes: &[u8],
+    environment: &[(String, String)],
+) -> Result<Uploaded> {
+    let key = random_key()?;
+    let file_key = hex(&random_key()?);
+    let nonce = nonce();
+    let bearer = format!("Bearer {}", account.token.trim());
+    let stored_size = padded_len(bytes.len());
+    let permission = http::post_json(
+        &endpoint(&account.base_url, "getuploadurl"),
+        &headers(&bearer, &nonce),
+        &json!({
+            "filekey": file_key,
+            "media_type": medium.upload_type(),
+            "to_user_id": account.user_id,
+            "rawsize": bytes.len(),
+            "rawfilemd5": md5_hex(bytes),
+            "filesize": stored_size,
+            "no_need_thumb": true,
+            "aeskey": hex(&key),
+            "base_info": { "channel_version": env!("CARGO_PKG_VERSION") },
+        }),
+        environment,
+    )?;
+    capture_raw("upload-url", &permission);
+    let upload_param = text_at(&permission, "upload_param");
+    if upload_param.is_empty() {
+        bail!(
+            "WeChat would not say where to put the file: {}",
+            one_line(&permission)
+        );
+    }
+    // Everything past here is the CDN rather than the API, so a refusal comes
+    // back as a status rather than as a code in a body.
+    let answer = http::post_bytes(
+        &format!(
+            "{CDN}/upload?encrypted_query_param={}&filekey={}",
+            urlencode(&upload_param),
+            urlencode(&file_key)
+        ),
+        &[],
+        "application/octet-stream",
+        &encrypt(bytes, &key),
+        environment,
+    )?;
+    // The stored object's handle comes back in a header and nowhere else — an
+    // empty body with a 200 is the success case, so not finding the header is
+    // the failure that has to be caught here rather than three lines later as a
+    // message referring to nothing.
+    let query_param = answer
+        .header("x-encrypted-param")
+        .unwrap_or_default()
+        .to_string();
+    if query_param.is_empty() {
+        bail!("WeChat's CDN took the file but did not say where it put it");
+    }
+    Ok(Uploaded {
+        query_param,
+        aes_key: base64(&key),
+        raw_size: bytes.len(),
+        stored_size,
+    })
+}
+
+/// The outgoing body for one media send, apart from the wire so its shape can
+/// be checked without a network.
+fn media_body(
+    to: &str,
+    id: &str,
+    context_token: &str,
+    medium: Medium,
+    file_name: &str,
+    uploaded: &Uploaded,
+) -> Value {
+    let media = json!({
+        "encrypt_query_param": uploaded.query_param,
+        "aes_key": uploaded.aes_key,
+        "encrypt_type": ENCRYPT_AES,
+    });
+    // The two items disagree about which size they want and what they call it.
+    // An image reports the stored (encrypted, padded) length; a file reports
+    // the real one, as a string, because that is the number shown under the
+    // document's name on the phone.
+    let body = match medium {
+        Medium::Image => json!({ "media": media, "mid_size": uploaded.stored_size }),
+        Medium::File => json!({
+            "media": media,
+            "file_name": file_name,
+            "len": uploaded.raw_size.to_string(),
+        }),
+    };
+    let field = match medium {
+        Medium::Image => "image_item",
+        Medium::File => "file_item",
+    };
+    json!({
+        "msg": {
+            "to_user_id": to,
+            "client_id": id,
+            "message_type": FROM_BOT,
+            "message_state": FINISHED,
+            "context_token": context_token,
+            "item_list": [{ "type": medium.item_type(), field: body }],
+        },
+        "base_info": { "channel_version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
+/// Sixteen bytes from the operating system's own source.
+///
+/// An error here is not survivable by falling back to something weaker: the
+/// caller is about to encrypt somebody's file, and a key from a worse source
+/// would be a silent downgrade of the only protection the bytes get.
+fn random_key() -> Result<[u8; BLOCK]> {
+    let mut key = [0u8; BLOCK];
+    getrandom::getrandom(&mut key)
+        .map_err(|error| anyhow!("this machine would not give out a random key: {error}"))?;
+    Ok(key)
+}
+
+/// AES-128-ECB with PKCS#7 padding, which is what the CDN reads.
+///
+/// ECB is the platform's choice, not one open to us: a message naming any other
+/// mode is refused. It leaks equal blocks, which for a picture is a real
+/// weakness — but the alternative on offer is not a better mode, it is sending
+/// nothing.
+fn encrypt(bytes: &[u8], key: &[u8; BLOCK]) -> Vec<u8> {
+    use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut out = Vec::with_capacity(padded_len(bytes.len()));
+    out.extend_from_slice(bytes);
+    // PKCS#7: pad to the next block with the pad length repeated, and add a
+    // whole block when the input already fits — so the far side can always
+    // trust the last byte and there is no length to send separately.
+    let pad = BLOCK - (bytes.len() % BLOCK);
+    out.extend(std::iter::repeat_n(pad as u8, pad));
+    for block in out.chunks_mut(BLOCK) {
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    }
+    out
+}
+
+/// How long `bytes` becomes once padded — always strictly longer, never equal.
+fn padded_len(len: usize) -> usize {
+    len + BLOCK - (len % BLOCK)
+}
+
+/// The file's MD5, lowercase hex, which the upload declares up front so the CDN
+/// can tell a truncated arrival from a whole one. Not a security claim, and not
+/// used as one: the confidentiality here is the AES key.
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    hex(&Md5::digest(bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// A refusal body squeezed onto one line, for an error message. Trimmed,
+/// because these can be long and the useful part is at the front.
+fn one_line(answer: &Value) -> String {
+    let text = answer.to_string();
+    match text.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
 }
 
 /// Read the verdict off one reply body: the code, the human reason, whether
@@ -974,6 +1283,136 @@ mod tests {
         // An empty id is no quote: it must not ride along as a broken one.
         let blank = send_body("u@im.wechat", "muxloom-x", "ctx", "hi", Some("  "));
         assert!(blank["msg"]["item_list"][0].get("ref_msg").is_none());
+    }
+
+    /// The protocol numbers the same four things twice, differently, and the
+    /// two numberings are never both visible at one call site. Pinning them
+    /// together is the only place the disagreement can be seen at all.
+    #[test]
+    fn a_picture_and_a_document_are_numbered_the_way_each_call_wants_them() {
+        assert_eq!(Medium::Image.upload_type(), 1);
+        assert_eq!(Medium::Image.item_type(), 2);
+        assert_eq!(Medium::File.upload_type(), 3);
+        assert_eq!(Medium::File.item_type(), 4);
+    }
+
+    /// PKCS#7 never leaves the length alone, which is why an image reports its
+    /// stored size rather than its real one. A padded_len that returned the
+    /// input for a whole number of blocks would truncate the last block of
+    /// every file whose size happened to divide by sixteen.
+    #[test]
+    fn padding_always_grows_the_file_so_the_last_byte_can_be_trusted() {
+        assert_eq!(padded_len(0), 16);
+        assert_eq!(padded_len(1), 16);
+        assert_eq!(padded_len(15), 16);
+        assert_eq!(padded_len(16), 32, "a whole block still gains a block");
+        assert_eq!(padded_len(17), 32);
+    }
+
+    /// Against FIPS-197's own AES-128 vector, so a wrong key schedule or a
+    /// byte order swapped somewhere cannot pass. The CDN would report such a
+    /// file as stored and the phone would show a broken picture.
+    #[test]
+    fn encryption_matches_the_published_aes_vector() {
+        let key = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let plain = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let out = encrypt(&plain, &key);
+        // One block in, two out: the second is the pure padding block.
+        assert_eq!(out.len(), 32);
+        assert_eq!(hex(&out[..16]), "69c4e0d86a7b0430d8cdb78070b4c55a");
+    }
+
+    /// The declared digest is how the CDN tells a truncated arrival from a
+    /// whole one, so it has to be the digest of what actually went up.
+    #[test]
+    fn the_declared_digest_is_the_files_own() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// The key travels in the message and nowhere else — WeChat's CDN never
+    /// sees it. A body that lost it would leave the phone holding bytes it
+    /// cannot read, which looks on the wire exactly like a successful send.
+    #[test]
+    fn the_media_body_carries_the_key_the_phone_needs_to_read_the_file() {
+        let uploaded = Uploaded {
+            query_param: "param-1".into(),
+            aes_key: "a2V5".into(),
+            raw_size: 100,
+            stored_size: 112,
+        };
+        let picture = media_body(
+            "user-1",
+            "id-1",
+            "ctx-1",
+            Medium::Image,
+            "shot.png",
+            &uploaded,
+        );
+        let item = &picture["msg"]["item_list"][0];
+        assert_eq!(item["type"], ITEM_IMAGE);
+        assert_eq!(item["image_item"]["media"]["aes_key"], "a2V5");
+        assert_eq!(
+            item["image_item"]["media"]["encrypt_query_param"],
+            "param-1"
+        );
+        assert_eq!(item["image_item"]["media"]["encrypt_type"], ENCRYPT_AES);
+        // An image is measured as stored: padded and encrypted.
+        assert_eq!(item["image_item"]["mid_size"], 112);
+        assert_eq!(picture["msg"]["context_token"], "ctx-1");
+        assert_eq!(picture["msg"]["to_user_id"], "user-1");
+
+        let document = media_body(
+            "user-1",
+            "id-1",
+            "ctx-1",
+            Medium::File,
+            "notes.pdf",
+            &uploaded,
+        );
+        let item = &document["msg"]["item_list"][0];
+        assert_eq!(item["type"], ITEM_FILE);
+        assert_eq!(item["file_item"]["file_name"], "notes.pdf");
+        // A document is measured as the person sees it, and as a string —
+        // this is the number printed under the name on the phone.
+        assert_eq!(item["file_item"]["len"], "100");
+        assert_eq!(item["file_item"]["media"]["aes_key"], "a2V5");
+    }
+
+    /// A key drawn from the clock the way [`nonce`] is would be a silent
+    /// downgrade of the only protection the bytes get.
+    #[test]
+    fn every_file_is_encrypted_under_a_key_of_its_own() {
+        let keys: std::collections::HashSet<[u8; BLOCK]> = (0..64)
+            .map(|_| random_key().expect("the OS has randomness"))
+            .collect();
+        assert_eq!(keys.len(), 64, "a repeated key is not a key");
+    }
+
+    /// A conversation nobody has opened has no token to answer into, and the
+    /// bytes should not be uploaded before that is discovered — an upload is
+    /// the expensive half and it would be thrown away.
+    #[test]
+    fn media_will_not_be_uploaded_into_a_conversation_that_has_no_token() {
+        let error = send_media(
+            &Account::default(),
+            "   ",
+            Medium::Image,
+            "shot.png",
+            b"bytes",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("say anything to this bot"),
+            "{error:#}"
+        );
     }
 
     #[test]
