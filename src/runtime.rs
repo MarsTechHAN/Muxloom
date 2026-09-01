@@ -424,6 +424,7 @@ impl Runtime {
             for session_id in disposable {
                 let _ = self.bridges.delete(target, session_id);
             }
+            merge_stranded_tmux_sessions(&mut sessions, self.stranded_tmux_sessions(target));
             let mut probe = Probe::default();
             for (kind, command) in commands {
                 probe.set(*kind, available.iter().any(|item| item == command));
@@ -535,6 +536,35 @@ impl Runtime {
             ),
         );
         Ok((probe, sessions))
+    }
+
+    /// The agents the tmux backend is still holding on a machine muxloomd has
+    /// since taken over.
+    ///
+    /// A daemon lists only the sessions it owns, and the scan above returns as
+    /// soon as one answers - so a tmux-backed session started before the daemon
+    /// existed, or during a window when it was down, silently drops out of the
+    /// list while its agent keeps running. Dropping out of the list is what
+    /// makes it immortal: ending a session is a keystroke on its row, so an
+    /// agent with no row is an agent nobody can stop, and it holds its model,
+    /// its folder and its tokens for as long as the machine stays up. Listing
+    /// them costs one `tmux list-panes` a scan and hands `x` back its target.
+    fn stranded_tmux_sessions(&self, target: &Target) -> Vec<AgentSession> {
+        let discover = shell_join(&[
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            FORMAT,
+            "-f",
+            "#{m/r:^(muxloom-|ad-),#{session_name}}",
+        ]) + " 2>/dev/null || true";
+        let Ok(output) = self.run_shell(target, &discover, false) else {
+            return Vec::new();
+        };
+        parse_discovery(&target.id, &String::from_utf8_lossy(&output.stdout))
+            .map(|(_, sessions)| sessions)
+            .unwrap_or_default()
     }
 
     /// Refresh muxloomd-owned session metadata without running executable
@@ -5353,6 +5383,22 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
     Ok((probe, sessions))
 }
 
+/// Put the tmux sessions a daemon-served listing left out back into it.
+///
+/// Only the ones still running: a dead pane on a machine that has moved to a
+/// daemon is the remains of a backend it no longer uses, and nothing sweeps
+/// those away, so showing them would grow a column of rows that mean nothing
+/// and never leave. What matters is that no *live* agent is missing, because
+/// that is the one a person meant to stop.
+fn merge_stranded_tmux_sessions(sessions: &mut Vec<AgentSession>, stranded: Vec<AgentSession>) {
+    for session in stranded {
+        if session.dead || sessions.iter().any(|known| known.id == session.id) {
+            continue;
+        }
+        sessions.push(session);
+    }
+}
+
 fn sanitize_field(value: &str) -> String {
     value
         .chars()
@@ -6114,6 +6160,44 @@ mod tests {
         assert_eq!(sessions[0].target_id, "gpu");
         assert!(sessions[1].id.starts_with("ad-"));
         assert!(sessions[1].dead, "remote dead panes must be archived");
+    }
+
+    /// A machine that gains a daemon does not lose the agents tmux was already
+    /// holding, and the listing is the only thing that can say so. Left out of
+    /// it they run on with no row to press `x` on - which is how three claude
+    /// sessions a chat channel had launched were still running two days after
+    /// the person thought they had closed them.
+    #[test]
+    fn a_daemon_listing_still_names_the_agents_tmux_is_holding() {
+        let (_, stranded) = parse_discovery(
+            "local",
+            concat!(
+                "muxloom-claude-100-5\tclaude\t/work\tWeChat\t100\t\t\t\t\t0\t9001\n",
+                "muxloom-codex-101-6\tcodex\t/work\tover\t101\t\t\t\t\t1\t9002\n",
+                "muxloom-claude-102-7\tclaude\t/work\tknown\t102\t\t\t\t\t0\t9003\n"
+            ),
+        )
+        .expect("the pane records parse");
+        let (_, mut sessions) = parse_discovery(
+            "local",
+            "muxloom-claude-102-7\tclaude\t/work\tknown\t102\t\t\t\t\t0\t9003\n",
+        )
+        .expect("the daemon listing parses");
+        merge_stranded_tmux_sessions(&mut sessions, stranded);
+        let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+        // The live one tmux is holding is the whole point of the sweep.
+        assert!(ids.contains(&"muxloom-claude-100-5"), "{ids:?}");
+        // A pane that has already ended is the remains of a backend this
+        // machine has left, and nothing would ever clear the row.
+        assert!(!ids.contains(&"muxloom-codex-101-6"), "{ids:?}");
+        // And one the listing already carries is not carried twice.
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == "muxloom-claude-102-7")
+                .count(),
+            1,
+            "{ids:?}"
+        );
     }
 
     #[test]
