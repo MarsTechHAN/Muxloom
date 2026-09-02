@@ -2007,6 +2007,67 @@ mod platform {
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
+    /// Whether the process has a child: for a shell, whether it is running
+    /// something rather than sitting at its prompt.
+    ///
+    /// A plain terminal paints no spinner and no interrupt hint, so its screen
+    /// cannot say whether anything is happening in it, and a job that writes
+    /// nothing for a minute — a build linking, a download, a test suite — is
+    /// silent in exactly the way a prompt is. The kernel knows: the shell
+    /// forked what it is waiting on, and the child is there until it exits.
+    /// A job put in the background counts too, which is right for what a
+    /// reader wants to know — whether the terminal is doing something.
+    fn has_child_process(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        child_processes(pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn child_processes(pid: i32) -> bool {
+        // One entry is enough: the question is whether there are any.
+        let mut children = [0 as libc::pid_t; 4];
+        let size = i32::try_from(std::mem::size_of_val(&children)).unwrap_or(i32::MAX);
+        let found = unsafe { libc::proc_listchildpids(pid, children.as_mut_ptr().cast(), size) };
+        found > 0
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn child_processes(pid: i32) -> bool {
+        // Linux lists a task's children outright when the kernel was built
+        // with CONFIG_PROC_CHILDREN; when it was not, the parent of every
+        // process is in its stat line, which is the long way round.
+        if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+            return children.split_whitespace().next().is_some();
+        }
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        let wanted = pid.to_string();
+        entries.flatten().any(|entry| {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            {
+                return false;
+            }
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                return false;
+            };
+            // `pid (comm) state ppid ...`; the name can hold spaces and
+            // parentheses, so the fields start after the last `)`.
+            stat.rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+                .is_some_and(|parent| parent == wanted)
+        })
+    }
+
     /// The last `limit` bytes of a session log, which is where an agent leaves
     /// whatever it has to say for itself.
     fn history_tail(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -6236,6 +6297,18 @@ mod platform {
                         .clone();
                     snapshot.attention_reason = attention_reason(kind, &visible_screen, &patterns);
                     snapshot.needs_attention = snapshot.attention_reason.is_some();
+                    // A plain terminal is doing something when its shell has a
+                    // child to wait on, and asking something only when it is:
+                    // a shell at its prompt asks nothing, whatever the last
+                    // program left on the last row.
+                    if kind == AgentKind::Terminal {
+                        let busy = snapshot.pid.is_some_and(has_child_process);
+                        snapshot.needs_attention &= busy;
+                        if !snapshot.needs_attention {
+                            snapshot.attention_reason = None;
+                        }
+                        snapshot.working = busy && !snapshot.needs_attention;
+                    }
                     // A screen claiming a turn is running is believed for as
                     // long as the marker it is claiming it with can be
                     // believed while nothing comes off the PTY: seconds for a
@@ -6257,13 +6330,16 @@ mod platform {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .working();
-                    snapshot.working = !snapshot.needs_attention
-                        && fresh
-                        && if kind == AgentKind::Codex {
-                            working_hint.unwrap_or_else(|| agent_is_working(kind, &visible_screen))
-                        } else {
-                            agent_is_working(kind, &visible_screen)
-                        };
+                    if kind != AgentKind::Terminal {
+                        snapshot.working = !snapshot.needs_attention
+                            && fresh
+                            && if kind == AgentKind::Codex {
+                                working_hint
+                                    .unwrap_or_else(|| agent_is_working(kind, &visible_screen))
+                            } else {
+                                agent_is_working(kind, &visible_screen)
+                            };
+                    }
                     // A trigger that fired asked for someone: it outranks the
                     // classification, which only knows what is on screen.
                     if let Some(notice) = self
@@ -13181,6 +13257,68 @@ mod platform {
 
             session.archive().unwrap();
             discard_root(root);
+        }
+
+        #[test]
+        fn a_terminal_is_working_while_its_shell_has_something_to_wait_on() {
+            let state = test_state("terminal-working");
+            let paths = state.paths.clone();
+            let launch = |id: &str, program: &str, arguments: Vec<String>| {
+                launch_session(
+                    &state,
+                    id.into(),
+                    "terminal".into(),
+                    "/tmp".into(),
+                    String::new(),
+                    false,
+                    program.into(),
+                    arguments,
+                    vec![],
+                    1,
+                    80,
+                    24,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            // A shell running a job: the job is its child for as long as it
+            // runs, however quiet the two of them are.
+            let busy = launch(
+                "muxloomd-terminal-busy",
+                "/bin/sh",
+                vec!["-c".into(), "sleep 3; echo done".into()],
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !busy.snapshot().working && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let snapshot = busy.snapshot();
+            assert!(snapshot.working, "{snapshot:?}");
+            assert!(!snapshot.needs_attention);
+            // The job's own question on the last row is what the terminal is
+            // waiting on.
+            busy.record_output(b"\x1b[2J\x1b[Hcp: overwrite '/tmp/a'? [y/N] ");
+            let asked = busy.snapshot();
+            assert_eq!(
+                asked.attention_reason.as_deref(),
+                Some("cp: overwrite '/tmp/a'? [y/N]")
+            );
+            assert!(asked.needs_attention && !asked.working);
+            // Nothing to wait on: a program that is its own shell, sitting
+            // there. The same question left on its last row asks nothing,
+            // because nothing is there to be answered.
+            let idle = launch("muxloomd-terminal-idle", "/bin/cat", vec![]);
+            idle.record_output(b"\x1b[2J\x1b[Hcp: overwrite '/tmp/a'? [y/N] ");
+            thread::sleep(Duration::from_millis(50));
+            let snapshot = idle.snapshot();
+            assert!(!snapshot.working, "{snapshot:?}");
+            assert!(!snapshot.needs_attention, "{snapshot:?}");
+            assert_eq!(snapshot.attention_reason, None);
+            busy.stop().unwrap();
+            idle.stop().unwrap();
+            discard_root(paths.root);
         }
 
         #[test]

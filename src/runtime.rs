@@ -3687,6 +3687,14 @@ pub(crate) fn attention_reason(
     if permission_shape {
         return because("permission request");
     }
+    // A plain shell asks in the words of whatever it is running, and those
+    // are on the last row: a `[y/N]` at the end of it, a password prompt, a
+    // pager waiting on a key.
+    if kind == AgentKind::Terminal
+        && let Some(prompt) = terminal_prompt(&rows)
+    {
+        return Some(prompt);
+    }
 
     let builtins: &[(&str, &[&str])] = match kind {
         AgentKind::Codex => &[
@@ -3769,6 +3777,35 @@ pub(crate) fn attention_reason(
         return Some("interrupted, waiting for a new instruction".into());
     }
     None
+}
+
+/// The input a program in a plain terminal is waiting on, read off the last
+/// drawn row: a yes-or-no tail (`Overwrite? [y/N]`), a password or passphrase
+/// prompt, a "press any key" or "press enter", a pager's `--More--` or `:`.
+/// The row itself is the answer, so a reader sees the question as asked.
+///
+/// Only the last row counts. The same words higher up are a question already
+/// answered, and a shell prompt drawn under them is what says so.
+fn terminal_prompt(rows: &[&str]) -> Option<String> {
+    let last = rows.iter().rev().find(|row| !row.trim().is_empty())?.trim();
+    let lower = last.to_lowercase();
+    let tail = lower.trim_end_matches([':', '?', ' ', '›', '>']);
+    let yes_no = [
+        "[y/n]", "(y/n)", "[yes/no]", "(yes/no)", "[y/n/a]", "(y/n/a)", "[yn]",
+    ]
+    .iter()
+    .any(|shape| tail.ends_with(shape));
+    let secret = (lower.contains("password") || lower.contains("passphrase"))
+        && lower.trim_end().ends_with(':');
+    let any_key = lower.contains("press any key")
+        || lower.contains("press enter")
+        || lower.contains("press return")
+        || lower.contains("hit enter")
+        || lower.contains("to continue");
+    let pager = matches!(tail, "--more--" | "(end)" | "") && !last.is_empty() && last.len() <= 12
+        || lower.starts_with("--more--")
+        || lower.starts_with("(end)");
+    (yes_no || secret || any_key || pager).then(|| last.to_string())
 }
 
 /// The question a dialog is asking, in the words it is asking it.
@@ -6388,6 +6425,51 @@ mod tests {
         );
         assert_eq!(attention_reason(AgentKind::Codex, &stale_prompt, &[]), None);
         assert!(attention_reason(AgentKind::Codex, "working...", &[]).is_none());
+    }
+
+    #[test]
+    fn a_shell_waiting_on_its_program_is_read_off_the_last_row() {
+        // A program's own question, in its own words.
+        let overwrite = "cp: overwrite '/tmp/a'? [y/N] ";
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, overwrite, &[]).as_deref(),
+            Some("cp: overwrite '/tmp/a'? [y/N]")
+        );
+        let sudo = "$ sudo make install\nPassword:";
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, sudo, &[]).as_deref(),
+            Some("Password:")
+        );
+        let apt = "After this operation, 12 MB will be used.\nDo you want to continue? [Y/n]";
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, apt, &[]).as_deref(),
+            Some("Do you want to continue? [Y/n]")
+        );
+        let pager = "line one\nline two\n--More--";
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, pager, &[]).as_deref(),
+            Some("--More--")
+        );
+        let less = "line one\n:";
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, less, &[]).as_deref(),
+            Some(":")
+        );
+        let key = "Setup complete.\nPress any key to continue . . .";
+        assert!(attention_reason(AgentKind::Terminal, key, &[]).is_some());
+        // Answered already: the shell prompt under it is the last row.
+        let answered = "cp: overwrite '/tmp/a'? [y/N] y\n$ ";
+        assert_eq!(attention_reason(AgentKind::Terminal, answered, &[]), None);
+        // A shell at its prompt, and a build printing about passwords, ask
+        // nothing.
+        assert_eq!(
+            attention_reason(AgentKind::Terminal, "➜  Terminal git:(main) ✗", &[]),
+            None
+        );
+        let prose = "warning: password hashing is slow\nBuilding...";
+        assert_eq!(attention_reason(AgentKind::Terminal, prose, &[]), None);
+        // Other kinds keep their own reading.
+        assert_eq!(attention_reason(AgentKind::Claude, overwrite, &[]), None);
     }
 
     #[test]

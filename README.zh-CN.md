@@ -256,7 +256,9 @@ PTY 沉默后被信任多久，取决于它用的是哪种标记：spinner 和�
 （adopt）的会话，其屏幕是从录像里重放出来的，可能还在画一小时前就结束的回合，所以必须
 等这个 daemon 亲耳听见它出声才算 Working——重启一次不会再让整台机器上没人碰过的 agent
 一起亮起来。压缩对话、subagent 并行阶段、无 token 计数的早期阶段都能正确
-识别。Codex 另有 OSC 标题 spinner 兜底。Waiting 检测覆盖审批提
+识别。Codex 另有 OSC 标题 spinner 兜底。纯终端不画任何标记，所以改问内核：shell
+还有子进程在等就算 Working（静默链接中的编译也是编译），子进程在最后一行留下问题
+（`[y/N]`、密码提示、分页器的 `--More--`）就算 Waiting，理由就是那一行原话。Waiting 检测覆盖审批提
 示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
 用；Waiting Agent 的整个条目会变成黄色加粗。
 

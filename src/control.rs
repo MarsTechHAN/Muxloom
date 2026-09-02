@@ -409,8 +409,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         description: "List managed agent sessions with fresh status: kind (codex/claude/pi/\
                       opencode/terminal), working directory, whether the agent is working, \
                       whether it waits for input (needs_attention plus the matched reason), and \
-                      a recap line. A terminal has no recap - read_screen is how a shell is \
-                      read. Archived sessions are included only with include_archived."
+                      a recap line. A terminal works while its shell is running something and \
+                      waits when that program asks on its last row; it has no recap - \
+                      read_screen is how a shell is read. Archived sessions are included only \
+                      with include_archived."
             .into(),
         input_schema: schema_across(
             flavor,

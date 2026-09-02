@@ -185,7 +185,12 @@ screen replayed out of the capture, which may be drawing a turn that ended an
 hour ago, so it counts as working only once this daemon has heard it — a
 rebuild no longer lights up every untouched agent on the machine at once. Codex
 activity additionally follows its OSC title spinner, so status survives the
-CLI erasing and repainting the visible `Working` line. When a session needs
+CLI erasing and repainting the visible `Working` line. A plain terminal paints
+no marker at all, so it is read off the kernel instead: it works while its
+shell has a child to wait on — a build linking in silence is still a build —
+and it waits when that child leaves a question on the last row (`[y/N]`, a
+password prompt, a pager's `--More--`), in the program's own words. When a
+session needs
 input — approval prompts, numbered menus, or your own `attention_patterns`,
 which the daemon now applies itself at its own refresh cadence — its entire
 agent item turns bold yellow, it raises a clickable banner, rings the bell,
