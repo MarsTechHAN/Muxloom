@@ -1104,7 +1104,9 @@ fn past_escape(body: &[u8]) -> &[u8] {
 }
 
 /// [`past_escape`], for a test elsewhere in the crate that reads pages back.
-#[cfg(test)]
+/// That test lives in the daemon, which only Unix builds, so off Unix this
+/// would be dead code and clippy's `-D warnings` says so.
+#[cfg(all(test, unix))]
 pub(crate) fn past_escape_for_test(body: &[u8]) -> &[u8] {
     past_escape(body)
 }
