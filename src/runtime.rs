@@ -297,6 +297,26 @@ struct RemoteRelease {
     algorithm: DigestAlgorithm,
 }
 
+/// A page of a session's screen and history, as [`Runtime::screen_page`]
+/// reads it: rows counted from the last drawn row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenRead {
+    /// The rows, newline-separated, still carrying the escapes that painted
+    /// them.
+    pub text: String,
+    /// How many rows above the last drawn row the page ends: what was asked
+    /// for, or less when the history does not reach that far.
+    pub offset_from_bottom: usize,
+    /// How many rows the read found in all, the page included.
+    pub total_rows: usize,
+    /// Whether the read began at the start of the log, so `total_rows`
+    /// measures the session rather than the reach of one read.
+    pub reached_start: bool,
+    /// Whether the session is a full-screen program on the alternate screen,
+    /// whose drawing never scrolls into history.
+    pub alternate_screen: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Runtime {
     ssh_connect_timeout_secs: u64,
@@ -1681,6 +1701,55 @@ if [ -z "$found" ]; then exit 69; fi
             .output()
             .with_context(|| format!("failed to download {remote_path}"))?;
         ensure_success(&output, "download remote file")
+    }
+
+    /// The newest `lines` rows of a session as a reader lays them out, ending
+    /// `offset_from_bottom` rows above the last row anything was drawn on.
+    ///
+    /// [`Self::capture_page`] counts from the bottom of the grid, which is
+    /// the unit an attached emulator scrolls in and the wrong one for reading:
+    /// a program that paints the top of a tall pane leaves a page counted
+    /// from the bottom holding only the blanks under it. This asks the daemon
+    /// to count from the drawing instead, and to answer off the live screen
+    /// when that holds the whole page — see
+    /// [`crate::daemon_protocol::DaemonRequest::ReadHistory`].
+    pub fn screen_page(
+        &self,
+        target: &Target,
+        session_id: &str,
+        offset_from_bottom: usize,
+        lines: usize,
+    ) -> Result<ScreenRead> {
+        validate_session_id(session_id)?;
+        let lines = lines.max(1);
+        if is_daemon_session_id(session_id) {
+            let history = self.bridges.read_screen_page(
+                target,
+                session_id.into(),
+                offset_from_bottom,
+                lines,
+            )?;
+            return Ok(ScreenRead {
+                text: String::from_utf8_lossy(&history.bytes)
+                    .trim_end()
+                    .to_string(),
+                offset_from_bottom: history.offset_from_bottom,
+                total_rows: history.total_lines,
+                // A daemon too old to say whether it reached the start reads
+                // as one that did not, which is the reading that keeps a
+                // caller paging rather than the one that stops it short.
+                reached_start: history.reached_start,
+                alternate_screen: history.alternate_screen,
+            });
+        }
+        let page = self.capture_page(target, session_id, offset_from_bottom, lines, 0, 0)?;
+        Ok(ScreenRead {
+            total_rows: page.history_size + page.pane_height,
+            reached_start: !page.more_history,
+            alternate_screen: false,
+            offset_from_bottom: page.offset_from_bottom,
+            text: page.text,
+        })
     }
 
     pub fn capture_page(

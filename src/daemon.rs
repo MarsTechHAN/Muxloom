@@ -146,7 +146,8 @@ mod platform {
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
-            CodexActivity, InlineScrollback, page_has_content, render_history_rows, resize_parser,
+            Anchor, CodexActivity, InlineScrollback, page_has_content, render_history_page,
+            resize_parser,
         },
     };
 
@@ -3498,10 +3499,16 @@ mod platform {
                 offset_from_bottom,
                 lines,
                 rendered,
+                from_drawn,
             } => {
+                let anchor = match from_drawn {
+                    true => Anchor::Drawn,
+                    false => Anchor::Grid,
+                };
                 let (history, columns, rows) =
                     if let Ok(session) = daemon_session(state, &session_id) {
-                        let history = session.read_history(offset_from_bottom, lines, rendered)?;
+                        let history =
+                            session.read_history(offset_from_bottom, lines, rendered, anchor)?;
                         (
                             history,
                             session.columns.load(Ordering::Relaxed),
@@ -3509,7 +3516,8 @@ mod platform {
                         )
                     } else {
                         let session = persisted_session(state, &session_id)?;
-                        let history = session.read_history(offset_from_bottom, lines, rendered)?;
+                        let history =
+                            session.read_history(offset_from_bottom, lines, rendered, anchor)?;
                         (history, session.columns, session.rows)
                     };
                 write_chunks(writer, stream::HISTORY, request_id, &history.rows)?;
@@ -3523,6 +3531,7 @@ mod platform {
                         offset_from_bottom: history.offset_from_bottom,
                         rendered,
                         reached_start: history.reached_start,
+                        alternate_screen: history.alternate_screen,
                     },
                 )
             }
@@ -6012,6 +6021,7 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
             rendered: bool,
+            anchor: Anchor,
         ) -> Result<HistoryRead> {
             if self.snapshot().temporary {
                 return Ok(HistoryRead::empty());
@@ -6025,6 +6035,7 @@ mod platform {
                     lines,
                     SCROLLBACK_SEED_BYTES_MIN,
                     SCROLLBACK_SEED_BYTES_MAX,
+                    anchor,
                 );
             }
             read_history_file(
@@ -6857,12 +6868,19 @@ mod platform {
             offset_from_bottom: usize,
             lines: usize,
             rendered: bool,
+            anchor: Anchor,
         ) -> Result<HistoryRead> {
             if self.temporary() {
                 return Ok(HistoryRead::empty());
             }
             let rows = self.rows.load(Ordering::Relaxed);
             if rendered {
+                if anchor == Anchor::Drawn
+                    && offset_from_bottom == 0
+                    && let Some(live) = self.live_screen_page(lines)
+                {
+                    return Ok(live);
+                }
                 return render_history_file(
                     &self.history_path,
                     self.columns.load(Ordering::Relaxed),
@@ -6871,6 +6889,7 @@ mod platform {
                     lines,
                     SCROLLBACK_SEED_BYTES_MIN,
                     SCROLLBACK_SEED_BYTES_MAX,
+                    anchor,
                 );
             }
             read_history_file(
@@ -6880,6 +6899,70 @@ mod platform {
                 offset_from_bottom,
                 lines,
             )
+        }
+
+        /// The newest `lines` drawn rows, off the emulator the daemon feeds
+        /// as the session writes, when that emulator holds all of them.
+        ///
+        /// The screen a live session is showing is already drawn here, kept
+        /// current byte by byte; replaying the log into a fresh emulator to
+        /// reach the same picture costs a window of the log per read and
+        /// gets it wrong whenever the window opens after a program's last
+        /// full paint. A full-screen program is the case where that matters
+        /// most: nothing it draws ever scrolls off, so its screen is the whole
+        /// of what there is to read, and the replay of a log it has been
+        /// repainting in place for hours is a screenful of blanks with the
+        /// last few moves drawn over it.
+        ///
+        /// `None` when the page asks for more rows than are drawn on a screen
+        /// that can scroll, which is what the log is for.
+        fn live_screen_page(&self, lines: usize) -> Option<HistoryRead> {
+            let columns = self.columns.load(Ordering::Relaxed).max(20);
+            let (mut rows, alternate_screen) = {
+                let screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let screen = screen.screen();
+                let rows: Vec<(Vec<u8>, bool)> = screen
+                    .rows_formatted(0, columns)
+                    .enumerate()
+                    .map(|(row, bytes)| {
+                        (
+                            bytes,
+                            u16::try_from(row).is_ok_and(|row| screen.row_wrapped(row)),
+                        )
+                    })
+                    .collect();
+                (rows, screen.alternate_screen())
+            };
+            while rows.last().is_some_and(|(row, _)| row.is_empty()) {
+                rows.pop();
+            }
+            if !alternate_screen && rows.len() < lines.max(1) {
+                return None;
+            }
+            let start = rows.len().saturating_sub(lines.max(1));
+            let mut page = Vec::new();
+            for (index, (row, wrapped)) in rows.iter().enumerate().skip(start) {
+                if index > start {
+                    page.push(b'\n');
+                }
+                page.extend_from_slice(row);
+                page.extend_from_slice(b"\x1b[m");
+                if *wrapped {
+                    page.extend_from_slice(crate::terminal_session::WRAPPED_ROW_MARK);
+                }
+            }
+            Some(HistoryRead {
+                rows: page,
+                total_lines: rows.len(),
+                offset_from_bottom: 0,
+                // A full-screen program's grid is all there is; a screen that
+                // scrolls has a log under it this page did not look at.
+                reached_start: alternate_screen,
+                alternate_screen,
+            })
         }
 
         fn search_history(
@@ -6959,6 +7042,10 @@ mod platform {
         /// session, and a client needs the difference to know where to stop
         /// scrolling.
         reached_start: bool,
+        /// Whether the session is on the alternate screen: a full-screen
+        /// program holding the whole terminal, whose drawing never scrolls
+        /// into history. Only a rendered read can tell.
+        alternate_screen: bool,
     }
 
     impl HistoryRead {
@@ -6969,6 +7056,7 @@ mod platform {
                 total_lines: 0,
                 offset_from_bottom: 0,
                 reached_start: true,
+                alternate_screen: false,
             }
         }
     }
@@ -7003,6 +7091,7 @@ mod platform {
             .clamp(least.max(1).min(most), most)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_history_file(
         path: &Path,
         columns: u16,
@@ -7011,6 +7100,7 @@ mod platform {
         lines: usize,
         least: u64,
         most: u64,
+        anchor: Anchor,
     ) -> Result<HistoryRead> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
@@ -7021,13 +7111,16 @@ mod platform {
         loop {
             let start = end.saturating_sub(window);
             file.seek(SeekFrom::Start(start))?;
-            let (page, total_lines, actual_offset) = render_history_rows(
+            let rendered = render_history_page(
                 BufReader::new(&mut file).take(end - start),
                 columns,
                 rows,
                 offset_from_bottom,
                 wanted,
+                anchor,
             )?;
+            let (page, total_lines, actual_offset) =
+                (rendered.page, rendered.total, rendered.offset_from_bottom);
             // A page with nothing on it is not a picture of the screen, it is
             // a window that failed to draw one. An agent repainting in place
             // writes only what changed and puts the cursor back where it was,
@@ -7075,6 +7168,7 @@ mod platform {
                     total_lines,
                     offset_from_bottom: actual_offset,
                     reached_start: start == 0,
+                    alternate_screen: rendered.alternate_screen,
                 });
             }
             reached = Some(total_lines);
@@ -7106,6 +7200,7 @@ mod platform {
                 total_lines,
                 offset_from_bottom: actual_offset,
                 reached_start: true,
+                alternate_screen: false,
             });
         }
         let start = end.saturating_sub(lines);
@@ -7154,6 +7249,7 @@ mod platform {
             // Raw reads count the whole log, so `total_lines` already measures
             // the session rather than the reach of one page.
             reached_start: true,
+            alternate_screen: false,
         })
     }
 
@@ -8500,8 +8596,17 @@ mod platform {
             // Small enough that reaching 300 rows back takes several widenings.
             let window = (log.len() / 8) as u64;
 
-            let read =
-                render_history_file(&path, 20, 5, 300, 40, window, log.len() as u64).unwrap();
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                300,
+                40,
+                window,
+                log.len() as u64,
+                Anchor::Grid,
+            )
+            .unwrap();
             let page = String::from_utf8_lossy(&read.rows).into_owned();
 
             assert_eq!(read.offset_from_bottom, 300, "the row that was asked for");
@@ -8513,7 +8618,8 @@ mod platform {
             );
 
             // A window that may not widen answers with what it could reach.
-            let shallow = render_history_file(&path, 20, 5, 300, 40, window, window).unwrap();
+            let shallow =
+                render_history_file(&path, 20, 5, 300, 40, window, window, Anchor::Grid).unwrap();
             assert!(
                 shallow.offset_from_bottom < 300,
                 "as far back as one window reaches: {}",
@@ -8549,7 +8655,9 @@ mod platform {
             // The seed reaches 12,800 bytes and quadruples from there, so the
             // first two looks both land inside the repaint; the third would
             // span the whole log and reach the rows at the top of it.
-            let read = render_history_file(&path, 20, 5, 0, 40, 4 * 1024, 1024 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 0, 40, 4 * 1024, 1024 * 1024, Anchor::Grid)
+                    .unwrap();
 
             assert!(
                 !read.reached_start,
@@ -8600,7 +8708,8 @@ mod platform {
             // the page the old read stopped on. Asking for more than the screen
             // holds happened to escape it: the blanks could not fill a page
             // deeper than they were.
-            let read = render_history_file(&path, 20, 5, 0, 5, 4 * 1024, 1024 * 1024).unwrap();
+            let read = render_history_file(&path, 20, 5, 0, 5, 4 * 1024, 1024 * 1024, Anchor::Grid)
+                .unwrap();
 
             let page = String::from_utf8_lossy(&read.rows).into_owned();
             assert!(
@@ -8626,14 +8735,18 @@ mod platform {
             let log: String = (1..=30).map(|line| format!("line{line}\r\n")).collect();
             fs::write(&path, &log).unwrap();
 
-            let read = render_history_file(&path, 20, 5, 0, 500, 16 * 1024, 64 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 0, 500, 16 * 1024, 64 * 1024, Anchor::Grid)
+                    .unwrap();
             assert!(read.reached_start, "a 30-row log is read whole");
             assert_eq!(read.offset_from_bottom, 0);
             // The rows above the screen are the ones a client may scroll to.
             assert!(read.total_lines >= 30, "rows in all: {}", read.total_lines);
 
             // Asking past the oldest row answers with the oldest row there is.
-            let read = render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024).unwrap();
+            let read =
+                render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024, Anchor::Grid)
+                    .unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
         }
@@ -9182,14 +9295,19 @@ mod platform {
 
             let revived = start(1);
             assert_eq!(
-                revived.read_history(0, 1, false).unwrap().total_lines,
+                revived
+                    .read_history(0, 1, false, Anchor::Grid)
+                    .unwrap()
+                    .total_lines,
                 lines,
                 "the log it came back to is part of how long the log is"
             );
             // And the number is not just reported: it is what the paging is
             // measured against, so a page from before the revival is asked
             // for by an offset the old count would have clamped away.
-            let deep = revived.read_history(lines - 100, 1, false).unwrap();
+            let deep = revived
+                .read_history(lines - 100, 1, false, Anchor::Grid)
+                .unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&deep.rows).trim_end(),
                 "line 99",
@@ -13066,6 +13184,95 @@ mod platform {
         }
 
         #[test]
+        fn the_newest_page_of_a_live_session_is_read_off_its_screen() {
+            let state = test_state("live-screen");
+            let paths = state.paths.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-codex-live-screen".into(),
+                "codex".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                40,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // Painted straight onto the daemon's emulator, the way the reader
+            // thread paints what the child writes; the log on disk has none
+            // of it, which is what tells the two sources apart below.
+            session.record_output(
+                b"\x1b[2J\x1b[H\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour\x1b[5;1Hfive",
+            );
+            let live = session.read_history(0, 3, true, Anchor::Drawn).unwrap();
+            assert_eq!(
+                page_lines(&live.rows),
+                vec!["three", "four", "five"],
+                "the newest rows come off the live screen"
+            );
+            assert_eq!(live.total_lines, 5);
+            assert!(
+                !live.reached_start,
+                "a screen that scrolls has a log under it"
+            );
+            assert!(!live.alternate_screen);
+            // A page deeper than the screen holds is the log's to answer, and
+            // the log here holds nothing.
+            let deep = session.read_history(0, 100, true, Anchor::Drawn).unwrap();
+            assert!(
+                !page_has_content(&deep.rows),
+                "{:?}",
+                page_lines(&deep.rows)
+            );
+            // Counted from the grid, the newest three rows are the blanks at
+            // the bottom of a twenty-four-row pane: the client's view, not the
+            // reader's.
+            let grid = session.read_history(0, 3, true, Anchor::Grid).unwrap();
+            assert!(
+                !page_has_content(&grid.rows),
+                "{:?}",
+                page_lines(&grid.rows)
+            );
+            // A full-screen program's screen is the whole of what there is,
+            // however many rows are asked for.
+            session.record_output(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;1Happ\x1b[2;1Hscreen");
+            let app = session.read_history(0, 100, true, Anchor::Drawn).unwrap();
+            assert_eq!(page_lines(&app.rows), vec!["app", "screen"]);
+            assert!(app.alternate_screen);
+            assert!(
+                app.reached_start,
+                "nothing above a full-screen program's grid"
+            );
+            session.stop().unwrap();
+            discard_root(paths.root);
+        }
+
+        /// The rows of a rendered page as text, attributes and marks off.
+        fn page_lines(page: &[u8]) -> Vec<String> {
+            let mut plain = Vec::new();
+            let mut rest = page;
+            while let Some((byte, tail)) = rest.split_first() {
+                if *byte == 0x1b {
+                    rest = crate::terminal_session::past_escape_for_test(tail);
+                } else {
+                    plain.push(*byte);
+                    rest = tail;
+                }
+            }
+            String::from_utf8_lossy(&plain)
+                .lines()
+                .map(|line| line.trim_end().to_string())
+                .collect()
+        }
+
+        #[test]
         fn temporary_session_never_creates_history_or_becomes_archived() {
             let state = test_state("temporary");
             let paths = state.paths.clone();
@@ -13091,7 +13298,7 @@ mod platform {
 
             assert!(session.snapshot().temporary);
             assert!(!paths.history.join(format!("{session_id}.ansi")).exists());
-            let history = session.read_history(0, 100, false).unwrap();
+            let history = session.read_history(0, 100, false, Anchor::Grid).unwrap();
             assert!(history.rows.is_empty() && history.total_lines == 0);
             assert!(session.search_history("anything", 10).unwrap().is_empty());
             assert!(session.archive().is_err());
@@ -13502,7 +13709,7 @@ mod platform {
                     snapshot.recap.as_deref(),
                     Some("completed the persistent work")
                 );
-                let history = persisted.read_history(0, 10, false).unwrap();
+                let history = persisted.read_history(0, 10, false, Anchor::Grid).unwrap();
                 assert_eq!(history.total_lines, 3);
                 assert_eq!(history.offset_from_bottom, 0);
                 assert_eq!(
@@ -13673,7 +13880,7 @@ mod platform {
             let restarted = DaemonState::new(paths.clone(), KeeperMode::InProcess);
             let persisted = persisted_session(&restarted, session_id)
                 .expect("a missing log must not erase the session that recorded it");
-            let history = persisted.read_history(0, 10, false).unwrap();
+            let history = persisted.read_history(0, 10, false, Anchor::Grid).unwrap();
             assert!(history.rows.is_empty() && history.total_lines == 0);
             assert!(persisted.search_history("anything", 10).unwrap().is_empty());
             discard_root(paths.root);

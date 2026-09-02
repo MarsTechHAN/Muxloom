@@ -34,7 +34,7 @@ use crate::{
         Target,
     },
     relay::now_ms,
-    runtime::Runtime,
+    runtime::{Runtime, ScreenRead},
     ssh_config::{self, MANAGED_INCLUDE, ManagedHosts},
     talk::{
         MAX_TEXT, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft, TalkFilter, TalkKind,
@@ -426,18 +426,23 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             "Read a session's terminal. Returns the screen's read result by default: \
              the text a person would read off the screen — borders and the bottom \
              status/footer bar stripped, internal whitespace collapsed, content in \
-             reading order. The visible screen plus scrollback, up to `lines` rows \
-             (default {DEFAULT_SCREEN_LINES}) ending `offset_from_bottom` rows above \
-             the live bottom edge; page older output by raising the offset. Pass \
-             `raw: true` for the raw vt100 grid (ANSI stripped, column positions \
-             intact) when you need the exact layout."
+             reading order, a line that wrapped joined back together. The visible \
+             screen plus scrollback, up to `lines` rows (default {DEFAULT_SCREEN_LINES}) \
+             ending `offset_from_bottom` rows above the last row anything was drawn on. \
+             The trailer says how many rows the page holds, whether there is older \
+             history above it, and the `offset_from_bottom` that reaches the page before \
+             it — pass that back to page older output. A full-screen program (OpenCode) \
+             is named as one: the terminal keeps nothing it drew before, so its earlier \
+             turns are read with read_conversation. Pass `raw: true` for the raw vt100 \
+             grid (ANSI stripped, column positions intact) when you need the exact \
+             layout."
         ),
         input_schema: schema_across(
             flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
                 "lines": { "type": "integer", "description": "Rows to return." },
-                "offset_from_bottom": { "type": "integer", "description": "Rows above the bottom to end at." },
+                "offset_from_bottom": { "type": "integer", "description": "Rows above the last drawn row to end at; the previous page's trailer names the one that reaches the page before it." },
                 "raw": { "type": "boolean", "description": "Return the raw vt100 grid instead of the read result." },
             }),
             &["session_id"],
@@ -2926,18 +2931,42 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
     })
 }
 
-fn screen_page(
-    text: &str,
-    raw: bool,
-    offset_from_bottom: usize,
-    rows: usize,
-    older: bool,
-) -> String {
-    let plain = plain_screen(text);
+/// What `read_screen` answers with: the page as text, and a trailer saying
+/// what the page is — how many rows it holds, where it ends, and whether and
+/// where there is more above it.
+///
+/// `rows` counts the rows the page holds before blank ones are folded away,
+/// which is what the next page has to be offset by; the trailer says that
+/// offset outright so a reader paging back does no arithmetic. A full-screen
+/// program is named as one, because the terminal keeps nothing of what it
+/// draws: paging back through its history reaches only what ran before it
+/// opened, and a reader who wants its earlier turns wants its transcript.
+fn screen_page(read: &ScreenRead, raw: bool) -> String {
+    let plain = plain_screen(&read.text);
     let body = if raw { plain } else { read_result(&plain) };
-    format!(
-        "{body}\n\n[rows={rows} offset_from_bottom={offset_from_bottom} older_history_above={older}]"
-    )
+    let rows = match read.text.is_empty() {
+        true => 0,
+        false => read.text.lines().count(),
+    };
+    let offset_from_bottom = read.offset_from_bottom;
+    let older = !read.reached_start || offset_from_bottom + rows < read.total_rows;
+    let mut trailer =
+        format!("[rows={rows} offset_from_bottom={offset_from_bottom} older_history_above={older}");
+    if older {
+        trailer.push_str(&format!(
+            " next_offset_from_bottom={}",
+            offset_from_bottom + rows
+        ));
+    }
+    trailer.push(']');
+    if read.alternate_screen {
+        trailer.push_str(
+            "\n[full-screen program: this is its whole screen, and the terminal keeps no \
+             history of what it drew before. Its earlier turns are in its own transcript — \
+             search_conversations / read_conversation.]",
+        );
+    }
+    format!("{body}\n\n{trailer}")
 }
 
 /// Flatten rendered rows into the text a terminal would have shown.
@@ -2955,6 +2984,11 @@ fn plain_screen(text: &str) -> String {
         if byte != 0x1b {
             plain.push(byte);
             index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(WRAPPED_ROW_MARK_TEXT.as_bytes()) {
+            plain.extend_from_slice(WRAPPED_ROW_MARK_TEXT.as_bytes());
+            index += WRAPPED_ROW_MARK_TEXT.len();
             continue;
         }
         match bytes.get(index + 1) {
@@ -2997,12 +3031,37 @@ fn plain_screen(text: &str) -> String {
         }
     }
     let plain = String::from_utf8_lossy(&plain);
-    let mut lines: Vec<&str> = plain.lines().map(str::trim_end).collect();
+    // A row that ran off the right edge carried on in the row under it, and
+    // the renderer marks it so: the two are one line as the program wrote it,
+    // and a reader wants the line, not the edge of the pane it was cut at.
+    let mut lines: Vec<String> = Vec::new();
+    let mut joining = false;
+    for line in plain.split('\n') {
+        let (line, wraps) = match line.strip_suffix(WRAPPED_ROW_MARK_TEXT) {
+            Some(line) => (line, true),
+            None => (line, false),
+        };
+        match lines.last_mut() {
+            Some(previous) if joining => previous.push_str(line),
+            _ => lines.push(line.to_string()),
+        }
+        joining = wraps;
+    }
+    for line in &mut lines {
+        let trimmed = line.trim_end().len();
+        line.truncate(trimmed);
+    }
     while lines.last().is_some_and(|line| line.is_empty()) {
         lines.pop();
     }
     lines.join("\n")
 }
+
+/// [`crate::terminal_session::WRAPPED_ROW_MARK`] as it survives
+/// [`plain_screen`]'s pass over the escapes, which strips string sequences
+/// only when they open with ESC; this one is left whole for the join above
+/// to find.
+const WRAPPED_ROW_MARK_TEXT: &str = "\x1b_wrap\x1b\\";
 
 /// What `read_screen` returns by default: the screen as a person reads it.
 /// Border glyphs and the indent they carry are off each row, a row that is
@@ -3535,14 +3594,8 @@ impl ControllerControl {
         let raw = optional_bool(arguments, "raw");
         let page = self
             .runtime
-            .capture_page(&target, session_id, offset, lines, 0, 0)?;
-        Ok(screen_page(
-            &page.text,
-            raw,
-            page.offset_from_bottom,
-            page.pane_height,
-            page.has_older(),
-        ))
+            .screen_page(&target, session_id, offset, lines)?;
+        Ok(screen_page(&page, raw))
     }
 
     fn wait_for(&self, arguments: &Value) -> Result<String> {
@@ -3560,9 +3613,9 @@ impl ControllerControl {
                 )
             },
             || {
-                let page =
-                    self.runtime
-                        .capture_page(&target, &session_id, 0, WAIT_SCREEN_LINES, 0, 0)?;
+                let page = self
+                    .runtime
+                    .screen_page(&target, &session_id, 0, WAIT_SCREEN_LINES)?;
                 Ok(plain_screen(&page.text))
             },
         )
@@ -4303,7 +4356,7 @@ mod daemon_surface {
             Trigger, stream,
         },
         model::{AgentKind, LOCAL_TARGET_ID, Reach},
-        runtime::{launch_arguments, launch_seed, new_daemon_session_id},
+        runtime::{ScreenRead, launch_arguments, launch_seed, new_daemon_session_id},
     };
 
     /// How long one daemon request may run. Matches the bridge's own request
@@ -4490,35 +4543,32 @@ mod daemon_surface {
         /// One page of a session's screen as the daemon renders it: the rows
         /// themselves, where they end, the pane height, and whether there is
         /// older history above them.
-        fn screen_rows(
-            &self,
-            session_id: &str,
-            offset: usize,
-            lines: usize,
-        ) -> Result<(String, usize, usize, bool)> {
+        fn screen_rows(&self, session_id: &str, offset: usize, lines: usize) -> Result<ScreenRead> {
             let (response, data) = self.transact(&DaemonRequest::ReadHistory {
                 session_id: session_id.into(),
                 offset_from_bottom: offset,
                 lines,
                 rendered: true,
+                from_drawn: true,
             })?;
             match response {
                 DaemonResponse::HistoryComplete {
-                    rows,
+                    total_lines,
                     offset_from_bottom,
-                    rendered,
                     reached_start,
+                    alternate_screen,
                     ..
                 } => {
                     let text = String::from_utf8_lossy(
                         data.get(&stream::HISTORY).map_or(&[][..], Vec::as_slice),
                     );
-                    Ok((
-                        text.trim_end().to_string(),
+                    Ok(ScreenRead {
+                        text: text.trim_end().to_string(),
                         offset_from_bottom,
-                        usize::from(rows),
-                        rendered && !reached_start && offset_from_bottom >= offset,
-                    ))
+                        total_rows: total_lines,
+                        reached_start,
+                        alternate_screen,
+                    })
                 }
                 response => bail!("unexpected history response: {response:?}"),
             }
@@ -4529,9 +4579,8 @@ mod daemon_surface {
             let lines = optional_usize(arguments, "lines", DEFAULT_SCREEN_LINES);
             let offset = optional_usize(arguments, "offset_from_bottom", 0);
             let raw = optional_bool(arguments, "raw");
-            let (text, offset_from_bottom, rows, older) =
-                self.screen_rows(session_id, offset, lines)?;
-            Ok(screen_page(&text, raw, offset_from_bottom, rows, older))
+            let page = self.screen_rows(session_id, offset, lines)?;
+            Ok(screen_page(&page, raw))
         }
 
         fn wait_for(&self, arguments: &Value) -> Result<String> {
@@ -4549,7 +4598,7 @@ mod daemon_surface {
                     )
                 },
                 || {
-                    let (text, ..) = self.screen_rows(&session_id, 0, WAIT_SCREEN_LINES)?;
+                    let text = self.screen_rows(&session_id, 0, WAIT_SCREEN_LINES)?.text;
                     Ok(plain_screen(&text))
                 },
             )
@@ -5973,14 +6022,120 @@ mod tests {
         // A row as the renderer writes it: colour, a jump over blanks that
         // stands in for indentation, and a title nobody reading wants.
         let page = screen_page(
-            "\x1b[1;32m❯ 1. Yes\x1b[m\n\x1b[m\x1b]0;claude\x07 2.\x1b[3CNo   \n\n",
+            &read_of("\x1b[1;32m❯ 1. Yes\x1b[m\n\x1b[m\x1b]0;claude\x07 2.\x1b[3CNo   \n\n"),
             true,
-            0,
-            40,
-            false,
         );
         let (text, _) = page.split_once("\n\n[rows=").unwrap();
         assert_eq!(text, "❯ 1. Yes\n 2.   No");
+    }
+
+    /// A page as the daemon would answer it for `text`: the newest rows of
+    /// a session read whole, with nothing above them.
+    fn read_of(text: &str) -> ScreenRead {
+        ScreenRead {
+            text: text.trim_end().to_string(),
+            offset_from_bottom: 0,
+            total_rows: text.trim_end().lines().count(),
+            reached_start: true,
+            alternate_screen: false,
+        }
+    }
+
+    #[test]
+    fn a_page_says_how_many_rows_it_holds_and_where_the_next_one_starts() {
+        // Five rows drawn, the newest two asked for: the trailer counts the
+        // rows handed over, not the pane, and names the offset that reaches
+        // the three above them.
+        let page = screen_page(
+            &ScreenRead {
+                text: "four\nfive".into(),
+                offset_from_bottom: 0,
+                total_rows: 5,
+                reached_start: true,
+                alternate_screen: false,
+            },
+            true,
+        );
+        assert!(
+            page.ends_with(
+                "[rows=2 offset_from_bottom=0 older_history_above=true next_offset_from_bottom=2]"
+            ),
+            "{page}"
+        );
+        // The page that reaches the top says so, and offers no next.
+        let top = screen_page(
+            &ScreenRead {
+                text: "one\ntwo\nthree".into(),
+                offset_from_bottom: 2,
+                total_rows: 5,
+                reached_start: true,
+                alternate_screen: false,
+            },
+            true,
+        );
+        assert!(
+            top.ends_with("[rows=3 offset_from_bottom=2 older_history_above=false]"),
+            "{top}"
+        );
+        // A read that did not reach the start of the log cannot vouch for the
+        // top, whatever it counted.
+        let deep = screen_page(
+            &ScreenRead {
+                text: "one\ntwo\nthree".into(),
+                offset_from_bottom: 2,
+                total_rows: 5,
+                reached_start: false,
+                alternate_screen: false,
+            },
+            true,
+        );
+        assert!(
+            deep.contains("older_history_above=true next_offset_from_bottom=5]"),
+            "{deep}"
+        );
+        // A blank page holds no rows, and a blank row folded away by the read
+        // result is still a row the next page has to step over.
+        let blank = screen_page(&read_of(""), true);
+        assert!(blank.contains("[rows=0 "), "{blank}");
+        let gappy = screen_page(&read_of("one\n\nthree"), false);
+        assert!(gappy.contains("[rows=3 "), "{gappy}");
+    }
+
+    #[test]
+    fn a_full_screen_program_is_named_and_sent_to_its_transcript() {
+        let page = screen_page(
+            &ScreenRead {
+                text: "△ Permission required".into(),
+                offset_from_bottom: 0,
+                total_rows: 1,
+                reached_start: true,
+                alternate_screen: true,
+            },
+            false,
+        );
+        assert!(page.contains("older_history_above=false]"), "{page}");
+        assert!(page.contains("[full-screen program:"), "{page}");
+        assert!(page.contains("read_conversation"), "{page}");
+        let inline = screen_page(&read_of("hello"), false);
+        assert!(!inline.contains("full-screen"), "{inline}");
+    }
+
+    #[test]
+    fn a_row_that_wrapped_reads_back_as_the_line_it_was() {
+        // The renderer marks a row that ran off the right edge; the read
+        // joins it to the row under it, in the raw grid and the read result
+        // alike, and a row that merely ends at the edge stays its own line.
+        let wrapped = "abc\x1b[m\x1b_wrap\x1b\\\ndef\x1b[m\nghi\x1b[m";
+        assert_eq!(plain_screen(wrapped), "abcdef\nghi");
+        let page = screen_page(&read_of(wrapped), false);
+        let (text, trailer) = page.split_once("\n\n[rows=").unwrap();
+        assert_eq!(text, "abcdef\nghi");
+        // The rows the page holds are still the three the pane drew.
+        assert!(trailer.starts_with("3 "), "{trailer}");
+        // Blanks at the edge of a wrapped row are the line's own.
+        assert_eq!(plain_screen("cd  \x1b_wrap\x1b\\\n/tmp\n"), "cd  /tmp");
+        // A page ending on a wrapped row has nothing to join it to.
+        assert_eq!(plain_screen("tail\x1b_wrap\x1b\\"), "tail");
     }
 
     #[test]
@@ -6046,7 +6201,7 @@ mod tests {
         let ansi = "  \u{2502}  Fix the flaky test in src/main.rs  \u{2502}\n\
                     \u{2579}\u{2580}\u{2580}\u{2580}\n\
                     ~/work:main  1.18.23\n";
-        let raw = screen_page(ansi, true, 0, 40, false);
+        let raw = screen_page(&read_of(ansi), true);
         let (raw_text, _) = raw.split_once("\n\n[rows=").unwrap();
         assert_eq!(
             raw_text,
@@ -6054,7 +6209,7 @@ mod tests {
              \u{2579}\u{2580}\u{2580}\u{2580}\n\
              ~/work:main  1.18.23"
         );
-        let read = screen_page(ansi, false, 0, 40, false);
+        let read = screen_page(&read_of(ansi), false);
         let (read_text, _) = read.split_once("\n\n[rows=").unwrap();
         assert_eq!(read_text, "Fix the flaky test in src/main.rs");
     }

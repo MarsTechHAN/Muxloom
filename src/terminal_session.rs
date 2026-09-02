@@ -848,9 +848,19 @@ fn replay_history(
 }
 
 /// Read back every row a replayed emulator holds — its scrollback and its
-/// screen — as the rows a terminal would have shown.
+/// screen — as the rows a terminal would have shown, each with whether it ran
+/// on into the row below it.
 #[cfg(any(unix, test))]
-fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<Vec<u8>> {
+fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<(Vec<u8>, bool)> {
+    // Resizing drops every row's wrap flag, so the screen's are read off
+    // first, from the grid as it stands and before it is scrolled: vt100 0.15
+    // finds a visible row through a subtraction that underflows once the
+    // scrollback offset is deeper than the screen is tall. The scrollback's
+    // are read off the grown grid, where rows that scrolled off keep the
+    // flag they scrolled off with.
+    let screen_wraps: Vec<bool> = (0..rows)
+        .map(|row| parser.screen().row_wrapped(row))
+        .collect();
     parser.set_scrollback(usize::MAX);
     let depth = parser.screen().scrollback();
     // vt100 0.15 reads rows past the first screenful of scrollback through a
@@ -863,7 +873,57 @@ fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<Vec
         .saturating_add(rows);
     parser.set_size(tall, columns);
     parser.set_scrollback(depth);
-    parser.screen().rows_formatted(0, columns).collect()
+    let deep = parser.screen();
+    deep.rows_formatted(0, columns)
+        .enumerate()
+        .map(|(index, row)| {
+            let wrapped = match index.checked_sub(depth) {
+                Some(screen_row) => screen_wraps.get(screen_row).copied().unwrap_or(false),
+                None => u16::try_from(index).is_ok_and(|row| deep.row_wrapped(row)),
+            };
+            (row, wrapped)
+        })
+        .collect()
+}
+
+/// Marks a rendered row that ran off the right edge and carried on in the row
+/// under it. It is an application program command, which every emulator and
+/// [`crate::ui`]'s own painter discard unseen, so a page carrying it draws the
+/// same as one without; a reader laying the page out as text joins the two
+/// rows back into the one line the program wrote.
+pub const WRAPPED_ROW_MARK: &[u8] = b"\x1b_wrap\x1b\\";
+
+/// What [`render_history_page`] hands back.
+#[cfg(any(unix, test))]
+pub(crate) struct RenderedPage {
+    /// The rows, newline-separated, each reset to default attributes at its
+    /// end and carrying [`WRAPPED_ROW_MARK`] when it wraps into the next.
+    pub page: Vec<u8>,
+    /// How many rows the render reached in all: its scrollback plus the screen.
+    pub total: usize,
+    /// The offset it could honour — the caller only gets as far back as the
+    /// window it handed over reaches.
+    pub offset_from_bottom: usize,
+    /// Whether the session was on the alternate screen when the log ended,
+    /// which is a full-screen program holding the whole terminal: nothing it
+    /// draws ever scrolls into history.
+    pub alternate_screen: bool,
+}
+
+/// Where a page's offsets are counted from.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Anchor {
+    /// The bottom row of the grid, blank or not: the unit an attached emulator
+    /// scrolls in, so a client paging out of its own buffer lands on the row
+    /// it expects.
+    Grid,
+    /// The last row anything was drawn on. A program that paints the top of a
+    /// tall grid and leaves the rest blank — Codex's welcome box on an
+    /// eighty-row pane — puts its whole picture above a page counted from the
+    /// grid's bottom, and a reader asking for the last thirty rows gets thirty
+    /// blanks.
+    Drawn,
 }
 
 /// Render `stream` — the tail of a session's raw output — into the rows a
@@ -879,7 +939,7 @@ fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<Vec
 /// Returns the rows, how many the render reached in all (its scrollback plus
 /// the screen), and the offset it could honour — the caller only gets as far
 /// back as the window it handed over reaches.
-#[cfg(any(unix, test))]
+#[cfg(test)]
 pub(crate) fn render_history_rows(
     stream: impl Read,
     columns: u16,
@@ -887,27 +947,65 @@ pub(crate) fn render_history_rows(
     offset_from_bottom: usize,
     wanted: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
-    let columns = columns.max(20);
-    let rows = rows.max(5);
-    let wanted = wanted.max(1);
-    let (mut parser, _) = replay_history(
+    let page = render_history_page(
         stream,
         columns,
         rows,
-        offset_from_bottom.saturating_add(wanted),
+        offset_from_bottom,
+        wanted,
+        Anchor::Grid,
     )?;
-    // An agent that draws on the alternate screen — Claude Code does, and its
-    // whole session lives there — leaves the primary grid holding only what ran
-    // before it opened. Its screen *is* the newest history, so read it off
-    // first and step off afterwards to reach what scrolled by underneath;
-    // rendering the primary alone hands back a screenful of blanks.
-    let rendered = if parser.screen().alternate_screen() {
-        let application: Vec<Vec<u8>> = parser.screen().rows_formatted(0, columns).collect();
+    Ok((page.page, page.total, page.offset_from_bottom))
+}
+
+/// [`render_history_rows`], counted from `anchor`, with what else the render
+/// learned about the session on the way.
+#[cfg(any(unix, test))]
+pub(crate) fn render_history_page(
+    stream: impl Read,
+    columns: u16,
+    rows: u16,
+    offset_from_bottom: usize,
+    wanted: usize,
+    anchor: Anchor,
+) -> Result<RenderedPage> {
+    let columns = columns.max(20);
+    let rows = rows.max(5);
+    let wanted = wanted.max(1);
+    // Counting from the last drawn row can put a whole blank screen between
+    // the page and the grid's bottom, so keep that much more scrollback.
+    let keep = offset_from_bottom
+        .saturating_add(wanted)
+        .saturating_add(match anchor {
+            Anchor::Grid => 0,
+            Anchor::Drawn => usize::from(rows),
+        });
+    let (mut parser, _) = replay_history(stream, columns, rows, keep)?;
+    // An agent that draws on the alternate screen leaves the primary grid
+    // holding only what ran before it opened. Its screen *is* the newest
+    // history, so read it off first and step off afterwards to reach what
+    // scrolled by underneath; rendering the primary alone hands back a
+    // screenful of blanks.
+    let alternate_screen = parser.screen().alternate_screen();
+    let mut rendered = if alternate_screen {
+        let application: Vec<(Vec<u8>, bool)> = {
+            let screen = parser.screen();
+            screen
+                .rows_formatted(0, columns)
+                .enumerate()
+                .map(|(row, bytes)| {
+                    (
+                        bytes,
+                        u16::try_from(row).is_ok_and(|row| screen.row_wrapped(row)),
+                    )
+                })
+                .collect()
+        };
         parser.process(b"\x1b[?1049l");
         let mut history = buffered_rows(&mut parser, columns, rows);
         // The primary screen was left mid-page when the app opened, so drop the
         // blanks below it rather than pushing the app down by a screenful.
-        while history.last().is_some_and(|row| row.is_empty()) {
+        while history.last().is_some_and(|(row, _)| row.is_empty()) {
             history.pop();
         }
         history.extend(application);
@@ -915,12 +1013,28 @@ pub(crate) fn render_history_rows(
     } else {
         buffered_rows(&mut parser, columns, rows)
     };
+    // How far up a page may end. Counted from the grid it is the scrollback
+    // depth: an emulator scrolls its screen up over the history and never
+    // past it, so the last page is the screen with the whole history above.
+    // Counted from the drawing the pages are the reader's, and the reader
+    // wants them to tile — the next page starts where this one ended — so a
+    // page may end anywhere down to the top row, and one asked for from past
+    // the top comes back short rather than sliding down over its neighbour.
+    let reach = match anchor {
+        Anchor::Grid => usize::from(rows),
+        Anchor::Drawn => {
+            while rendered.last().is_some_and(|(row, _)| row.is_empty()) {
+                rendered.pop();
+            }
+            1
+        }
+    };
     let total = rendered.len();
-    let actual_offset = offset_from_bottom.min(total.saturating_sub(usize::from(rows)));
+    let actual_offset = offset_from_bottom.min(total.saturating_sub(reach));
     let end = total - actual_offset;
     let start = end.saturating_sub(wanted);
     let mut page = Vec::new();
-    for (index, row) in rendered.iter().take(end).enumerate().skip(start) {
+    for (index, (row, wrapped)) in rendered.iter().take(end).enumerate().skip(start) {
         if index > start {
             page.push(b'\n');
         }
@@ -928,8 +1042,16 @@ pub(crate) fn render_history_rows(
         // Every row is rendered as if the terminal started it with default
         // attributes, so leave it that way for the next one.
         page.extend_from_slice(b"\x1b[m");
+        if *wrapped {
+            page.extend_from_slice(WRAPPED_ROW_MARK);
+        }
     }
-    Ok((page, total, actual_offset))
+    Ok(RenderedPage {
+        page,
+        total,
+        offset_from_bottom: actual_offset,
+        alternate_screen,
+    })
 }
 
 /// Whether a page from [`render_history_rows`] has anything drawn on it.
@@ -963,6 +1085,13 @@ fn past_escape(body: &[u8]) -> &[u8] {
     let Some((introducer, rest)) = body.split_first() else {
         return body;
     };
+    if *introducer == b'_' {
+        // An application program command runs to its string terminator.
+        return match rest.windows(2).position(|pair| pair == b"\x1b\\") {
+            Some(end) => &rest[end + 2..],
+            None => &[],
+        };
+    }
     if *introducer != b'[' {
         return rest;
     }
@@ -972,6 +1101,12 @@ fn past_escape(body: &[u8]) -> &[u8] {
         // nothing after it to find.
         None => &[],
     }
+}
+
+/// [`past_escape`], for a test elsewhere in the crate that reads pages back.
+#[cfg(test)]
+pub(crate) fn past_escape_for_test(body: &[u8]) -> &[u8] {
+    past_escape(body)
 }
 
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
@@ -1730,6 +1865,79 @@ mod tests {
             );
         }
         whole.set_scrollback(0);
+    }
+
+    #[test]
+    fn a_page_counted_from_the_drawing_holds_what_a_program_drew_at_the_top() {
+        // Codex on a tall pane: clear, paint a welcome box on the first rows,
+        // leave the rest of the grid blank. Counted from the grid's bottom the
+        // newest three rows are three blanks; counted from the drawing they
+        // are the last three rows the program drew.
+        let stream =
+            "\x1b[2J\x1b[H\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour\x1b[5;1Hfive";
+        let grid = render_history_page(stream.as_bytes(), 40, 20, 0, 3, Anchor::Grid).unwrap();
+        assert!(!page_has_content(&grid.page), "{:?}", page_text(&grid.page));
+        assert_eq!(grid.total, 20);
+        let drawn = render_history_page(stream.as_bytes(), 40, 20, 0, 3, Anchor::Drawn).unwrap();
+        assert_eq!(page_text(&drawn.page), "three\nfour\nfive");
+        assert_eq!(
+            drawn.total, 5,
+            "the blank rows under the drawing are not history"
+        );
+        assert!(!drawn.alternate_screen);
+        // Paging up from there reaches the rows above, and stops at the top.
+        let above = render_history_page(stream.as_bytes(), 40, 20, 3, 3, Anchor::Drawn).unwrap();
+        assert_eq!(page_text(&above.page), "one\ntwo");
+        assert_eq!(above.offset_from_bottom, 3);
+        let past = render_history_page(stream.as_bytes(), 40, 20, 50, 3, Anchor::Drawn).unwrap();
+        assert_eq!(page_text(&past.page), "one");
+        assert_eq!(
+            past.offset_from_bottom, 4,
+            "the offset is clamped to what there is"
+        );
+        // A grid whose drawing fills it is counted the same either way.
+        let full = transcript(1..=30);
+        let from_grid = render_history_page(full.as_bytes(), 20, 6, 4, 6, Anchor::Grid).unwrap();
+        let from_drawn = render_history_page(full.as_bytes(), 20, 6, 4, 6, Anchor::Drawn).unwrap();
+        assert_eq!(page_text(&from_grid.page), page_text(&from_drawn.page));
+    }
+
+    #[test]
+    fn a_row_that_ran_off_the_edge_is_marked_for_the_reader() {
+        // A line wider than the pane wraps onto the row below; the page marks
+        // the row it broke at so a reader can join the two back together, and
+        // leaves a row that merely reached the edge alone.
+        let stream = "0123456789abcdefghijKLMNO\r\nshort\r\n01234567890123456789\r\nend\r\n";
+        let page = render_history_page(stream.as_bytes(), 20, 8, 0, 8, Anchor::Drawn)
+            .unwrap()
+            .page;
+        let mark = String::from_utf8(WRAPPED_ROW_MARK.to_vec()).unwrap();
+        let text = String::from_utf8(page).unwrap();
+        let rows: Vec<&str> = text.split('\n').collect();
+        assert_eq!(rows.len(), 5, "{text:?}");
+        assert!(
+            rows[0].ends_with(&mark),
+            "the broken row is marked: {:?}",
+            rows[0]
+        );
+        assert!(
+            !rows[1].ends_with(&mark),
+            "its continuation is not: {:?}",
+            rows[1]
+        );
+        assert!(
+            !rows[3].ends_with(&mark),
+            "a row at the edge is not: {:?}",
+            rows[3]
+        );
+        assert_eq!(
+            page_text(text.replace(&mark, "").as_bytes()),
+            "0123456789abcdefghij\nKLMNO\nshort\n01234567890123456789\nend"
+        );
+        // The mark is an escape, not content: a page of marked blanks is blank.
+        let mut blank = b"\x1b[m".to_vec();
+        blank.extend_from_slice(WRAPPED_ROW_MARK);
+        assert!(!page_has_content(&blank));
     }
 
     #[test]

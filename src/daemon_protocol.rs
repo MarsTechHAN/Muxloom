@@ -358,6 +358,14 @@ pub enum DaemonRequest {
         /// which [`DaemonResponse::HistoryComplete::rendered`] reports back.
         #[serde(default)]
         rendered: bool,
+        /// Count rendered rows from the last row anything was drawn on rather
+        /// than from the bottom of the grid, and answer the newest page off
+        /// the live screen when it holds the whole of it. For a reader laying
+        /// the screen out as text; a client paging out of its own emulator
+        /// leaves it unset so the rows line up with the ones it holds. A
+        /// daemon that predates it counts from the grid.
+        #[serde(default)]
+        from_drawn: bool,
     },
     SearchHistory {
         session_id: String,
@@ -637,6 +645,12 @@ pub enum DaemonResponse {
         /// false and a page is read as possibly having older rows above it.
         #[serde(default)]
         reached_start: bool,
+        /// Whether the session is on the alternate screen — a full-screen
+        /// program holding the whole terminal, whose drawing never scrolls
+        /// into history — so the screen is the whole of what a rendered read
+        /// can reach. Absent from daemons that predate it.
+        #[serde(default)]
+        alternate_screen: bool,
     },
     HistoryMatches {
         matches: Vec<DaemonHistoryMatch>,

@@ -169,6 +169,7 @@ fn history(state: &TestState, session_id: &str) -> String {
             offset_from_bottom: 0,
             lines: 200,
             rendered: false,
+            from_drawn: false,
         },
     )
     .unwrap()

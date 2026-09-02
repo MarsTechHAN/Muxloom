@@ -114,6 +114,10 @@ pub struct BridgeHistory {
     /// measures the session rather than how far this page happened to reach.
     /// A daemon that predates the field leaves this false.
     pub reached_start: bool,
+    /// Whether the session is on the alternate screen, where nothing it draws
+    /// scrolls into history. A daemon that predates the field leaves this
+    /// false.
+    pub alternate_screen: bool,
 }
 
 struct ConnectionState {
@@ -739,11 +743,25 @@ impl BridgeConnection {
         lines: usize,
         rendered: bool,
     ) -> Result<BridgeHistory> {
+        self.read_history_from(session_id, offset_from_bottom, lines, rendered, false)
+    }
+
+    /// [`Self::read_history`], with rows counted from the last drawn row when
+    /// `from_drawn` is set — see [`DaemonRequest::ReadHistory`].
+    pub fn read_history_from(
+        &self,
+        session_id: String,
+        offset_from_bottom: usize,
+        lines: usize,
+        rendered: bool,
+        from_drawn: bool,
+    ) -> Result<BridgeHistory> {
         let reply = self.request(DaemonRequest::ReadHistory {
             session_id,
             offset_from_bottom,
             lines,
             rendered,
+            from_drawn,
         })?;
         match reply.response {
             DaemonResponse::HistoryComplete {
@@ -753,6 +771,7 @@ impl BridgeConnection {
                 offset_from_bottom,
                 rendered,
                 reached_start,
+                alternate_screen,
             } => Ok(BridgeHistory {
                 bytes: reply.data,
                 total_lines,
@@ -761,6 +780,7 @@ impl BridgeConnection {
                 offset_from_bottom,
                 rendered,
                 reached_start,
+                alternate_screen,
             }),
             response => bail!("unexpected history response: {response:?}"),
         }
@@ -2534,6 +2554,25 @@ impl BridgePool {
             offset_from_bottom,
             lines,
             rendered,
+        )
+    }
+
+    /// The newest rendered rows of a session as a reader would lay them out:
+    /// counted from the last drawn row, off the live screen when it holds
+    /// them. See [`DaemonRequest::ReadHistory`].
+    pub fn read_screen_page(
+        &self,
+        target: &Target,
+        session_id: String,
+        offset_from_bottom: usize,
+        lines: usize,
+    ) -> Result<BridgeHistory> {
+        self.connection_for_target(target)?.read_history_from(
+            session_id,
+            offset_from_bottom,
+            lines,
+            true,
+            true,
         )
     }
 

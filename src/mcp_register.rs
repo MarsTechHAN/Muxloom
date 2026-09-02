@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 14;
+const SKILL_REVISION: u32 = 15;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -449,9 +449,15 @@ so a conversation still in progress may be a few minutes behind.
 
 `read_screen { session_id, lines?, offset_from_bottom?, raw? }` returns the
 screen's read result by default: borders and the bottom status/footer bar
-stripped, whitespace collapsed, content in reading order — the text a person
-would read off the screen. Pass `raw: true` for the raw vt100 grid (ANSI
-stripped, columns intact) when you need the exact layout.
+stripped, whitespace collapsed, content in reading order, a line that wrapped
+joined back together — the text a person would read off the screen. Rows are
+counted from the last row anything was drawn on, and the trailer says how many
+the page holds, whether there is older history above it, and the
+`offset_from_bottom` that reaches the page before it: pass that back to page
+older output. A full-screen program (OpenCode) is named as one — the terminal
+keeps nothing it drew before, so its earlier turns are in `read_conversation`.
+Pass `raw: true` for the raw vt100 grid (ANSI stripped, columns intact) when
+you need the exact layout.
 
 ## Shells are the last resort
 
