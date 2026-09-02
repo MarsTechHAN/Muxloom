@@ -2874,6 +2874,23 @@ impl BridgePool {
         Ok(bytes)
     }
 
+    /// Read a remote file from `offset` to its end. An agent's transcript is
+    /// appended to and never rewritten, so a backup that already holds the
+    /// first `offset` bytes of one asks for the rest rather than pulling the
+    /// whole conversation down again. Fails when the file is shorter than
+    /// `offset`, which is how the caller learns it is no longer the same file.
+    pub fn read_file_from(&self, target: &Target, path: String, offset: u64) -> Result<Vec<u8>> {
+        let connection = self.connection_for_target(target)?;
+        let mut stream = connection.open_file(path, offset, None, false)?;
+        let mut bytes = Vec::new();
+        while !stream.is_closed() {
+            if let Some(chunk) = stream.read_timeout(REQUEST_TIMEOUT)? {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn open_media(
         &self,
         target: &Target,

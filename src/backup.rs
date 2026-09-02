@@ -20,15 +20,16 @@
 //! Storage is deliberately file-based (no database): transparent, trivially
 //! synced by external tools, and easy to prune. Blobs are compressed with zstd
 //! — the terminal `.ansi` is extremely redundant (full-screen repaints) and
-//! compresses ~50-350x. Incremental captures are stored as a sequence of
-//! independent length-prefixed zstd frames so a sync only ever appends the new
-//! delta; [`BackupStore::read_blob`] stitches the frames back into one stream.
+//! compresses ~50-350x. A blob is a sequence of independent length-prefixed
+//! zstd frames so a sync only ever appends the new delta — of the capture, and
+//! of the transcript, which the runtimes append to and never rewrite;
+//! [`BackupStore::read_blob`] stitches the frames back into one stream.
 
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -37,6 +38,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     model::{AgentKind, LOCAL_TARGET_ID, RestoredTranscript, Target, Transport},
@@ -89,9 +91,16 @@ pub struct BackupRecord {
     /// Incremental cursors so a sync only pulls new data. The capture cursor is
     /// the number of `.ansi` lines already mirrored (read_history is line
     /// addressed and works over both the local socket and SSH); the transcript
-    /// cursor tracks the native file size.
+    /// cursor is how far into the native file the mirror reaches, always at the
+    /// end of a whole line.
     pub ansi_lines_synced: usize,
     pub jsonl_bytes_synced: u64,
+    /// A fingerprint of the transcript's opening bytes at the last sync. A file
+    /// that still starts with these is the same conversation, grown, and only
+    /// what was added is pulled; anything else is a different file at the same
+    /// path and is mirrored whole again. Empty until a transcript is long
+    /// enough to fingerprint - see [`HEAD_DIGEST_BYTES`].
+    pub jsonl_head_digest: String,
     pub message_count: usize,
     /// Unix seconds of the last successful sync of this session.
     pub last_synced: u64,
@@ -461,7 +470,7 @@ fn decode_frames(bytes: &[u8]) -> Result<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// A single conversation message extracted from a native transcript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedMessage {
     pub role: String,
     pub text: String,
@@ -888,11 +897,105 @@ fn sync_capture(
     Ok(())
 }
 
+/// How much of a transcript's opening is fingerprinted to tell "the same file,
+/// grown" from "a different file written to the same path". The runtimes append
+/// to a transcript and never rewrite it, so its first records stand for as long
+/// as it is the same conversation.
+const HEAD_DIGEST_BYTES: usize = 4096;
+
+/// The fingerprint of a transcript's opening, or nothing when there is not yet
+/// enough of it to fingerprint. Below the window the digest would cover a
+/// different number of bytes on each pass and never agree with itself; a
+/// transcript that short is no work to mirror whole anyway.
+fn head_digest(data: &[u8]) -> String {
+    if data.len() < HEAD_DIGEST_BYTES {
+        return String::new();
+    }
+    let mut digest = Sha256::new();
+    digest.update(&data[..HEAD_DIGEST_BYTES]);
+    format!("{:x}", digest.finalize())
+}
+
+/// How much of `data` ends in a whole line.
+///
+/// A transcript is appended to while it is being read, so the last line of what
+/// a sync sees can be half-written. Mirroring that half and resuming after it
+/// would splice the rest of the record onto the next pass's first one and lose
+/// both, so the mirror stops at the last newline and picks the line up whole
+/// next time.
+fn whole_lines(data: &[u8]) -> usize {
+    data.iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1)
+}
+
+/// The newest message already mirrored for a session, read off the end of its
+/// message blob without decompressing the rest of it.
+fn last_mirrored_message(
+    store: &BackupStore,
+    partition: &str,
+    session_id: &str,
+) -> Option<ExtractedMessage> {
+    let (tail, _) = store
+        .read_blob_tail(partition, session_id, MESSAGES_BLOB, 64 * 1024)
+        .ok()?;
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<ExtractedMessage>(line).ok())
+}
+
+/// What has been added to a transcript since the mirror last read it, or
+/// `None` when what is at that path is no longer the file this record
+/// describes and has to be pulled whole again.
+fn appended_transcript(
+    runtime: &Runtime,
+    target: &Target,
+    is_local: bool,
+    source_path: &str,
+    record: &BackupRecord,
+) -> Result<Option<Vec<u8>>> {
+    if is_local {
+        return appended_locally(source_path, record);
+    }
+    let bridges = runtime.bridge_pool();
+    let opening = bridges.read_file(target, source_path.to_string(), HEAD_DIGEST_BYTES as u64)?;
+    if head_digest(&opening) != record.jsonl_head_digest {
+        return Ok(None);
+    }
+    // The companion refuses an offset past the end of the file, which is the
+    // remote way of learning the transcript shrank.
+    Ok(bridges
+        .read_file_from(target, source_path.to_string(), record.jsonl_bytes_synced)
+        .ok())
+}
+
+/// The same question asked of a file on this machine, which is read straight
+/// rather than over the bridge.
+fn appended_locally(source_path: &str, record: &BackupRecord) -> Result<Option<Vec<u8>>> {
+    let Ok(mut file) = File::open(source_path) else {
+        return Ok(None); // vanished; the whole path leaves the prior backup intact
+    };
+    if file.metadata()?.len() < record.jsonl_bytes_synced {
+        return Ok(None); // shorter than what is mirrored: rewritten, not grown
+    }
+    let mut opening = vec![0; HEAD_DIGEST_BYTES];
+    file.read_exact(&mut opening)?;
+    if head_digest(&opening) != record.jsonl_head_digest {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(record.jsonl_bytes_synced))?;
+    let mut added = Vec::new();
+    file.read_to_end(&mut added)?;
+    Ok(Some(added))
+}
+
 /// Resolve and mirror the agent-native transcript (Codex rollout / Claude
 /// jsonl / Pi jsonl). Local files are read directly; remote files are pulled
 /// over the bridge; OpenCode, which has no file to copy, is asked for its
 /// session instead. Skips work when the transcript's update marker is
-/// unchanged.
+/// unchanged, and appends only what has been added when the file is one it
+/// already mirrors.
 #[allow(clippy::too_many_arguments)]
 fn sync_transcript(
     runtime: &Runtime,
@@ -919,6 +1022,7 @@ fn sync_transcript(
         store.remove_blob(partition, &session.id, MESSAGES_BLOB)?;
         record.native_updated_at.clear();
         record.jsonl_bytes_synced = 0;
+        record.jsonl_head_digest.clear();
         record.message_count = 0;
         record.title.clear();
     }
@@ -945,6 +1049,51 @@ fn sync_transcript(
     }
     let updated_at = candidate.updated_at.clone();
     let source_path = candidate.source_path.clone();
+
+    // A conversation that has been going for a day is tens of megabytes, and
+    // re-reading and re-compressing every byte of it each pass is what left the
+    // searchable copy minutes behind the session it is a copy of. A transcript
+    // is appended to and never rewritten, so a mirror that already holds the
+    // front of one asks only for the rest.
+    if kind != AgentKind::OpenCode
+        && !record.jsonl_head_digest.is_empty()
+        && let Some(added) = appended_transcript(runtime, target, is_local, &source_path, record)?
+    {
+        let added = &added[..whole_lines(&added)];
+        let (mut messages, title) = extract_messages(kind, added);
+        // Mirroring the whole file drops a message that only repeats the one
+        // before it - Codex files the same sentence twice, once as the event
+        // and once as the response it came back on - and the seam between two
+        // appended chunks has to drop it too, or a repeat survives purely
+        // because of where the mirror happened to stop.
+        if let Some(first) = messages.first()
+            && last_mirrored_message(store, partition, &session.id)
+                .is_some_and(|previous| previous.role == first.role && previous.text == first.text)
+        {
+            messages.remove(0);
+        }
+        store.append_frame(partition, &session.id, TRANSCRIPT_BLOB, added)?;
+        store.append_frame(
+            partition,
+            &session.id,
+            MESSAGES_BLOB,
+            messages_to_jsonl(&messages).as_bytes(),
+        )?;
+        record.message_count += messages.len();
+        record.jsonl_bytes_synced += added.len() as u64;
+        record.native_updated_at = updated_at;
+        // Only a name the runtime wrote itself can come out of the end of a
+        // transcript. A guess drawn from the last few lines is not what the
+        // conversation is about, and the pass that mirrored it whole already
+        // guessed from the whole of it.
+        if let Some(Title::Named(named)) = title {
+            record.title = named;
+        }
+        if !added.is_empty() {
+            stats.transcripts += 1;
+        }
+        return Ok(());
+    }
 
     // OpenCode has no transcript to copy. Its conversations are rows in one
     // store shared by every folder on the machine, and that same file holds the
@@ -979,8 +1128,16 @@ fn sync_transcript(
         data
     };
 
-    store.write_blob(partition, &session.id, TRANSCRIPT_BLOB, &data)?;
-    let (messages, title) = extract_messages(kind, &data);
+    // A transcript is mirrored to the end of its last whole line so the next
+    // pass can carry on from there; OpenCode's export is one document rather
+    // than a line per event, and is only ever taken whole.
+    let data = if kind == AgentKind::OpenCode {
+        &data[..]
+    } else {
+        &data[..whole_lines(&data)]
+    };
+    store.write_blob(partition, &session.id, TRANSCRIPT_BLOB, data)?;
+    let (messages, title) = extract_messages(kind, data);
     store.write_blob(
         partition,
         &session.id,
@@ -989,6 +1146,11 @@ fn sync_transcript(
     )?;
     record.message_count = messages.len();
     record.jsonl_bytes_synced = data.len() as u64;
+    record.jsonl_head_digest = if kind == AgentKind::OpenCode {
+        String::new()
+    } else {
+        head_digest(data)
+    };
     record.native_updated_at = updated_at;
     match title {
         // A runtime renames a conversation as it learns what it is about, and
@@ -2150,6 +2312,168 @@ mod tests {
             .unwrap();
         let out = store.read_blob("local", "s1", TRANSCRIPT_BLOB).unwrap();
         assert_eq!(out, b"second value");
+    }
+
+    /// A transcript long enough to fingerprint, written where a sync can read
+    /// it. Returns the path and the record a first whole pass would have left.
+    fn mirrored_transcript(name: &str, lines: usize) -> (PathBuf, BackupRecord) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("muxloom-transcript-{name}-{nonce}.jsonl"));
+        let mut body = String::new();
+        for seq in 0..lines {
+            body.push_str(&format!(
+                "{{\"type\":\"user\",\"seq\":{seq},\"pad\":\"{}\"}}\n",
+                "x".repeat(200)
+            ));
+        }
+        fs::write(&path, &body).unwrap();
+        assert!(
+            body.len() > HEAD_DIGEST_BYTES,
+            "the fixture has to be long enough to fingerprint: {}",
+            body.len()
+        );
+        let record = BackupRecord {
+            jsonl_bytes_synced: body.len() as u64,
+            jsonl_head_digest: head_digest(body.as_bytes()),
+            ..Default::default()
+        };
+        (path, record)
+    }
+
+    #[test]
+    fn a_transcript_that_only_grew_is_read_from_where_the_last_pass_stopped() {
+        let (path, record) = mirrored_transcript("grown", 40);
+        let more = "{\"type\":\"assistant\",\"seq\":40}\n{\"type\":\"user\",\"seq\":41}\n";
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(more.as_bytes()).unwrap();
+        drop(file);
+
+        let added = appended_locally(path.to_str().unwrap(), &record)
+            .unwrap()
+            .expect("the same file, grown, carries on from the cursor");
+        assert_eq!(
+            String::from_utf8_lossy(&added),
+            more,
+            "only what was written after the last pass is read again"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_half_written_last_line_waits_for_the_rest_of_itself() {
+        let (path, mut record) = mirrored_transcript("torn", 40);
+        // The agent is mid-write: the record has opened but not closed.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"type\":\"assistant\",\"seq\"").unwrap();
+        drop(file);
+
+        let torn = appended_locally(path.to_str().unwrap(), &record)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            whole_lines(&torn),
+            0,
+            "half a record is not something that was said"
+        );
+        record.jsonl_bytes_synced += whole_lines(&torn) as u64;
+
+        // The rest of it lands, and the next pass reads the whole record - not
+        // the half of it that the mirror had not already taken.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b":40,\"text\":\"done\"}\n").unwrap();
+        drop(file);
+        let added = appended_locally(path.to_str().unwrap(), &record)
+            .unwrap()
+            .unwrap();
+        let added = &added[..whole_lines(&added)];
+        assert_eq!(
+            String::from_utf8_lossy(added),
+            "{\"type\":\"assistant\",\"seq\":40,\"text\":\"done\"}\n"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_transcript_rewritten_under_the_same_name_is_mirrored_whole_again() {
+        let (path, record) = mirrored_transcript("rewritten", 40);
+        let mut replacement = String::new();
+        for seq in 0..60 {
+            replacement.push_str(&format!(
+                "{{\"type\":\"user\",\"seq\":{seq},\"pad\":\"{}\"}}\n",
+                "y".repeat(200)
+            ));
+        }
+        // Longer than what was mirrored, so only the opening can tell that this
+        // is a different conversation rather than the same one continued.
+        assert!(replacement.len() as u64 > record.jsonl_bytes_synced);
+        fs::write(&path, &replacement).unwrap();
+
+        assert!(
+            appended_locally(path.to_str().unwrap(), &record)
+                .unwrap()
+                .is_none(),
+            "a file that no longer opens the way it did is not the one being mirrored"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_mirror_is_not_stitched_onto() {
+        let (path, record) = mirrored_transcript("shrunk", 40);
+        let body = fs::read(&path).unwrap();
+        fs::write(&path, &body[..body.len() / 2]).unwrap();
+
+        assert!(
+            appended_locally(path.to_str().unwrap(), &record)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_transcript_too_short_to_fingerprint_is_taken_whole() {
+        assert_eq!(head_digest(b"{\"type\":\"user\"}\n"), "");
+        let long = vec![b'x'; HEAD_DIGEST_BYTES + 10];
+        assert_ne!(head_digest(&long), "");
+        // The window is fixed, so growth past it never changes the answer.
+        let longer = vec![b'x'; HEAD_DIGEST_BYTES * 3];
+        assert_eq!(head_digest(&long), head_digest(&longer));
+    }
+
+    #[test]
+    fn the_seam_between_two_appended_chunks_knows_what_came_before_it() {
+        let store = temp_store();
+        let said = ExtractedMessage {
+            role: "assistant".into(),
+            text: "the same sentence, filed twice".into(),
+            ts: "2026-09-02T04:00:00.000Z".into(),
+        };
+        store
+            .append_frame(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&[
+                    ExtractedMessage {
+                        role: "user".into(),
+                        text: "ask".into(),
+                        ts: String::new(),
+                    },
+                    said.clone(),
+                ])
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            last_mirrored_message(&store, "local", "s1"),
+            Some(said),
+            "the newest mirrored message is what a new chunk is compared against"
+        );
+        assert_eq!(last_mirrored_message(&store, "local", "nothing-here"), None);
     }
 
     #[test]
