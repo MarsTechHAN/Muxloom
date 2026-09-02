@@ -16,7 +16,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -29,10 +29,36 @@ use crate::model::AgentKind;
 /// How much of a transcript's end is read. Both CLIs write one JSON object per
 /// line and append forever, so the latest exchange is found by reading the end.
 const TAIL_BYTES: u64 = 256 * 1024;
+/// How far back a scan may reach when the end of a transcript held nothing the
+/// agent itself said. What crowds the last exchange out of the window is the
+/// runtime's own bookkeeping - tool results, attachments, the modes and titles
+/// and prompt echoes filed alongside the conversation - and it can run to a few
+/// hundred kilobytes at a stretch. Reading only [`TAIL_BYTES`] then reports a
+/// conversation as silent when it is not.
+const TAIL_CEILING: u64 = 4 * 1024 * 1024;
 /// How much of the start is read to find out when the conversation began.
 /// Claude Code writes its first timestamped line inside the first kilobyte;
 /// this leaves room for a transcript that opens with something larger.
 const HEAD_BYTES: u64 = 64 * 1024;
+/// How far into a transcript a scan may read for its opening facts: where it
+/// ran, when it began, and the first thing the person said in it.
+///
+/// The first two are on the first line. The third is not, and it is the one
+/// that carries the weight - the first words are what tell two agents started
+/// seconds apart apart, and the only thing that can take a transcript back off
+/// a session that claimed it wrongly (see [`assign_threads`]). A runtime writes
+/// a great deal under the person's role before the person says anything: the
+/// environment it was handed, files read into the conversation, everything a
+/// resumed session carries over. Measured on this machine, 110 of 248 Codex
+/// rollouts open their first real sentence further in than [`HEAD_BYTES`], one
+/// of them 2.4 MB in - and a window that stops short does not report a late
+/// answer, it reports no answer, which reads as a session that never said
+/// anything and is matched on timing alone.
+///
+/// A scan stops at the line that answers it, so this is what one is allowed to
+/// read and not what it costs: a transcript that opens normally is done inside
+/// a single buffer.
+const HEAD_CEILING: u64 = 8 * 1024 * 1024;
 /// How many transcripts one scan opens, newest first. A folder accumulates
 /// every conversation ever held in it; the ones a live session could be
 /// writing are at the top of that list.
@@ -592,7 +618,7 @@ fn claude_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
     let mut cwd = None;
     let mut started_at = 0;
     let mut first_message = None;
-    for value in read_head(path, HEAD_BYTES)?.lines().filter_map(parse_line) {
+    scan_head(path, |value| {
         if cwd.is_none() {
             cwd = value.get("cwd").and_then(Value::as_str).map(normalize_path);
         }
@@ -604,36 +630,42 @@ fn claude_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
                 .unwrap_or(0);
         }
         if first_message.is_none() {
-            first_message = claude_user_text(&value).and_then(clean_message);
+            first_message = claude_user_text(value).and_then(clean_message);
         }
-        if cwd.is_some() && started_at != 0 && first_message.is_some() {
-            break;
-        }
-    }
+        cwd.is_some() && started_at != 0 && first_message.is_some()
+    })?;
 
     let mut title = None;
     let mut legacy_title = None;
     let mut last_message = None;
-    for value in read_tail(path, TAIL_BYTES)?.lines().filter_map(parse_line) {
-        if id.is_none() {
-            id = value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+    widening_tail(path, |text| {
+        title = None;
+        legacy_title = None;
+        last_message = None;
+        for value in text.lines().filter_map(parse_line) {
+            // The id and the working directory belong to the whole file, so a
+            // wider look can only confirm what an earlier one already said.
+            if id.is_none() {
+                id = value
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if cwd.is_none() {
+                cwd = value.get("cwd").and_then(Value::as_str).map(normalize_path);
+            }
+            if let Some(named) = claude_ai_title(&value) {
+                title = clean_message(named);
+            }
+            if legacy_title.is_none() {
+                legacy_title = claude_legacy_title(&value).and_then(clean_message);
+            }
+            if let Some(said) = claude_assistant_text(&value) {
+                last_message = Some(said);
+            }
         }
-        if cwd.is_none() {
-            cwd = value.get("cwd").and_then(Value::as_str).map(normalize_path);
-        }
-        if let Some(named) = claude_ai_title(&value) {
-            title = clean_message(named);
-        }
-        if legacy_title.is_none() {
-            legacy_title = claude_legacy_title(&value).and_then(clean_message);
-        }
-        if let Some(said) = claude_assistant_text(&value) {
-            last_message = Some(said);
-        }
-    }
+        last_message.is_some()
+    })?;
 
     Some(NativeThread {
         id: id?,
@@ -752,11 +784,18 @@ fn codex_thread(
     updated_at: u64,
     names: &HashMap<String, String>,
 ) -> Option<NativeThread> {
-    let head = read_head(path, HEAD_BYTES)?;
-    let meta = head
-        .lines()
-        .filter_map(parse_line)
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))?;
+    let mut meta = None;
+    let mut first_message = None;
+    scan_head(path, |value| {
+        if meta.is_none() && value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            meta = Some(value.clone());
+        }
+        if first_message.is_none() {
+            first_message = codex_user_text(value).and_then(clean_message);
+        }
+        meta.is_some() && first_message.is_some()
+    })?;
+    let meta = meta?;
     let payload = meta.get("payload")?;
     // A subagent writes its own rollout in the same folder. It belongs to the
     // thread that spawned it, not to a session of its own.
@@ -783,18 +822,16 @@ fn codex_thread(
         .get("forked_from_id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let first_message = head
-        .lines()
-        .filter_map(parse_line)
-        .filter_map(|value| codex_user_text(&value).and_then(clean_message))
-        .next();
-
     let mut last_message = None;
-    for value in read_tail(path, TAIL_BYTES)?.lines().filter_map(parse_line) {
-        if let Some(said) = codex_agent_text(&value) {
-            last_message = Some(said);
+    widening_tail(path, |text| {
+        last_message = None;
+        for value in text.lines().filter_map(parse_line) {
+            if let Some(said) = codex_agent_text(&value) {
+                last_message = Some(said);
+            }
         }
-    }
+        last_message.is_some()
+    })?;
 
     Some(NativeThread {
         title: names.get(&id).cloned(),
@@ -878,10 +915,42 @@ pub fn pi_session_name(value: &Value) -> Option<&str> {
 
 fn pi_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
     let head = read_head(path, HEAD_BYTES)?;
-    let header = head
+    let mut header = head
         .lines()
         .filter_map(parse_line)
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"))?;
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"));
+    // A name given at the start sits in the head of a transcript long enough
+    // that the tail no longer reaches it, so both ends are read for one. This
+    // one stays on the opening window: a name is written where a name is
+    // written, and reading further for it would only find the same one again.
+    let mut title = head
+        .lines()
+        .filter_map(parse_line)
+        .filter_map(|value| pi_session_name(&value).and_then(clean_message))
+        .next_back();
+    // The first thing the person said is normally in the head too: pi writes
+    // the opening message before any answer could crowd it out. Normally.
+    // Where something larger was written ahead of it - a resumed conversation
+    // carried over, a file read in before the person spoke - the opening window
+    // holds none of it, and neither the header nor the first words are found by
+    // stopping there. See [`HEAD_CEILING`].
+    let mut first_message = head
+        .lines()
+        .filter_map(parse_line)
+        .filter_map(|value| pi_user_text(&value).and_then(clean_message))
+        .next();
+    if header.is_none() || first_message.is_none() {
+        scan_head(path, |value| {
+            if header.is_none() && value.get("type").and_then(Value::as_str) == Some("session") {
+                header = Some(value.clone());
+            }
+            if first_message.is_none() {
+                first_message = pi_user_text(value).and_then(clean_message);
+            }
+            header.is_some() && first_message.is_some()
+        })?;
+    }
+    let header = header?;
     let id = header.get("id").and_then(Value::as_str)?.to_string();
     let cwd = header
         .get("cwd")
@@ -900,29 +969,19 @@ fn pi_thread(path: &Path, updated_at: u64) -> Option<NativeThread> {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // A name given at the start sits in the head of a transcript long enough
-    // that the tail no longer reaches it, so both ends are read for one.
-    let mut title = head
-        .lines()
-        .filter_map(parse_line)
-        .filter_map(|value| pi_session_name(&value).and_then(clean_message))
-        .next_back();
-    // The first thing the person said, like the name, is in the head: pi
-    // writes the opening message before any answer could crowd it out.
-    let first_message = head
-        .lines()
-        .filter_map(parse_line)
-        .filter_map(|value| pi_user_text(&value).and_then(clean_message))
-        .next();
     let mut last_message = None;
-    for value in read_tail(path, TAIL_BYTES)?.lines().filter_map(parse_line) {
-        if let Some(named) = pi_session_name(&value).and_then(clean_message) {
-            title = Some(named);
+    widening_tail(path, |text| {
+        last_message = None;
+        for value in text.lines().filter_map(parse_line) {
+            if let Some(named) = pi_session_name(&value).and_then(clean_message) {
+                title = Some(named);
+            }
+            if let Some(said) = pi_agent_text(&value) {
+                last_message = Some(said);
+            }
         }
-        if let Some(said) = pi_agent_text(&value) {
-            last_message = Some(said);
-        }
-    }
+        last_message.is_some()
+    })?;
 
     Some(NativeThread {
         id,
@@ -1206,6 +1265,81 @@ pub fn last_written(path: &Path) -> Option<u64> {
 fn as_epoch_ms(time: SystemTime) -> Option<u64> {
     let elapsed = time.duration_since(UNIX_EPOCH).ok()?;
     Some(elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Read forward from the start of a transcript, a line at a time, until `take`
+/// says it has what it came for or [`HEAD_CEILING`] bytes have gone by.
+///
+/// Lazy on purpose. The alternative - take a fixed slice of the front and parse
+/// all of it - pays the same price for every transcript whether the answer was
+/// on line one or is not in the file at all, and it cannot be widened without
+/// making the common case worse. Here the common case reads one buffer and
+/// stops, which leaves room for the uncommon one to keep going.
+///
+/// Says nothing about what was found; that is for the caller's own state, which
+/// `take` writes as it goes. `None` only means the file could not be opened at
+/// all - the same thing a short read used to mean, and the one case where a
+/// caller has no transcript rather than an unhelpful one.
+fn scan_head(path: &Path, mut take: impl FnMut(&Value) -> bool) -> Option<()> {
+    let file = File::open(path).ok()?;
+    let lines = HeadLines {
+        reader: BufReader::new(file.take(HEAD_CEILING)),
+        line: Vec::new(),
+    };
+    for value in lines {
+        if take(&value) {
+            break;
+        }
+    }
+    Some(())
+}
+
+/// The records at the start of a file, parsed one at a time and no further than
+/// the reader asks.
+struct HeadLines {
+    reader: BufReader<io::Take<File>>,
+    line: Vec<u8>,
+}
+
+impl Iterator for HeadLines {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        loop {
+            self.line.clear();
+            if self.reader.read_until(b'\n', &mut self.line).ok()? == 0 {
+                return None;
+            }
+            // Nothing closed the line and there is no budget left to close it
+            // with: the read stopped inside a record, and half a record says
+            // nothing. A line that simply ends the file is whole.
+            if !self.line.ends_with(b"\n") && self.reader.get_ref().limit() == 0 {
+                return None;
+            }
+            if let Some(value) = parse_line(&String::from_utf8_lossy(&self.line)) {
+                return Some(value);
+            }
+        }
+    }
+}
+
+/// The end of a transcript, read again over a longer reach each time `scan`
+/// says the last look found nothing.
+///
+/// `scan` is handed a whole window rather than a line because what it is after
+/// is the *last* of something, so it has to read to the end of the window to
+/// know it. It sees each window from the beginning and is expected to start
+/// over on what it collects, the wider window being a better answer to the same
+/// question rather than more of the same one.
+fn widening_tail(path: &Path, mut scan: impl FnMut(&str) -> bool) -> Option<()> {
+    let ceiling = fs::metadata(path).ok()?.len().min(TAIL_CEILING);
+    let mut window = TAIL_BYTES;
+    loop {
+        if scan(&read_tail(path, window)?) || window >= ceiling {
+            return Some(());
+        }
+        window = window.saturating_mul(4).min(ceiling);
+    }
 }
 
 /// The end of a file as text, minus the line the read landed in the middle of.
@@ -1527,6 +1661,207 @@ mod tests {
 
         // Nothing has been written since the scan's floor.
         assert!(claude_threads(&projects, "/work/Terminal", u64::MAX - 1).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Four kilobytes of a runtime writing about itself. A handful of these is
+    /// all it takes to push a conversation outside a fixed window - which is
+    /// what real transcripts do, at both ends and routinely.
+    fn machinery(seq: usize) -> String {
+        format!(
+            r#"{{"type":"attachment","sessionId":"aaa","attachment":{{"seq":{seq},"content":"{}"}}}}"#,
+            "x".repeat(4096)
+        )
+    }
+
+    #[test]
+    fn a_late_first_sentence_and_a_buried_last_answer_are_both_still_read() {
+        let root = scratch("claude-buried");
+        let projects = root.join("projects");
+        let folder = projects.join(claude_project_slug("/work/Terminal"));
+        fs::create_dir_all(&folder).unwrap();
+
+        let mut transcript = String::new();
+        transcript.push_str(
+            r#"{"type":"mode","sessionId":"aaa","cwd":"/work/Terminal","timestamp":"2026-08-19T03:48:05.620Z"}"#,
+        );
+        transcript.push('\n');
+        // Everything the runtime read into the conversation before the person
+        // got a word in.
+        for seq in 0..20 {
+            transcript.push_str(&machinery(seq));
+            transcript.push('\n');
+        }
+        transcript.push_str(
+            r#"{"type":"user","sessionId":"aaa","message":{"content":"Fix the recap first, it is unreadable."}}"#,
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            r#"{"type":"ai-title","aiTitle":"what it is really about","sessionId":"aaa"}"#,
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            r#"{"type":"assistant","sessionId":"aaa","message":{"content":[{"type":"text","text":"The keeper spawn is what fails."}]}}"#,
+        );
+        transcript.push('\n');
+        // And everything it wrote after the last thing it said out loud.
+        for seq in 20..90 {
+            transcript.push_str(&machinery(seq));
+            transcript.push('\n');
+        }
+
+        // The fixture is only a test of anything while it really does bury
+        // both ends past the window the first look takes.
+        let opening = transcript.find("Fix the recap first").unwrap() as u64;
+        assert!(
+            opening > HEAD_BYTES,
+            "the first sentence is not buried: {opening}"
+        );
+        let answer = (transcript.len() - transcript.rfind("The keeper spawn").unwrap()) as u64;
+        assert!(
+            answer > TAIL_BYTES,
+            "the last answer is not buried: {answer}"
+        );
+        fs::write(folder.join("aaa.jsonl"), &transcript).unwrap();
+
+        let threads = claude_threads(&projects, "/work/Terminal", 0);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert_eq!(
+            threads[0].first_message.as_deref(),
+            Some("Fix the recap first, it is unreadable.")
+        );
+        assert_eq!(
+            threads[0].last_message.as_deref(),
+            Some("The keeper spawn is what fails.")
+        );
+        assert_eq!(threads[0].title.as_deref(), Some("what it is really about"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_line_wider_than_the_opening_window_does_not_blank_the_whole_head() {
+        let root = scratch("claude-wide-line");
+        let projects = root.join("projects");
+        let folder = projects.join(claude_project_slug("/work/Terminal"));
+        fs::create_dir_all(&folder).unwrap();
+
+        // A single record larger than the window a fixed read takes. Cut in the
+        // middle of it, a reader has no whole line at all - and used to
+        // conclude from that that the transcript said nothing about itself.
+        let mut transcript = format!(
+            r#"{{"type":"attachment","sessionId":"ccc","attachment":{{"content":"{}"}}}}"#,
+            "x".repeat(HEAD_BYTES as usize + 4096)
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            r#"{"type":"user","sessionId":"ccc","cwd":"/work/Terminal","timestamp":"2026-08-19T03:48:05.620Z","message":{"content":"The one thing that was actually said."}}"#,
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            r#"{"type":"assistant","sessionId":"ccc","message":{"content":[{"type":"text","text":"And the answer to it."}]}}"#,
+        );
+        transcript.push('\n');
+        fs::write(folder.join("ccc.jsonl"), &transcript).unwrap();
+
+        let threads = claude_threads(&projects, "/work/Terminal", 0);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert_eq!(
+            threads[0].first_message.as_deref(),
+            Some("The one thing that was actually said.")
+        );
+        // The end of a transcript carries its id and its cwd, so those survived
+        // a blank head. When it began is only ever said at the start.
+        assert_eq!(
+            threads[0].started_at,
+            parse_timestamp("2026-08-19T03:48:05.620Z").unwrap()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_rollout_that_thought_before_it_listened_still_gives_up_its_opening() {
+        let root = scratch("codex-buried");
+        let day = root.join("sessions").join("2026").join("08").join("19");
+        fs::create_dir_all(&day).unwrap();
+
+        let mut rollout = String::from(
+            r#"{"type":"session_meta","payload":{"id":"one","cwd":"/work","timestamp":"2026-08-19T04:00:00.000Z"}}"#,
+        );
+        rollout.push('\n');
+        for seq in 0..20 {
+            rollout.push_str(&format!(
+                r#"{{"type":"event_msg","payload":{{"type":"agent_reasoning","seq":{seq},"text":"{}"}}}}"#,
+                "x".repeat(4096)
+            ));
+            rollout.push('\n');
+        }
+        rollout.push_str(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"Chase the flaky keeper spawn, then the tests."}}"#,
+        );
+        rollout.push('\n');
+        rollout.push_str(
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"The first thing it said."}}"#,
+        );
+        rollout.push('\n');
+        let opening = rollout.find("Chase the flaky").unwrap() as u64;
+        assert!(
+            opening > HEAD_BYTES,
+            "the first sentence is not buried: {opening}"
+        );
+        fs::write(day.join("rollout-2026-08-19T04-00-00-one.jsonl"), &rollout).unwrap();
+
+        let threads = codex_threads(&root, "/work", 0);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert_eq!(
+            threads[0].first_message.as_deref(),
+            Some("Chase the flaky keeper spawn, then the tests.")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pi_session_read_into_before_it_was_asked_still_gives_up_its_opening() {
+        let root = scratch("pi-buried");
+        let sessions = root.join("sessions");
+        let folder = sessions.join(pi_session_slug("/work/Terminal"));
+        fs::create_dir_all(&folder).unwrap();
+
+        let mut transcript = String::from(
+            r#"{"type":"session","version":3,"id":"aaa","timestamp":"2026-08-25T06:59:08.453Z","cwd":"/work/Terminal"}"#,
+        );
+        transcript.push('\n');
+        for seq in 0..20 {
+            transcript.push_str(&format!(
+                r#"{{"type":"message","id":"t{seq}","message":{{"role":"toolResult","content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                "x".repeat(4096)
+            ));
+            transcript.push('\n');
+        }
+        transcript.push_str(
+            r#"{"type":"message","id":"u1","message":{"role":"user","content":[{"type":"text","text":"What is the star of the show here?"}]}}"#,
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            r#"{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"text","text":"The keeper spawn is what fails."}]}}"#,
+        );
+        transcript.push('\n');
+        let opening = transcript.find("What is the star").unwrap() as u64;
+        assert!(
+            opening > HEAD_BYTES,
+            "the first sentence is not buried: {opening}"
+        );
+        fs::write(
+            folder.join("2026-08-25T06-59-08-453Z_aaa.jsonl"),
+            &transcript,
+        )
+        .unwrap();
+
+        let threads = pi_threads(&sessions, "/work/Terminal", 0);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert_eq!(
+            threads[0].first_message.as_deref(),
+            Some("What is the star of the show here?")
+        );
         fs::remove_dir_all(&root).ok();
     }
 
