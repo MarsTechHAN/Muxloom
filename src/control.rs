@@ -3105,11 +3105,13 @@ fn chrome_char(c: char) -> bool {
 /// only from the last few rows, where that bar lives, so a line of real
 /// content is safe. A row is a bar when it carries a strong signal — a
 /// braille spinner or a usage figure — or when it is a build footer (ends on
-/// a version stamp next to a path or an mcp marker) or a short key-hint bar.
-/// The version signal alone is too common in prose ("shipped in release
-/// 1.2.3"), so it only counts beside a path or an mcp marker; the same
-/// restraint keeps a sentence that merely mentions a key alive — a key hint
-/// is short.
+/// a version stamp next to a path or an mcp marker), a mode bar (Claude
+/// Code's `⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt`), a
+/// key-hint bar, or the bare glyph of an empty prompt. The version signal
+/// alone is too common in prose ("shipped in release 1.2.3"), so it only
+/// counts beside a path or an mcp marker; the same restraint keeps a sentence
+/// that merely mentions a key alive — a key hint is a short row, and a mode
+/// bar names the key that cycles it.
 fn is_status_bar(row: &str) -> bool {
     let lower = row.to_ascii_lowercase();
     if row.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)) || usage_figure(&lower) {
@@ -3118,10 +3120,24 @@ fn is_status_bar(row: &str) -> bool {
     if ends_with_version(&lower) && (lower.contains('/') || lower.contains("mcp")) {
         return true;
     }
-    row.len() <= 40
+    if lower.contains("shift+tab to cycle") || lower.contains("? for shortcuts") {
+        return true;
+    }
+    if empty_prompt(row) {
+        return true;
+    }
+    row.chars().count() <= 40
         && (lower.contains("ctrl+p commands")
             || lower.contains("esc interrupt")
             || lower.contains("esc to interrupt"))
+}
+
+/// A row that is nothing but the glyph a CLI draws its prompt with: the
+/// composer with nothing typed in it. What is typed there is content and
+/// stays; the empty box is chrome.
+fn empty_prompt(row: &str) -> bool {
+    let mut glyphs = row.trim().chars();
+    matches!(glyphs.next(), Some('❯' | '›' | '»' | '>')) && glyphs.next().is_none()
 }
 
 /// A usage figure: a number, an optional unit letter, and a percentage in
@@ -6179,6 +6195,29 @@ mod tests {
              ▣ Build · Qwen3.8-27B (SGLang via SOIL) · 1m 23s\n\
              Build · Qwen3.8-27B (SGLang via SOIL) ~/Works/Minimax-H3"
         );
+    }
+
+    #[test]
+    fn read_result_drops_claude_codes_mode_bar_and_empty_prompt() {
+        // The bottom of a working Claude Code session: the last answer, the
+        // spinner line, the empty composer, and the mode bar under it. The
+        // spinner line is what says a turn is running, so it stays; the empty
+        // prompt and the mode bar are chrome.
+        let plain = "⏺ Calling muxloom 2 times… (ctrl+o to expand)\n\
+                     ✢ Forming… (9m 34s · ↓ 14.8k tokens · thinking with xhigh effort)\n\
+                     ❯\n\
+                     ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert_eq!(
+            read_result(plain),
+            "⏺ Calling muxloom 2 times… (ctrl+o to expand)\n\
+             ✢ Forming… (9m 34s · ↓ 14.8k tokens · thinking with xhigh effort)"
+        );
+        // Idle, with a draft in the box: the draft is content.
+        let idle = "⏺ Done.\n❯ run the tests again\n? for shortcuts";
+        assert_eq!(read_result(idle), "⏺ Done.\n❯ run the tests again");
+        // A prompt glyph starting a line of prose is not an empty prompt.
+        assert!(!empty_prompt("> quoted reply"));
+        assert!(empty_prompt("  ❯  "));
     }
 
     #[test]
