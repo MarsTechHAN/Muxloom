@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 15;
+const SKILL_REVISION: u32 = 16;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -442,8 +442,12 @@ on a pattern while nothing is watching at all.
 
 `search_conversations { query }` searches every enabled machine's transcripts;
 `read_conversation { machine, session_id, around_index }` pages through one
-without dragging the whole thing into your context. Both read backup snapshots,
-so a conversation still in progress may be a few minutes behind.
+without dragging the whole thing into your context. The search reads backup
+snapshots, so a conversation still in progress may be a few minutes behind;
+`read_conversation` reads a claude, codex or pi conversation held on this
+machine off the runtime's own transcript as it stands now (`source:
+transcript`), and only one held elsewhere, or by OpenCode, off the backup.
+This is how the earlier turns of a full-screen agent are read.
 
 ## Read a screen
 

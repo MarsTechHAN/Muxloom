@@ -907,8 +907,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       A conversation is far too long to read whole, so this returns at most \
                       `limit` messages and `max_chars` characters of text and tells you what \
                       is left: `next_cursor` is where to carry on, has_more_before and \
-                      has_more_after say which way there is more. Same backup as \
-                      search_conversations, so it may lag a live session by a few minutes."
+                      has_more_after say which way there is more. A conversation held on \
+                      this machine by claude, codex or pi is read off the runtime's own \
+                      transcript as it stands now (`source: transcript`); one held elsewhere, \
+                      or by opencode, comes from the same backup as search_conversations and \
+                      may lag a live session by a few minutes (`source: backup`)."
             .into(),
         input_schema: schema(
             false,
@@ -4151,7 +4154,9 @@ impl ControllerControl {
             "hits": rendered,
             "note": "read around a hit with read_conversation { session_id, machine, \
                      around_index }. This is a backup taken every few minutes, so a conversation \
-                     happening right now may be missing its last turns.",
+                     happening right now may be missing its last turns; read_conversation reads \
+                     a claude, codex or pi conversation on this machine off its own transcript, \
+                     which has them.",
         })))
     }
 
@@ -4162,7 +4167,7 @@ impl ControllerControl {
 
     #[cfg(feature = "controller")]
     fn read_conversation(&self, arguments: &Value) -> Result<String> {
-        use crate::backup::{BackupStore, read_messages};
+        use crate::backup::{BackupStore, read_conversation};
 
         let session_id = required_str(arguments, "session_id")?;
         let limit = optional_u64(arguments, "limit", 20).clamp(1, 200) as usize;
@@ -4185,7 +4190,8 @@ impl ControllerControl {
             u64::MAX => optional_u64(arguments, "from_index", 0) as usize,
             around => (around as usize).saturating_sub(limit / 2),
         };
-        let (window, total) = read_messages(&store, &record.target_id, session_id, from, limit)?;
+        let read = read_conversation(&store, record, from, limit)?;
+        let (window, total, source) = (read.messages, read.total, read.source);
 
         let (messages, next, clipped_any) = conversation_page(&window, max_chars);
         let after = window
@@ -4203,6 +4209,7 @@ impl ControllerControl {
             "title": record.title,
             "total_messages": total,
             "from_index": from,
+            "source": source.as_str(),
             "messages": messages,
             "has_more_before": from > 0,
             "has_more_after": next_cursor.is_some(),

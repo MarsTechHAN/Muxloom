@@ -2058,6 +2058,105 @@ impl TopHits {
     }
 }
 
+/// Where [`read_conversation`] read a conversation from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationSource {
+    /// The backup's mirror, which lags a live session by up to a sync pass.
+    Backup,
+    /// The runtime's own transcript on this machine, read as it stands now.
+    Transcript,
+}
+
+impl ConversationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backup => "backup",
+            Self::Transcript => "transcript",
+        }
+    }
+}
+
+/// [`read_messages`], off the runtime's own transcript when that is on this
+/// machine and has moved since the backup last mirrored it.
+///
+/// The backup is a copy taken every few minutes, and a reader asking after a
+/// conversation still in progress is usually asking about its last few
+/// minutes — the turn an agent is on now, the question it just asked. That
+/// is exactly the part the copy has not got yet. The transcript itself is a
+/// file the runtime appends to, so when it is here it is read the way the
+/// backup would read it on its next pass, and the messages come out the same
+/// way and in the same order; an index from a search hit still lands on the
+/// message it named. OpenCode keeps no file to read, and a transcript on
+/// another machine is the backup's to fetch, so those still come from the
+/// mirror — as does a transcript the mirror already holds whole.
+pub fn read_conversation(
+    store: &BackupStore,
+    record: &BackupRecord,
+    from: usize,
+    limit: usize,
+) -> Result<ConversationWindow> {
+    if let Some(messages) = live_transcript_messages(record) {
+        let total = messages.len();
+        let messages = messages
+            .into_iter()
+            .enumerate()
+            .skip(from)
+            .take(limit)
+            .collect();
+        return Ok(ConversationWindow {
+            messages,
+            total,
+            source: ConversationSource::Transcript,
+        });
+    }
+    let (messages, total) =
+        read_messages(store, &record.target_id, &record.session_id, from, limit)?;
+    Ok(ConversationWindow {
+        messages,
+        total,
+        source: ConversationSource::Backup,
+    })
+}
+
+/// What [`read_conversation`] hands back: the messages in the window, each
+/// with its index, how many the conversation holds in all, and where they
+/// were read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationWindow {
+    pub messages: Vec<(usize, ExtractedMessage)>,
+    pub total: usize,
+    pub source: ConversationSource,
+}
+
+/// The messages of a record's transcript as it stands on this machine, when
+/// there is one here that the backup has not caught up with.
+fn live_transcript_messages(record: &BackupRecord) -> Option<Vec<ExtractedMessage>> {
+    if record.target_id != LOCAL_TARGET_ID || record.native_path.is_empty() {
+        return None;
+    }
+    let kind = record.kind.parse::<AgentKind>().ok()?;
+    if !matches!(kind, AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) {
+        return None;
+    }
+    let metadata = fs::metadata(&record.native_path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // Grown since the mirror was taken, or grown past it: either says the
+    // mirror is behind. The size check is what catches a file the sync pass
+    // read in the same second it was written to.
+    let behind = modified > record.last_synced || metadata.len() > record.jsonl_bytes_synced;
+    if !behind {
+        return None;
+    }
+    let data = fs::read(&record.native_path).ok()?;
+    let (messages, _) = extract_messages(kind, &data[..whole_lines(&data)]);
+    Some(messages)
+}
+
 /// A window of one backed-up conversation, addressed by message index: the
 /// line number in the extracted jsonl, which is what a search hit reports.
 ///
@@ -3070,6 +3169,99 @@ mod tests {
         let (past, total) = read_messages(&store, "local", "s1", 9, 5).unwrap();
         assert!(past.is_empty());
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn a_conversation_still_being_written_is_read_off_its_own_transcript() {
+        let store = temp_store();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let transcript = std::env::temp_dir().join(format!("muxloom-live-{nonce}.jsonl"));
+        let mirrored = concat!(
+            r#"{"type":"user","timestamp":"t1","message":{"content":"where is the parser?"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"t2","message":{"content":[{"type":"text","text":"in src/parse.rs"}]}}"#,
+            "\n",
+        );
+        fs::write(&transcript, mirrored).unwrap();
+        let (messages, _) = extract_messages(AgentKind::Claude, mirrored.as_bytes());
+        assert_eq!(messages.len(), 2, "the fixture reads as two turns");
+        store
+            .write_blob(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&messages).as_bytes(),
+            )
+            .unwrap();
+        let mut record = BackupRecord {
+            target_id: "local".into(),
+            session_id: "s1".into(),
+            kind: "claude".into(),
+            native_path: transcript.to_string_lossy().into_owned(),
+            jsonl_bytes_synced: mirrored.len() as u64,
+            last_synced: u64::MAX,
+            message_count: 2,
+            ..BackupRecord::default()
+        };
+        // Mirrored whole, and not moved since: the mirror is the answer.
+        let window = read_conversation(&store, &record, 0, 10).unwrap();
+        assert_eq!(
+            (window.messages.len(), window.total, window.source),
+            (2, 2, ConversationSource::Backup)
+        );
+
+        // The runtime writes another turn. The mirror has not seen it; the
+        // transcript has, and the indexes the mirror handed out still hold.
+        let mut file = OpenOptions::new().append(true).open(&transcript).unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"user","timestamp":"t3","message":{"content":"and the lexer?"}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        let window = read_conversation(&store, &record, 1, 10).unwrap();
+        assert_eq!(window.source, ConversationSource::Transcript);
+        assert_eq!(window.total, 3);
+        assert_eq!(
+            window
+                .messages
+                .iter()
+                .map(|(index, message)| (*index, message.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "in src/parse.rs"), (2, "and the lexer?")]
+        );
+
+        // Another machine's transcript is not here to read, whatever the
+        // record says about it.
+        record.target_id = "elsewhere".into();
+        store
+            .write_blob(
+                "elsewhere",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&messages).as_bytes(),
+            )
+            .unwrap();
+        let window = read_conversation(&store, &record, 0, 10).unwrap();
+        assert_eq!(
+            (window.total, window.source),
+            (2, ConversationSource::Backup)
+        );
+        // A transcript that has gone is the mirror's to remember.
+        record.target_id = "local".into();
+        fs::remove_file(&transcript).unwrap();
+        let window = read_conversation(&store, &record, 0, 10).unwrap();
+        assert_eq!(
+            (window.total, window.source),
+            (2, ConversationSource::Backup)
+        );
+        fs::remove_dir_all(&store.root).ok();
     }
 
     #[test]
