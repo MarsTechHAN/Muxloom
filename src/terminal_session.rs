@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::{
+    activity::{Activity, ActivityTracker, now_ms},
     bridge::{BridgePool, BridgeStream},
     debug,
     model::{Target, Transport},
@@ -61,7 +62,7 @@ pub(crate) const SCROLLBACK_SEED_ROWS_LIMIT: usize = 5_000;
 pub struct TerminalSession {
     parser: vt100::Parser,
     inline: InlineScrollback,
-    codex_activity: CodexActivity,
+    activity: ActivityTracker,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -204,7 +205,7 @@ impl TerminalSession {
         Ok(Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             inline: InlineScrollback::default(),
-            codex_activity: CodexActivity::default(),
+            activity: ActivityTracker::default(),
             master: Some(pair.master),
             writer: Some(writer),
             child: Some(child),
@@ -238,7 +239,7 @@ impl TerminalSession {
         Ok(Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             inline: InlineScrollback::default(),
-            codex_activity: CodexActivity::default(),
+            activity: ActivityTracker::default(),
             master: None,
             writer: None,
             child: None,
@@ -266,7 +267,7 @@ impl TerminalSession {
                     break;
                 };
                 taken += bytes.len();
-                self.codex_activity.process(&bytes);
+                self.activity.process(&bytes, now_ms());
                 self.inline.process(&mut self.parser, &bytes);
                 changed = true;
             }
@@ -282,7 +283,7 @@ impl TerminalSession {
                 match event {
                     TerminalEvent::Output(bytes) => {
                         taken += bytes.len();
-                        self.codex_activity.process(&bytes);
+                        self.activity.process(&bytes, now_ms());
                         self.inline.process(&mut self.parser, &bytes);
                         changed = true;
                     }
@@ -300,8 +301,10 @@ impl TerminalSession {
         self.parser.screen()
     }
 
-    pub fn codex_working_hint(&self) -> Option<bool> {
-        self.codex_activity.working()
+    /// What the session is doing, as its terminal reads it: the title it
+    /// writes, how often it paints, whether it has hidden the cursor.
+    pub fn activity(&self) -> Activity {
+        self.activity.report(now_ms())
     }
 
     /// A session with no process behind it whose output is whatever a test
@@ -321,7 +324,7 @@ impl TerminalSession {
         Self {
             parser: vt100::Parser::new(height, width, SCROLLBACK_LINES),
             inline: InlineScrollback::default(),
-            codex_activity: CodexActivity::default(),
+            activity: ActivityTracker::default(),
             master: None,
             writer: None,
             child: None,
@@ -466,65 +469,6 @@ impl TerminalSession {
             writer.flush().context("failed to flush embedded terminal")
         }
     }
-}
-
-/// Tracks Codex's terminal-title spinner independently from its screen redraw.
-/// The title is a stable activity signal even while the visible `Working` text
-/// is being erased and repainted one character at a time.
-#[derive(Debug, Default)]
-pub(crate) struct CodexActivity {
-    tail: Vec<u8>,
-    working: Option<bool>,
-}
-
-impl CodexActivity {
-    const TAIL_LIMIT: usize = 2_048;
-
-    pub(crate) fn process(&mut self, bytes: &[u8]) {
-        self.tail.extend_from_slice(bytes);
-        let mut cursor = 0;
-        let mut latest = None;
-        while let Some(relative) = self.tail[cursor..]
-            .windows(4)
-            .position(|window| window == b"\x1b]0;")
-        {
-            let start = cursor + relative + 4;
-            let Some((end, terminator)) = osc_terminator(&self.tail[start..]) else {
-                break;
-            };
-            let title = String::from_utf8_lossy(&self.tail[start..start + end]);
-            latest = Some(
-                title
-                    .trim_start()
-                    .chars()
-                    .next()
-                    .is_some_and(|character| ('\u{2800}'..='\u{28ff}').contains(&character)),
-            );
-            cursor = start + end + terminator;
-        }
-        if latest.is_some() {
-            self.working = latest;
-        }
-        if self.tail.len() > Self::TAIL_LIMIT {
-            self.tail.drain(..self.tail.len() - Self::TAIL_LIMIT);
-        }
-    }
-
-    pub(crate) fn working(&self) -> Option<bool> {
-        self.working
-    }
-}
-
-fn osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == 0x07 {
-            return Some((index, 1));
-        }
-        if *byte == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-            return Some((index, 2));
-        }
-    }
-    None
 }
 
 /// Keeps the scrollback of agents that pin a footer with a scroll region.
@@ -1459,23 +1403,6 @@ mod tests {
         assert!(text.contains("$ echo done"), "{text}");
         assert!(text.contains("done"), "{text}");
         assert!(!text.contains("agent screen"), "{text}");
-    }
-
-    #[test]
-    fn codex_title_spinner_tracks_activity_across_split_osc_sequences() {
-        let mut activity = CodexActivity::default();
-
-        activity.process(b"\x1b]0;\xe2\xa0");
-        assert_eq!(activity.working(), None);
-        activity.process(b"\x8b project\x07");
-        assert_eq!(activity.working(), Some(true));
-
-        // Screen redraws do not erase the last title-derived state.
-        activity.process(b"\x1b[2J\x1b[Hpartial redraw");
-        assert_eq!(activity.working(), Some(true));
-
-        activity.process(b"\x1b]0;project\x1b\\");
-        assert_eq!(activity.working(), Some(false));
     }
 
     #[test]

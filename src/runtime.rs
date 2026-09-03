@@ -17,6 +17,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
+    activity::{Status, title_has_spinner},
     bridge::{BridgeOptions, BridgePool},
     config::{CommandConfig, Config},
     daemon_protocol::DaemonSession,
@@ -56,6 +57,16 @@ const PI_LATEST: &str = "https://github.com/earendil-works/pi/releases/latest";
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const CODEX_NO_ALT_SCREEN_ARG: &str = "--no-alt-screen";
 const CODEX_NO_HISTORY_CONFIG: &str = "history.persistence=\"none\"";
+/// The terminal integration Codex is asked for: a spinner in the title while
+/// a turn runs (and the "Action Required" blink while it waits), and an OSC 9
+/// notification naming the approval it is waiting on, sent whether or not the
+/// terminal reports itself focused, because nothing here ever does.
+const CODEX_TERMINAL_CONFIG: [(&str, &str); 4] = [
+    ("tui.terminal_title", "[\"spinner\",\"project\"]"),
+    ("tui.notifications", "true"),
+    ("tui.notification_method", "\"osc9\""),
+    ("tui.notification_condition", "\"always\""),
+];
 
 /// How a runtime is asked to run its own turn without stopping to ask.
 ///
@@ -339,7 +350,6 @@ impl Runtime {
             bootstrap_binary: config.companion_binary.clone(),
             download_environment: default_download_environment,
             remote_environment: config.environment_for(LOCAL_TARGET_ID).unwrap_or_default(),
-            attention_patterns: config.attention_patterns_for(LOCAL_TARGET_ID).to_vec(),
         };
         let bridge_options = config
             .hosts
@@ -363,7 +373,6 @@ impl Runtime {
                             .unwrap_or_else(|| config.companion_binary.clone()),
                         download_environment: Self::controller_environment_for_config(config, host),
                         remote_environment: config.environment_for(host).unwrap_or_default(),
-                        attention_patterns: config.attention_patterns_for(host).to_vec(),
                     },
                 )
             })
@@ -1863,66 +1872,53 @@ if [ -z "$found" ]; then exit 69; fi
         Ok(newest_drawn_rows(&page.text, lines))
     }
 
-    pub fn detect_attention(
-        &self,
-        target: &Target,
-        session_id: &str,
-        kind: AgentKind,
-        patterns: &[String],
-    ) -> Result<Option<String>> {
-        validate_session_id(session_id)?;
-        let script = shell_join(&["tmux", "capture-pane", "-p", "-t", session_id]);
-        let output = self.run_shell(target, &script, false)?;
-        ensure_success(&output, "inspect agent attention")?;
-        let screen = String::from_utf8_lossy(&output.stdout);
-        let reason = attention_reason(kind, &screen, patterns);
-        if let Some(reason) = &reason {
-            debug::log(
-                "attention",
-                format!(
-                    "matched target={} session={} kind={} reason={} tail={}",
-                    target.id,
-                    session_id,
-                    kind,
-                    reason,
-                    attention_debug_tail(&screen)
-                ),
-            );
-        }
-        Ok(reason)
-    }
-
+    /// What a tmux-hosted agent is doing, read off the pane's state the way
+    /// the daemon reads a session it owns off the bytes: the title the agent
+    /// writes, sampled twice a moment apart so a spinner or a blink can be
+    /// told from a title left standing; whether the cursor is shown; and
+    /// whether anything came out of the pane in the last couple of seconds.
+    /// The screen is captured too, but only for the recap and for the words
+    /// of the question once the state says one is being asked.
     pub fn inspect_agent(
         &self,
         target: &Target,
         session_id: &str,
         kind: AgentKind,
-        patterns: &[String],
     ) -> Result<(bool, Option<String>, Option<String>)> {
         validate_session_id(session_id)?;
         if is_daemon_session_id(session_id) {
             return Ok((false, None, None));
         }
-        let script = shell_join(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
+        let sample = shell_join(&[
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            session_id,
+            PANE_SAMPLE_FORMAT,
+        ]);
+        let capture = shell_join(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
+        let script =
+            format!("{sample}; sleep {PANE_SAMPLE_GAP_SECS}; {sample}; date +%s; {capture}");
         let output = self.run_shell(target, &script, false)?;
         ensure_success(&output, "inspect agent state")?;
-        let screen = String::from_utf8_lossy(&output.stdout);
-        let attention = attention_reason(kind, &screen, patterns);
-        let working = attention.is_none() && agent_is_working(kind, &screen);
-        let recap = extract_recap(kind, &screen);
-        if let Some(reason) = &attention {
-            debug::log(
-                "attention",
-                format!(
-                    "matched target={} session={} kind={} reason={} tail={}",
-                    target.id,
-                    session_id,
-                    kind,
-                    reason,
-                    attention_debug_tail(&screen)
-                ),
-            );
-        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut lines = output.splitn(4, '\n');
+        let first = lines.next().and_then(parse_pane_sample);
+        let second = lines.next().and_then(parse_pane_sample);
+        let now = lines
+            .next()
+            .and_then(|line| line.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let screen = lines.next().unwrap_or_default();
+        let status = match (first, second) {
+            (Some(first), Some(second)) => tmux_pane_status(kind, &first, &second, now),
+            _ => Status::Idle,
+        };
+        let attention = (status == Status::Waiting)
+            .then(|| dialog_question(screen).unwrap_or_else(|| WAITING_FOR_INPUT.to_string()));
+        let working = status == Status::Working;
+        let recap = extract_recap(kind, screen);
         debug::log(
             "activity",
             format!(
@@ -1931,7 +1927,7 @@ if [ -z "$found" ]; then exit 69; fi
                 session_id,
                 kind,
                 working,
-                attention.is_some()
+                attention.as_deref().unwrap_or("-")
             ),
         );
         Ok((working, attention, recap))
@@ -3627,196 +3623,35 @@ fn parse_history_page(output: &str, offset_from_bottom: usize) -> Result<History
     })
 }
 
-pub(crate) fn attention_reason(
-    kind: AgentKind,
-    screen: &str,
-    patterns: &[String],
-) -> Option<String> {
-    let tail = attention_tail(screen);
-    let rows: Vec<&str> = tail.lines().collect();
-    let screen = tail.to_lowercase();
-
-    let has_yes = screen.lines().any(|line| choice_line(line, "yes"));
-    let has_no = screen.lines().any(|line| choice_line(line, "no"));
-    let has_allow = screen.lines().any(|line| choice_line(line, "allow"));
-    let has_deny = screen.lines().any(|line| {
-        choice_line(line, "deny") || choice_line(line, "reject") || choice_line(line, "cancel")
-    });
-    let has_choice = (has_yes && has_no)
-        || (has_allow && has_deny)
-        || (has_yes && (screen.contains("esc to cancel") || screen.contains("enter to confirm")));
-    // OpenCode draws its permission dialog inside a bordered box: a header
-    // ("△ Permission required") over the request and a single row of buttons
-    // ("Allow once  Allow always  Reject"). The options sit on one row, which
-    // the per-line choice detection cannot split into a pair, so the buttons
-    // carry the shape and the header says what it is. The words alone do not:
-    // an agent summarising yesterday's permission asks has them too.
-    let permission_shape = kind == AgentKind::OpenCode
-        && screen.contains("permission required")
-        && (screen.contains("allow once") || screen.contains("allow always"));
-    let working_hint = screen.contains("esc to interrupt") || screen.contains("esc interrupt");
-    let menu_open = !working_hint && bottom_menu_is_open(&screen);
-    let dialog_open = has_choice || permission_shape || menu_open;
-
-    // What the dialog is actually asking, when it can be read. Every reason
-    // below is a category — "permission request", "confirmation" — and a
-    // category is the same for every session that lands on one: a fleet of
-    // agents each stopped at a different question all read back identically,
-    // and the one thing the reader needs, which question, is the one thing the
-    // reason did not say. The category stays as the fallback.
-    let asked = dialog_open.then(|| question_line(&rows)).flatten();
-    let because = |category: &str| Some(asked.clone().unwrap_or_else(|| category.to_string()));
-
-    // A configured pattern is a word, and words are what transcripts are made
-    // of: a briefing quoted on screen asking to "approve" things, a recap
-    // mentioning a "user-approved" path, an agent saying "Standing by" — each
-    // matched blind `contains` and flagged a session as waiting when nothing
-    // was asking. What tells a live question from a remembered one is the
-    // shape it is drawn in, so a pattern counts on a row that is itself part
-    // of a question's shape, or anywhere once a dialog stands open on screen.
-    if let Some(pattern) = patterns.iter().find(|pattern| {
-        let needle = pattern.trim().to_lowercase();
-        !needle.is_empty()
-            && screen.lines().any(|line| {
-                line.contains(needle.as_str()) && (dialog_open || interactive_line(line))
-            })
-    }) {
-        return because(pattern);
-    }
-
-    if permission_shape {
-        return because("permission request");
-    }
-    // A plain shell asks in the words of whatever it is running, and those
-    // are on the last row: a `[y/N]` at the end of it, a password prompt, a
-    // pager waiting on a key.
-    if kind == AgentKind::Terminal
-        && let Some(prompt) = terminal_prompt(&rows)
-    {
-        return Some(prompt);
-    }
-
-    let builtins: &[(&str, &[&str])] = match kind {
-        AgentKind::Codex => &[
-            (
-                "command approval",
-                &[
-                    "run this command",
-                    "run the following command",
-                    "allow command",
-                    "wants to run",
-                ],
-            ),
-            (
-                "file change approval",
-                &["apply this patch", "make this change"],
-            ),
-            (
-                "confirmation",
-                &["press enter to confirm", "enter to confirm"],
-            ),
-        ],
-        AgentKind::Claude => &[
-            (
-                "permission request",
-                &[
-                    "allow this",
-                    "allow command",
-                    "permission",
-                    "trust the files",
-                ],
-            ),
-            (
-                "confirmation",
-                &[
-                    "do you want to proceed",
-                    "do you want to make this edit",
-                    "esc to cancel",
-                ],
-            ),
-        ],
-        // OpenCode and Pi have no wording of their own here yet; the generic
-        // choice detection below still catches the menus they open.
-        AgentKind::OpenCode | AgentKind::Pi | AgentKind::Terminal => &[],
-    };
-    for (reason, markers) in builtins {
-        if markers.iter().any(|marker| screen.contains(marker)) && has_choice {
-            return because(reason);
-        }
-    }
-    if has_choice
-        && [
-            "would you like",
-            "do you want",
-            "choose an option",
-            "select an option",
-            "permission",
-        ]
-        .iter()
-        .any(|marker| screen.contains(marker))
-    {
-        return because("interactive choice");
-    }
-    // A selection menu open at the bottom of the screen is a question being
-    // asked even when no option says yes or no — the answers to a
-    // model-authored question rarely do. Menus the model merely printed in
-    // its reply scroll away above the input line, so only the bottom rows
-    // count, and a real menu shows several numbered options, exactly one
-    // cursor, and a key hint. The interrupt marker rules out the working
-    // phase, whose panels can also draw pointed lists.
-    if menu_open {
-        return because("interactive choice");
-    }
-    // Last, and weakest: a turn Claude Code stopped part-way through. Nothing
-    // is drawn to say so, which is exactly why it has to be looked for.
-    if kind == AgentKind::Claude
-        && !working_hint
-        && !rows.iter().any(|line| spinner_status_line(line))
-        && claude_stopped_mid_turn(&rows)
-    {
-        return Some("interrupted, waiting for a new instruction".into());
-    }
-    None
-}
-
-/// The input a program in a plain terminal is waiting on, read off the last
-/// drawn row: a yes-or-no tail (`Overwrite? [y/N]`), a password or passphrase
-/// prompt, a "press any key" or "press enter", a pager's `--More--` or `:`.
-/// The row itself is the answer, so a reader sees the question as asked.
-///
-/// Only the last row counts. The same words higher up are a question already
-/// answered, and a shell prompt drawn under them is what says so.
-fn terminal_prompt(rows: &[&str]) -> Option<String> {
-    let last = rows.iter().rev().find(|row| !row.trim().is_empty())?.trim();
-    let lower = last.to_lowercase();
-    let tail = lower.trim_end_matches([':', '?', ' ', '›', '>']);
-    let yes_no = [
-        "[y/n]", "(y/n)", "[yes/no]", "(yes/no)", "[y/n/a]", "(y/n/a)", "[yn]",
-    ]
-    .iter()
-    .any(|shape| tail.ends_with(shape));
-    let secret = (lower.contains("password") || lower.contains("passphrase"))
-        && lower.trim_end().ends_with(':');
-    let any_key = lower.contains("press any key")
-        || lower.contains("press enter")
-        || lower.contains("press return")
-        || lower.contains("hit enter")
-        || lower.contains("to continue");
-    let pager = matches!(tail, "--more--" | "(end)" | "") && !last.is_empty() && last.len() <= 12
-        || lower.starts_with("--more--")
-        || lower.starts_with("(end)");
-    (yes_no || secret || any_key || pager).then(|| last.to_string())
-}
-
 /// The question a dialog is asking, in the words it is asking it.
 ///
-/// A dialog draws its question above its answers, so the question is the last
-/// row of prose above the first option row. Box borders and transcript markers
-/// are stripped, and a row that says nothing a person could read as a question
-/// — chrome, a bare rule, a row of buttons — is skipped rather than reported.
+/// This names what a session is waiting on; it never decides whether it is
+/// waiting. That is read off the terminal's state (see [`crate::activity`]),
+/// and the words are only looked for once it says so.
 ///
-/// `None` when nothing above the options reads as a question: the caller falls
-/// back to naming the category, which is what it always did.
+/// A dialog draws its question above its answers, so the question is the last
+/// row of prose above the block of numbered options at the bottom of the
+/// screen. Box borders and transcript markers are stripped, and a row that
+/// says nothing a person could read as a question — chrome, a bare rule, a
+/// row of buttons — is skipped rather than reported. Only the bottom of what
+/// was drawn is read: a numbered list higher up is transcript.
+///
+/// `None` when the dialog draws no numbered options, or nothing above them
+/// reads as a question.
+pub(crate) fn dialog_question(screen: &str) -> Option<String> {
+    let mut rows: Vec<&str> = screen.lines().collect();
+    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+        rows.pop();
+    }
+    let tail = &rows[rows.len().saturating_sub(DIALOG_TAIL_LINES)..];
+    question_line(tail)
+}
+
+/// How far up from the bottom of what was drawn a dialog is looked for. A
+/// full-height pane draws its dialog well above the empty bottom of the grid,
+/// so this counts from the last drawn row.
+const DIALOG_TAIL_LINES: usize = 24;
+
 fn question_line(rows: &[&str]) -> Option<String> {
     let last = rows.iter().rposition(|line| numbered_option_line(line))?;
     // Back to the top of this block of options: everything from there down is
@@ -3856,70 +3691,14 @@ fn dialog_prose(line: &str) -> Option<String> {
     if !stripped.chars().any(char::is_alphanumeric) {
         return None;
     }
-    // A row of buttons is the dialog's answers restated, not its question.
-    if interactive_line(&format!("  {stripped}")) {
+    // An option row is the dialog's answers restated, not its question.
+    if numbered_option_line(stripped) || selector_line(stripped) {
         return None;
     }
     Some(match stripped.chars().count() > 80 {
         true => format!("{}…", stripped.chars().take(79).collect::<String>()),
         false => stripped.to_string(),
     })
-}
-
-/// The turn Claude Code stopped part-way through: the transcript ends with its
-/// interrupt marker and the prompt box below is open and empty, waiting to be
-/// told what to do instead.
-///
-/// Nothing on that screen says a question is being asked. There is no dialog,
-/// no options and no spinner — an interrupted agent looks exactly like one
-/// that finished its turn and has nothing left to do. So it was reported as
-/// plain idle, and whoever was waiting on it, a person or the agent that
-/// started it, was told nothing at all and went on waiting.
-///
-/// The marker stays in the scrollback for good, so it only counts as the last
-/// thing that happened: the transcript has to end there, with nothing but the
-/// prompt box under it. Anything typed into that box since is a turn about to
-/// run rather than a session standing still.
-fn claude_stopped_mid_turn(tail: &[&str]) -> bool {
-    if claude_composer(tail) != Composer::Ready {
-        return false;
-    }
-    let Some(bottom) = tail.iter().rposition(|line| is_rule(line)) else {
-        return false;
-    };
-    let Some(top) = tail[..bottom].iter().rposition(|line| is_rule(line)) else {
-        return false;
-    };
-    tail[..top]
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| {
-            // The two halves are matched apart because the terminal grid can
-            // put any amount of space between them: Claude writes the second
-            // half at a fixed column, so a narrow pane draws
-            // `Interrupted ·        What should Claude do instead?`.
-            let line = line.to_lowercase();
-            line.contains("interrupted") && line.contains("what should claude do instead")
-        })
-}
-
-fn bottom_menu_is_open(tail: &str) -> bool {
-    let lines: Vec<&str> = tail
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let window = &lines[lines.len().saturating_sub(10)..];
-    let numbered = window
-        .iter()
-        .filter(|line| numbered_option_line(line))
-        .count();
-    let cursors = window.iter().filter(|line| selector_line(line)).count();
-    let hint = window.iter().any(|line| {
-        let line = line.trim();
-        line.chars().count() <= 80 && (line.contains("enter") || line.contains("esc"))
-    });
-    numbered >= 2 && cursors == 1 && hint
 }
 
 /// A numbered option row, with or without the selection cursor.
@@ -3941,156 +3720,6 @@ fn selector_line(line: &str) -> bool {
     let rest = rest.trim_start();
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
     digits > 0 && matches!(rest.chars().nth(digits), Some('.') | Some(')') | Some(':'))
-}
-
-pub(crate) fn agent_is_working(kind: AgentKind, screen: &str) -> bool {
-    if kind == AgentKind::Terminal {
-        return false;
-    }
-    let tail = attention_tail(screen);
-    let lower = tail.to_lowercase();
-    // "esc to interrupt" is the marker Claude Code and Codex keep on screen
-    // for the whole of an interruptible turn; OpenCode's status bar says
-    // "esc interrupt" (no "to"). Either one means a turn is running.
-    if lower.contains("esc to interrupt") || lower.contains("esc interrupt") {
-        return true;
-    }
-    // OpenCode's status bar does not always carry the interrupt hint — a live
-    // capture shows it displaying the working path instead — so the other sign
-    // of a running turn is its ▣ activity line ticking an elapsed counter:
-    // `▣  Build · <model> · 6.0s`. A ▣ line with no counter (a turn paused at
-    // a permission dialog, for instance) is not a running turn.
-    if kind == AgentKind::OpenCode {
-        // An idle OpenCode keeps the previous turn's ▣ activity line in the
-        // visible transcript when the pane is tall, so a ▣ counter on its own
-        // is not proof of a running turn. What a running turn suppresses is
-        // the composer: a live turn draws no prompt box (the model status line
-        // replaces the input), while at the end the bordered box returns with
-        // its placeholder or a draft. So a ▣ counter only counts as working
-        // when no open composer sits below it.
-        let mut lines: Vec<&str> = screen.lines().collect();
-        while lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.pop();
-        }
-        let box_tail = &lines[lines.len().saturating_sub(COMPOSER_TAIL_LINES)..];
-        let at_prompt = matches!(
-            opencode_composer(box_tail),
-            Composer::Ready | Composer::Occupied
-        );
-        if !at_prompt && tail.lines().any(opencode_turn_counter) {
-            return true;
-        }
-    }
-    // Not every phase offers an interrupt, though. Claude Code drops the hint
-    // while it compacts a conversation — which can run for minutes — and while
-    // it waits out a rate limit, and it drops it whenever the footer is too
-    // narrow for the hint. The spinner keeps turning throughout, so the status
-    // line it heads is the other half of the answer.
-    tail.lines().any(spinner_status_line)
-}
-
-/// How far up from the bottom of what is drawn a status bar reaches. Claude
-/// Code's hint is the line under its composer, OpenCode's is its bottom bar;
-/// three lines covers both, and is tight enough that the same words sitting in
-/// the transcript are outside it.
-#[cfg_attr(not(unix), allow(dead_code))]
-const STATUS_BAR_LINES: usize = 3;
-
-/// Whether the sign that a turn is running is one the CLI painted once and
-/// then left alone.
-///
-/// A spinner and the counter beside it tick about once a second for as long as
-/// the turn lasts, so the same frame still on screen much later means the
-/// terminal stopped being painted, not that the turn is still going. An
-/// interrupt hint on a status bar is the opposite: drawn once when the turn
-/// starts and left alone until it ends. Its stillness says nothing at all — a
-/// turn that shells out to a build, or waits on a model that streams nothing,
-/// holds that hint for minutes without a byte crossing the PTY — so how long a
-/// quiet session may go on being read as working depends on which of the two
-/// its screen is showing.
-///
-/// The hint has to be where a status bar is drawn to count as one. `esc to
-/// interrupt` is ordinary enough to turn up in what an agent is reading or
-/// writing — a grep hit, a diff, the tests in this very file — and a transcript
-/// that happens to quote it must not buy a session that stopped talking ten
-/// minutes of looking busy.
-///
-/// Only the daemon weighs a session's patience, and there is no daemon off
-/// Unix, so this is unreachable there. Allowed rather than `cfg`'d out, like
-/// [`composer`] below it: it is plain text work, and the tests for it are
-/// worth running wherever they can run.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn working_marker_is_held(screen: &str) -> bool {
-    let tail = attention_tail(screen);
-    if tail
-        .lines()
-        .any(|line| spinner_status_line(line) || opencode_turn_counter(line))
-    {
-        return false;
-    }
-    let lines: Vec<&str> = tail.lines().collect();
-    lines[lines.len().saturating_sub(STATUS_BAR_LINES)..]
-        .iter()
-        .any(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("esc to interrupt") || lower.contains("esc interrupt")
-        })
-}
-
-/// The frames Claude Code and Pi cycle at the head of their status line.
-/// Claude Code uses ✻ ✽ ✶ ✳ ✢ ·; Pi uses braille dots ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.
-const SPINNER_FRAMES: [char; 16] = [
-    '✻', '✽', '✶', '✳', '✢', '·', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
-];
-
-/// A turn's live status line: a spinner frame, the phase, and the counter it
-/// ticks — `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`. The phase
-/// itself is no help, being anything from `Cogitating` to the title of the task
-/// in hand, so the elapsed time is what makes this a line only a running turn
-/// draws rather than prose that happens to trail off. The line is drawn hard
-/// against the left edge, which is what keeps a transcript quoting one — every
-/// transcript row is indented under its marker — from reading as a live turn.
-fn spinner_status_line(line: &str) -> bool {
-    if !line.starts_with(SPINNER_FRAMES) {
-        return false;
-    }
-    let Some((_, counter)) = line.split_once('…') else {
-        return false;
-    };
-    let Some(counter) = counter.trim_start().strip_prefix('(') else {
-        return false;
-    };
-    let elapsed = counter
-        .split(['·', '•', ')'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    elapsed.starts_with(|character: char| character.is_ascii_digit())
-        && elapsed.ends_with(['h', 'm', 's'])
-        && elapsed
-            .chars()
-            .all(|character| character.is_ascii_digit() || " hms".contains(character))
-}
-
-/// OpenCode's per-turn activity line, captured off live sessions:
-/// `▣  Build · <model> · 6.0s`. The `▣` row stays on screen for the whole of a
-/// running turn and its last ` · ` segment is the elapsed counter it ticks; a
-/// turn paused at a permission dialog drops the counter, which is what tells a
-/// running turn from a waiting one.
-fn opencode_turn_counter(line: &str) -> bool {
-    let line = line.trim_start();
-    if !line.starts_with('▣') {
-        return false;
-    }
-    let Some(counter) = line.rsplit(" · ").next() else {
-        return false;
-    };
-    let counter = counter.trim();
-    counter.ends_with(['h', 'm', 's'])
-        && counter
-            .chars()
-            .all(|character| character.is_ascii_digit() || " .hms".contains(character))
-        && counter.chars().any(|character| character.is_ascii_digit())
 }
 
 /// How far up from the bottom of a screen a prompt box is looked for. Both
@@ -4382,7 +4011,7 @@ fn opencode_composer(tail: &[&str]) -> Composer {
 ///
 /// A transcript row carries the same glyph, but it scrolls above the composer
 /// and is long; a select list's choice rows are prefixed `N. Option` with one
-/// cursor row, which `attention_reason` already flags as a question. So only a
+/// cursor row, which `dialog_question` reads as a question. So only a
 /// glyph line that is within a couple of rows of the bottom of the screen —
 /// where a live composer always sits — and that carries no numbered-option
 /// shape counts.
@@ -4491,105 +4120,66 @@ fn is_rule(line: &str) -> bool {
     line.chars().count() >= RULE_MIN_LEN && line.chars().all(|character| character == '─')
 }
 
-fn attention_tail(screen: &str) -> String {
-    let mut lines: Vec<_> = screen.lines().collect();
-    // Drop trailing blank rows first. A full-height TUI (e.g. Claude Code in an
-    // 86-row pane with a short transcript) draws its status/spinner line well
-    // above the empty bottom of the grid; without this the last 24 raw lines are
-    // all blank and a working/waiting agent is misread as idle.
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    lines[lines.len().saturating_sub(24)..].join("\n")
+/// The reason a waiting session reports when its screen draws no question it
+/// can read: the state says it waits, and that is all that is known.
+pub(crate) const WAITING_FOR_INPUT: &str = "waiting for input";
+
+/// What is asked of tmux about a pane, in one line: the title the program in
+/// it wrote, whether it is showing the cursor, whether it holds the alternate
+/// screen, and when output last came out of its window (epoch seconds).
+const PANE_SAMPLE_FORMAT: &str =
+    "#{pane_title}\t#{cursor_flag}\t#{alternate_on}\t#{window_activity}";
+/// How long the two samples are apart: long enough for a spinner to have
+/// turned and a blinked title to have blinked.
+const PANE_SAMPLE_GAP_SECS: &str = "0.6";
+
+/// One reading of a tmux pane's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneSample {
+    pub title: String,
+    pub cursor_shown: bool,
+    pub alternate_screen: bool,
+    /// Epoch seconds of the window's last activity.
+    pub activity: u64,
 }
 
-fn attention_debug_tail(screen: &str) -> String {
-    let lines: Vec<_> = screen.lines().collect();
-    lines[lines.len().saturating_sub(10)..]
-        .iter()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ")
-        .chars()
-        .take(600)
-        .collect()
-}
-
-/// Whether a row belongs to the shape of something asking: a choice or cursor
-/// row, a button row, a boxed-dialog border, the agent's prompt line, or its
-/// live status line. Words only ask a question inside one of these shapes;
-/// the same words in scrolled transcript prose are a memory of a question,
-/// not a question — that distinction is what keeps a quoted briefing from
-/// flagging a session as waiting.
-fn interactive_line(line: &str) -> bool {
-    if line.chars().count() > 120 {
-        return false;
-    }
-    let value = line.trim_start();
-    if value.is_empty() {
-        return false;
-    }
-    // A box border opens or closes a dialog; the opencode composer and its
-    // dialogs are drawn as `┃` rows over a `╹▀▀▀` bottom rule, Claude Code
-    // fences questions between full-width rules.
-    if value.starts_with([
-        '│', '┃', '┆', '┇', '╻', '╽', '┏', '┓', '┌', '┐', '└', '┘', '╭', '╮', '╯', '╰', '┖', '┗',
-        '┕', '┙', '╹', '╺', '─', '━', '❙', '❚',
-    ]) || value.starts_with("╹▀")
-    {
-        return true;
-    }
-    // Prompt glyphs and selection cursors head the live input line.
-    if value.starts_with(['❯', '›', '»', '▸', '>'])
-        || numbered_option_line(value)
-        || selector_line(value)
-    {
-        return true;
-    }
-    // The agent's own spinner status line is current state, never prose.
-    if value.starts_with(SPINNER_FRAMES) {
-        return true;
-    }
-    // A button row: two or more action tokens side by side never occur in
-    // prose at once, and every dialog closes with one.
-    let buttons = [
-        "allow once",
-        "allow always",
-        "reject",
-        "deny",
-        "cancel",
-        "esc to",
-        "enter to confirm",
-        "enter confirm",
-        "tab to",
-        "⇆ select",
-        "(y/n)",
-        "y/n",
-    ]
-    .iter()
-    .filter(|token| line.contains(**token))
-    .count();
-    buttons >= 2
-}
-
-fn choice_line(line: &str, label: &str) -> bool {
-    if line.chars().count() > 120 {
-        return false;
-    }
-    let value = line.trim_start_matches(|character: char| {
-        character.is_whitespace() || matches!(character, '›' | '❯' | '>' | '•' | '*' | '-')
-    });
-    let value = value.trim_start_matches(|character: char| {
-        character.is_whitespace()
-            || character.is_ascii_digit()
-            || matches!(character, '.' | ')' | '(' | '[' | ']')
-    });
-    value.strip_prefix(label).is_some_and(|rest| {
-        rest.chars()
-            .next()
-            .is_none_or(|character| !character.is_ascii_alphanumeric())
+fn parse_pane_sample(line: &str) -> Option<PaneSample> {
+    let mut fields = line.trim_end_matches(['\r', '\n']).rsplitn(4, '\t');
+    let activity = fields.next()?.trim().parse().ok()?;
+    let alternate_screen = fields.next()?.trim() == "1";
+    let cursor_shown = fields.next()?.trim() != "0";
+    let title = fields.next().unwrap_or_default().to_string();
+    Some(PaneSample {
+        title,
+        cursor_shown,
+        alternate_screen,
+        activity,
     })
+}
+
+/// [`crate::activity::agent_status`] over two tmux readings: a spinner at the
+/// head of the title is a turn running, so is output in the last couple of
+/// seconds; a title that changed between the readings without a spinner is
+/// being blinked at whoever is looking; a hidden cursor is a dialog holding
+/// the keyboard, on a runtime that shows the cursor at its prompt box at all.
+pub(crate) fn tmux_pane_status(
+    kind: AgentKind,
+    first: &PaneSample,
+    second: &PaneSample,
+    now: u64,
+) -> Status {
+    if title_has_spinner(&second.title) || now.saturating_sub(second.activity) <= 2 {
+        return Status::Working;
+    }
+    if first.title != second.title {
+        return Status::Waiting;
+    }
+    // pi draws its own cursor and never shows the terminal's, so a hidden
+    // cursor says nothing about it.
+    if !second.cursor_shown && kind != AgentKind::Pi && kind != AgentKind::Terminal {
+        return Status::Waiting;
+    }
+    Status::Idle
 }
 
 fn parse_history_matches(output: &str) -> Vec<HistoryMatch> {
@@ -5252,6 +4842,23 @@ pub(crate) fn launch_arguments(
         })
     {
         args.extend(["-c".into(), CODEX_NO_HISTORY_CONFIG.into()]);
+    }
+    // What Codex is doing is read off its terminal title and its
+    // notifications (see `crate::activity`), and it writes neither unless
+    // asked. Session-local, like the rest: the user's own config is not
+    // touched, and a config that already speaks to either is left to say
+    // what it says.
+    if kind == AgentKind::Codex {
+        for (setting, value) in CODEX_TERMINAL_CONFIG {
+            if !args.iter().any(|argument| {
+                argument
+                    .trim_start_matches("-c=")
+                    .trim_start()
+                    .starts_with(setting)
+            }) {
+                args.extend(["-c".into(), format!("{setting}={value}")]);
+            }
+        }
     }
     if let Some(resume_id) = resume_id {
         match kind {
@@ -6366,180 +5973,105 @@ mod tests {
         assert!(row_has_content("\u{1b}[m你好"));
     }
 
+    /// The words of a question are only ever read once the terminal's state
+    /// says one is being asked; here they are read off dialogs as the CLIs
+    /// draw them.
     #[test]
-    fn detects_runtime_attention_prompts() {
-        // The reason is the question, in the words it was asked: a fleet all
-        // stopped at "command approval" says nothing about which command.
-        let codex = "Would you like to run the following command?\n› 1. Yes\n  2. No\nPress enter to confirm";
+    fn a_dialog_question_is_the_prose_above_its_numbered_options() {
+        let codex = concat!(
+            "  $ cargo test\n",
+            "› Would you like to run the following command?\n",
+            "› 1. Yes\n",
+            "  2. No\n",
+            "  Press enter to confirm\n"
+        );
         assert_eq!(
-            attention_reason(AgentKind::Codex, codex, &[]).as_deref(),
+            dialog_question(codex).as_deref(),
             Some("Would you like to run the following command?")
         );
-        let claude = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        let claude = format!(
+            "{}\n Bash command\n\n   curl -sI https://example.com | head -3\n\n This command requires approval\n\n \
+             Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don’t ask again for: curl\n   4. No\n\n \
+             Esc to cancel · Tab to amend\n",
+            rule()
+        );
         assert_eq!(
-            attention_reason(AgentKind::Claude, claude, &[]).as_deref(),
+            dialog_question(&claude).as_deref(),
             Some("Do you want to proceed?")
         );
-        // The category is still the answer when the question cannot be read:
-        // here the dialog is drawn with nothing above its options.
-        let unreadable = "❯ 1. Yes\n  2. No\nEsc to cancel";
-        assert_eq!(
-            attention_reason(AgentKind::Claude, unreadable, &[]).as_deref(),
-            Some("confirmation")
-        );
-        let idle_prompt = concat!(
-            "Earlier output: 1. Yes\n",
-            "Earlier output: 2. No\n",
-            "Task completed successfully.\n",
-            "› Explain this codebase\n",
-            "gpt-5.6-sol max · /work/project\n"
-        );
-        assert_eq!(attention_reason(AgentKind::Codex, idle_prompt, &[]), None);
-
-        let codex_working = "• Working (7s • esc to interrupt) · 1 background terminal running";
-        assert!(agent_is_working(AgentKind::Codex, codex_working));
-        assert!(agent_is_working(
-            AgentKind::Codex,
-            "• Refactoring terminal state (12s • esc to interrupt)"
-        ));
-        assert!(!agent_is_working(AgentKind::Codex, idle_prompt));
-        let claude_working = concat!(
-            "Bash(sleep 20)\n",
-            "  Running… (7s)\n",
-            "✶ Tomfoolering… (9s · ↓ 82 tokens)\n",
-            "manual mode on · esc to interrupt"
-        );
-        assert!(agent_is_working(AgentKind::Claude, claude_working));
-        assert!(!agent_is_working(
-            AgentKind::Claude,
-            "❯ \nmanual mode on · ? for shortcuts"
-        ));
-        assert!(!agent_is_working(AgentKind::Terminal, codex_working));
-
-        let mut stale_prompt =
+        // Nothing above the options: no words to give.
+        assert_eq!(dialog_question("❯ 1. Yes\n  2. No\nEsc to cancel"), None);
+        // A numbered list that scrolled up under later work is transcript.
+        let mut stale =
             String::from("Would you like to run the following command?\n› 1. Yes\n  2. No\n");
-        stale_prompt.push_str(
+        stale.push_str(
             &(0..30)
                 .map(|index| format!("working output {index}\n"))
                 .collect::<String>(),
         );
-        assert_eq!(attention_reason(AgentKind::Codex, &stale_prompt, &[]), None);
-        assert!(attention_reason(AgentKind::Codex, "working...", &[]).is_none());
+        assert_eq!(dialog_question(&stale), None);
+        // OpenCode draws its answers as buttons on one row, not as options,
+        // so its question is not read: the state still says it waits.
+        let opencode = concat!(
+            "  ┃  △ Permission required\n",
+            "  ┃    # Shell command\n",
+            "  ┃  $ curl -sI https://example.com\n",
+            "  ┃   Allow once   Allow always   Reject     enter confirm\n"
+        );
+        assert_eq!(dialog_question(opencode), None);
     }
 
+    /// A tmux pane's state is read the way the daemon reads a session it
+    /// owns: title spinner or fresh output is a turn, a title that changed
+    /// without one is a blink, a hidden cursor is a dialog.
     #[test]
-    fn a_shell_waiting_on_its_program_is_read_off_the_last_row() {
-        // A program's own question, in its own words.
-        let overwrite = "cp: overwrite '/tmp/a'? [y/N] ";
+    fn a_tmux_pane_is_classified_off_its_title_cursor_and_activity() {
+        let sample = |title: &str, cursor: &str, activity: u64| {
+            parse_pane_sample(&format!("{title}\t{cursor}\t0\t{activity}\n")).unwrap()
+        };
         assert_eq!(
-            attention_reason(AgentKind::Terminal, overwrite, &[]).as_deref(),
-            Some("cp: overwrite '/tmp/a'? [y/N]")
+            sample("[ . ] Action Required | codex", "1", 1_000),
+            PaneSample {
+                title: "[ . ] Action Required | codex".into(),
+                cursor_shown: true,
+                alternate_screen: false,
+                activity: 1_000,
+            }
         );
-        let sudo = "$ sudo make install\nPassword:";
-        assert_eq!(
-            attention_reason(AgentKind::Terminal, sudo, &[]).as_deref(),
-            Some("Password:")
-        );
-        let apt = "After this operation, 12 MB will be used.\nDo you want to continue? [Y/n]";
-        assert_eq!(
-            attention_reason(AgentKind::Terminal, apt, &[]).as_deref(),
-            Some("Do you want to continue? [Y/n]")
-        );
-        let pager = "line one\nline two\n--More--";
-        assert_eq!(
-            attention_reason(AgentKind::Terminal, pager, &[]).as_deref(),
-            Some("--More--")
-        );
-        let less = "line one\n:";
-        assert_eq!(
-            attention_reason(AgentKind::Terminal, less, &[]).as_deref(),
-            Some(":")
-        );
-        let key = "Setup complete.\nPress any key to continue . . .";
-        assert!(attention_reason(AgentKind::Terminal, key, &[]).is_some());
-        // Answered already: the shell prompt under it is the last row.
-        let answered = "cp: overwrite '/tmp/a'? [y/N] y\n$ ";
-        assert_eq!(attention_reason(AgentKind::Terminal, answered, &[]), None);
-        // A shell at its prompt, and a build printing about passwords, ask
-        // nothing.
-        assert_eq!(
-            attention_reason(AgentKind::Terminal, "➜  Terminal git:(main) ✗", &[]),
-            None
-        );
-        let prose = "warning: password hashing is slow\nBuilding...";
-        assert_eq!(attention_reason(AgentKind::Terminal, prose, &[]), None);
-        // Other kinds keep their own reading.
-        assert_eq!(attention_reason(AgentKind::Claude, overwrite, &[]), None);
-    }
+        // A title holding a tab is still read: the fields are taken from the right.
+        assert_eq!(parse_pane_sample("a\tb\t0\t1\t7").unwrap().title, "a\tb");
+        assert_eq!(parse_pane_sample("garbage"), None);
 
-    #[test]
-    fn a_word_pattern_counts_only_where_a_question_is_being_asked() {
-        // Today's two real false positives, quoted as they sat on screen. Both
-        // sessions were idle; the only thing on screen resembling the user's
-        // configured "approve" pattern was an ordinary sentence remembering
-        // the word. Blind `contains` over the screen tail flagged each one —
-        // and since parent alerts landed, every such flag interrupts somebody.
-        let patterns: Vec<String> = ["approve", "批准"]
-            .iter()
-            .map(|pattern| (*pattern).to_string())
-            .collect();
-        let quoted_briefing = concat!(
-            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL) · 9.3s\n",
-            "\n",
-            "     Coordinator note: I will approve the plan once the gates are\n",
-            "     green, and reply to the thread with the results. Standing by.\n",
-            "\n",
-            "  ┃\n",
-            "  ┃  Ask anything... \"What should we work on next?\"\n",
-            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL)\n",
-            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
-            "   /work/project        ctrl+p commands    • OpenCode 1.18.24\n",
-        );
+        let now = 2_000;
+        let spinning = sample("⠹ codex", "1", 1_000);
         assert_eq!(
-            attention_reason(AgentKind::OpenCode, quoted_briefing, &patterns),
-            None,
-            "a briefing quoting the word approve is prose, not a question"
+            tmux_pane_status(AgentKind::Codex, &spinning, &spinning, now),
+            Status::Working
         );
-        let remembered_path = format!(
-            "TASK D delivered via the user-approved send path.\n\
-             Standing by.\n{}\n❯ \nmanual mode on · ? for shortcuts\n",
-            rule()
-        );
+        let fresh = sample("OpenCode", "1", now - 1);
         assert_eq!(
-            attention_reason(AgentKind::Claude, &remembered_path, &patterns),
-            None,
-            "a recap remembering a user-approved path is prose, not a question"
+            tmux_pane_status(AgentKind::OpenCode, &fresh, &fresh, now),
+            Status::Working
         );
-
-        // The same words do count when a dialog is open: the question sits in
-        // the box while the yes/no pair is up.
-        let asking = format!(
-            "{}\nAllow this change to the approved list?\n❯ 1. Yes\n  2. No\n{}\n",
-            rule(),
-            rule()
-        );
+        let idle = sample("codex", "1", 1_000);
         assert_eq!(
-            attention_reason(AgentKind::Claude, &asking, &patterns).as_deref(),
-            Some("Allow this change to the approved list?"),
-            "the pattern belongs in a live question box"
+            tmux_pane_status(AgentKind::Codex, &idle, &idle, now),
+            Status::Idle
         );
-        // And on a shaped row even without a full dialog: the prompt glyph
-        // heads the live input line, the y/n token heads a question's tail.
+        let blink_a = sample("[ . ] Action Required | codex", "1", 1_000);
+        let blink_b = sample("[ ! ] Action Required | codex", "1", 1_000);
         assert_eq!(
-            attention_reason(AgentKind::Codex, "❯ approve now?\n", &patterns).as_deref(),
-            Some("approve"),
-            "the agent's own prompt line counts"
+            tmux_pane_status(AgentKind::Codex, &blink_a, &blink_b, now),
+            Status::Waiting
         );
+        let dialog = sample("✳ Claude Code", "0", 1_000);
         assert_eq!(
-            attention_reason(
-                AgentKind::Codex,
-                "Approve this patch? (y/n)\ngpt-5.6-sol max · /work/project\n",
-                &patterns
-            )
-            .as_deref(),
-            Some("approve"),
-            "a y/n question line counts"
+            tmux_pane_status(AgentKind::Claude, &dialog, &dialog, now),
+            Status::Waiting
         );
+        // pi never shows the terminal cursor, so hiding it says nothing.
+        let pi = sample("π - pi", "0", 1_000);
+        assert_eq!(tmux_pane_status(AgentKind::Pi, &pi, &pi, now), Status::Idle);
     }
 
     /// A rule as wide as Claude Code draws one.
@@ -6567,7 +6099,6 @@ mod tests {
             rule()
         );
         assert_eq!(composer(AgentKind::Claude, &working), Some(Composer::Ready));
-        assert!(agent_is_working(AgentKind::Claude, &working));
     }
 
     #[test]
@@ -6612,46 +6143,11 @@ mod tests {
             "╌".repeat(120)
         );
         assert_eq!(composer(AgentKind::Claude, &dialog), Some(Composer::Absent));
-        // And the reason it gives is the question itself, read from the row
-        // above the options — not the category every such dialog shares.
+        // And the question it asks is read from the row above the options.
         assert_eq!(
-            attention_reason(AgentKind::Claude, &dialog, &[]).as_deref(),
+            dialog_question(&dialog).as_deref(),
             Some("Do you want to create probe.txt?")
         );
-    }
-
-    #[test]
-    fn a_turn_claude_stopped_part_way_through_is_still_waiting() {
-        // Read off a stuck session: the turn was interrupted, the prompt box
-        // reopened empty, and nothing else on screen says anything is wrong.
-        // Whoever started it — a person or another agent — was told the
-        // session was plain idle and went on waiting for a reply.
-        let interrupted = format!(
-            "⏺ Bash(sleep 300)\n  ⎿  Interrupted · What should Claude do instead?\n\n{}\n❯\n{}\n  \
-             ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n",
-            rule(),
-            rule()
-        );
-        assert_eq!(
-            attention_reason(AgentKind::Claude, &interrupted, &[]).as_deref(),
-            Some("interrupted, waiting for a new instruction")
-        );
-        // A narrow pane draws the second half at its own column; the halves
-        // are read apart so the gap between them does not matter.
-        let split = interrupted.replace("Interrupted · What", "Interrupted ·         What");
-        assert!(attention_reason(AgentKind::Claude, &split, &[]).is_some());
-
-        // Once something is typed into the box, a turn is about to run.
-        let answered = interrupted.replace("\n❯\n", "\n❯ carry on without the sleep\n");
-        assert_eq!(attention_reason(AgentKind::Claude, &answered, &[]), None);
-        // And a marker left in the scrollback above later work is history.
-        let moved_on = format!(
-            "⏺ Bash(sleep 300)\n  ⎿  Interrupted · What should Claude do instead?\n\n⏺ Read(\
-             src/lib.rs)\n  ⎿  Read 40 lines\n\n{}\n❯\n{}\n  ⏵⏵ auto mode on · ← for agents\n",
-            rule(),
-            rule()
-        );
-        assert_eq!(attention_reason(AgentKind::Claude, &moved_on, &[]), None);
     }
 
     #[test]
@@ -6785,340 +6281,6 @@ mod tests {
         assert_eq!(
             composer(AgentKind::OpenCode, no_box),
             Some(Composer::Absent)
-        );
-    }
-
-    #[test]
-    fn pi_and_opencode_working_status_are_read_consistently() {
-        // pi draws its whole-turn working hint; it is the same marker Codex and
-        // Claude use, so the generic path already catches it.
-        assert!(agent_is_working(
-            AgentKind::Pi,
-            "Working... (esc to interrupt)\n",
-        ));
-        // A tool run inside the turn keeps the hint.
-        assert!(agent_is_working(
-            AgentKind::Pi,
-            "Running bash: cargo test (esc to interrupt)\n",
-        ));
-        // Pi also uses braille spinner frames for its status line.
-        assert!(agent_is_working(
-            AgentKind::Pi,
-            "⠧ Working… (5s · ↓ 3 tokens · thinking with high effort)\n",
-        ));
-        // An idle pi with a prompt drawn is not working.
-        assert!(!agent_is_working(AgentKind::Pi, "❯ \nCtrl+N new session\n"));
-
-        // OpenCode's status bar says "esc interrupt" (not "esc to interrupt").
-        assert!(agent_is_working(
-            AgentKind::OpenCode,
-            "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                  60.0K (23%)  ctrl+p commands    • OpenCode 1.18.23\n",
-        ));
-        // OpenCode also shows "esc to interrupt" in some older builds.
-        assert!(agent_is_working(
-            AgentKind::OpenCode,
-            "⚡ Reading sessions… (esc to interrupt)\n",
-        ));
-        assert!(!agent_is_working(
-            AgentKind::OpenCode,
-            "❯ \nctrl+r session\n",
-        ));
-    }
-
-    #[test]
-    fn opencode_permission_prompt_triggers_attention() {
-        // A real OpenCode 1.18.23 permission dialog, captured off a live
-        // session: the whole dialog is drawn inside the ┃-bordered composer
-        // box, the options sit on one row, and the status bar is gone while
-        // it is up.
-        let screen = concat!(
-            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL)\n",
-            "\n",
-            "  ┃\n",
-            "  ┃  △ Permission required\n",
-            "  ┃    ← Access external directory /tmp\n",
-            "  ┃\n",
-            "  ┃  Patterns\n",
-            "  ┃\n",
-            "  ┃  - /tmp/*\n",
-            "  ┃\n",
-            "  ┃\n",
-            "  ┃   Allow once   Allow always   Reject   ctrl+f fullscreen  ⇆ select  enter confirm\n",
-            "  ┃\n",
-        );
-        assert_eq!(
-            attention_reason(AgentKind::OpenCode, screen, &[]),
-            Some("permission request".to_string()),
-        );
-        // And working must be false when attention is set (daemon gates on
-        // !needs_attention). The dialog itself carries no spinner and no
-        // "esc interrupt", so both halves of the gate agree.
-        assert!(!agent_is_working(AgentKind::OpenCode, screen));
-    }
-
-    #[test]
-    fn opencode_real_idle_and_working_screens_classify_correctly() {
-        // A real idle OpenCode 1.18.23 screen: ASCII banner, the ┃-bordered
-        // composer with its greyed placeholder, the model status line, and the
-        // bottom bar. No spinner, no "esc interrupt", nothing to attend to.
-        let idle = concat!(
-            "                                         █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n",
-            "                                         █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n",
-            "                                         ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n",
-            "\n",
-            "\n",
-            "                       ┃\n",
-            "                       ┃  Ask anything... \"Fix a TODO in the codebase\"\n",
-            "                       ┃\n",
-            "                       ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
-            "                       ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
-            "                       tab agents  ctrl+p commands\n",
-            "\n",
-            "                                   ● Tip Use opencode run for non-interactive scripting\n",
-            "\n",
-            "\n",
-            "\n",
-            "\n",
-            "\n",
-            "\n",
-            "  ~/Works/Terminal:main  ⊙ 1 MCP /status                                                                       1.18.23\n",
-        );
-        assert_eq!(attention_reason(AgentKind::OpenCode, idle, &[]), None);
-        assert!(!agent_is_working(AgentKind::OpenCode, idle));
-
-        // A real mid-turn screen: the ▣ activity line and the status bar's
-        // "esc interrupt" (no "to") are what mark a running turn.
-        let working = concat!(
-            "     ▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n",
-            "\n",
-            "  ┃\n",
-            "  ┃\n",
-            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)                    ~/Works/xperf_infer:zhen/layer_cut\n",
-            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
-            "   /Users/bytedance/Works/xperf_infer  22.4K (9%)  ctrl+p commands  • OpenCode 1.18.23\n",
-        );
-        assert_eq!(attention_reason(AgentKind::OpenCode, working, &[]), None);
-        assert!(agent_is_working(AgentKind::OpenCode, working));
-    }
-
-    #[test]
-    fn opencode_working_does_not_trigger_bottom_menu() {
-        // OpenCode working state has numbered output and a hint line; make sure
-        // the "esc interrupt" guard prevents a false interactive-choice match.
-        let screen = concat!(
-            "▣  Build · Qwen3.8-27B (SGLang via SOIL)\n",
-            "  1. reading file\n",
-            "  2. writing edit\n",
-            "  3. running test\n",
-            "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                  60.0K (23%)  ctrl+p commands\n",
-        );
-        assert!(agent_is_working(AgentKind::OpenCode, screen));
-        assert!(attention_reason(AgentKind::OpenCode, screen, &[]).is_none());
-    }
-
-    #[test]
-    fn opencode_stale_turn_counter_above_an_idle_composer_is_not_working() {
-        // A tall pane keeps a just-finished turn's ▣ activity line in the tail
-        // after the turn is over: the status bar and the bordered composer sit
-        // below it, so the ▣ counter is a memory of work, not a turn running.
-        // A ▣ counter must not read as working while the open composer is on
-        // screen. (Live fixture: the coordinator's own idle session showed
-        // `▣ Build · ... · 2.9s` above an open `┃` box and was misread as busy.)
-        let idle_after_turn = concat!(
-            "▣ Compaction · Qwen3.8-27B (SGLang via SOIL) · 14.8s\n",
-            "\n",
-            "  ┃\n",
-            "  ┃  Ask anything... \"Fix a TODO in the codebase\"\n",
-            "  ┃\n",
-            "  ┃  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)\n",
-            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
-            "  tab agents  ctrl+p commands\n",
-        );
-        assert!(!agent_is_working(AgentKind::OpenCode, idle_after_turn));
-
-        // A genuinely working turn draws the ▣ counter with no composer box
-        // beneath it — the live activity row is the bottom of the screen.
-        let running = concat!(
-            "▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n",
-            "\n",
-            "  Build · Qwen3.8-27B (SGLang via SOIL) Qwen3.8-27B (SGLang via SOIL)  ~/Works/Terminal:main\n",
-        );
-        assert!(agent_is_working(AgentKind::OpenCode, running));
-    }
-
-    /// Which marker a screen is claiming a running turn with decides how long
-    /// the claim outlives the last byte off the PTY: a spinner stops turning
-    /// within a second of the CLI going quiet, while an interrupt hint is
-    /// painted once and sits untouched for the whole of a turn that shelled
-    /// out to something slow.
-    #[test]
-    fn a_held_interrupt_hint_is_told_apart_from_a_ticking_counter() {
-        // Live capture: an OpenCode session minutes into a benchmark it shelled
-        // out to. The status bar holds the hint, the ▣ line carries no counter,
-        // and nothing at all is written to the PTY while the run goes on.
-        let held = concat!(
-            "  ┃  === ORIGINAL seed-0 (3x, current conditions) ===\n",
-            "  ┃\n",
-            "     ▣  Build · DeepSeek-V4-Flash\n",
-            "  ┃\n",
-            "  ┃  Build · DeepSeek-V4-Flash SGLang via SOIL\n",
-            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
-            "   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                    211.7K (81%)  ctrl+p commands\n",
-        );
-        assert!(agent_is_working(AgentKind::OpenCode, held));
-        assert!(working_marker_is_held(held));
-
-        // The counters both CLIs redraw about once a second. Silence with one
-        // of those on screen is the painting having stopped.
-        assert!(!working_marker_is_held(
-            "✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)\n"
-        ));
-        assert!(!working_marker_is_held(
-            "▣  Build · Qwen3.8-27B (SGLang via SOIL) · 6.0s\n"
-        ));
-        // Claude Code draws both at once: the spinner above the composer, the
-        // hint on the bar below it. The one that ticks is the one to go by.
-        assert!(!working_marker_is_held(concat!(
-            "✶ Garnishing… (14m 20s · ↓ 32.4k tokens)\n",
-            "\n",
-            "──────────────────────────────────────\n",
-            "❯\n",
-            "──────────────────────────────────────\n",
-            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents\n",
-        )));
-
-        // Nothing on a screen at rest is held either.
-        assert!(!working_marker_is_held("❯ \nCtrl+N new session\n"));
-
-        // The words in the transcript rather than on the bar: an agent reading
-        // this very file, or grepping for the marker. Whatever that session is
-        // doing, this is not the evidence for it, and it buys no patience.
-        assert!(!working_marker_is_held(concat!(
-            "  ⎿  src/runtime.rs:3714:    if lower.contains(\"esc to interrupt\")\n",
-            "\n",
-            "──────────────────────────────────────\n",
-            "❯ \n",
-            "──────────────────────────────────────\n",
-            "  ⏵⏵ accepts edits on\n",
-        )));
-    }
-
-    #[test]
-    fn working_status_is_detected_above_a_blank_screen_bottom() {
-        // A tall pane whose transcript is short leaves the bottom rows empty, so
-        // the status/spinner line sits well above the last raw lines. It must
-        // still be classified as working rather than idle.
-        let mut claude =
-            String::from("✻ Nucleating… (esc to interrupt · 27m 56s · ↓ 24.0k tokens)\n");
-        claude.push_str(&"\n".repeat(40));
-        assert!(agent_is_working(AgentKind::Claude, &claude));
-
-        let mut codex =
-            String::from("• Working (7s • esc to interrupt) · 1 background terminal running\n");
-        codex.push_str(&"   \n".repeat(40));
-        assert!(agent_is_working(AgentKind::Codex, &codex));
-    }
-
-    #[test]
-    fn every_interruptible_phase_counts_as_working() {
-        // The early phase, before any token count is drawn.
-        assert!(agent_is_working(
-            AgentKind::Claude,
-            "✳ Deliberating… (esc to interrupt)\n"
-        ));
-        // A tool run.
-        assert!(agent_is_working(
-            AgentKind::Claude,
-            "  Running… (esc to interrupt)\n"
-        ));
-        // A parallel subagent display.
-        assert!(agent_is_working(
-            AgentKind::Claude,
-            "✻ Task(explore the repo)\n✻ Task(review tests)\n2 agents running · esc to interrupt\n"
-        ));
-        // A finished turn is not working, whatever the transcript retains.
-        assert!(!agent_is_working(
-            AgentKind::Claude,
-            "✻ Worked for 27s · ↓ 24.0k tokens\n❯ \n? for shortcuts\n"
-        ));
-    }
-
-    #[test]
-    fn a_phase_that_offers_no_interrupt_is_still_working() {
-        // Compaction runs for minutes with no interrupt hint anywhere on the
-        // screen — the footer shows the mode and the context meter instead —
-        // and used to read as a session that had stopped.
-        let compacting = concat!(
-            "✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)\n",
-            "  ▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱  18%\n",
-            "──────────────────────────────\n",
-            "❯\n",
-            "──────────────────────────────\n",
-            "  ⏵⏵ auto mode on (shift+tab to cycle)   100% context used\n"
-        );
-        assert!(agent_is_working(AgentKind::Claude, compacting));
-        // The same shape carries every other phase whose hint the footer had no
-        // room for, whether the phase is a spinner word or the task in hand.
-        for phase in [
-            "· Precipitating… (36m 2s · ↓ 57.0k tokens)",
-            "✽ Sprouting… (3m 10s · ↓ 8.3k tokens · thinking with xhigh effort)",
-            "✳ Add the waveform lab module… (20m 2s · ↓ 73.0k tokens)",
-            "✻ Cogitating… (9s)",
-            "✢ 修复 forced update 根因… (1h 2m 3s · ↓ 1.0k tokens)",
-        ] {
-            assert!(
-                agent_is_working(AgentKind::Claude, &format!("{phase}\n❯\n")),
-                "{phase}"
-            );
-        }
-        // Prose that trails off, a transcript line quoting a counter, and the
-        // collapsed-output hint all keep their session idle.
-        for quiet in [
-            "· so that is where the parser gave up…\n❯\n",
-            "  ⎿  … +138 lines (ctrl+o to expand)\n❯\n",
-            "✻ Worked for 27s · ↓ 24.0k tokens\n❯\n",
-            "  ✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)  ← what it looked like\n❯\n",
-        ] {
-            assert!(!agent_is_working(AgentKind::Claude, quiet), "{quiet}");
-        }
-    }
-
-    #[test]
-    fn a_selection_cursor_on_a_numbered_option_asks_for_attention() {
-        let menu = "Which approach should we take?\n\
-                    ❯ 1. Refactor the parser\n  2. Patch the renderer\n  3. Other\n\
-                    esc to skip\n";
-        assert_eq!(
-            attention_reason(AgentKind::Claude, menu, &[]).as_deref(),
-            Some("Which approach should we take?")
-        );
-        // The same pointed list while a turn is running is a progress panel,
-        // not a question.
-        let busy = format!("{menu}✻ Nucleating… (esc to interrupt)\n");
-        assert_eq!(attention_reason(AgentKind::Claude, &busy, &[]), None);
-        // A bare input caret is not a menu.
-        assert_eq!(
-            attention_reason(AgentKind::Claude, "❯ \n? for shortcuts\n", &[]),
-            None
-        );
-        // A numbered list the model merely printed in its reply must not
-        // trigger: no cursor and no key hint...
-        let quoted = "Here are the options I considered:\n\
-                      1. Refactor the parser\n  2. Patch the renderer\n\
-                      Let me know which you prefer.\n";
-        assert_eq!(attention_reason(AgentKind::Claude, quoted, &[]), None);
-        // ...and even a cursor-looking quote scrolled above the input line
-        // sits outside the bottom window once the reply continues.
-        let scrolled = format!("{menu}{}", "output line\n".repeat(12));
-        assert_eq!(attention_reason(AgentKind::Claude, &scrolled, &[]), None);
-        // A single numbered line with a stray cursor is not a menu either.
-        assert_eq!(
-            attention_reason(
-                AgentKind::Claude,
-                "❯ 1. the only line\npress esc maybe\n",
-                &[]
-            ),
-            None
         );
     }
 
@@ -7401,7 +6563,15 @@ mod tests {
         };
         assert_eq!(
             command_line(&command, AgentKind::Codex, false, Some("session id"), None),
-            "codex --full-auto --no-alt-screen resume 'session id'"
+            format!(
+                "codex --full-auto --no-alt-screen {} resume 'session id'",
+                shell_join(
+                    &codex_terminal_args()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                )
+            )
         );
         let command = CommandConfig {
             command: "claude".into(),
@@ -7433,6 +6603,53 @@ mod tests {
         );
     }
 
+    /// The `-c` pairs every Codex launch carries so its terminal says what
+    /// it is doing.
+    fn codex_terminal_args() -> Vec<String> {
+        CODEX_TERMINAL_CONFIG
+            .iter()
+            .flat_map(|(setting, value)| ["-c".to_string(), format!("{setting}={value}")])
+            .collect()
+    }
+
+    fn with_codex_terminal(base: &[&str]) -> Vec<String> {
+        base.iter()
+            .map(|argument| (*argument).to_string())
+            .chain(codex_terminal_args())
+            .collect()
+    }
+
+    /// Codex says what it is doing through its terminal title and its
+    /// notifications only when asked, so every launch asks — unless the config
+    /// already speaks to a setting, in which case it is the config's call.
+    #[test]
+    fn codex_is_asked_to_report_through_its_terminal_unless_the_config_already_says() {
+        let command = CommandConfig {
+            command: "codex".into(),
+            args: vec![
+                "--full-auto".into(),
+                "-c".into(),
+                "tui.terminal_title=[\"project\"]".into(),
+                "-c=tui.notifications=false".into(),
+            ],
+            ..CommandConfig::default()
+        };
+        assert_eq!(
+            launch_arguments(&command, AgentKind::Codex, false, None, None),
+            [
+                "--full-auto",
+                "-c",
+                "tui.terminal_title=[\"project\"]",
+                "-c=tui.notifications=false",
+                "--no-alt-screen",
+                "-c",
+                "tui.notification_method=\"osc9\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+            ]
+        );
+    }
+
     /// A session muxloom starts has nobody in front of it, so each runtime is
     /// asked for its own unattended mode. Pi has none to ask for.
     #[test]
@@ -7449,13 +6666,13 @@ mod tests {
         );
         assert_eq!(
             launch_arguments(&bare("codex"), AgentKind::Codex, false, None, None),
-            [
+            with_codex_terminal(&[
                 "--sandbox",
                 "workspace-write",
                 "--ask-for-approval",
                 "never",
                 "--no-alt-screen"
-            ]
+            ])
         );
         assert_eq!(
             launch_arguments(&bare("opencode"), AgentKind::OpenCode, false, None, None),
@@ -7498,7 +6715,7 @@ mod tests {
                 None,
                 None
             ),
-            ["--sandbox", "read-only", "--no-alt-screen"]
+            with_codex_terminal(&["--sandbox", "read-only", "--no-alt-screen"])
         );
         assert_eq!(
             launch_arguments(
@@ -7527,7 +6744,11 @@ mod tests {
                 None,
                 Some("keep this history")
             ),
-            ["--no-alt-screen", "--full-auto", "keep this history"]
+            {
+                let mut expected = with_codex_terminal(&["--no-alt-screen", "--full-auto"]);
+                expected.push("keep this history".into());
+                expected
+            }
         );
     }
 
@@ -7541,16 +6762,16 @@ mod tests {
 
         assert_eq!(
             launch_arguments(&command, AgentKind::Codex, true, None, None),
-            [
+            with_codex_terminal(&[
                 "--full-auto",
                 "--no-alt-screen",
                 "-c",
                 "history.persistence=\"none\""
-            ]
+            ])
         );
         assert_eq!(
             launch_arguments(&command, AgentKind::Codex, false, None, None),
-            ["--full-auto", "--no-alt-screen"]
+            with_codex_terminal(&["--full-auto", "--no-alt-screen"])
         );
         assert!(is_temporary_session_id("muxloomd-temporal-codex-1"));
         assert!(is_temporary_session_id("muxloom-temporal-codex-1"));

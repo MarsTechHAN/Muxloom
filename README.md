@@ -171,37 +171,39 @@ row itself. Folder group rows carry their children's state as a steady colour
 static capability icon for each runtime that machine has, so exactly one thing
 on screen blinks per busy agent. When the list is scrolled far enough that a
 folder row has gone off the top, the agent left at the top of the pane keeps
-its folder on the pane's own edge, in that same colour. Working means the CLI's interrupt marker or a
-live status line — a turning spinner over a counter, which is all a phase that
-offers no interrupt leaves behind, compaction included — is on screen *and* the
-daemon has heard the session speak. How long such a screen outlives the last
-byte off the PTY depends on which marker it is: seconds for a spinner, which
-stops turning the moment the CLI stops painting, but minutes for an interrupt
-hint held on a status bar, because a turn that shells out to a build holds one
-the whole time it says nothing at all. The hint has to be down on the bar to
-earn that: the same words quoted in a transcript — a grep hit, a diff — buy a
-quiet session nothing. A session a new daemon adopted has its
-screen replayed out of the capture, which may be drawing a turn that ended an
-hour ago, so it counts as working only once this daemon has heard it — a
-rebuild no longer lights up every untouched agent on the machine at once. Codex
-activity additionally follows its OSC title spinner, so status survives the
-CLI erasing and repainting the visible `Working` line. A plain terminal paints
-no marker at all, so it is read off the kernel instead: it works while its
-shell has a child to wait on — a build linking in silence is still a build —
-and it waits when that child leaves a question on the last row (`[y/N]`, a
-password prompt, a pager's `--More--`), in the program's own words. When a
-session needs
-input — approval prompts, numbered menus, or your own `attention_patterns`,
-which the daemon now applies itself at its own refresh cadence — its entire
-agent item turns bold yellow, it raises a clickable banner, rings the bell,
-and emits a desktop notification. The reason it reports is the question being
-asked, in the words it is asked in, read off the row above the options; a
-category ("permission request", "confirmation") is the fallback for a dialog
-whose question cannot be read. Claude Code also counts as waiting when a turn
-was interrupted and the prompt box reopened empty: nothing on that screen says
-so, which is why whoever started it used to be told nothing at all. Opening the
-session clears the banner — the session list keeps showing Waiting until the
-agent stops asking — and a later prompt raises it again.
+its folder on the pane's own edge, in that same colour. Working, waiting and idle are read off the
+terminal itself, never off the words on the screen: a transcript can quote
+yesterday's permission prompt word for word, and a grep hit full of `esc to
+interrupt` used to keep an idle session lit. Each CLI tells its terminal what it
+is doing. Codex rewrites the window title ten times a second with a braille
+spinner while a turn runs, blinks `Action Required` in it while it waits on an
+approval, and sends an OSC 9 notification naming the command it is asking about
+— muxloom asks for all three at launch, session-locally, without touching the
+user's config. Claude Code alternates `◐`/`◑` at the head of its title for the
+whole of a turn and rests on `✳`. OpenCode and pi paint their spinners twenty to
+forty frames a second and go silent the moment a turn ends. A dialog holding the
+keyboard hides the terminal cursor on every runtime whose prompt box shows one,
+which is how a permission prompt, a numbered menu or a trust dialog reads as
+Waiting without a word of it being matched (pi draws its own cursor and has no
+dialogs, so it never reads as waiting). A spinner held in the title while
+nothing comes off the PTY is still a turn — one that shelled out to a build —
+for up to ten minutes. A session a new daemon adopted has its screen replayed
+out of the capture, which may be drawing a turn that ended an hour ago, so its
+title and cursor stand but nothing about it counts as happening until this
+daemon has heard it — a rebuild no longer lights up every untouched agent on
+the machine at once. A plain terminal is read off the kernel and the cursor
+instead: it works while its shell has a child to wait on — a build linking in
+silence is still a build — and it waits when that child has gone quiet with the
+cursor parked after what it printed (`[y/N]`, a password prompt, a pager's
+`--More--`), or has taken the whole screen and stopped painting it. A
+tmux-hosted session is read the same way, off `#{pane_title}`, `#{cursor_flag}`
+and `#{window_activity}`. When a session waits, its entire agent item turns
+bold yellow, it raises a clickable banner, rings the bell, and emits a desktop
+notification. The reason it reports is the runtime's own notification when it
+sent one, else the question the dialog draws above its options, in the words
+it is asked in, else plainly `waiting for input`. Opening the session clears
+the banner — the session list keeps showing Waiting until the agent stops
+asking — and a later prompt raises it again.
 
 **Keys** — spinners are automatic · `a` show/hide archived · click the attention
 banner to jump to the session.
@@ -563,15 +565,6 @@ history_limit = 1000000
 history_chunk_lines = 500
 ssh_config = "~/.ssh/config"
 
-attention_patterns = [
-  "do you want to",
-  "would you like to",
-  "allow command",
-  "approve",
-  "waiting for your input",
-  "press enter to confirm",
-]
-
 # Shell-style NAME=value assignments, injected into installs and launches.
 environment = ""
 reverse_tunnel = ""
@@ -638,7 +631,6 @@ read_only = false
 [hosts.gpu-box]
 environment = 'HTTP_PROXY=http://127.0.0.1:18118 HTTPS_PROXY=http://127.0.0.1:18118'
 reverse_tunnel = "18118:127.0.0.1:8118"
-attention_patterns = ["gpu approval", "do you want to proceed"]
 
 [hosts.gpu-box.codex]
 command = "/opt/codex/bin/codex"
@@ -1099,8 +1091,11 @@ muxloom --debug-log /tmp/muxloom-debug.log
   `source=muxloomd` activity records and verify the companion fingerprint updated.
 - **Portrait renders horizontally** — inspect the `layout` pixel/cell dimensions;
   some outer terminals do not report pixel size.
-- **Attention too broad** — inspect the matched reason and visible tail, then
-  narrow that machine's `attention_patterns`.
+- **Attention wrong** — `list_sessions` reports the reason, and the state is
+  read off the runtime's title and cursor, not the words on screen. A Codex
+  that never reads as working was launched outside muxloom without
+  `tui.terminal_title`; a pi never reads as waiting because it draws its own
+  cursor and has no dialogs. `attention_patterns` in an old config is ignored.
 - **`⟳` chip in the footer** — that machine's running daemon is older than
   this build. The controller updates it on its own once the machine's terminal
   is not attached; sessions keep running through the change.

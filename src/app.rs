@@ -15,6 +15,7 @@ use ratatui::{layout::Rect, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    activity::{Activity, Status, agent_status},
     channel::ChannelKind,
     config::{Config, State},
     debug,
@@ -25,7 +26,7 @@ use crate::{
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
     port_forward::{PortForwardManager, PortForwardState, PortForwardSummary},
-    runtime::{Runtime, agent_is_working, attention_reason, is_temporary_session_id},
+    runtime::{Runtime, WAITING_FOR_INPUT, dialog_question, is_temporary_session_id},
     ssh_config,
     talk::{TalkAuthor, TalkDraft, TalkKind, TalkMessage, TalkPage, TalkScope, TalkVoice},
     terminal_session::TerminalSession,
@@ -4740,19 +4741,19 @@ impl App {
         // Keep cached terminals receiving output and prune closed ones.
         self.drain_terminal_cache();
 
-        let (changed, closed, codex_working_hint) = self
+        let (changed, closed, activity) = self
             .terminal
             .as_mut()
             .map(|terminal| {
                 let changed = terminal.drain();
-                (changed, terminal.is_closed(), terminal.codex_working_hint())
+                (changed, terminal.is_closed(), Some(terminal.activity()))
             })
             .unwrap_or((false, false, None));
         if changed && !closed {
             self.refresh_terminal_screen();
             if let Some(session_id) = self.terminal_session_id.clone() {
                 let screen = std::mem::take(&mut self.terminal_screen);
-                self.sync_live_agent_activity(&session_id, &screen, codex_working_hint);
+                self.sync_live_agent_activity(&session_id, &screen, activity);
                 self.terminal_screen = screen;
             }
         }
@@ -4840,11 +4841,15 @@ impl App {
         }
     }
 
+    /// What the session in the live terminal is doing, read off the terminal
+    /// the way the daemon reads its own (see `crate::activity`); the screen
+    /// is only read for the words of a question once the state says one is
+    /// being asked.
     fn sync_live_agent_activity(
         &mut self,
         session_id: &str,
         screen: &str,
-        codex_working_hint: Option<bool>,
+        activity: Option<Activity>,
     ) {
         let Some(index) = self
             .sessions
@@ -4861,14 +4866,19 @@ impl App {
             return;
         }
 
-        let attention =
-            attention_reason(kind, screen, self.config.attention_patterns_for(&target_id));
-        let working = attention.is_none()
-            && if kind == AgentKind::Codex {
-                codex_working_hint.unwrap_or_else(|| agent_is_working(kind, screen))
-            } else {
-                agent_is_working(kind, screen)
-            };
+        let Some(activity) = activity else {
+            return;
+        };
+        let status = agent_status(&activity);
+        let attention = (status == Status::Waiting).then(|| {
+            activity
+                .notice
+                .as_ref()
+                .map(|notice| notice.text.clone())
+                .or_else(|| dialog_question(screen))
+                .unwrap_or_else(|| WAITING_FOR_INPUT.to_string())
+        });
+        let working = status == Status::Working;
         let session = &mut self.sessions[index];
         let changed = session.working != working
             || session.needs_attention != attention.is_some()
@@ -7178,7 +7188,6 @@ impl App {
                 .map(|kind| (kind, self.config.command_for(id, kind).command.clone()))
                 .collect(),
             environment: self.config.environment_for(id).unwrap_or_default(),
-            attention_patterns: self.config.attention_patterns_for(id).to_vec(),
         };
         if self.worker.requests.send(Request::Scan(request)).is_ok() {
             self.pending_scans.insert(id.into());
@@ -13407,32 +13416,46 @@ mod tests {
             parent: None,
         });
 
+        let read = |spinner: bool, cursor_hidden: bool| Activity {
+            painting: false,
+            spinner,
+            blinking: false,
+            cursor_hidden,
+            cursor_shown_once: true,
+            title: None,
+            quiet_ms: 0,
+            notice: None,
+            bell_at: None,
+        };
+        // A spinner in the title is a turn, whatever the screen says.
         app.sync_live_agent_activity(
             "muxloomd-codex-live",
-            "• Working (1s • esc to interrupt)",
-            None,
+            "partially erased status line",
+            Some(read(true, false)),
         );
         assert!(app.sessions[0].working);
 
         app.sync_live_agent_activity(
             "muxloomd-codex-live",
             "› Ask Codex anything\ngpt-5.6-sol xhigh · /work",
-            None,
+            Some(read(false, false)),
         );
-        assert!(!app.sessions[0].working);
+        assert!(!app.sessions[0].working && !app.sessions[0].needs_attention);
 
+        // A hidden cursor is a dialog; the screen gives its words.
         app.sync_live_agent_activity(
             "muxloomd-codex-live",
-            "partially erased status line",
-            Some(true),
+            "Run cargo test?\n❯ 1. Yes\n  2. No",
+            Some(read(false, true)),
         );
-        assert!(app.sessions[0].working);
-        app.sync_live_agent_activity(
-            "muxloomd-codex-live",
-            "• Working (1s • esc to interrupt)",
-            Some(false),
+        assert!(app.sessions[0].needs_attention && !app.sessions[0].working);
+        assert_eq!(
+            app.sessions[0].attention_reason.as_deref(),
+            Some("Run cargo test?")
         );
-        assert!(!app.sessions[0].working);
+        // Nothing read at all changes nothing.
+        app.sync_live_agent_activity("muxloomd-codex-live", "", None);
+        assert!(app.sessions[0].needs_attention);
     }
 
     #[test]
@@ -18105,7 +18128,6 @@ mod tests {
             reloaded.command_for("gpu", AgentKind::Codex).args,
             ["--full-auto"]
         );
-        assert_eq!(reloaded.attention_patterns_for("gpu"), ["gpu approval"]);
         assert_eq!(reloaded.reverse_tunnel_for("gpu"), "18118:127.0.0.1:8080");
         assert_eq!(
             reloaded.companion_binary_for("gpu"),

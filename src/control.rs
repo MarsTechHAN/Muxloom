@@ -8529,23 +8529,23 @@ mod tests {
                     .unwrap_or_default()
                     .subsec_nanos()
             ));
-            // It repaints the whole screen each time, as the real one does:
-            // an agent's marker leaves the screen when its turn ends, and a
-            // stand-in that let the old frame scroll up would still be showing
-            // the interrupt hint in the transcript above its idle prompt box.
+            // It says what it is doing the way the real one does — through
+            // the terminal title, a spinner glyph at its head for the whole
+            // of a turn and `✳` once the turn ends — and repaints the whole
+            // screen each time.
             std::fs::write(
                 &script,
                 "rule='────────────────────────────────────────'\n\
-                 hint='  esc to interrupt'\n\
+                 title='◐ Claude Code'\n\
                  said=''\n\
-                 draw() { printf '\\033[2J\\033[H%s\\n%s\\n❯ \\n%s\\n%s\\n' \\\n\
-                 \x20 \"$said\" \"$rule\" \"$rule\" \"$hint\"; }\n\
+                 draw() { printf '\\033]0;%s\\007\\033[2J\\033[H%s\\n%s\\n❯ \\n%s\\n' \\\n\
+                 \x20 \"$title\" \"$said\" \"$rule\" \"$rule\"; }\n\
                  draw\n\
                  while IFS= read -r line; do\n\
                  \x20 said=\"$said\n\
                  $line\"\n\
                  \x20 case $line in\n\
-                 \x20   *settled*) hint='  ⏵⏵ accepts edits on' ;;\n\
+                 \x20   *settled*) title='✳ Claude Code' ;;\n\
                  \x20 esac\n\
                  \x20 draw\n\
                  done\n",

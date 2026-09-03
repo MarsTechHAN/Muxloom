@@ -121,6 +121,7 @@ mod platform {
     use anyhow::{Context, Result, anyhow, bail};
 
     use crate::{
+        activity::{ActivityTracker, CursorRow, Status, agent_status, terminal_status},
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonHistorySearchHit, DaemonRequest,
@@ -137,8 +138,8 @@ mod platform {
         recap::extract_recap,
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
-            DAEMON_SESSION_PREFIX, agent_is_working, attention_reason, composer, composer_text,
-            is_temporary_session_id, working_marker_is_held,
+            DAEMON_SESSION_PREFIX, WAITING_FOR_INPUT, composer, composer_text, dialog_question,
+            is_temporary_session_id,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
@@ -146,24 +147,11 @@ mod platform {
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
-            Anchor, CodexActivity, InlineScrollback, page_has_content, render_history_page,
-            resize_parser,
+            Anchor, InlineScrollback, page_has_content, render_history_page, resize_parser,
         },
     };
 
     const RECENT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
-    /// How recently the PTY must have produced output for a session whose
-    /// screen shows a *ticking* working marker (a spinner, an elapsed counter)
-    /// to count as working. A CLI redraws those about once a second for the
-    /// whole of a turn, so one that has gone this quiet is not drawing them.
-    const WORKING_TICKING_QUIET_MS: u64 = 15_000;
-    /// The same, for a marker the CLI paints once and holds: an interrupt hint
-    /// on a status bar. A turn that shells out to a build, or waits on a model
-    /// that streams nothing back, sits silent for minutes with that hint on
-    /// screen the whole time, and calling that quiet "stopped" is what makes a
-    /// working agent report itself finished. What the bound still catches is
-    /// the frame frozen by a process that died or wedged mid-turn.
-    const WORKING_HELD_QUIET_MS: u64 = 10 * 60_000;
     /// The least of a session's log to render for a page, however few rows the
     /// page holds. Small enough that the shallowest ask pays about what it is
     /// worth, and large enough that a plainly written transcript fills a screen
@@ -403,10 +391,6 @@ mod platform {
         /// The file a keeper is started from, settled once while this daemon
         /// still knows where its own binary is.
         keeper_executable: PathBuf,
-        /// Extra attention patterns a controller sank down, applied alongside
-        /// the built-in classification on every snapshot. Shared with every
-        /// session so an update reaches sessions launched before it arrived.
-        attention_patterns: Arc<Mutex<Vec<String>>>,
         /// Standing watches on session screens, kept for whoever armed them.
         triggers: Mutex<Vec<ArmedTrigger>>,
         /// How many triggers exist at all. Session readers see every byte a
@@ -496,8 +480,6 @@ mod platform {
         /// what tells a session that is thinking apart from one that has been
         /// started over somewhere else.
         last_input: AtomicU64,
-        /// Shared with [`DaemonState::attention_patterns`].
-        attention_patterns: Arc<Mutex<Vec<String>>>,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
         /// How many times the grid has been changed. Bumped under [`Self::screen`]
@@ -511,7 +493,9 @@ mod platform {
         /// Tracks the scroll region the session has, so an attach snapshot can
         /// hand the client the same `DECSTBM` the app left behind.
         inline: Mutex<InlineScrollback>,
-        codex_activity: Mutex<CodexActivity>,
+        /// What the session is doing, read off the bytes it writes: the
+        /// title, the paint rate, the cursor, the bell. See [`crate::activity`].
+        activity: Mutex<ActivityTracker>,
         /// The text last read out of this session's composer box, and the
         /// epoch-ms when it last changed. The outbox path reads it on every
         /// pass to age an unsent draft: a box that keeps changing has someone
@@ -761,7 +745,6 @@ mod platform {
                 paths,
                 keeper_mode,
                 keeper_executable,
-                attention_patterns: Arc::new(Mutex::new(Vec::new())),
                 triggers: Mutex::new(triggers),
                 armed,
                 talk: OnceLock::new(),
@@ -3068,7 +3051,6 @@ mod platform {
                             "shell-compat-v1".into(),
                             "pty-v1".into(),
                             "send-input-v1".into(),
-                            "attention-patterns-v1".into(),
                             "files-v1".into(),
                             "history-v1".into(),
                             "media-v1".into(),
@@ -3548,11 +3530,10 @@ mod platform {
                     },
                 )
             }
-            DaemonRequest::SetAttentionPatterns { patterns } => {
-                *state
-                    .attention_patterns
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = patterns;
+            // Waiting is read off the terminal's state now, never off words on
+            // the screen; an older controller still sinking its patterns is
+            // thanked and ignored.
+            DaemonRequest::SetAttentionPatterns { .. } => {
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::ReadHistory {
@@ -4721,13 +4702,12 @@ mod platform {
             // own. Nothing has been asked of it yet.
             last_output: AtomicU64::new(now_ms()),
             last_input: AtomicU64::new(0),
-            attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             screen_seq: AtomicU64::new(0),
             screen_text: Mutex::new(None),
             inline: Mutex::new(InlineScrollback::default()),
-            codex_activity: Mutex::new(CodexActivity::default()),
+            activity: Mutex::new(ActivityTracker::default()),
             draft_watch: Mutex::new(None),
             // A revival that reopens the thread carries the opening words too;
             // a fresh session starts with nothing heard, and the recorder
@@ -4765,7 +4745,7 @@ mod platform {
             rows: AtomicU16::new(rows.max(5)),
         });
         if let Some(head) = replay {
-            session.record_output(&head);
+            session.record_output_at(&head, 0);
         }
         session.persist_metadata()?;
         state
@@ -5613,13 +5593,12 @@ mod platform {
             // over.
             last_output: AtomicU64::new(0),
             last_input: AtomicU64::new(0),
-            attention_patterns: Arc::clone(&state.attention_patterns),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             screen_seq: AtomicU64::new(0),
             screen_text: Mutex::new(None),
             inline: Mutex::new(InlineScrollback::default()),
-            codex_activity: Mutex::new(CodexActivity::default()),
+            activity: Mutex::new(ActivityTracker::default()),
             draft_watch: Mutex::new(None),
             // Read back out of the metadata, the same as the seed and the
             // claim below: this daemon did not hear the conversation open,
@@ -5663,7 +5642,7 @@ mod platform {
             rows: AtomicU16::new(rows),
         });
         if let Some(tail) = replay {
-            session.record_output(&tail);
+            session.record_output_at(&tail, 0);
         }
         session.persist_metadata()?;
         state
@@ -6290,56 +6269,45 @@ mod platform {
                     // was drawn above and every reading below has it.
                     let visible_screen = visible_screen.unwrap_or_else(|| Arc::from(""));
                     snapshot.composer = composer(kind, &visible_screen);
-                    let patterns = self
-                        .attention_patterns
+                    // What the session is doing is read off its terminal —
+                    // the title it writes, how often it paints, whether it
+                    // hid the cursor — and never off the words on its screen
+                    // (see `crate::activity`). The words are read afterwards,
+                    // and only to say what a waiting session is waiting on.
+                    // A frame replayed into an adopted session was fed with no
+                    // time on it, so it can show a dialog but never a turn.
+                    let activity = self
+                        .activity
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    snapshot.attention_reason = attention_reason(kind, &visible_screen, &patterns);
-                    snapshot.needs_attention = snapshot.attention_reason.is_some();
-                    // A plain terminal is doing something when its shell has a
-                    // child to wait on, and asking something only when it is:
-                    // a shell at its prompt asks nothing, whatever the last
-                    // program left on the last row.
-                    if kind == AgentKind::Terminal {
+                        .report(now_ms());
+                    let (status, reason) = if kind == AgentKind::Terminal {
+                        // A plain terminal is doing something when its shell
+                        // has a child to wait on, and asking something only
+                        // when that child has gone quiet with the cursor
+                        // parked after its question.
                         let busy = snapshot.pid.is_some_and(has_child_process);
-                        snapshot.needs_attention &= busy;
-                        if !snapshot.needs_attention {
-                            snapshot.attention_reason = None;
-                        }
-                        snapshot.working = busy && !snapshot.needs_attention;
-                    }
-                    // A screen claiming a turn is running is believed for as
-                    // long as the marker it is claiming it with can be
-                    // believed while nothing comes off the PTY: seconds for a
-                    // spinner, which stops turning the moment the CLI stops
-                    // painting, but minutes for an interrupt hint held on a
-                    // status bar, which is exactly what a turn that shells out
-                    // to a build leaves behind while it says nothing at all.
-                    // Either way it takes having heard the session at least
-                    // once: a screen replayed into an adopted session is a
-                    // record of what it was doing, not of what it is doing.
-                    let heard = self.last_output.load(Ordering::Relaxed);
-                    let patience = match working_marker_is_held(&visible_screen) {
-                        true => WORKING_HELD_QUIET_MS,
-                        false => WORKING_TICKING_QUIET_MS,
+                        terminal_status(&activity, busy, &self.cursor_row())
+                    } else {
+                        let status = agent_status(&activity);
+                        let reason = (status == Status::Waiting).then(|| {
+                            // The runtime's own notification names the
+                            // question best; the dialog's prose is next; the
+                            // state alone is the floor.
+                            let last_input = self.last_input.load(Ordering::Relaxed);
+                            activity
+                                .notice
+                                .as_ref()
+                                .filter(|notice| notice.at > last_input)
+                                .map(|notice| notice.text.clone())
+                                .or_else(|| dialog_question(&visible_screen))
+                                .unwrap_or_else(|| WAITING_FOR_INPUT.to_string())
+                        });
+                        (status, reason)
                     };
-                    let fresh = heard != 0 && now_ms().saturating_sub(heard) < patience;
-                    let working_hint = self
-                        .codex_activity
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .working();
-                    if kind != AgentKind::Terminal {
-                        snapshot.working = !snapshot.needs_attention
-                            && fresh
-                            && if kind == AgentKind::Codex {
-                                working_hint
-                                    .unwrap_or_else(|| agent_is_working(kind, &visible_screen))
-                            } else {
-                                agent_is_working(kind, &visible_screen)
-                            };
-                    }
+                    snapshot.working = status == Status::Working;
+                    snapshot.needs_attention = status == Status::Waiting;
+                    snapshot.attention_reason = reason;
                     // A trigger that fired asked for someone: it outranks the
                     // classification, which only knows what is on screen.
                     if let Some(notice) = self
@@ -6856,6 +6824,13 @@ mod platform {
 
         /// `bytes` does not belong in it.
         fn record_output(&self, bytes: &[u8]) {
+            self.record_output_at(bytes, now_ms());
+        }
+
+        /// [`Self::record_output`] for bytes heard at `at` — or replayed out
+        /// of a record rather than heard, with `at == 0`: a replayed frame
+        /// says what the session drew, not what it is doing.
+        fn record_output_at(&self, bytes: &[u8], at: u64) {
             self.line_count.fetch_add(
                 bytes.iter().filter(|&&byte| byte == b'\n').count(),
                 Ordering::Relaxed,
@@ -6878,10 +6853,25 @@ mod platform {
                 // would render (scroll-region rewriting included).
                 inline.process(&mut screen, bytes);
             }
-            self.codex_activity
+            self.activity
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .process(bytes);
+                .process(bytes, at);
+        }
+
+        /// Where a plain terminal's cursor sits, for reading whether the
+        /// program in it is waiting on a key.
+        fn cursor_row(&self) -> CursorRow {
+            let screen = self
+                .screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let screen = screen.screen();
+            let (row, column) = screen.cursor_position();
+            CursorRow {
+                alternate_screen: screen.alternate_screen(),
+                before_cursor: screen.contents_between(row, 0, row, column),
+            }
         }
 
         fn broadcast(&self, bytes: &[u8]) {
@@ -11676,7 +11666,7 @@ mod platform {
                 "/bin/sh".into(),
                 vec![
                     "-c".into(),
-                    "printf '\\033[2J\\033[H• Working (2s • esc to interrupt)'; sleep 1".into(),
+                    "printf '\\033]0;⠋ project\\007\\033[2J\\033[H• Working'; sleep 1".into(),
                 ],
                 vec![],
                 1,
@@ -11705,14 +11695,35 @@ mod platform {
             assert_eq!(session.snapshot().archived_at, Some(put_down));
         }
 
-        /// A question as the daemon sees it: the configured words, and the
-        /// yes/no pair that makes them a question rather than prose.
+        /// A dialog as the daemon sees it: the title at rest, the cursor
+        /// hidden by the dialog that took the keyboard, and the question drawn
+        /// above its options for the reason to be read from.
         fn approval_screen(reason_word: &str) -> Vec<u8> {
-            format!("\x1b[2J\x1b[H{reason_word} needed\n> 1. Yes\n  2. No").into_bytes()
+            format!(
+                "\x1b]0;project\x07\x1b[?25h\x1b[2J\x1b[H{reason_word} needed\n❯ 1. Yes\n  2. No\x1b[?25l"
+            )
+            .into_bytes()
+        }
+
+        /// A turn as the daemon sees it: a spinner in the title.
+        fn working_screen() -> Vec<u8> {
+            b"\x1b]0;\xe2\xa0\x8b project\x07\x1b[?25h\x1b[2J\x1b[H\xe2\x80\xa2 Working".to_vec()
+        }
+
+        /// A session at its prompt box: title at rest, cursor shown.
+        fn idle_screen() -> Vec<u8> {
+            b"\x1b]0;project\x07\x1b[?25h\x1b[2J\x1b[Hready when you are".to_vec()
+        }
+
+        /// Draw `bytes` as if they arrived just outside the paint window, so
+        /// a test that draws several frames in a row is not read as a turn
+        /// painting itself.
+        fn draw(session: &ManagedSession, bytes: &[u8]) {
+            session.record_output_at(bytes, now_ms() - crate::activity::PAINT_WINDOW_MS - 1);
         }
 
         #[test]
-        fn a_quiet_pty_stops_counting_as_working_and_sunk_patterns_classify_waiting() {
+        fn a_turn_is_read_off_the_title_and_the_paint_rate_and_a_dialog_off_the_cursor() {
             let state = test_state("freshness");
             let root = state.paths.root.clone();
             let session = launch_session(
@@ -11733,58 +11744,69 @@ mod platform {
                 None,
             )
             .unwrap();
-            session.record_output("\x1b[2J\x1b[H• Working (2s • esc to interrupt)".as_bytes());
+            // A spinner in the title is a turn running, however quiet the PTY:
+            // a turn that shells out to a build says nothing for minutes.
+            draw(&session, &working_screen());
             assert!(session.snapshot().working);
-
-            // An interrupt hint is painted once and held for the whole turn,
-            // so a quiet PTY under one says nothing: a turn that shells out to
-            // a build sounds exactly like this, and calling it stopped is how
-            // a working agent came to report itself finished.
-            session.last_output.store(
-                now_ms().saturating_sub(WORKING_TICKING_QUIET_MS + 1),
-                Ordering::Relaxed,
+            session.record_output_at(
+                &working_screen(),
+                now_ms() - crate::activity::SPINNER_HELD_QUIET_MS + 60_000,
             );
             assert!(session.snapshot().working);
-
             // Quiet for long enough, though, and what is on screen is a frame
-            // frozen by a turn that ended or wedged.
-            session.last_output.store(
-                now_ms().saturating_sub(WORKING_HELD_QUIET_MS + 1),
-                Ordering::Relaxed,
+            // frozen by a turn that wedged.
+            session.record_output_at(
+                &working_screen(),
+                now_ms() - crate::activity::SPINNER_HELD_QUIET_MS - 1,
             );
             assert!(!session.snapshot().working);
-            session.last_output.store(now_ms(), Ordering::Relaxed);
-            assert!(session.snapshot().working);
 
-            // A spinner and its counter are the other kind of marker: drawn
-            // afresh about once a second, so one that has not moved in a
-            // quarter of a minute is one nobody is drawing.
-            session.record_output("\x1b[2J\x1b[H✻ Cogitating… (12s · ↓ 1.2k tokens)".as_bytes());
-            assert!(session.snapshot().working);
-            session.last_output.store(
-                now_ms().saturating_sub(WORKING_TICKING_QUIET_MS + 1),
-                Ordering::Relaxed,
-            );
-            assert!(!session.snapshot().working);
-            session.last_output.store(now_ms(), Ordering::Relaxed);
-            assert!(session.snapshot().working);
-
-            // Patterns a controller sank down classify waiting on the
-            // daemon's own snapshots, custom wording included. The reason
-            // reads back as the question the screen is asking, which is what
-            // the pattern matched inside.
-            session.record_output(&approval_screen("gpu quota approval"));
-            *state
-                .attention_patterns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into()];
+            // A runtime with no spinner in its title is stopped once it has
+            // not painted for the length of the window, however many frames
+            // it painted before that.
+            draw(&session, &idle_screen());
+            let quiet = now_ms() - crate::activity::PAINT_WINDOW_MS - 1;
+            for _ in 0..8 {
+                session.record_output_at(&[b'.'; 200], quiet);
+            }
             let snapshot = session.snapshot();
-            assert!(snapshot.needs_attention);
+            assert!(
+                !snapshot.working && !snapshot.needs_attention,
+                "{snapshot:?}"
+            );
+
+            // A dialog hides the cursor; the reason reads back as the
+            // question the dialog draws above its options.
+            draw(&session, &approval_screen("gpu quota approval"));
+            let snapshot = session.snapshot();
+            assert!(
+                snapshot.needs_attention && !snapshot.working,
+                "{snapshot:?}"
+            );
             assert_eq!(
                 snapshot.attention_reason.as_deref(),
                 Some("gpu quota approval needed")
             );
+            // The runtime's own notification, when it sends one, names the
+            // question better than the screen does.
+            session.record_output(b"\x1b]9;Approval requested: cargo publish\x07");
+            assert_eq!(
+                session.snapshot().attention_reason.as_deref(),
+                Some("Approval requested: cargo publish")
+            );
+            // Answered: the box is back, and the cursor with it.
+            draw(&session, &idle_screen());
+            let snapshot = session.snapshot();
+            assert!(
+                !snapshot.needs_attention && !snapshot.working,
+                "{snapshot:?}"
+            );
+
+            // And a turn is a turn while it paints — a dozen frames a second.
+            for _ in 0..8 {
+                session.record_output(&[b'.'; 200]);
+            }
+            assert!(session.snapshot().working);
 
             session.archive().unwrap();
             discard_root(root);
@@ -11931,11 +11953,6 @@ mod platform {
         fn a_waiting_child_is_told_about_once_and_the_reminders_widen_to_silence() {
             let state = test_state("parent-edge");
             let root = state.paths.root.clone();
-            *state
-                .attention_patterns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into(), "second opinion".into()];
             let child = launch_child_with_parent(&state, "parent-edge", Some("the-parent"));
             let note = |child: &ManagedSession| {
                 let snapshot = child.snapshot();
@@ -11943,22 +11960,21 @@ mod platform {
             };
 
             // An idle child with an idle screen says nothing to its parent.
-            child.record_output(b"\x1b[2J\x1b[Hready when you are");
+            draw(&child, &idle_screen());
             note(&child);
             assert!(child.take_parent_alert().is_none());
 
             // A working one says less: the edge is the fall onto a question,
             // not the child being busy. The bullet and middle dot are spelled
             // as their UTF-8 bytes because byte strings take no \u escapes.
-            child
-                .record_output(b"\x1b[2J\x1b[H\xe2\x80\xa2 Working (2s \xc2\xb7 esc to interrupt)");
+            draw(&child, &working_screen());
             assert!(child.snapshot().working);
             note(&child);
             assert!(child.take_parent_alert().is_none());
 
             // The moment it stops working and asks for approval, the first
             // tell is immediate, and it says who is waiting and why.
-            child.record_output(&approval_screen("gpu quota approval"));
+            draw(&child, &approval_screen("gpu quota approval"));
             note(&child);
             let alert = child.take_parent_alert().expect("the edge is handed over");
             assert_eq!(alert.session_id, "muxloomd-codex-parent-edge");
@@ -12041,7 +12057,7 @@ mod platform {
                 "a new question after a settled stretch is told about at once"
             );
             settle_parent_alert(&child);
-            child.record_output(&approval_screen("second opinion"));
+            draw(&child, &approval_screen("second opinion"));
             note(&child);
             let alert = child.take_parent_alert().expect("new reason is a new edge");
             assert_eq!(
@@ -12052,7 +12068,7 @@ mod platform {
             // A child nobody started is no one's errand: the same fall marks
             // nothing for no parent to hear about.
             let orphan = launch_child_with_parent(&state, "parent-edge-orphan", None);
-            orphan.record_output(&approval_screen("gpu quota approval"));
+            draw(&orphan, &approval_screen("gpu quota approval"));
             let snapshot = orphan.snapshot();
             assert!(snapshot.needs_attention);
             orphan.note_parent_alert(&snapshot);
@@ -12076,11 +12092,6 @@ mod platform {
         fn last_words_going_missing_and_coming_back_is_not_a_new_question() {
             let state = test_state("parent-edge-blink");
             let root = state.paths.root.clone();
-            *state
-                .attention_patterns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into()];
             let told = |child: &ManagedSession, recap: Option<&str>| {
                 let mut snapshot = child.snapshot();
                 snapshot.recap = recap.map(str::to_string);
@@ -12091,7 +12102,7 @@ mod platform {
             // A question that arrives with its last words attached, and a
             // reading that then blinks out and back while nothing moves.
             let child = launch_child_with_parent(&state, "parent-edge-blink", Some("the-parent"));
-            child.record_output(&approval_screen("gpu quota approval"));
+            draw(&child, &approval_screen("gpu quota approval"));
             assert!(told(&child, Some("waiting on the gpu quota")), "first tell");
             assert!(!told(&child, None), "last words going missing is not news");
             assert!(
@@ -12119,7 +12130,7 @@ mod platform {
             // the arrival - and that is what lets a real change afterwards be
             // measured against real last words instead of against a blank.
             let late = launch_child_with_parent(&state, "parent-edge-late", Some("the-parent"));
-            late.record_output(&approval_screen("gpu quota approval"));
+            draw(&late, &approval_screen("gpu quota approval"));
             assert!(told(&late, None), "the first tell, last words or not");
             assert!(
                 !told(&late, Some("waiting on the gpu quota")),
@@ -12154,11 +12165,6 @@ mod platform {
         fn last_words_changing_hands_between_their_two_sources_is_not_a_new_question() {
             let state = test_state("parent-edge-sources");
             let root = state.paths.root.clone();
-            *state
-                .attention_patterns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into()];
             let told = |child: &ManagedSession, recap: &str| {
                 let mut snapshot = child.snapshot();
                 snapshot.recap = Some(recap.to_string());
@@ -12172,7 +12178,7 @@ mod platform {
             let scraped = "$ venv/bin/pip list | grep -iE mlx";
 
             let child = launch_child_with_parent(&state, "parent-edge-sources", Some("the-parent"));
-            child.record_output(&approval_screen("gpu quota approval"));
+            draw(&child, &approval_screen("gpu quota approval"));
             assert!(told(&child, claimed), "first tell");
             assert!(
                 !told(&child, scraped),
@@ -12560,13 +12566,8 @@ mod platform {
                     return frame.decode_json::<DaemonResponse>().unwrap();
                 }
             };
-            *state
-                .attention_patterns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec!["gpu quota approval".into()];
             let child = launch_child_with_parent(&state, "drain-alerts", Some("the-parent"));
-            child.record_output(&approval_screen("gpu quota approval"));
+            draw(&child, &approval_screen("gpu quota approval"));
             assert!(child.snapshot().needs_attention);
 
             // A ListSessions is what marks it - the dashboard's own poll does
@@ -13298,8 +13299,14 @@ mod platform {
             assert!(snapshot.working, "{snapshot:?}");
             assert!(!snapshot.needs_attention);
             // The job's own question on the last row is what the terminal is
-            // waiting on.
+            // waiting on — once the job has gone quiet behind it, with the
+            // cursor parked after the question.
             busy.record_output(b"\x1b[2J\x1b[Hcp: overwrite '/tmp/a'? [y/N] ");
+            assert!(busy.snapshot().working, "just printed: still at work");
+            busy.record_output_at(
+                b" \x08",
+                now_ms() - crate::activity::TERMINAL_ASK_QUIET_MS - 1,
+            );
             let asked = busy.snapshot();
             assert_eq!(
                 asked.attention_reason.as_deref(),
@@ -14214,7 +14221,7 @@ mod platform {
                 "/bin/sh".into(),
                 vec![
                     "-c".into(),
-                    "printf '\\033[2J\\033[H• Working (2s • esc to interrupt)'; cat".into(),
+                    "printf '\\033]0;⠋ project\\007\\033[2J\\033[H• Working'; cat".into(),
                 ],
                 vec![],
                 5,
@@ -14242,22 +14249,26 @@ mod platform {
             let adopted = daemon_session(&restarted, session_id)
                 .expect("a live keeper session must be adopted, not archived");
             let replayed = adopted
-                .screen
+                .activity
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .screen()
-                .contents();
-            assert!(
-                agent_is_working(AgentKind::Codex, &replayed),
-                "the replayed screen still carries the marker"
+                .title()
+                .map(str::to_string);
+            assert_eq!(
+                replayed.as_deref(),
+                Some("⠋ project"),
+                "the replayed title still carries the spinner"
             );
             assert!(
                 !adopted.snapshot().working,
                 "but nothing has been heard from the session since the handover"
             );
 
-            // Once it speaks for itself the same screen means what it says.
-            adopted.write_input(b"\r").unwrap();
+            // Once it speaks for itself — `cat` hands back the title it is
+            // given — the spinner means what it says.
+            adopted
+                .write_input("\x1b]0;\u{2819} project\x07\r".as_bytes())
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while !adopted.snapshot().working && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));

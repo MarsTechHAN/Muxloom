@@ -64,10 +64,6 @@ pub struct BridgeOptions {
     /// work a target does on its own behalf — pulling its companion down from
     /// the release rather than waiting for us to push it.
     pub remote_environment: Vec<(String, String)>,
-    /// Attention patterns sunk into the daemon right after the handshake, so
-    /// waiting states surface at its refresh cadence rather than the
-    /// controller's full scans.
-    pub attention_patterns: Vec<String>,
 }
 
 impl Default for BridgeOptions {
@@ -79,7 +75,6 @@ impl Default for BridgeOptions {
             bootstrap_binary: String::new(),
             download_environment: Vec::new(),
             remote_environment: Vec::new(),
-            attention_patterns: Vec::new(),
         }
     }
 }
@@ -962,10 +957,6 @@ impl BridgeConnection {
     pub fn send_input(&self, session_id: String, bytes: Vec<u8>) -> Result<()> {
         self.require_capability("send-input-v1")?;
         self.expect_ack(DaemonRequest::SendInput { session_id, bytes })
-    }
-
-    fn set_attention_patterns(&self, patterns: Vec<String>) -> Result<()> {
-        self.expect_ack(DaemonRequest::SetAttentionPatterns { patterns })
     }
 
     pub fn set_trigger(&self, trigger: Trigger) -> Result<Trigger> {
@@ -3011,19 +3002,6 @@ impl BridgePool {
                 (BridgeConnection::connect_local(&options.command)?, None)
             }
         };
-        // Sink the machine's attention patterns into the daemon so its own
-        // snapshots classify waiting states without waiting on a full scan.
-        // Best-effort: an older daemon simply keeps using its built-ins.
-        if !options.attention_patterns.is_empty()
-            && connection.has_capability("attention-patterns-v1")
-            && let Err(error) =
-                connection.set_attention_patterns(options.attention_patterns.clone())
-        {
-            debug::log(
-                "bridge",
-                format!("target={target_id} could not sink attention patterns: {error:#}"),
-            );
-        }
         self.connections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

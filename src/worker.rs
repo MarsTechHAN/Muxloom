@@ -67,7 +67,6 @@ pub struct ScanRequest {
     /// it actually has.
     pub commands: Vec<(AgentKind, String)>,
     pub environment: Vec<(String, String)>,
-    pub attention_patterns: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -627,7 +626,6 @@ impl Worker {
                                     &request.target,
                                     &session.id,
                                     session.kind,
-                                    &request.attention_patterns,
                                 ) {
                                     Ok((working, attention, recap)) => {
                                         session.working = working;

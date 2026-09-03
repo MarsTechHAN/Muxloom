@@ -245,22 +245,26 @@ Working 动画**只出现在对应 agent 行**：Codex 使用青色旋转盲文 
 Claude 使用橙色 sparkle（`✻✽✶✳`），OpenCode 使用紫色菱形（`◈◇◆`），Pi 使用旋转的
 `π`，均按墙钟时间推进。Folder 分组行不再闪烁，改为整行静态变色标示子会话状态——有等待
 输入的子会话时变黄，有工作中的变绿；Machines 行为该机器实际装有的每个 Runtime 显示一
-个静态能力图标。Working 的判定 = CLI 的中断标记（esc to interrupt）**或**实时状态行
-（行首 spinner + 计时器，如 `✶ Compacting conversation… (11m 4s · ↓ 27.7k tokens)`，这
-是不提供中断的阶段唯一留下的痕迹）可见 **且** daemon 自己听见过这个会话说话。屏幕能在
-PTY 沉默后被信任多久，取决于它用的是哪种标记：spinner 和计时器每秒重画，停住就说明没人
-在画了（数秒即失效）；而状态栏上那行一次画好就不动的中断提示，正是一个 shell 出去跑构
-建、整段时间一个字节都不吐的回合会留下的东西，因此可以信任数分钟。但这行提示必须真的
-在底部状态栏上才算数：同样的字眼出现在正文里（grep 结果、diff）不会给一个已经沉默的会
-话买到任何额外时间。被新 daemon 接管
-（adopt）的会话，其屏幕是从录像里重放出来的，可能还在画一小时前就结束的回合，所以必须
-等这个 daemon 亲耳听见它出声才算 Working——重启一次不会再让整台机器上没人碰过的 agent
-一起亮起来。压缩对话、subagent 并行阶段、无 token 计数的早期阶段都能正确
-识别。Codex 另有 OSC 标题 spinner 兜底。纯终端不画任何标记，所以改问内核：shell
-还有子进程在等就算 Working（静默链接中的编译也是编译），子进程在最后一行留下问题
-（`[y/N]`、密码提示、分页器的 `--More--`）就算 Waiting，理由就是那一行原话。Waiting 检测覆盖审批提
-示、编号选择菜单，且自定义 `attention_patterns` 现在下沉到 daemon 按其自身刷新节奏应
-用；Waiting Agent 的整个条目会变成黄色加粗。
+个静态能力图标。Working / Waiting / Idle 完全从终端本身的状态读出，
+不再匹配屏幕上的任何字眼：正文里可以一字不差地引用昨天的审批提示，一条 grep 命中的
+`esc to interrupt` 也曾让空闲会话一直亮着。每个 CLI 都会把自己在做什么告诉终端：Codex
+在回合进行中每秒十次改写窗口标题、行首是盲文 spinner，等待审批时在标题里闪烁
+`Action Required`，并发出一条 OSC 9 通知说明它要批准的命令——这三样 muxloom 在启动时
+以会话级 `-c` 参数向 Codex 索取，不改用户配置；Claude Code 整个回合在标题行首交替
+`◐`/`◑`，回合结束回到 `✳`；OpenCode 和 pi 工作时每秒重画二三十帧，回合一结束就完全
+静默。对话框接管键盘时会隐藏终端光标（凡是在输入框里显示光标的 runtime 都如此），
+审批提示、编号菜单、信任目录对话框因此都读作 Waiting，而无需匹配其中任何一个词
+（pi 自己画光标、也没有对话框，所以永远不会读作 Waiting）。标题里挂着 spinner 而 PTY
+一个字节都不吐，仍然算回合进行中——那是一个 shell 出去跑构建的回合——最长十分钟。被新
+daemon 接管（adopt）的会话，其屏幕是从录像里重放出来的，可能还在画一小时前就结束的
+回合，所以标题和光标状态保留，但在这个 daemon 亲耳听见它出声之前，什么都不算正在发
+生——重启一次不会再让整台机器上没人碰过的 agent 一起亮起来。纯终端改问内核和光标：
+shell 还有子进程在等就算 Working（静默链接中的编译也是编译），子进程沉默下来且光标停
+在它刚打印的内容之后（`[y/N]`、密码提示、分页器的 `--More--`），或者占了整个备用屏幕
+却不再重画，就算 Waiting，理由就是那一行原话。tmux 托管的会话用同样的办法读
+`#{pane_title}`、`#{cursor_flag}` 和 `#{window_activity}`。Waiting 的理由依次取 runtime
+自己发出的通知、对话框选项上方的那句问话、否则就是 `waiting for input`；Waiting Agent
+的整个条目会变成黄色加粗。
 
 <a id="zh-controls"></a>
 
@@ -638,13 +642,12 @@ Host/Port 与本地 Port（`0` 表示自动分配），之后访问 `127.0.0.1:L
 探测不可用时仍可手动填写。TCP 流量复用该机器已有的持久 Bridge；选中活动转发按 `d` 停止，
 不会停止远端服务或 Agent。本地 Listener 只在当前 Muxloom Controller 进程期间存在。
 
-提醒只检查当前屏幕底部物理行。Attached 和 legacy-inspected Session 会组合内置审批布局与
-每机器 Pattern；每机器的 `attention_patterns` 现在也会下发给 daemon，由它按自身刷新节奏
-应用到后台 snapshot。新提醒会把整个 Agent 条目显示为
+提醒来自终端状态（标题、光标、重画频率），不来自屏幕上的字；旧配置里的
+`attention_patterns` 会被忽略。新提醒会把整个 Agent 条目显示为
 黄色加粗，并显示可点击 Banner、Waiting 状态、Bell 和 OSC 9，对同一个 Prompt 去重。进入会话即消除它的 Banner——会话
 列表仍然显示 Waiting，直到 Agent 不再询问——之后的新 Prompt 会重新提醒。Attached
-Terminal 直接从实时帧更新 Working/Waiting，Codex 还读取持续变化的 OSC 标题 spinner，
-因此短推理和可见状态行重绘不会被后台刷新间隔漏掉；其他会话由 daemon snapshot 更新。
+Terminal 直接从实时字节流更新 Working/Waiting，因此短推理不会被后台刷新间隔漏掉；
+其他会话由 daemon snapshot 更新。
 
 <a id="zh-files"></a>
 
@@ -765,7 +768,8 @@ muxloom --debug-log /tmp/muxloom-debug.log
 - Working 动画不出现：检查 `source=live-terminal` / `source=muxloomd` 和 companion Fingerprint；
 - Codex 缺 `bubblewrap`/`bwrap`：使用带资源的 Standalone Package 或绝对 Wrapper；
 - 竖屏仍横向：查看 Layout Log 的 Pixel/Cell，外层终端可能没有报告 Pixel Size；
-- 提醒误报：根据 Reason 和可见 Tail 收窄该机器的 `attention_patterns`；
+- 提醒不对：`list_sessions` 会报理由；状态读自 runtime 的标题和光标。muxloom 之外启动、没有
+  `tui.terminal_title` 的 Codex 永远不会读作 Working；pi 自己画光标，永远不会读作 Waiting；
 - footer 出现 `⟳` 标记：该机器运行中的 daemon 落后于当前构建；终端未 attach 时
   Controller 会自动完成升级，会话不受影响；
 - 视频不能解码：检查 Bundle 内 FFmpeg、`MUXLOOM_FFMPEG` 或 Controller `PATH`。

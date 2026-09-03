@@ -16,6 +16,11 @@ pub struct Config {
     pub ssh_connect_timeout_secs: u64,
     pub history_limit: usize,
     pub history_chunk_lines: usize,
+    /// No longer read. Whether a session waits is read off its terminal's
+    /// state — the title its runtime writes, the cursor, the paint rate —
+    /// never off words on its screen; the field stays so an older config
+    /// still loads.
+    #[serde(default, skip_serializing)]
     pub attention_patterns: Vec<String>,
     /// When a subagent session falls onto something only its parent agent can
     /// answer — a permission request, a question, any waiting-for-input state —
@@ -61,14 +66,7 @@ impl Default for Config {
             ssh_connect_timeout_secs: 5,
             history_limit: 1_000_000,
             history_chunk_lines: 500,
-            attention_patterns: vec![
-                "do you want to".into(),
-                "would you like to".into(),
-                "allow command".into(),
-                "approve".into(),
-                "waiting for your input".into(),
-                "press enter to confirm".into(),
-            ],
+            attention_patterns: Vec::new(),
             alerts_to_parent: true,
             ssh_config: "~/.ssh/config".into(),
             environment: String::new(),
@@ -254,6 +252,8 @@ pub struct HostConfig {
     pub reverse_tunnel: Option<String>,
     pub companion_command: Option<String>,
     pub companion_binary: Option<String>,
+    /// No longer read; see [`Config::attention_patterns`].
+    #[serde(default, skip_serializing)]
     pub attention_patterns: Option<Vec<String>>,
 }
 
@@ -328,13 +328,6 @@ impl Config {
             AgentKind::Terminal => host.terminal.as_ref(),
         });
         override_command.unwrap_or_else(|| self.agents.get(kind))
-    }
-
-    pub fn attention_patterns_for(&self, host: &str) -> &[String] {
-        self.hosts
-            .get(host)
-            .and_then(|host| host.attention_patterns.as_deref())
-            .unwrap_or(&self.attention_patterns)
     }
 
     pub fn environment_for(&self, host: &str) -> Result<Vec<(String, String)>> {
@@ -569,7 +562,6 @@ refresh_interval_ms = 5000
 ssh_connect_timeout_secs = 5
 history_limit = 1000000
 history_chunk_lines = 500
-attention_patterns = ["do you want to", "would you like to", "allow command", "approve", "waiting for your input", "press enter to confirm"]
 # When a subagent lands on a permission request or a question, tell the agent
 # that started it rather than making it poll. On by default.
 alerts_to_parent = true
@@ -663,7 +655,6 @@ sync_files = []
 # reverse_tunnel = "18118:127.0.0.1:8118"
 # companion_command = "~/.local/bin/muxloomd"
 # companion_binary = "~/Downloads/muxloomd-x86_64-unknown-linux-musl"
-# attention_patterns = ["approve", "do you want to proceed"]
 
 # [hosts.gpu-box.claude]
 # command = "/opt/claude/bin/claude"
@@ -782,13 +773,6 @@ mod tests {
             config.command_for("gpu", AgentKind::Claude).command,
             "claude"
         );
-        assert_eq!(
-            config.attention_patterns_for("gpu"),
-            config.attention_patterns.as_slice()
-        );
-        config.hosts.get_mut("gpu").unwrap().attention_patterns =
-            Some(vec!["machine prompt".into()]);
-        assert_eq!(config.attention_patterns_for("gpu"), ["machine prompt"]);
     }
 
     #[test]
