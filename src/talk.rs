@@ -47,11 +47,58 @@ pub const MAX_TEXT: usize = 8 * 1024;
 const RETAIN_PER_ORIGIN: usize = 20_000;
 /// How long a message is kept regardless of how few there are.
 const RETAIN_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// The path namespace muxloom keeps its own coordination notes under: which
+/// machine holds a chat account's lease, what a person said about an approval
+/// another machine parked. Reserved — a post from a tool call is refused here,
+/// because none of it is anybody's memory.
+pub const WIRE_PATH_PREFIX: &str = "/muxloom/";
+/// What the log holding that traffic is called, next to the one holding what
+/// was written down.
+const WIRE_SUFFIX: &str = "_wire";
+/// The same two limits for that log. Small and short, because none of it is
+/// worth reading tomorrow: a lease expires in forty-five seconds and a
+/// delivered message has already been delivered.
+const RETAIN_PER_WIRE_ORIGIN: usize = 1_000;
+const RETAIN_WIRE_MS: u64 = 12 * 60 * 60 * 1000;
 /// How far past the retention limit a log may run before it is rewritten.
 /// Compaction rewrites a whole file, so it must not happen on every post.
 const COMPACT_SLACK: usize = 512;
 /// The most messages one read or one replication fetch carries.
 pub const MAX_PAGE: usize = 500;
+
+/// Whether a record is muxloom talking to itself rather than something
+/// somebody wrote down.
+///
+/// Two kinds of traffic ride the board because it is the only thing every
+/// machine replicates: the coordination notes under [`WIRE_PATH_PREFIX`], and
+/// direct messages, which are filed after delivery so a machine can be read
+/// later for what its agents said to each other. Neither is memory, and both
+/// are written thousands of times more often than memory is — on the board
+/// this was measured on, twenty-three thousand lease heartbeats against about
+/// two hundred real notes, with the real notes already being evicted by them.
+///
+/// So they go in a log of their own. Not a filter over one log: the log is
+/// append-only and sequence-numbered, and a record dropped from the middle of
+/// one leaves a hole that stops the version vector, so peers re-send it and it
+/// comes straight back. Separate sequence spaces are the only way one class of
+/// record can be dropped on a schedule of its own.
+fn is_wire(kind: TalkKind, scope: &TalkScope) -> bool {
+    kind == TalkKind::Direct
+        || matches!(scope, TalkScope::Path { path, .. } if path.starts_with(WIRE_PATH_PREFIX))
+}
+
+/// Which log a machine files that traffic in. Its own, beside the durable one.
+fn wire_origin(origin: &str) -> String {
+    format!("{origin}{WIRE_SUFFIX}")
+}
+
+/// How much of a log is kept, and for how long, by which log it is.
+fn retention_for(origin: &str) -> (usize, u64) {
+    match origin.ends_with(WIRE_SUFFIX) {
+        true => (RETAIN_PER_WIRE_ORIGIN, RETAIN_WIRE_MS),
+        false => (RETAIN_PER_ORIGIN, RETAIN_MS),
+    }
+}
 
 /// Where a message belongs. `machine` is an origin key, not a display name, so
 /// a machine that gets renamed keeps its board.
@@ -698,15 +745,22 @@ impl TalkStore {
         {
             to.machine = origin.clone();
         }
+        // Which log this is filed in, which is not the same question as which
+        // machine said it: `author.machine` and every address on the record
+        // stay this machine's own key, and only the sequence space moves.
+        let log = match is_wire(draft.kind, &draft.scope) {
+            true => wire_origin(&origin),
+            false => origin.clone(),
+        };
         let mut inner = self.inner();
         let seq = inner
             .logs
-            .get(&origin)
+            .get(&log)
             .map_or(0, OriginLog::highest)
             .saturating_add(1);
         let message = TalkMessage {
-            id: format!("{origin}:{seq}"),
-            origin: origin.clone(),
+            id: format!("{log}:{seq}"),
+            origin: log,
             seq,
             ts: now_ms(),
             scope: draft.scope,
@@ -880,8 +934,9 @@ impl TalkStore {
             .join(format!("{message_origin}.jsonl"));
         append_line(&path, &message)?;
         log.messages.insert(at, message);
-        if log.messages.len() > RETAIN_PER_ORIGIN + COMPACT_SLACK {
-            let cut = log.messages.len() - RETAIN_PER_ORIGIN;
+        let (retain, _) = retention_for(&message_origin);
+        if log.messages.len() > retain + COMPACT_SLACK {
+            let cut = log.messages.len() - retain;
             log.low_water = log.messages[cut - 1].seq;
             log.messages.drain(..cut);
             rewrite_log(&path, &message_origin, log.low_water, &log.messages)?;
@@ -893,9 +948,10 @@ impl TalkStore {
     /// a timer: a daemon that nobody talks to should not be doing work.
     pub fn compact(&self) -> Result<()> {
         let mut inner = self.inner();
-        let cutoff = now_ms().saturating_sub(RETAIN_MS);
+        let now = now_ms();
         let root = self.root.join("log");
         for (origin, log) in inner.logs.iter_mut() {
+            let cutoff = now.saturating_sub(retention_for(origin).1);
             let keep = log
                 .messages
                 .iter()
@@ -952,6 +1008,17 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
             machine_label(message, machine, mine, label),
         ),
         TalkScope::Path { machine, path } => {
+            // muxloom's own coordination notes are on the board because every
+            // machine replicates it, not because anyone is meant to read them.
+            // They surface only for the code that asks for that exact path, so
+            // a person or an agent reading the board sees the board.
+            if path.starts_with(WIRE_PATH_PREFIX)
+                && !matches!(&filter.paths, TalkSelector::Only { names } if names
+                    .iter()
+                    .any(|name| name == path))
+            {
+                return false;
+            }
             filter.machines.admits(
                 Some(mine),
                 machine,
@@ -1899,6 +1966,117 @@ mod tests {
         assert_eq!(restarted.state().vector["other-1234abcd"], 4);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn muxlooms_own_traffic_rides_a_log_beside_the_one_holding_memory() {
+        let store = store("wire");
+        let mine = store.origin();
+        let wire = format!("{mine}_wire");
+
+        // What somebody wrote down.
+        let note = store
+            .post(draft(
+                "the lease flood evicts real notes",
+                TalkScope::Path {
+                    machine: String::new(),
+                    path: "/work/repo".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!((note.origin.as_str(), note.seq), (mine.as_str(), 1));
+
+        // A coordination note muxloom writes to itself. It is filed under its
+        // own log, and says the same machine said it: everything addressed on
+        // the record stays this machine's own key, and only the sequence space
+        // moves.
+        let lease = store
+            .post(draft(
+                "muxloom-channel-lease v1\naccount=bot@im\nuntil=9\ncursor=a",
+                TalkScope::Path {
+                    machine: String::new(),
+                    path: format!("{WIRE_PATH_PREFIX}channel-leases"),
+                },
+            ))
+            .unwrap();
+        assert_eq!((lease.origin.as_str(), lease.seq), (wire.as_str(), 1));
+        assert_eq!(lease.author.machine, mine);
+        assert_eq!(lease.scope.machine(), Some(mine.as_str()));
+
+        // A delivered direct is a record of a delivery, not a memory either.
+        let mut sent = draft("look at line 40", TalkScope::Global);
+        sent.kind = TalkKind::Direct;
+        sent.to = Some(TalkAddress {
+            machine: String::new(),
+            session_id: "session-2".into(),
+        });
+        let direct = store.post(sent).unwrap();
+        assert_eq!((direct.origin.as_str(), direct.seq), (wire.as_str(), 2));
+        assert_eq!(direct.to.expect("addressed").machine, mine);
+
+        // So the next thing written down is the second thing written down,
+        // however much traffic went by in between. That is the whole point:
+        // the durable log's sequence space is not spent on machinery, and its
+        // retention window is not either.
+        let second = store
+            .post(draft(
+                "and a second thing worth keeping",
+                TalkScope::Path {
+                    machine: String::new(),
+                    path: "/work/repo".into(),
+                },
+            ))
+            .unwrap();
+        assert_eq!((second.origin.as_str(), second.seq), (mine.as_str(), 2));
+
+        // Reading the board shows the board. The coordination note is only
+        // handed to the code that asks for that exact path.
+        let texts = |filter: TalkFilter| -> Vec<String> {
+            store
+                .read(&filter)
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        let seen = texts(TalkFilter {
+            session_id: Some("session-1".into()),
+            paths: TalkSelector::All,
+            machines: TalkSelector::All,
+            ..TalkFilter::default()
+        });
+        assert!(
+            !seen.iter().any(|text| text.contains("channel-lease")),
+            "the board is not muxloom's own traffic: {seen:?}"
+        );
+        assert_eq!(seen.len(), 3, "two notes and the direct it sent: {seen:?}");
+        // Even to the person the machines belong to, who sees everything else.
+        let owned = texts(TalkFilter {
+            owner: true,
+            paths: TalkSelector::All,
+            machines: TalkSelector::All,
+            ..TalkFilter::default()
+        });
+        assert!(!owned.iter().any(|text| text.contains("channel-lease")));
+        // And the lease reader still finds it, by naming it.
+        let asked = texts(TalkFilter {
+            scope: Some("path".into()),
+            machines: TalkSelector::All,
+            paths: TalkSelector::Only {
+                names: vec![format!("{WIRE_PATH_PREFIX}channel-leases")],
+            },
+            ..TalkFilter::default()
+        });
+        assert_eq!(asked.len(), 1);
+
+        // Each log is kept to its own depth and its own age.
+        assert_eq!(
+            retention_for(&wire),
+            (RETAIN_PER_WIRE_ORIGIN, RETAIN_WIRE_MS)
+        );
+        assert_eq!(retention_for(&mine), (RETAIN_PER_ORIGIN, RETAIN_MS));
+
+        fs::remove_dir_all(&store.root).ok();
     }
 
     /// A catch-up batch is capped, and what it drops has to be the newest -

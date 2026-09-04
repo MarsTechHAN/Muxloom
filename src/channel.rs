@@ -2673,7 +2673,11 @@ struct Leased {
 }
 
 /// Read one note as a lease on `account`, or None when it is not one. The
-/// holder is the note's origin — the only name both machines agree on. An
+/// holder is the machine that said it — the only name both machines agree on.
+/// Read off the author rather than off the record's own origin key, which
+/// names the log the record was filed in: muxloom's own coordination notes
+/// ride a log beside the durable one, so those two stopped being the same
+/// string and a machine reading its own lease saw a stranger's. An
 /// unreadable or foreign note is simply not a lease, never an error: old
 /// muxloom versions never post these, so a note that is not ours to parse is
 /// not ours to act on.
@@ -2693,7 +2697,7 @@ fn lease_from(message: &crate::talk::TalkMessage, account: &str) -> Option<Lease
         }
     }
     (named == account && until > 0).then(|| Leased {
-        holder: message.origin.clone(),
+        holder: message.author.machine.clone(),
         until,
         cursor: cursor.to_string(),
         ts: message.ts,
@@ -3099,7 +3103,10 @@ fn take_forwarded_verdicts(runtime: &Runtime, targets: &[Target]) -> Vec<String>
         if let Some((pending, line)) = settle_approval(&mut ledger, &id, verdict) {
             debug::log(
                 "approval",
-                format!("{id} was answered on {} and settled here", note.origin),
+                format!(
+                    "{id} was answered on {} and settled here",
+                    note.author.machine
+                ),
             );
             said.push(line);
             woken.push((pending, verdict));
@@ -6326,17 +6333,23 @@ mod tests {
 
     #[test]
     fn lease_notes_parse_only_their_own_shape() {
-        fn note(origin: &str, ts: u64, text: &str) -> crate::talk::TalkMessage {
+        // A lease is filed in the log muxloom keeps its own traffic in, whose
+        // key is not the machine's: the holder is the machine that said it.
+        fn note(machine: &str, ts: u64, text: &str) -> crate::talk::TalkMessage {
+            let origin = format!("{machine}_wire");
             crate::talk::TalkMessage {
                 id: format!("{origin}:1"),
-                origin: origin.into(),
+                origin,
                 seq: 1,
                 ts,
                 scope: crate::talk::TalkScope::Path {
-                    machine: origin.into(),
+                    machine: machine.into(),
                     path: LEASE_PATH.into(),
                 },
-                author: Default::default(),
+                author: crate::talk::TalkAuthor {
+                    machine: machine.into(),
+                    ..Default::default()
+                },
                 kind: crate::talk::TalkKind::Note,
                 to: None,
                 reply_to: None,
