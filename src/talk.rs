@@ -862,6 +862,7 @@ impl TalkStore {
 
     /// Add one message to memory and to its origin's log file.
     fn file(&self, inner: &mut TalkInner, message: TalkMessage) -> Result<bool> {
+        let message_origin = message.origin.clone();
         let log = inner.logs.entry(message.origin.clone()).or_default();
         if message.seq <= log.low_water {
             return Ok(false);
@@ -876,14 +877,14 @@ impl TalkStore {
         let path = self
             .root
             .join("log")
-            .join(format!("{}.jsonl", message.origin));
+            .join(format!("{message_origin}.jsonl"));
         append_line(&path, &message)?;
         log.messages.insert(at, message);
         if log.messages.len() > RETAIN_PER_ORIGIN + COMPACT_SLACK {
             let cut = log.messages.len() - RETAIN_PER_ORIGIN;
             log.low_water = log.messages[cut - 1].seq;
             log.messages.drain(..cut);
-            rewrite_log(&path, &log.messages)?;
+            rewrite_log(&path, &message_origin, log.low_water, &log.messages)?;
         }
         Ok(true)
     }
@@ -905,7 +906,12 @@ impl TalkStore {
             }
             log.low_water = log.messages[keep - 1].seq;
             log.messages.drain(..keep);
-            rewrite_log(&root.join(format!("{origin}.jsonl")), &log.messages)?;
+            rewrite_log(
+                &root.join(format!("{origin}.jsonl")),
+                origin,
+                log.low_water,
+                &log.messages,
+            )?;
         }
         Ok(())
     }
@@ -1023,11 +1029,20 @@ fn append_line(path: &Path, message: &TalkMessage) -> Result<()> {
         .with_context(|| format!("failed to write to the talk log at {}", path.display()))
 }
 
-fn rewrite_log(path: &Path, messages: &[TalkMessage]) -> Result<()> {
+fn rewrite_log(path: &Path, origin: &str, low_water: u64, messages: &[TalkMessage]) -> Result<()> {
     let temporary = path.with_extension("jsonl.tmp");
     let mut file = File::create(&temporary)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
     restrict(&file);
+    if low_water > 0 {
+        let mut header = serde_json::to_vec(&LogHeader {
+            log: origin.to_string(),
+            dropped_through: low_water,
+        })
+        .context("failed to encode a talk log header")?;
+        header.push(b'\n');
+        file.write_all(&header)?;
+    }
     for message in messages {
         let mut line = serde_json::to_vec(message).context("failed to encode a talk message")?;
         line.push(b'\n');
@@ -1037,6 +1052,26 @@ fn rewrite_log(path: &Path, messages: &[TalkMessage]) -> Result<()> {
     drop(file);
     fs::rename(&temporary, path)
         .with_context(|| format!("failed to replace the talk log at {}", path.display()))
+}
+
+/// The first line of a rewritten log: what that log has already dropped.
+///
+/// A log knows its own [`OriginLog::low_water`] while a daemon is running, but
+/// it was only ever written down inside the records themselves — read back as
+/// "one below the oldest record still here". A log compacted down to nothing
+/// therefore forgot it completely, the origin vanished from this machine's
+/// version vector, and the next replication round asked every peer for the
+/// whole thirty days again and filed all of it a second time. Retention that
+/// only holds until the next restart is not retention.
+///
+/// Written only when there is something to say, and shaped so that a build
+/// that predates it skips the line as unparseable and falls back to deriving
+/// the same number from the records — lower, never higher, so it can cost a
+/// re-fetch but can never drop a record on the floor.
+#[derive(Debug, Serialize, Deserialize)]
+struct LogHeader {
+    log: String,
+    dropped_through: u64,
 }
 
 fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
@@ -1052,17 +1087,36 @@ fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
         {
             continue;
         }
+        // The file is named after the log it holds, which is the only thing
+        // that still says which log an emptied one was.
+        let Some(origin) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+            .filter(|stem| valid_origin(stem))
+        else {
+            continue;
+        };
         let Ok(file) = File::open(&path) else {
             continue;
         };
         let mut log = OriginLog::default();
+        let mut headed = false;
         // A half-written line is what a crash leaves behind, and the rest of
         // the log is still perfectly good: skip it rather than lose the file.
         for line in BufReader::new(file).lines().map_while(Result::ok) {
             let Ok(message) = serde_json::from_str::<TalkMessage>(&line) else {
+                if let Ok(header) = serde_json::from_str::<LogHeader>(&line)
+                    && header.log == origin
+                {
+                    headed = true;
+                    log.low_water = log.low_water.max(header.dropped_through);
+                }
                 continue;
             };
-            if !message.acceptable() {
+            // A record filed under the wrong log would share a sequence space
+            // with records that are not its own, so it is not this log's.
+            if !message.acceptable() || message.origin != origin {
                 continue;
             }
             if let Err(at) = log
@@ -1072,10 +1126,14 @@ fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
                 log.messages.insert(at, message);
             }
         }
-        if let Some(origin) = log.messages.first().map(|message| message.origin.clone()) {
-            log.low_water = log.messages.first().map_or(0, |message| message.seq - 1);
-            logs.insert(origin, log);
+        if let Some(first) = log.messages.first() {
+            log.low_water = log.low_water.max(first.seq - 1);
+        } else if !headed {
+            // Nothing held and nothing dropped: an empty file nobody has
+            // written to yet, and no reason to claim an origin over it.
+            continue;
         }
+        logs.insert(origin, log);
     }
     logs
 }
@@ -1789,6 +1847,58 @@ mod tests {
         assert_eq!(from_two, vec![3]);
 
         fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_log_compacted_to_nothing_still_says_what_it_dropped() {
+        // Retention that only holds until the next restart is not retention.
+        // A log emptied by the age cutoff used to leave an empty file, which
+        // read back as a machine this board had never heard of - so the next
+        // round asked every peer for the whole thirty days again and filed
+        // all of it a second time.
+        let store = store("watermark");
+        let root = store.root.clone();
+        let old = |seq: u64| TalkMessage {
+            id: format!("other-1234abcd:{seq}"),
+            origin: "other-1234abcd".into(),
+            seq,
+            ts: 1,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: "other-1234abcd".into(),
+                machine_label: "gpu-box".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("message {seq}"),
+        };
+        assert_eq!(store.merge(vec![old(1), old(2), old(3)]).unwrap(), 3);
+        drop(store);
+
+        // Opening compacts, and everything here is older than the window.
+        let reopened = TalkStore::open(root.clone()).unwrap();
+        assert!(reopened.read(&TalkFilter::default()).messages.is_empty());
+        assert_eq!(reopened.state().vector["other-1234abcd"], 3);
+        assert_eq!(reopened.state().low_water["other-1234abcd"], 3);
+        drop(reopened);
+
+        // And it is still said after the restart that used to forget it.
+        let restarted = TalkStore::open(root.clone()).unwrap();
+        assert_eq!(restarted.state().vector["other-1234abcd"], 3);
+        assert_eq!(
+            restarted.merge(vec![old(1), old(2), old(3)]).unwrap(),
+            0,
+            "a peer re-offering what was dropped must not refill the board"
+        );
+        // What is genuinely newer is still taken.
+        let mut fresh = old(4);
+        fresh.ts = now_ms();
+        assert_eq!(restarted.merge(vec![fresh]).unwrap(), 1);
+        assert_eq!(restarted.state().vector["other-1234abcd"], 4);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A catch-up batch is capped, and what it drops has to be the newest -
