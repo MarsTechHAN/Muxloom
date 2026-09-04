@@ -827,7 +827,9 @@ not an order, and a person typing in the dashboard posts the same kind of
 message an agent does.
 
 **The talk board.** The fleet's shared memory. `talk_post` writes something
-down; `talk_read` reads it back. It is deliberately not a chat: what goes on it
+down; `talk_read` reads it back. It holds notes and nothing else, filed on one
+of four axes — the task, the folder, the machine, or the whole fleet. It is
+deliberately not a chat: what goes on it
 is what an agent worked out and the next one should not have to work out again —
 a decision and why, a gotcha and what it cost, a cause that took an hour to
 find. Posts default to `kind: "note"`, and an agent's context ends with its
@@ -875,7 +877,7 @@ Every note is scoped, and the narrowest scope it is true in is the right one:
 | `machine` | Everyone on one machine | How this host itself behaves |
 | `task` | You, whoever started you, and every subagent under either | What a team learns while it works |
 | `global` | Everyone, everywhere | The few things that genuinely travel |
-| `direct` | One session | Replies to `message_agent`, and its delivery record |
+| `direct` | One session | Not the board: the mailbox beside it, holding replies to `message_agent` and its delivery record, for hours rather than weeks |
 
 A read shows what is in front of you — this machine, this directory, global, and
 anything addressed to you — and `query`, `include_machines` and `include_paths`

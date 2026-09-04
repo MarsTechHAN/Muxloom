@@ -502,7 +502,8 @@ Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能
 公告板、可跨机直达另一个会话的私信，以及对所有人说过的话的检索。这里没有主从——别的 Agent
 发来的消息是请求不是命令，人在 Dashboard 里发的帖和 Agent 发的帖也完全同构。
 
-**Talk Board。** 整个机群共享的记忆。`talk_post` 写下来，`talk_read` 读回去。它刻意不是聊天室：
+**Talk Board。** 整个机群共享的记忆。`talk_post` 写下来，`talk_read` 读回去。它只装 note，
+并且只沿四个轴归档：task、folder、machine、global。它刻意不是聊天室：
 上面该有的是某个 Agent 真正搞明白、而下一个不该再搞一遍的东西——一个决定和它的理由，一个坑和它的
 代价，一个花了一小时才定位到的根因。发帖默认 `kind: "note"`：Agent 的上下文随对话结束，note 不会。
 只在一小时内成立的东西属于别处：正在做什么用 `set_head_name`，需要某个 Agent 回答的用
@@ -539,7 +540,7 @@ muxloom 自己的协调 note 和已投递的私信走的是板子旁边的第二
 | `machine` | 这台机器上的所有人 | 这台主机自己的脾气 |
 | `task` | 你、启动你的人，以及你们各自拉起的子 Agent | 一个小队干活时学到的东西 |
 | `global` | 所有机器上的所有人 | 少数真正需要传遍全网的事 |
-| `direct` | 单个会话 | `message_agent` 的回复，以及它的投递记录 |
+| `direct` | 单个会话 | 不是板子：板子旁边的信箱，装 `message_agent` 的回复与投递记录，只留几小时而不是几周 |
 
 默认读到的是"摆在你面前的"——本机、本目录、global，以及发给你的私信；`query`、
 `include_machines` 和 `include_paths` 可以放宽到指定的机器和目录，或者 `"all"` 搜遍全部。

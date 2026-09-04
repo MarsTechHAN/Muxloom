@@ -589,7 +589,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              directories, or to \"all\" to look everywhere. scope \"task\" narrows it to you, \
              whoever started you, and the subagents any of you started.\n\n\
              scope \"direct\" is the exception to all of that, and the one thing here worth \
-             waiting on: it is the record of what agents said straight to each other, and it is \
+             waiting on. It is not one of the four axes and not the board: it is the mailbox of \
+             what agents said straight to each other, filed beside the board rather than on it \
+             and kept hours rather than weeks. It is read through this tool because that is \
              where a reply to your message_agent arrives. `since_cursor` takes the `cursor` from \
              a previous read and returns only what has happened since, so polling never repeats \
              itself; `wait_seconds` (up to {TALK_MAX_WAIT_SECONDS}) holds the call open until \
