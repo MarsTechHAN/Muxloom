@@ -176,9 +176,17 @@ impl TalkScope {
 #[serde(rename_all = "snake_case")]
 pub enum TalkKind {
     /// Something said to whoever is reading the scope.
+    ///
+    /// Legacy. Nothing mints one any more: the board is a memory keyed by
+    /// task, folder, machine or fleet, and a remark addressed to whoever
+    /// happens to be reading is the one thing it is not for. The variant
+    /// stays because machines running older builds still mint them and their
+    /// records have to replicate and render — dropping the variant would
+    /// leave a hole in their sequence space that every round tries to fill
+    /// forever.
     Message,
-    /// Something written down to be found later: the board doubles as the
-    /// memory a session cannot keep.
+    /// Something written down to be found later, and the only kind anything
+    /// files now: the board is the memory a session cannot keep.
     Note,
     /// A message delivered straight into one session, recorded here so the
     /// board shows what agents said to each other and delivery can be audited.
@@ -2229,6 +2237,50 @@ mod tests {
         other.author.voice.session_id = Some("session-2".into());
         store.post(other).unwrap();
         assert_eq!(store.read(&TalkFilter::default()).messages.len(), 4);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn an_older_machines_message_still_replicates_and_reads() {
+        // Nothing mints a message any more, but a machine on an older build
+        // does, and its records have to arrive, read back and replicate like
+        // anything else. Dropping the kind would leave a hole in that
+        // machine's sequence space that every round would try to fill forever.
+        let store = store("legacy-kind");
+        let far = TalkMessage {
+            id: "other-1234abcd:1".into(),
+            origin: "other-1234abcd".into(),
+            seq: 1,
+            ts: now_ms(),
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: "other-1234abcd".into(),
+                machine_label: "gpu-box".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: "said on a build that still had the other kind".into(),
+        };
+        assert_eq!(store.merge(vec![far.clone()]).unwrap(), 1);
+        let page = store.read(&TalkFilter::default());
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].kind, TalkKind::Message);
+        assert_eq!(store.state().vector["other-1234abcd"], 1);
+        // And a reader can still ask for that kind by name.
+        assert_eq!(
+            store
+                .read(&TalkFilter {
+                    kinds: vec!["message".into()],
+                    ..TalkFilter::default()
+                })
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(TalkKind::parse("message").unwrap(), TalkKind::Message);
 
         fs::remove_dir_all(&store.root).ok();
     }

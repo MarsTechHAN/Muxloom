@@ -4297,7 +4297,9 @@ fn handle(
                     machine: String::new(),
                 },
                 author: desk.author(&called, &binding.id),
-                kind: crate::talk::TalkKind::Message,
+                // A person writing on the board is writing it down, the same
+                // as anybody else. The board holds notes and nothing else.
+                kind: crate::talk::TalkKind::Note,
                 to: None,
                 reply_to: None,
                 text,

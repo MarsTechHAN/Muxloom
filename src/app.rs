@@ -6873,10 +6873,11 @@ impl App {
             .collect()
     }
 
-    /// Say something on the board as the person at the keyboard. It is minted
+    /// Write something on the board as the person at the keyboard. It is minted
     /// by the local daemon like any other post and replicated from there, so a
-    /// human's message and an agent's are the same thing on every machine that
-    /// receives it.
+    /// person's note and an agent's are the same thing on every machine that
+    /// receives it — a note either way, because the board is a memory and not
+    /// a place to say something to whoever is looking.
     fn post_board(&mut self, text: String, reply_to: Option<String>, scope: TalkScope) {
         let draft = TalkDraft {
             scope,
@@ -6884,7 +6885,7 @@ impl App {
                 voice: human_voice(),
                 ..TalkAuthor::default()
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to,
             text,
@@ -21178,8 +21179,9 @@ mod tests {
         };
         assert_eq!(draft.text, "ship it");
         // Same store, same replication, same shape — the only difference is
-        // that a person has no session to speak from.
-        assert_eq!(draft.kind, TalkKind::Message);
+        // that a person has no session to speak from. A note either way: the
+        // board holds what is written down, whoever writes it.
+        assert_eq!(draft.kind, TalkKind::Note);
         assert_eq!(draft.scope, TalkScope::Global);
         assert!(draft.author.voice.human);
         assert_eq!(draft.author.voice.session_id, None);
