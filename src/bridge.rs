@@ -52,6 +52,15 @@ const LOCAL_BRIDGE_COMPLAINTS: usize = 8;
 const LOCAL_BRIDGE_COMPLAINT_GRACE: Duration = Duration::from_millis(100);
 const COMPANION_RELEASE_ROOT: &str =
     "https://github.com/MarsTechHAN/Muxloom/releases/latest/download";
+/// The rolling tag's name, as the asset URL and the cache directory both spell
+/// it. Named here rather than taken from the updater because the companion
+/// build has no updater in it; the two are held together by a test.
+const COMPANION_NIGHTLY_STREAM: &str = "nightly";
+/// Where the rolling nightly hangs its assets. `releases/latest` skips it on
+/// purpose - it is a prerelease - which is why a nightly controller has to ask
+/// for it by name.
+const COMPANION_NIGHTLY_ROOT: &str =
+    "https://github.com/MarsTechHAN/Muxloom/releases/download/nightly";
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
@@ -2001,6 +2010,38 @@ fn exchange_companion_pull(
     bail!("invalid bootstrap pull response from {alias}: {status}")
 }
 
+/// Which release a companion is fetched from: the rolling nightly tag for a
+/// nightly controller, the newest tagged release for anything else.
+///
+/// A build follows the stream it came from, exactly as the updater does. A
+/// nightly reading `releases/latest` could never carry a remote past the last
+/// tagged release however far the fleet had moved on - it would fetch the very
+/// build the remote was already running, find the fingerprints equal, and pin
+/// the machine there.
+fn companion_release_root() -> &'static str {
+    if following_the_nightly_stream() {
+        COMPANION_NIGHTLY_ROOT
+    } else {
+        COMPANION_RELEASE_ROOT
+    }
+}
+
+/// Whether this build follows the nightly stream.
+///
+/// Only a controller ever resolves a companion asset, and only a controller
+/// build carries the updater that knows the streams apart. The companion beside
+/// a session answers no and never asks.
+fn following_the_nightly_stream() -> bool {
+    #[cfg(feature = "controller")]
+    {
+        crate::update::running_a_nightly()
+    }
+    #[cfg(not(feature = "controller"))]
+    {
+        false
+    }
+}
+
 /// The release URL a target can fetch this exact asset from, if the published
 /// checksum says the release holds the same bytes.
 fn companion_release_match(
@@ -2013,7 +2054,7 @@ fn companion_release_match(
     let asset_name = format!("muxloomd-{triple}{}", executable_suffix(os));
     let digest = sha256_file(asset).ok()?;
     let published = controller_fetch_text(
-        &format!("{COMPANION_RELEASE_ROOT}/{asset_name}.sha256"),
+        &format!("{}/{asset_name}.sha256", companion_release_root()),
         &options.download_environment,
     )
     .ok()
@@ -2029,7 +2070,7 @@ fn companion_release_match(
         return None;
     }
     Some((
-        format!("{COMPANION_RELEASE_ROOT}/{asset_name}"),
+        format!("{}/{asset_name}", companion_release_root()),
         digest,
         triple,
     ))
@@ -2282,11 +2323,19 @@ fn download_latest_companion_at(
         "muxloomd-{triple}{}",
         executable_suffix_for_name(executable)
     );
-    let cache = cache_root.join(triple);
+    let cache = if following_the_nightly_stream() {
+        // Two controllers of different streams share one cache directory, and
+        // the asset name is the same in both releases. Offline, the verified
+        // cache is used as-is - so a nightly must not be handed the stable
+        // companion another install left there.
+        cache_root.join(triple).join(COMPANION_NIGHTLY_STREAM)
+    } else {
+        cache_root.join(triple)
+    };
     fs::create_dir_all(&cache)
         .with_context(|| format!("failed to create companion cache {}", cache.display()))?;
     let destination = cache.join(executable);
-    let checksum_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}.sha256");
+    let checksum_url = format!("{}/{asset_name}.sha256", companion_release_root());
     progress(TaskProgress::pending(format!(
         "Checking {triple} companion release"
     )));
@@ -2318,7 +2367,7 @@ fn download_latest_companion_at(
     }
 
     let partial = cache.join(format!(".{executable}.partial-{}", std::process::id()));
-    let asset_url = format!("{COMPANION_RELEASE_ROOT}/{asset_name}");
+    let asset_url = format!("{}/{asset_name}", companion_release_root());
     let label = format!("Downloading {triple} companion");
     let result = controller_download(&asset_url, &partial, environment, |completed, total| {
         progress(TaskProgress::bytes(&label, completed, total));
@@ -3433,6 +3482,20 @@ mod tests {
             asset
         );
         fs::remove_file(asset).unwrap();
+    }
+
+    #[test]
+    fn companions_are_fetched_from_the_stream_this_build_came_from() {
+        // The nightly is a prerelease, so `releases/latest` steps over it: the
+        // tag has to be named, and naming it wrong would send a whole fleet of
+        // nightlies back to the last tagged release.
+        assert_eq!(COMPANION_NIGHTLY_STREAM, crate::update::NIGHTLY_TAG);
+        assert!(COMPANION_NIGHTLY_ROOT.ends_with(COMPANION_NIGHTLY_STREAM));
+        assert_ne!(COMPANION_RELEASE_ROOT, COMPANION_NIGHTLY_ROOT);
+        assert_eq!(
+            companion_release_root() == COMPANION_NIGHTLY_ROOT,
+            crate::update::running_a_nightly()
+        );
     }
 
     #[test]
