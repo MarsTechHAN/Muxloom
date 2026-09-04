@@ -531,7 +531,8 @@ and let them carry it, or ask them to start the next session wider.
 ## Ask the human first
 
 - Deleting a session: `delete_session` destroys its history for good.
-  `archive_session` keeps it.
+  `archive_session` keeps it. Both take the sessions that one started down with
+  it, so closing a master closes its whole fleet.
 - Touching a session you did not launch: it is someone else's work.
 - Enabling or disabling a machine, or editing SSH configuration: that is the
   user's own setup, not muxloom's.

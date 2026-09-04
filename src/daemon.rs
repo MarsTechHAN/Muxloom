@@ -3692,38 +3692,17 @@ mod platform {
                 },
             ),
             DaemonRequest::Archive { session_id } => {
-                if let Ok(session) = daemon_session(state, &session_id) {
-                    session.archive()?;
-                } else {
-                    persisted_session(state, &session_id)?.archive()?;
-                }
+                // The one that was asked for goes first, then everything it
+                // started: a master told that a child has just died is liable
+                // to start a replacement, and a replacement started here would
+                // not be in the list of what to close.
+                archive_one(state, &session_id)?;
+                close_fleet_below(state, &session_id, Closing::Archive);
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::Delete { session_id } => {
-                let live = state
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&session_id);
-                if let Some(session) = live {
-                    session.stop()?;
-                    let _ = fs::remove_file(&session.history_path);
-                    // Not a plain remove: a round that took this handle before
-                    // the map lost it can still be about to write the record,
-                    // and a write that lands after the delete brings the
-                    // session back for every daemon that starts afterwards.
-                    session.discard();
-                } else {
-                    let session = state
-                        .persisted_sessions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&session_id)
-                        .with_context(|| format!("unknown daemon session {session_id}"))?;
-                    let _ = fs::remove_file(&session.history_path);
-                    session.discard();
-                }
-                remove_scratch_dir(&state.paths, &session_id);
+                delete_one(state, &session_id)?;
+                close_fleet_below(state, &session_id, Closing::Delete);
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
             DaemonRequest::SetLabel { session_id, label } => {
@@ -5114,6 +5093,145 @@ mod platform {
             }
         }
         moved
+    }
+
+    /// Whether a fleet is being put down for the day or destroyed for good.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Closing {
+        Archive,
+        Delete,
+    }
+
+    /// Close everything started under `root_id` the same way `root_id` itself
+    /// has just been closed, deepest first.
+    ///
+    /// A subagent is work its master handed out. When the master goes the
+    /// child has nobody left to report to and nobody reading what it says, and
+    /// left running it goes on spending a model on a question whose answer is
+    /// now addressed to a session that no longer exists. So closing a master
+    /// closes its fleet, however many levels deep it goes.
+    ///
+    /// A child on another machine is another daemon's to close: only the ids
+    /// this one holds are here to be walked. A child that will not close is
+    /// reported and stepped over, because the master is already gone and
+    /// stopping half way through would leave more behind than going on does.
+    fn close_fleet_below(state: &DaemonState, root_id: &str, how: Closing) {
+        for child in fleet_below(state, root_id) {
+            // Nothing is kept of a temporary chat, so there is no archive for
+            // one to move into. Asked for by hand that is refused and the
+            // caller is told to delete it instead; but a scratch session under
+            // a master that is going down cannot be left running for want of a
+            // record to keep.
+            let closed = if how == Closing::Delete || is_temporary_session_id(&child) {
+                delete_one(state, &child)
+            } else {
+                archive_one(state, &child)
+            };
+            if let Err(error) = closed {
+                eprintln!("muxloomd could not close {child} under {root_id}: {error:#}");
+            }
+        }
+    }
+
+    /// Everything hanging off `root_id` by its recorded parent link, deepest
+    /// first, so a fleet comes down leaves before trunk and no child is left
+    /// naming a master that is already gone.
+    ///
+    /// Both maps are read: an archived session in the middle of a chain still
+    /// has live subagents under it, and skipping the archive would strand
+    /// them. `seen` bounds a link that somehow points back up its own chain.
+    fn fleet_below(state: &DaemonState, root_id: &str) -> Vec<String> {
+        let mut parentage: Vec<(String, Option<String>)> = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|session| session.parentage())
+            .collect();
+        parentage.extend(
+            state
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .map(|session| session.parentage()),
+        );
+        fleet_under(&parentage, root_id)
+    }
+
+    /// The walk itself, over nothing but a list of `(session, its parent)`.
+    ///
+    /// Deepest generation first, and each generation in id order, so a fleet
+    /// comes down leaves before trunk and the same fleet always comes down in
+    /// the same order. `seen` bounds a chain that points back up itself, which
+    /// a rewritten parent link can leave behind; the root is seen from the
+    /// start, so a link pointing at it closes the loop instead of repeating it.
+    fn fleet_under(parentage: &[(String, Option<String>)], root_id: &str) -> Vec<String> {
+        let mut generations: Vec<Vec<String>> = Vec::new();
+        let mut seen = BTreeSet::from([root_id.to_string()]);
+        let mut frontier = vec![root_id.to_string()];
+        while !frontier.is_empty() {
+            let mut next: Vec<String> = parentage
+                .iter()
+                .filter(|(id, parent)| {
+                    !seen.contains(id)
+                        && parent
+                            .as_deref()
+                            .is_some_and(|parent| frontier.iter().any(|held| held == parent))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            next.sort();
+            next.dedup();
+            if next.is_empty() {
+                break;
+            }
+            for id in &next {
+                seen.insert(id.clone());
+            }
+            generations.push(next.clone());
+            frontier = next;
+        }
+        generations.into_iter().rev().flatten().collect()
+    }
+
+    /// Put one session down: stopped, kept, and listed under Archived.
+    fn archive_one(state: &DaemonState, session_id: &str) -> Result<()> {
+        if let Ok(session) = daemon_session(state, session_id) {
+            session.archive()
+        } else {
+            persisted_session(state, session_id)?.archive()
+        }
+    }
+
+    /// Destroy one session: stop whatever is running and drop its history and
+    /// its record for good.
+    fn delete_one(state: &DaemonState, session_id: &str) -> Result<()> {
+        let live = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+        if let Some(session) = live {
+            session.stop()?;
+            let _ = fs::remove_file(&session.history_path);
+            // Not a plain remove: a round that took this handle before the map
+            // lost it can still be about to write the record, and a write that
+            // lands after the delete brings the session back for every daemon
+            // that starts afterwards.
+            session.discard();
+        } else {
+            let session = state
+                .persisted_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id)
+                .with_context(|| format!("unknown daemon session {session_id}"))?;
+            let _ = fs::remove_file(&session.history_path);
+            session.discard();
+        }
+        remove_scratch_dir(&state.paths, session_id);
+        Ok(())
     }
 
     /// The tail of the first `prefix` bytes of a history file, bounded by
@@ -8642,6 +8760,71 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_fleet_comes_down_deepest_first_and_stops_at_its_own_edge() {
+            let link =
+                |id: &str, parent: Option<&str>| (id.to_string(), parent.map(str::to_string));
+            let parentage = [
+                link("master", None),
+                link("child-b", Some("master")),
+                link("child-a", Some("master")),
+                link("grandchild", Some("child-a")),
+                link("great-grandchild", Some("grandchild")),
+                // Another master's work, and a child of it: neither is under
+                // the fleet being walked.
+                link("stranger", None),
+                link("stranger-child", Some("stranger")),
+                // A child of a child that was itself put down long ago: the
+                // archive is walked too, or this one would be stranded.
+                link("late-child", Some("child-b")),
+            ];
+
+            let order = fleet_under(&parentage, "master");
+            assert_eq!(
+                order,
+                vec![
+                    "great-grandchild",
+                    "grandchild",
+                    "late-child",
+                    "child-a",
+                    "child-b",
+                ],
+                "deepest generation first, each generation in id order"
+            );
+
+            // Walking from the middle takes only what hangs off the middle.
+            assert_eq!(
+                fleet_under(&parentage, "child-a"),
+                vec!["great-grandchild", "grandchild"]
+            );
+            // A session with nothing under it takes nothing with it.
+            assert!(fleet_under(&parentage, "stranger-child").is_empty());
+            // A session nobody here has heard of has no fleet, not an error.
+            assert!(fleet_under(&parentage, "elsewhere").is_empty());
+        }
+
+        #[test]
+        fn a_parent_link_that_points_back_up_its_own_chain_still_terminates() {
+            let link =
+                |id: &str, parent: Option<&str>| (id.to_string(), parent.map(str::to_string));
+            // A rewritten link left a ring: master -> child -> grandchild ->
+            // child. Every session in it is closed once and the walk ends.
+            let parentage = [
+                link("child", Some("master")),
+                link("grandchild", Some("child")),
+                link("child", Some("grandchild")),
+                // And one pointing straight back at the root.
+                link("loop-to-root", Some("grandchild")),
+                link("master", Some("loop-to-root")),
+            ];
+            let order = fleet_under(&parentage, "master");
+            assert_eq!(order, vec!["loop-to-root", "grandchild", "child"]);
+            assert!(
+                !order.contains(&"master".to_string()),
+                "the root is closed by its caller, not by the walk"
+            );
+        }
 
         #[test]
         fn a_history_page_widens_its_window_until_it_reaches_the_rows_asked_for() {

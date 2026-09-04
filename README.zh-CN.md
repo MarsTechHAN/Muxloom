@@ -282,7 +282,7 @@ shell 还有子进程在等就算 Working（静默链接中的编译也是编译
 | `t`（Agents） | 选择一个 Runtime，在专属临时目录启动无历史的 Temporal Chat，可选填别名 |
 | `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
-| `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除 |
+| `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除。它起的子 Agent 一并关闭，光标上移一格而不是跳回顶部 |
 | `a` | 展开或收起 Archived |
 | `/` / `Ctrl-p` | 搜索全部会话历史 |
 | `b` | 打开所有机器和 Agent 共用的 Talk Board；有未读时 Footer 会显示 `● N` |
@@ -456,6 +456,13 @@ Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）�
 
 通过 MCP 启动的会话就是普通托管会话：会出现在 Dashboard 中、在 MCP 客户端退出后继续运
 行，也要像其他会话一样归档或删除。未启用的机器不会被触碰——指向它的调用会被拒绝。
+
+关掉一个会话，会连同它起的会话、以及那些会话起的会话一并关掉，一直到底。主 Agent 没了，
+子 Agent 就没人可汇报、也没人看它说什么，所以归档主 Agent 会归档整支队伍，删除主 Agent
+则连同删除——队伍按记录下来的 parent 链在持有它的那台机器上遍历，起在别的机器上的子
+Agent 由那台机器自己关。随主 Agent 一起下线的 Temporal Chat 直接销毁而不是归档，因为它
+本来就什么都不留。整支归档的队伍可以一起回来：用 muxloom id 恢复主 Agent 时，记录在它名
+下的子 Agent 会跟着重新起来。
 
 Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能超过它自己持有的权限。
 `may_message` 决定新会话能写到多远——`parent` 只能回复起它的 Agent、以及它自己起的会

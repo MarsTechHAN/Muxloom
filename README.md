@@ -468,7 +468,7 @@ the full categorized help inside the TUI.
 | `t` in Agents | Choose a runtime for a no-history Temporal Chat, and optionally name it |
 | `p` in Agents | Configure local port forwarding for the selected machine |
 | `Enter` | Open the selected terminal or confirm the current form |
-| `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent |
+| `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent. The subagents it started go with it, and the cursor steps up one row rather than back to the top |
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
 | `b` | Open the talk board every machine and agent shares; the footer shows `● N` when it has unread messages |
@@ -753,6 +753,16 @@ Sessions launched over MCP are ordinary managed sessions: they appear in the
 dashboard, survive the MCP client exiting, and are archived or deleted like
 any other. A machine that is not enabled stays untouched — calls addressing
 it are refused.
+
+Closing a session closes the sessions it started, and theirs, all the way
+down. A subagent whose master is gone has nobody left to report to and nobody
+reading what it says, so archiving a master archives its fleet and deleting one
+deletes it — the fleet is walked by the recorded parent link, on the machine
+that holds it, and a subagent started on another machine is that machine's to
+close. A Temporal Chat under a master that is going down is dropped rather than
+archived, because nothing is kept of one anyway. An archived fleet comes back
+together: resuming the master by its muxloom id relaunches the children
+recorded under it.
 
 An agent launching a subagent also says what that subagent may do, and cannot
 say more than it holds itself. `may_message` is how far the new session may

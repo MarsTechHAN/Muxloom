@@ -311,7 +311,8 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          when it is done; a session you did not launch is someone else's — do not archive, \
          delete, or reconfigure it unless you were asked to.\n\
          - delete_session destroys a session's history irreversibly. Ask the human first; \
-         archive_session keeps the history.\n\
+         archive_session keeps the history. Either one takes the whole fleet under that session \
+         with it, so closing a master closes every subagent it started.\n\
          {manage}\
          - Typing into a session interrupts whoever is using it. Check `working` and \
          `needs_attention` in list_sessions before you type, and keep the interruption short.\n\n\
@@ -818,6 +819,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "archive_session",
         description: "Retire a live session but keep its history searchable and resumable. \
+                      Everything that session started goes with it, however many levels deep: a \
+                      subagent whose master has been put down has nobody left to report to. \
                       Temporary sessions cannot be archived — delete them instead."
             .into(),
         input_schema: schema_across(
@@ -831,7 +834,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "delete_session",
         description: "Destroy a session: needs explicit human authorization. Kills the process \
-                      and deletes its history and metadata, irreversibly. Delete only sessions \
+                      and deletes its history and metadata, irreversibly, and does the same to \
+                      every session it started, however many levels deep. Delete only sessions \
                       you launched yourself, or ones the human named; archive_session keeps the \
                       history instead."
             .into(),
@@ -8510,6 +8514,68 @@ mod tests {
                 .filter(|entry| entry["session_id"] == json!(id))
                 .count();
             assert_eq!(holders, 1);
+        }
+
+        #[test]
+        fn closing_a_master_closes_every_session_under_it() {
+            let _env_lock = HEAD_NAME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let script = fake_claude_script("fleet-close");
+            let mut surface = surface_with("fleet-close", claude_config(&script));
+            let workdir = std::env::temp_dir().to_str().unwrap().to_string();
+            let launched = |surface: &mut DaemonControl, caller: Option<&str>, label: &str| {
+                let _caller = EnvScope::set("MUXLOOM_SESSION_ID", caller);
+                let started: Value = serde_json::from_str(&call(
+                    surface,
+                    "launch_session",
+                    json!({ "kind": "claude", "path": workdir, "label": label }),
+                ))
+                .unwrap();
+                started["session_id"].as_str().unwrap().to_string()
+            };
+
+            // A master, a subagent under it, one under that, and a session
+            // that has nothing to do with any of them.
+            let master = launched(&mut surface, None, "master");
+            let child = launched(&mut surface, Some(&master), "child");
+            let grandchild = launched(&mut surface, Some(&child), "grandchild");
+            let bystander = launched(&mut surface, None, "bystander");
+
+            call(
+                &mut surface,
+                "archive_session",
+                json!({ "session_id": master }),
+            );
+
+            let listed: Value = serde_json::from_str(&call(
+                &mut surface,
+                "list_sessions",
+                json!({ "include_archived": true }),
+            ))
+            .unwrap();
+            let closed = |id: &str| -> bool {
+                listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["session_id"] == json!(id))
+                    .unwrap_or_else(|| panic!("{id} is not listed: {listed:#}"))["archived"]
+                    == json!(true)
+            };
+            assert!(closed(&master), "the master itself is closed");
+            assert!(
+                closed(&child),
+                "a subagent has nobody to report to once its master is closed: {listed:#}"
+            );
+            assert!(
+                closed(&grandchild),
+                "the walk reaches every level, not just the first: {listed:#}"
+            );
+            assert!(
+                !closed(&bystander),
+                "a session outside the fleet is left alone: {listed:#}"
+            );
         }
 
         #[test]

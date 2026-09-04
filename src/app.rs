@@ -1574,6 +1574,14 @@ pub struct App {
     /// session working inside it is a moderator; that is the only marker.
     moderator_state_dir: PathBuf,
     pub selected_session_id: Option<String>,
+    /// Where the cursor goes once the session being closed leaves the list:
+    /// the row above it, taken down as the close is asked for, because by the
+    /// time the machine says the session is gone there is no longer a row
+    /// above it to find. Closing something is not a reason to be thrown back
+    /// to the top of the list. `None` when nothing was closed, when the
+    /// closed session was not the highlighted one, and when it was the first
+    /// row and so has nothing above it.
+    selection_after_close: Option<String>,
     /// Last highlighted session for each machine. Machine navigation restores
     /// this before falling back to the first visible session.
     selected_sessions_by_target: HashMap<String, String>,
@@ -1811,6 +1819,7 @@ impl App {
             moderators_selected: false,
             moderator_state_dir: state_dir.clone(),
             selected_session_id: None,
+            selection_after_close: None,
             selected_sessions_by_target: HashMap::new(),
             history: HistoryPage::default(),
             history_message: "Select an agent to load its terminal history.".into(),
@@ -5408,6 +5417,7 @@ impl App {
             } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 self.forced_update_ack(&target_id);
+                let landing = self.selection_after_close.take();
                 match result {
                     Ok(()) => {
                         self.note_removed_session(&target_id, &session_id);
@@ -5418,7 +5428,18 @@ impl App {
                         }) {
                             self.close_terminal();
                         }
-                        self.selected_session_id = None;
+                        // One row up, not back to the top: the cursor lands on
+                        // whatever sat above the session that just closed, and
+                        // only falls to the first row when there was nothing
+                        // above it. A session closed while the cursor was
+                        // somewhere else does not move the cursor at all.
+                        match landing {
+                            Some(above) => self.select_session(above),
+                            None if self.selected_session_id.as_deref() == Some(&session_id) => {
+                                self.selected_session_id = None
+                            }
+                            None => {}
+                        }
                         self.refresh_target(&target_id);
                     }
                     Err(error) => self.set_error(format!("Close failed: {}", short_error(&error))),
@@ -5431,11 +5452,15 @@ impl App {
             } => {
                 self.busy_operations = self.busy_operations.saturating_sub(1);
                 self.forced_update_ack(&target_id);
+                let landing = self.selection_after_close.take();
                 match result {
                     Ok(()) => {
                         if self.selected_session_id.as_deref() == Some(&session_id) {
                             self.close_terminal();
                             self.history = HistoryPage::default();
+                        }
+                        if let Some(above) = landing {
+                            self.select_session(above);
                         }
                         // The archive stays as the user left it: archiving is
                         // how a session gets out of the way, so unfolding the
@@ -10597,8 +10622,12 @@ impl App {
     /// Remove a file watch by its id and restore selection to a real session.
     fn remove_file_watch(&mut self, id: &str) {
         if let Some(index) = self.file_watches.iter().position(|w| w.id == id) {
+            let landing = self.cursor_landing_for(id, true);
             let watch = self.file_watches.remove(index);
             self.selected_session_id = None;
+            if let Some(above) = landing {
+                self.select_session(above);
+            }
             self.status_message = format!("Stopped watching {}", watch.label);
             self.ensure_session_selection();
         }
@@ -11652,6 +11681,10 @@ impl App {
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
+        // An archived row is still a row while the archive is open, and the
+        // cursor is welcome to follow it down there. Collapsed, it leaves the
+        // list, and the cursor needs somewhere of its own to go.
+        self.selection_after_close = self.cursor_landing_for(session_id, !self.state.show_archived);
         if self
             .worker
             .requests
@@ -11698,6 +11731,7 @@ impl App {
         let Some(target) = self.target(&session.target_id).cloned() else {
             return;
         };
+        self.selection_after_close = self.cursor_landing_for(session_id, true);
         if self
             .worker
             .requests
@@ -11710,6 +11744,37 @@ impl App {
             self.busy_operations += 1;
             self.status_message = "Closing agent session...".into();
         }
+    }
+
+    /// Where to leave the cursor when `session_id` is closed, given whether
+    /// closing it takes its row out of the list.
+    ///
+    /// Only the highlighted row moves the cursor: closing something else -
+    /// a session named by number, a subagent going down with its master -
+    /// leaves the cursor where the person put it.
+    fn cursor_landing_for(&self, session_id: &str, row_leaves: bool) -> Option<String> {
+        if !row_leaves || self.selected_session_id.as_deref() != Some(session_id) {
+            return None;
+        }
+        self.row_above(session_id)
+    }
+
+    /// The row directly above `id` in the agent list.
+    ///
+    /// The list walked here is the one the arrow keys walk - the file watches
+    /// pinned above the sessions, then the sessions as the tree draws them -
+    /// so "one row up" means the same thing to this as it does to a finger on
+    /// the up key. `None` for the first row, which has nothing above it.
+    fn row_above(&self, id: &str) -> Option<String> {
+        let sessions = self.visible_sessions();
+        let mut ids: Vec<&str> = self
+            .file_watches
+            .iter()
+            .map(|watch| watch.id.as_str())
+            .collect();
+        ids.extend(sessions.iter().map(|session| session.id.as_str()));
+        let position = ids.iter().position(|row| *row == id)?;
+        position.checked_sub(1).map(|above| ids[above].to_string())
     }
 
     /// Write down that muxloom removed this session itself, so the local backup
@@ -20374,6 +20439,79 @@ mod tests {
             },
         );
         (app, request_rx)
+    }
+
+    /// Closing an agent leaves the cursor beside where that agent was. It used
+    /// to drop the selection entirely, and the next refresh put it back on the
+    /// first row — so closing the bottom of a long list threw the reader all
+    /// the way to the top of it.
+    #[test]
+    fn closing_an_agent_steps_the_cursor_up_one_row() {
+        let (mut app, _requests) = board_app();
+        let row = |id: &str, created_at: u64, parent: Option<&str>| AgentSession {
+            created_at,
+            parent: parent.map(Into::into),
+            needs_attention: false,
+            attention_reason: None,
+            ..waiting_session(id, "")
+        };
+        // One folder, newest first, with a subagent indented under its master.
+        app.sessions = vec![
+            row("lead", 4, None),
+            row("helper", 3, Some("lead")),
+            row("middle", 2, None),
+            row("trailer", 1, None),
+        ];
+        let listed = |app: &App| {
+            app.visible_sessions()
+                .iter()
+                .map(|session| session.id.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&app), ["lead", "helper", "middle", "trailer"]);
+        let closed = |app: &mut App, id: &str| {
+            app.delete_session(id);
+            app.handle_worker_event(Event::Killed {
+                target_id: "local".into(),
+                session_id: id.into(),
+                result: Ok(()),
+            });
+            // What the next refresh brings back: the closed row is gone.
+            app.sessions.retain(|session| session.id != id);
+            app.ensure_session_selection();
+        };
+
+        // The last row goes: the cursor steps onto the one above it.
+        app.selected_session_id = Some("trailer".into());
+        closed(&mut app, "trailer");
+        assert_eq!(app.selected_session_id.as_deref(), Some("middle"));
+
+        // "One row up" is a row of the list as drawn, so a subagent indented
+        // under its master is as good a landing as any other row.
+        closed(&mut app, "middle");
+        assert_eq!(app.selected_session_id.as_deref(), Some("helper"));
+
+        // Closing something that is not highlighted leaves the cursor alone.
+        app.sessions.push(row("stranger", 5, None));
+        assert_eq!(listed(&app), ["stranger", "lead", "helper"]);
+        closed(&mut app, "stranger");
+        assert_eq!(app.selected_session_id.as_deref(), Some("helper"));
+
+        // And the top row has nothing above it, so closing it falls back to
+        // the first row that is left.
+        app.selected_session_id = Some("lead".into());
+        app.delete_session("lead");
+        app.handle_worker_event(Event::Killed {
+            target_id: "local".into(),
+            session_id: "lead".into(),
+            result: Ok(()),
+        });
+        // A master takes its fleet with it, so both rows go at once.
+        app.sessions
+            .retain(|session| session.id != "lead" && session.id != "helper");
+        app.sessions.push(row("last-one", 6, None));
+        app.ensure_session_selection();
+        assert_eq!(app.selected_session_id.as_deref(), Some("last-one"));
     }
 
     /// The Task tab is the one view keyed to the agent list rather than to the
