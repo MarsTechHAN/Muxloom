@@ -26,7 +26,9 @@ use crate::{
         ResumeCandidate, SearchResult, Target, TargetStatus, TaskProgress,
     },
     port_forward::{PortForwardManager, PortForwardState, PortForwardSummary},
-    runtime::{Runtime, WAITING_FOR_INPUT, dialog_question, is_temporary_session_id},
+    runtime::{
+        Runtime, WAITING_FOR_INPUT, dialog_question, is_daemon_session_id, is_temporary_session_id,
+    },
     ssh_config,
     talk::{TalkAuthor, TalkDraft, TalkKind, TalkMessage, TalkPage, TalkScope, TalkVoice},
     terminal_session::TerminalSession,
@@ -468,6 +470,7 @@ pub struct PendingInstallLaunch {
     resume_id: Option<String>,
     initial_prompt: Option<String>,
     remove_archive_session_id: Option<String>,
+    revive: Option<String>,
 }
 
 /// An attach running on a background thread. Attaching dials the daemon bridge
@@ -578,6 +581,11 @@ pub struct ResumeForm {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// The archived record this picker was opened for, when it was: the
+    /// conversation picked here is that record coming back on its own
+    /// number, not a new session beside it. "New" and a reference to another
+    /// runtime's history are new sessions whatever this says.
+    pub revive: Option<String>,
     /// Cross-machine reference panel: search across every machine's backed-up
     /// history and reference one that is not on this machine. Collapsed until
     /// the user types a query.
@@ -2354,6 +2362,10 @@ impl App {
         for (pending, resume_id) in launches {
             let command = self.config.command_for(&target.id, pending.kind).clone();
             let environment = self.config.environment_for(&target.id).unwrap_or_default();
+            // A daemon record comes back as itself; only a legacy tmux
+            // session has to be a new launch, with the old entry then
+            // removed or kept as the setting says.
+            let in_place = is_daemon_session_id(&pending.session_id);
             let request = LaunchRequest {
                 target: target.clone(),
                 kind: pending.kind,
@@ -2361,20 +2373,19 @@ impl App {
                 label: pending.label,
                 temporary: false,
                 resume_id: Some(resume_id),
+                revive: in_place.then(|| pending.session_id.clone()),
                 initial_prompt: None,
                 // A person at the dashboard is nobody's subagent.
                 parent: None,
                 powers: None,
             };
-            let remove_archive_session_id = self
-                .state
-                .remove_archive_after_resume
-                .then_some(pending.session_id);
+            let remove_archive_session_id =
+                (!in_place && self.state.remove_archive_after_resume).then_some(pending.session_id);
             if self
                 .worker
                 .requests
                 .send(Request::Launch {
-                    request,
+                    request: Box::new(request),
                     command,
                     environment,
                     remove_archive_session_id,
@@ -5401,6 +5412,7 @@ impl App {
                                 pending.resume_id,
                                 pending.initial_prompt,
                                 pending.remove_archive_session_id,
+                                pending.revive,
                             );
                         }
                     }
@@ -5661,13 +5673,18 @@ impl App {
                                     of_kind.len()
                                 ),
                             );
+                            // A daemon record revives in place, so there is
+                            // no superseded archive to remove; the toggle is
+                            // only a legacy tmux session's.
+                            let in_place = is_daemon_session_id(&pending.source_session_id);
                             if let Some(candidate) = chosen {
                                 self.modal = Some(Modal::ConfirmArchivedResume {
                                     source_session_id: pending.source_session_id,
                                     launch: pending.launch,
                                     resume_id: candidate.id.clone(),
                                     summary: candidate.summary().to_string(),
-                                    remove_archive: self.state.remove_archive_after_resume,
+                                    remove_archive: !in_place
+                                        && self.state.remove_archive_after_resume,
                                 });
                             } else if !of_kind.is_empty() {
                                 // Several conversations in this folder and no way
@@ -5683,6 +5700,7 @@ impl App {
                                     selected: 1,
                                     loading: false,
                                     error: Some(note),
+                                    revive: in_place.then_some(pending.source_session_id),
                                     query: String::new(),
                                     history_hits: Vec::new(),
                                     history_selected: 0,
@@ -6141,7 +6159,19 @@ impl App {
                         match launch {
                             Some(launch) => {
                                 let kind = launch.kind;
-                                self.submit_launch(launch, Some(restored.resume_id), None, None);
+                                // Back on the number it had: the machine has
+                                // no record under it any more, and a launch
+                                // that asks for it writes the conversation
+                                // back where it was listed from.
+                                let revive =
+                                    is_daemon_session_id(&session_id).then(|| session_id.clone());
+                                self.submit_launch(
+                                    launch,
+                                    Some(restored.resume_id),
+                                    None,
+                                    None,
+                                    revive,
+                                );
                                 self.status_message = format!(
                                     "Restored {} of history to {target_id} - resuming {kind}...",
                                     crate::ui::format_bytes(restored.bytes)
@@ -9539,6 +9569,7 @@ impl App {
             selected: 0,
             loading: false,
             error: None,
+            revive: None,
             query: String::new(),
             history_hits: Vec::new(),
             history_selected: 0,
@@ -10944,7 +10975,16 @@ impl App {
                             self.modal = Some(Modal::ConfirmHistoryReference { form, candidate });
                         }
                         Some(candidate) => {
-                            self.confirm_or_submit_launch(form.launch, Some(candidate.id), None)
+                            // Picked for an archived record, this is that
+                            // record coming back on the conversation chosen.
+                            let revive = form.revive.take();
+                            self.confirm_or_submit_launch_with_archive(
+                                form.launch,
+                                Some(candidate.id),
+                                None,
+                                None,
+                                revive,
+                            )
                         }
                         None => self.confirm_or_submit_launch(form.launch, None, None),
                     }
@@ -11013,7 +11053,11 @@ impl App {
                 summary,
                 mut remove_archive,
             } => match key.code {
-                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                // A daemon record has no superseded archive to remove - it
+                // comes back as itself - so there is nothing here to toggle.
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                    if !is_daemon_session_id(&source_session_id) =>
+                {
                     remove_archive = !remove_archive;
                     self.modal = Some(Modal::ConfirmArchivedResume {
                         source_session_id,
@@ -11024,14 +11068,19 @@ impl App {
                     });
                 }
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    self.state.remove_archive_after_resume = remove_archive;
-                    self.persist_state();
-                    let archive = remove_archive.then_some(source_session_id);
+                    let in_place = is_daemon_session_id(&source_session_id);
+                    if !in_place {
+                        self.state.remove_archive_after_resume = remove_archive;
+                        self.persist_state();
+                    }
+                    let archive =
+                        (!in_place && remove_archive).then_some(source_session_id.clone());
                     self.confirm_or_submit_launch_with_archive(
                         launch,
                         Some(resume_id),
                         None,
                         archive,
+                        in_place.then_some(source_session_id),
                     );
                 }
                 KeyCode::Esc | KeyCode::Char('n') => {}
@@ -11501,6 +11550,7 @@ impl App {
         resume_id: Option<String>,
         initial_prompt: Option<String>,
         remove_archive_session_id: Option<String>,
+        revive: Option<String>,
     ) {
         if form.path.trim().is_empty() {
             self.status_message = "Launch cancelled: working directory is required".into();
@@ -11534,6 +11584,7 @@ impl App {
             label: form.label,
             temporary: form.temporary,
             resume_id,
+            revive,
             initial_prompt,
             parent: None,
             powers: None,
@@ -11542,7 +11593,7 @@ impl App {
             .worker
             .requests
             .send(Request::Launch {
-                request,
+                request: Box::new(request),
                 command,
                 environment,
                 remove_archive_session_id,
@@ -11560,7 +11611,7 @@ impl App {
         resume_id: Option<String>,
         initial_prompt: Option<String>,
     ) {
-        self.confirm_or_submit_launch_with_archive(form, resume_id, initial_prompt, None);
+        self.confirm_or_submit_launch_with_archive(form, resume_id, initial_prompt, None, None);
     }
 
     fn confirm_or_submit_launch_with_archive(
@@ -11569,6 +11620,7 @@ impl App {
         resume_id: Option<String>,
         initial_prompt: Option<String>,
         remove_archive_session_id: Option<String>,
+        revive: Option<String>,
     ) {
         let available = self
             .targets
@@ -11576,7 +11628,13 @@ impl App {
             .find(|target| target.target.id == form.target.id)
             .is_some_and(|target| target.probe.has(form.kind));
         if available || form.kind == AgentKind::Terminal {
-            self.submit_launch(form, resume_id, initial_prompt, remove_archive_session_id);
+            self.submit_launch(
+                form,
+                resume_id,
+                initial_prompt,
+                remove_archive_session_id,
+                revive,
+            );
         } else {
             let target = form.target.clone();
             let kind = form.kind;
@@ -11589,6 +11647,7 @@ impl App {
                     resume_id,
                     initial_prompt,
                     remove_archive_session_id,
+                    revive,
                 })),
             });
         }
@@ -16129,6 +16188,171 @@ mod tests {
         let _ = std::fs::remove_file(state_path);
     }
 
+    /// A daemon record is asked back under its own number. That is what
+    /// keeps its subagents' parent links, its history file and its place in
+    /// the archive as one entry - a fresh number left the old record in the
+    /// archive beside the new one, and the "remove the old archive" toggle
+    /// was only ever a patch over that.
+    #[test]
+    fn an_archived_daemon_record_comes_back_on_its_own_number() {
+        let config = Config::default();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "muxloom-revive-state-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Even asked to remove superseded archives, a revival has none.
+        let state = State {
+            remove_archive_after_resume: true,
+            ..Default::default()
+        };
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            state_path.clone(),
+            vec![Target::local()],
+            worker,
+        );
+        app.targets[0].probe.set(AgentKind::Claude, true);
+        let record = "muxloomd-claude-1788416965-71763-1";
+        app.sessions.push(AgentSession {
+            id: record.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            label: "coordinator".into(),
+            created_at: 1,
+            archived_at: Some(2),
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            // The conversation its launch was told to reopen, standing in
+            // for a match the daemon never made.
+            thread: Some("4797f4e5".into()),
+            parent: None,
+        });
+        app.selected_session_id = Some(record.into());
+        app.focus = Focus::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::ScanResumes { .. }
+        ));
+        let candidate = |id: &str| ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/test/.claude/projects/{id}.jsonl"),
+            recap: Some(format!("conversation {id}")),
+            first_message: None,
+            last_message: None,
+            updated_at: "2026-09-03T12:00:00Z".into(),
+        };
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            warning: None,
+            // Several conversations in the folder: only the recorded one is
+            // this session's, whichever was touched last.
+            result: Ok(vec![candidate("newest"), candidate("4797f4e5")]),
+        });
+        assert!(
+            matches!(
+                app.modal,
+                Some(Modal::ConfirmArchivedResume {
+                    ref source_session_id,
+                    ref resume_id,
+                    remove_archive: false,
+                    ..
+                }) if source_session_id == record && resume_id == "4797f4e5"
+            ),
+            "{:?}",
+            app.modal
+        );
+        // Nothing to toggle: Space does not turn the removal on.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmArchivedResume {
+                remove_archive: false,
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match receive_request(&request_rx) {
+            Request::Launch {
+                request,
+                remove_archive_session_id,
+                ..
+            } => {
+                assert_eq!(request.revive.as_deref(), Some(record));
+                assert_eq!(request.resume_id.as_deref(), Some("4797f4e5"));
+                assert_eq!(request.label, "coordinator");
+                assert_eq!(
+                    remove_archive_session_id, None,
+                    "a record that came back as itself has no old archive to remove"
+                );
+            }
+            request => panic!("expected an in-place resume launch, got {request:?}"),
+        }
+        // The setting is a legacy tmux session's, and a revival leaves it be.
+        assert!(app.state.remove_archive_after_resume);
+
+        // With nothing recorded and several conversations to choose from,
+        // the picker still knows whose record it is choosing for.
+        app.sessions[0].thread = None;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::ScanResumes { .. }
+        ));
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            warning: None,
+            result: Ok(vec![candidate("newest"), candidate("older")]),
+        });
+        assert!(
+            matches!(
+                app.modal,
+                Some(Modal::Resume(ResumeForm { ref revive, .. })) if revive.as_deref() == Some(record)
+            ),
+            "{:?}",
+            app.modal
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match receive_request(&request_rx) {
+            Request::Launch {
+                request,
+                remove_archive_session_id,
+                ..
+            } => {
+                assert_eq!(request.revive.as_deref(), Some(record));
+                assert_eq!(request.resume_id.as_deref(), Some("newest"));
+                assert_eq!(remove_archive_session_id, None);
+            }
+            request => panic!("expected an in-place resume launch, got {request:?}"),
+        }
+        let _ = std::fs::remove_file(state_path);
+    }
+
     #[test]
     fn old_archive_is_removed_only_after_a_successful_resumed_launch() {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
@@ -18306,6 +18530,7 @@ mod tests {
             selected: 0,
             loading: false,
             error: None,
+            revive: None,
             query: String::new(),
             history_hits: Vec::new(),
             history_selected: 0,
@@ -19095,7 +19320,7 @@ mod tests {
             path: "/work".into(),
             ..form.clone()
         };
-        app.submit_launch(form, None, None, None);
+        app.submit_launch(form, None, None, None, None);
         assert_eq!(
             app.state.last_launch_kinds.get("local"),
             Some(&AgentKind::Pi)
@@ -19530,6 +19755,7 @@ mod tests {
             selected: 1,
             loading: false,
             error: None,
+            revive: None,
             query: String::new(),
             history_hits: Vec::new(),
             history_selected: 0,

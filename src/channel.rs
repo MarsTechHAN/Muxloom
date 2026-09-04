@@ -3682,6 +3682,7 @@ impl<'a> Desk<'a> {
             label: label.to_string(),
             temporary,
             resume_id: None,
+            revive: None,
             initial_prompt,
             parent: None,
             powers: None,

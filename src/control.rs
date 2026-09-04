@@ -3777,6 +3777,7 @@ impl ControllerControl {
             label: optional_str(arguments, "label").unwrap_or_default().into(),
             temporary: false,
             resume_id: optional_str(arguments, "resume_id").map(Into::into),
+            revive: None,
             initial_prompt: optional_str(arguments, "initial_prompt").map(Into::into),
             parent: relayed_caller(arguments),
             powers: Some(powers),

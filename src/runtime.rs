@@ -430,9 +430,7 @@ impl Runtime {
                 .collect(),
             progress,
         ) {
-            let mut sessions = self
-                .bridges
-                .list_sessions(target)?
+            let mut sessions = without_superseded(self.bridges.list_sessions(target)?)
                 .into_iter()
                 .filter_map(|session| daemon_agent_session(&target.id, session))
                 .collect::<Vec<_>>();
@@ -644,7 +642,17 @@ impl Runtime {
                 request.target.id, request.kind, request.path, command.command
             ),
         );
-        let (session_id, now) = new_daemon_session_id(request.kind, request.temporary);
+        let (minted, now) = new_daemon_session_id(request.kind, request.temporary);
+        // A session coming back keeps its number: the daemon revives the
+        // record in place, and everything hanging off that number - the
+        // children's parent links, the history file, the archive's own entry
+        // - is still where it was. A fresh number would have been a second
+        // record of one conversation, with the first left in the archive.
+        let session_id = request
+            .revive
+            .clone()
+            .filter(|record| is_daemon_session_id(record))
+            .unwrap_or(minted);
         let label = request.label.replace(['\t', '\n', '\r'], " ");
         let args = launch_arguments(
             command,
@@ -5026,6 +5034,30 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
     })
 }
 
+/// The listing with every record whose conversation moved on to another
+/// listed record left out. A resume that minted a fresh number wrote on the
+/// old record where the conversation went, and both then sat in the list -
+/// the archive showing a session that was, by its own account, somewhere
+/// else. The record itself stays on the machine: its capture is still
+/// searchable, and the daemon still reads its alias.
+fn without_superseded(sessions: Vec<DaemonSession>) -> Vec<DaemonSession> {
+    let listed: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+    let superseded: HashSet<String> = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .resumed_to
+                .as_deref()
+                .is_some_and(|successor| successor != session.id && listed.contains(successor))
+        })
+        .map(|session| session.id.clone())
+        .collect();
+    sessions
+        .into_iter()
+        .filter(|session| !superseded.contains(&session.id))
+        .collect()
+}
+
 /// The installed runtimes as a comma-separated list, for the debug log.
 fn describe_runtimes(probe: &Probe) -> String {
     probe
@@ -5253,6 +5285,46 @@ pub fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(id: &str, resumed_to: Option<&str>) -> DaemonSession {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "kind": "claude",
+            "path": "/work",
+            "label": "",
+            "created_at": 1,
+            "pid": null,
+            "dead": true,
+            "archived": true,
+            "recap": null,
+            "working": false,
+            "needs_attention": false,
+            "attention_reason": null,
+            "resumed_to": resumed_to,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_record_whose_conversation_moved_to_a_listed_record_is_not_listed_twice() {
+        let listed = without_superseded(vec![
+            stored("muxloomd-claude-1-1-0", Some("muxloomd-claude-2-1-0")),
+            stored("muxloomd-claude-2-1-0", None),
+            // Moved to a record this machine no longer has: the only entry
+            // left for that conversation, so it stays.
+            stored("muxloomd-claude-3-1-0", Some("muxloomd-claude-gone")),
+            stored("muxloomd-claude-4-1-0", None),
+        ]);
+        let ids: Vec<&str> = listed.iter().map(|session| session.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "muxloomd-claude-2-1-0",
+                "muxloomd-claude-3-1-0",
+                "muxloomd-claude-4-1-0"
+            ]
+        );
+    }
 
     #[test]
     fn quotes_shell_values() {

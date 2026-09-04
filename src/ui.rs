@@ -1793,6 +1793,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
             );
         }
         Modal::ConfirmArchivedResume {
+            source_session_id,
             launch,
             summary,
             remove_archive,
@@ -1800,10 +1801,18 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
         } => {
             let area = centered_rect(72, 14, outer);
             frame.render_widget(Clear, area);
+            // A daemon record comes back as itself - same entry, history and
+            // subagents - so there is no old archive to offer to remove. Only
+            // a legacy tmux session is relaunched beside its archive.
+            let in_place = crate::runtime::is_daemon_session_id(source_session_id);
             let checkbox = if *remove_archive { "[x]" } else { "[ ]" };
-            let text = vec![
+            let mut text = vec![
                 Line::raw(""),
-                Line::raw("Reopen this conversation as a new running agent?"),
+                Line::raw(if in_place {
+                    "Reopen this conversation and bring the agent back?"
+                } else {
+                    "Reopen this conversation as a new running agent?"
+                }),
                 Line::raw(""),
                 // The name of what is about to be reopened, so a wrong match is
                 // caught here rather than after the agent has started.
@@ -1813,29 +1822,42 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
                 ),
                 Line::styled(format!("in {}", launch.path), Style::default().fg(MUTED)),
                 Line::raw(""),
-                Line::from(vec![
-                    Span::styled(
-                        checkbox,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" Remove the previous Archived entry after resume"),
-                ]),
-                Line::styled(
-                    "The old archive is removed only after the new agent starts successfully.",
-                    Style::default().fg(MUTED),
-                ),
-                Line::styled(
-                    "This choice is remembered for future resumes.",
-                    Style::default().fg(MUTED),
-                ),
-                Line::raw(""),
-                Line::styled(
-                    "Space toggle    Enter/y resume    Esc/n cancel",
-                    Style::default().fg(MUTED),
-                ),
             ];
+            if in_place {
+                text.extend([
+                    Line::styled(
+                        "It comes back on its own entry: history, label and subagents included.",
+                        Style::default().fg(MUTED),
+                    ),
+                    Line::raw(""),
+                    Line::styled("Enter/y resume    Esc/n cancel", Style::default().fg(MUTED)),
+                ]);
+            } else {
+                text.extend([
+                    Line::from(vec![
+                        Span::styled(
+                            checkbox,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" Remove the previous Archived entry after resume"),
+                    ]),
+                    Line::styled(
+                        "The old archive is removed only after the new agent starts successfully.",
+                        Style::default().fg(MUTED),
+                    ),
+                    Line::styled(
+                        "This choice is remembered for future resumes.",
+                        Style::default().fg(MUTED),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Space toggle    Enter/y resume    Esc/n cancel",
+                        Style::default().fg(MUTED),
+                    ),
+                ]);
+            }
             frame.render_widget(
                 Paragraph::new(text)
                     .alignment(Alignment::Center)
@@ -7123,6 +7145,7 @@ mod tests {
                 last_message: Some("last user message".into()),
                 updated_at: "2026-07-21T12:00:00Z".into(),
             }],
+            revive: None,
             selected: 0,
             loading: false,
             error: None,

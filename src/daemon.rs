@@ -480,6 +480,13 @@ mod platform {
         /// what tells a session that is thinking apart from one that has been
         /// started over somewhere else.
         last_input: AtomicU64,
+        /// When a turn was last asked for: the last input that carried an
+        /// Enter. Arrow keys, an Escape, a Tab cycling through a dialog all
+        /// move `last_input` and put nothing in any transcript, and they
+        /// are exactly what a person does to a session that is sitting
+        /// idle - so it is this clock, not that one, that says whether the
+        /// words went past the transcript the session was matched to.
+        last_submission: AtomicU64,
         subscribers: Mutex<HashMap<u64, Subscriber>>,
         screen: Mutex<vt100::Parser>,
         /// How many times the grid has been changed. Bumped under [`Self::screen`]
@@ -4214,9 +4221,14 @@ mod platform {
         // prompt submitted after the transcript last grew, an answer that came
         // back, and quiet since. That is the shape of a conversation cleared
         // and started over, which is the case this is here for.
+        //
+        // Submitted, not merely typed. An arrow key pressed at an idle
+        // session repaints the screen and appends nothing, and read as a
+        // prompt it took the session's name away and barred it from ever
+        // being matched to its own conversation again.
         let now = now_ms();
-        let last_input = session.last_input.load(Ordering::Relaxed);
-        let asked_and_answered = last_input > written && last_output > last_input;
+        let last_submission = session.last_submission.load(Ordering::Relaxed);
+        let asked_and_answered = last_submission > written && last_output > last_submission;
         let quiet_since = now.saturating_sub(last_output) >= NATIVE_CLAIM_STALE_MS;
         if !asked_and_answered || !quiet_since {
             return false;
@@ -4226,7 +4238,7 @@ mod platform {
                 .native
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            native.abandoned.push(id);
+            native.abandoned.push(id.clone());
             native.claim = None;
             native.scanned_at = 0;
             native.claim_checked = false;
@@ -4235,12 +4247,18 @@ mod platform {
         {
             // The name and the last answer belonged to that conversation, and
             // it is over. Better nothing than the wrong one until the session
-            // is matched to whatever it is writing now.
+            // is matched to whatever it is writing now. The thread itself
+            // stays on the record - written there now, because until here it
+            // was only ever read off the claim: it is what a resume of this
+            // session reopens, and until the new transcript has been found
+            // it is still the best account there is of which conversation
+            // this was. A record with no thread at all cannot be resumed as
+            // anything.
             let mut metadata = session
                 .metadata
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            metadata.thread = None;
+            metadata.thread = Some(id);
             metadata.title = None;
         }
         if let Err(error) = session.persist_metadata() {
@@ -4270,12 +4288,16 @@ mod platform {
             created_at,
             seed: native.seed.clone(),
             // A daemon that restarted holds no claim, but the one before it
-            // wrote down which transcript this session was reading.
+            // wrote down which transcript this session was reading. The one
+            // thing a record carries that was never a match is the seed it
+            // was launched with, written on it as its thread from the start;
+            // handed over as a claim it would be locked in as one, and for a
+            // runtime that forks on resume the fork would never be found.
             claimed: native
                 .claim
                 .as_ref()
                 .map(|claim| claim.id.clone())
-                .or(persisted),
+                .or(persisted.filter(|thread| native.seed.as_deref() != Some(thread))),
             abandoned: native.abandoned.clone(),
             // What the daemon heard the session open with, in this
             // generation's own hearing or the last one's - taken before any
@@ -4597,10 +4619,18 @@ mod platform {
             // belongs to the past.
             recap: resuming.as_ref().and_then(|record| record.recap.clone()),
             title: resuming.as_ref().and_then(|record| record.title.clone()),
+            // A launch told to reopen a conversation knows which one from
+            // the start, and says so before the transcript has grown by a
+            // byte. It used to wait for the matcher, which reads only what
+            // has been written since the launch - and a reopened conversation
+            // nobody has typed into yet was written long before it. Archived
+            // in that state the record named no conversation at all, and the
+            // next resume of it had to ask which of the folder's it meant.
             thread: resuming
                 .as_ref()
                 .filter(|_| seed.is_some())
-                .and_then(|record| record.thread.clone()),
+                .and_then(|record| record.thread.clone())
+                .or_else(|| seed.clone()),
             seed: seed.clone(),
             // A launch that reopens a thread reopens the conversation that
             // opened with those words too. One that starts fresh is being
@@ -4681,6 +4711,7 @@ mod platform {
             // own. Nothing has been asked of it yet.
             last_output: AtomicU64::new(now_ms()),
             last_input: AtomicU64::new(0),
+            last_submission: AtomicU64::new(0),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows.max(5), columns.max(20), 0)),
             screen_seq: AtomicU64::new(0),
@@ -5711,6 +5742,7 @@ mod platform {
             // over.
             last_output: AtomicU64::new(0),
             last_input: AtomicU64::new(0),
+            last_submission: AtomicU64::new(0),
             subscribers: Mutex::new(HashMap::new()),
             screen: Mutex::new(vt100::Parser::new(rows, columns, 0)),
             screen_seq: AtomicU64::new(0),
@@ -6718,7 +6750,11 @@ mod platform {
             // the very first input can be the opening of the conversation,
             // and a prompt the daemon missed - typed at a terminal in pieces
             // too small to record - is not to be invented from a later one.
-            let ever_asked = self.last_input.swap(now_ms(), Ordering::Relaxed) != 0;
+            let now = now_ms();
+            let ever_asked = self.last_input.swap(now, Ordering::Relaxed) != 0;
+            if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+                self.last_submission.store(now, Ordering::Relaxed);
+            }
             if !ever_asked && self.first_prompt_armed.load(Ordering::Relaxed) {
                 self.record_first_prompt(bytes);
             }
@@ -13299,7 +13335,7 @@ mod platform {
             // minute the transcript has been quiet for. This is the reading
             // that used to take a working session's name away from it.
             session
-                .last_input
+                .last_submission
                 .store(written.saturating_sub(60_000), Ordering::Relaxed);
             session.last_output.store(now_ms(), Ordering::Relaxed);
             assert!(
@@ -13311,15 +13347,30 @@ mod platform {
                 Some("the conversation before")
             );
 
-            // Asked something after the file stopped growing, answered, and
-            // quiet since: the words went into a transcript that is not this
-            // one.
+            // Keys pressed at it after the file stopped growing - an arrow,
+            // an Escape - repaint the screen and ask for nothing. Quiet
+            // since, and this is not a conversation that went anywhere.
             session
                 .last_input
                 .store(written.saturating_add(1_000), Ordering::Relaxed);
             session
                 .last_output
                 .store(now_ms().saturating_sub(2 * 60_000), Ordering::Relaxed);
+            assert!(
+                !refresh_native_claim(AgentKind::Claude, &session),
+                "a keystroke that submits nothing has not moved the conversation"
+            );
+            assert_eq!(
+                session.snapshot().title.as_deref(),
+                Some("the conversation before")
+            );
+
+            // Asked something after the file stopped growing, answered, and
+            // quiet since: the words went into a transcript that is not this
+            // one.
+            session
+                .last_submission
+                .store(written.saturating_add(1_000), Ordering::Relaxed);
             assert!(
                 refresh_native_claim(AgentKind::Claude, &session),
                 "the folder has to be looked through for wherever it went"
@@ -13337,9 +13388,58 @@ mod platform {
                 snapshot.title, None,
                 "that name belonged to a conversation that is over"
             );
-            assert_eq!(snapshot.thread, None);
+            assert_eq!(
+                snapshot.thread.as_deref(),
+                Some("thread-1"),
+                "the thread stays until a new one is found: it is what a resume reopens"
+            );
 
             session.archive().unwrap();
+            discard_root(root);
+        }
+
+        /// A launch told to reopen a conversation names it on the record at
+        /// once, and the name survives the session being put down before the
+        /// transcript ever grew.
+        #[test]
+        fn a_launch_told_to_reopen_a_conversation_records_it_before_the_transcript_grows() {
+            let state = test_state("seeded-thread");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-seeded-thread".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-reopened".into()],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                session.snapshot().thread.as_deref(),
+                Some("ses-reopened"),
+                "the conversation is known from the command line, not from a match"
+            );
+            // Written as a thread, it is not handed to the matcher as a claim:
+            // a claim is locked in, and a runtime that forks on resume has to
+            // be free to land on the fork.
+            let facts = session_facts(1, &session);
+            assert_eq!(facts.seed.as_deref(), Some("ses-reopened"));
+            assert_eq!(facts.claimed, None);
+
+            session.archive().unwrap();
+            let stored: DaemonSession =
+                serde_json::from_slice(&fs::read(&session.metadata_path).unwrap()).unwrap();
+            assert!(stored.archived);
+            assert_eq!(stored.thread.as_deref(), Some("ses-reopened"));
             discard_root(root);
         }
 

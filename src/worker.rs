@@ -100,7 +100,9 @@ pub enum Request {
         height: u16,
     },
     Launch {
-        request: LaunchRequest,
+        /// Boxed: a launch is rare and carries a target and a form, and the
+        /// channel's every other message would otherwise be sized for it.
+        request: Box<LaunchRequest>,
         command: CommandConfig,
         environment: Vec<(String, String)>,
         remove_archive_session_id: Option<String>,

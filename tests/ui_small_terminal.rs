@@ -383,6 +383,7 @@ fn launch_and_picker_modals_never_panic() {
             selected: 0,
             loading: false,
             error: Some("scan failed".into()),
+            revive: None,
             query: String::new(),
             history_hits: Vec::new(),
             history_selected: 0,

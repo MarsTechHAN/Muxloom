@@ -259,12 +259,21 @@ is on while the list fills in. Each session carries a recap line, and archived
 agents stay searchable and resumable. Inside a folder
 the archive is ordered by when each session was put down, not by when it
 started, so the conversation you just closed is at the top of its folder.
-Resuming an Archived agent asks whether to remove the superseded archive after
-the new agent starts successfully. Removal is enabled by default, can be toggled
-with `Space`, and the choice is remembered; launch or cleanup failure keeps the
-archive intact. A removal sticks: a closed agent and a superseded archive are
+Resuming an Archived agent brings that entry back as itself: the same session
+id, label, parent and subagents, its history file carried on rather than
+started over, and no second entry left behind in the archive. The
+conversation it reopens is the one the record names - the transcript the
+daemon matched it to while it ran, or, never matched, the one its own launch
+was told to reopen - so a session that was resumed and put down again before
+anyone typed into it still knows which conversation it was. Only when the
+record names none and the folder holds several is the choice handed to you.
+An entry a resume superseded before this - one whose record says the
+conversation moved on to another entry still listed - is not shown twice.
+Legacy tmux sessions are relaunched beside their archive instead, and for
+those the confirmation asks whether to remove the old entry once the new
+agent starts; that choice is remembered. A removal sticks: a closed agent is
 not offered back from the local backup, which lists only what a machine lost.
-Their transcripts stay in the store and stay searchable.
+Transcripts stay in the store and stay searchable.
 
 **Keys** — `/` or `Ctrl-p` search · `Enter` jump to a result · `x`
 archive/delete · `a` show archived.

@@ -640,12 +640,13 @@ pub struct AgentSession {
     /// keeps. Absent while it has not named one yet, from runtimes that write
     /// no transcript, and from daemons too old to read one.
     pub title: Option<String>,
-    /// The agent-native conversation this session is having, as the daemon
-    /// matched it. This is what `--resume` has to be given to reopen *this*
-    /// session rather than whichever conversation in the folder was touched
-    /// last. Absent from runtimes that write no transcript, from a session
-    /// whose transcript has not been matched yet, and from daemons too old to
-    /// record one.
+    /// The agent-native conversation this session is having: the transcript
+    /// the daemon matched it to, or - not matched yet - the conversation its
+    /// launch was told to reopen. This is what `--resume` has to be given to
+    /// reopen *this* session rather than whichever conversation in the folder
+    /// was touched last. Absent from runtimes that write no transcript, from
+    /// a fresh session whose transcript has not been matched yet, and from
+    /// daemons too old to record one.
     pub thread: Option<String>,
     /// The session that started this one, when an agent did. A person's launch
     /// from the dashboard has none, and neither has anything a daemon too old
@@ -684,6 +685,11 @@ pub struct LaunchRequest {
     pub label: String,
     pub temporary: bool,
     pub resume_id: Option<String>,
+    /// The archived record this launch is: a session put down earlier coming
+    /// back on its own number, with its label, parent, children and history
+    /// still attached, instead of a fresh number the old record would then
+    /// sit beside in the archive. `None` for a launch that is a new session.
+    pub revive: Option<String>,
     /// Initial prompt for a fresh session. Used when another agent runtime's
     /// history is referenced instead of passed as an incompatible resume id.
     pub initial_prompt: Option<String>,
