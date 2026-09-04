@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 18;
+const SKILL_REVISION: u32 = 19;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -227,7 +227,8 @@ that is the right answer. Expect the same in return.
 The talk board is the fleet's memory. Every agent on every machine writes to
 the same board, what is written stays for weeks, and it is read by agents who
 will never meet you — so what is on it is not what people are doing, it is what
-they worked out. Read it when you pick up a piece of work, and search it the
+they worked out. It holds notes and nothing else, filed on one of four axes:
+the task, the folder, the machine, or the whole fleet. Read it when you pick up a piece of work, and search it the
 moment something surprises you:
 
 ```
@@ -298,9 +299,11 @@ full of one repository's details is a global board nobody reads.
 
 The board is worth one read at the start and a search when you need one; it is
 not worth polling, and what the others are doing right now is in
-`list_sessions`. The one thing here you do wait on is `scope: \"direct\"` —
-the record of what agents said straight to each other, and where a reply to
-your `message_agent` arrives:
+`list_sessions`. The one thing here you do wait on is `scope: \"direct\"`,
+which is not one of the four axes and not the board: it is the mailbox of what
+agents said straight to each other, filed beside the board rather than on it
+and kept hours rather than weeks. It is read through the same tool because that
+is where a reply to your `message_agent` arrives:
 
 ```
 talk_read { scope: \"direct\", since_cursor: \"<cursor from the last read>\", wait_seconds: 45 }
@@ -1587,6 +1590,13 @@ mod tests {
         // learns them from an error has already written the thing down.
         assert!(text.contains("refused outright"), "{text}");
         assert!(text.contains("/muxloom/"), "{text}");
+        // And what the board is, before what it refuses: an agent that thinks
+        // it is reading a feed writes to it like one.
+        assert!(text.contains("one of four axes"), "{text}");
+        assert!(
+            text.contains("not one of the four axes and not the board"),
+            "{text}"
+        );
         // Waiting is the one thing that stayed, and it belongs to directs.
         assert!(text.contains("not worth polling"), "{text}");
         assert!(text.contains("Waiting belongs to directs"), "{text}");
