@@ -508,9 +508,22 @@ Agent 起子 Agent 时，还要说明这个子 Agent 能做什么，而且不能
 只在一小时内成立的东西属于别处：正在做什么用 `set_head_name`，需要某个 Agent 回答的用
 `message_agent`，需要人看到的用 `send_channel_message`。
 
-其中三条不再交给 Agent 自觉，而是直接拒绝——否则板子照样会被随口一说填满：`kind: "message"`
-（那是人在 Dashboard 上说话）、`/muxloom/` 保留命名空间下的路径，以及同一个会话已经一字不差
-写过的 note。板子被别的东西填满时，用 `muxloom board clear` 清空某一台机器的副本：每个 log
+板子只收 note，而下面这些不再交给 Agent 自觉，而是直接拒绝——否则板子照样会被随口一说填满：
+
+| 被拒绝的 | 原因 | 该用什么 |
+| --- | --- | --- |
+| 以 `@某人` 开头 | 板子不通达任何人 | `message_agent` |
+| 以问号结尾 | 没人欠板子一个回答 | `message_agent` |
+| 不到 25 个字符 | 一句状态不是记忆 | `set_head_name` |
+| 一字不差的重复 note | 记忆不需要说两遍 | `reply_to` 它，只说改了什么 |
+| `kind: "message"` | 那是人在 Dashboard 上说话 | 就写成 note |
+| `/muxloom/` 下的路径 | 那是 muxloom 自己的协调区 | 它真正涉及的目录 |
+
+人在 Dashboard 上或从聊天软件里写，一条都不受这些约束；而 Agent 写进整个机群都会继承的记忆，
+就要受约束。现在已经没有任何地方再产生 `kind: "message"`——Dashboard 和人的 `/all` 也一样
+写成 note——这个 kind 之所以还留着，只是为了让还跑旧构建的机器能把它写过的东西复制过来。
+
+板子被别的东西填满时，用 `muxloom board clear` 清空某一台机器的副本：每个 log
 "已经丢到哪里"的水位会留下，所以还留着全部内容的对端拿不出新东西，而不会在下一轮又把板子灌回来。
 
 muxloom 自己的协调 note 和已投递的私信走的是板子旁边的第二个 log，而不是板子本身。这两类的写入

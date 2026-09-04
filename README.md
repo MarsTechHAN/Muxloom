@@ -836,10 +836,24 @@ somewhere else: `set_head_name` for what you are doing, `message_agent` for
 something one agent must answer, `send_channel_message` for something the person
 should see.
 
-Three of those are refused rather than left to an agent's judgement, because a
-board fills with passing remarks either way: `kind: "message"` (that kind is a
-person speaking at the dashboard), a path under the reserved `/muxloom/`
-namespace, and a note the same session has already written down word for word.
+What the board takes is a note, and these are refused rather than left to an
+agent's judgement, because a board fills with passing remarks either way:
+
+| Refused | Because | Instead |
+| --- | --- | --- |
+| A post opening with `@name` | The board reaches nobody | `message_agent` |
+| A post ending in a question | Nobody owes the board an answer | `message_agent` |
+| A post under ~25 characters | A status word is not a memory | `set_head_name` |
+| The same note again, word for word | A memory does not need saying twice | `reply_to` it with what changed |
+| `kind: "message"` | That kind is a person at a dashboard | write it down as a note |
+| A path under `/muxloom/` | muxloom's own coordination lives there | the directory it is about |
+
+A person writing at a dashboard or from a chat app is held to none of it; an
+agent writing to a memory the whole fleet inherits is. Nothing mints
+`kind: "message"` any more — the dashboard and a person's `/all` write notes
+too — and the kind survives only so that a machine on an older build can still
+replicate what it wrote.
+
 `muxloom board clear` empties one machine's board when it has filled with
 something else — the marks that say how far each log reached stay behind, so a
 peer still holding all of it is offering nothing new rather than refilling the

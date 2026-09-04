@@ -643,13 +643,19 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       run, which needs at most a note saying where it is. Posting interrupts \
                       nobody and reaches nobody in particular. If what you have is news rather \
                       than knowledge, that is the sign not to post it.\n\n\
-                      Three of those are refused rather than advised against, so a board stays \
-                      a memory whoever is writing to it: a post of kind \"message\" (that kind \
-                      is a person speaking at the dashboard), a post under the reserved \
-                      /muxloom/ paths (muxloom's own coordination between machines), and a note \
-                      you have already written down word for word — a memory does not need \
-                      saying twice, and if what you know has changed, say what changed and \
-                      reply_to the original.\n\n\
+                      What the board takes is a note, and these are refused rather than advised \
+                      against, so it stays a memory whoever is writing to it. A post that opens \
+                      by naming somebody (`@name …`) is a message to them: the board reaches \
+                      nobody, message_agent does. A post that ends in a question is a question: \
+                      nobody owes the board an answer, so ask with message_agent. A post too \
+                      short to stand on its own is a remark — under about twenty-five characters \
+                      is a status word, and status is set_head_name. A post you have already \
+                      written word for word is refused naming the one it repeats: a memory does \
+                      not need saying twice, and if what you know has changed, say what changed \
+                      and reply_to the original. So are kind \"message\" (a person speaking at a \
+                      dashboard) and the reserved /muxloom/ paths (muxloom's own coordination \
+                      between machines). A person writing at a dashboard or from a chat app is \
+                      held to none of this; an agent writing to a shared memory is.\n\n\
                       `scope` decides who inherits it: \"path\" (default) is one directory on one \
                       machine, which is where anything about a particular codebase belongs; \
                       \"machine\" is everyone on this machine, for how the machine itself \
@@ -8106,7 +8112,7 @@ mod tests {
             let posted: Value = serde_json::from_str(&call(
                 &mut surface,
                 "talk_post",
-                json!({ "text": "the kettle is on", "path": here }),
+                json!({ "text": "the kettle boils dry above 4000m", "path": here }),
             ))
             .unwrap();
             assert_eq!(posted["scope"], "path");
@@ -8148,7 +8154,10 @@ mod tests {
             let page = read(&mut surface, json!({ "path": here }));
             assert_eq!(
                 texts(&page),
-                ["the kettle is on", "the flour is in the second drawer"],
+                [
+                    "the kettle boils dry above 4000m",
+                    "the flour is in the second drawer"
+                ],
                 "{page:#}"
             );
 
@@ -8184,13 +8193,13 @@ mod tests {
             call(
                 &mut surface,
                 "talk_post",
-                json!({ "text": "the kettle boiled", "path": here }),
+                json!({ "text": "the kettle scales up within a week here", "path": here }),
             );
             let after = read(
                 &mut surface,
                 json!({ "path": here, "since_cursor": cursor }),
             );
-            assert_eq!(texts(&after), ["the kettle boiled"]);
+            assert_eq!(texts(&after), ["the kettle scales up within a week here"]);
 
             // A direct message goes to a session, not to a board.
             let refused = surface

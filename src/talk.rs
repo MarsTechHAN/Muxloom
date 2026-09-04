@@ -66,6 +66,53 @@ const COMPACT_SLACK: usize = 512;
 /// The most messages one read or one replication fetch carries.
 pub const MAX_PAGE: usize = 500;
 
+/// The least a note has to say to be one.
+///
+/// Not a style rule. A note is read by somebody who was not here and has no
+/// idea what anyone was doing, so anything that only makes sense to whoever is
+/// looking right now is not a note however it is labelled — and a board of
+/// those is the "temporary display board" a memory turns into. Twenty-four
+/// characters is about the shortest a fact fits in ("APFS mtime is
+/// nanosecond." is twenty-five) and comfortably longer than the status words
+/// that used to arrive as notes: done, restarted, still waiting.
+const NOTE_MIN_CHARS: usize = 24;
+
+/// Whether a note is written down rather than said to whoever is looking.
+///
+/// Checked in the store, so it holds for every writer rather than for whichever
+/// surface remembered to check, and only for an agent: a person writing on
+/// their own board is not somebody to lecture about how to write it.
+///
+/// Three shapes, each of which has a tool that is actually the right one:
+/// a note that opens by naming somebody is a message to them, a note that ends
+/// in a question is a question, and a note too short to stand on its own is a
+/// remark. All three used to land on the board and stay for thirty days.
+fn note_discipline(text: &str) -> Result<()> {
+    if text.starts_with(['@', '\u{ff20}']) {
+        bail!(
+            "a note that opens by naming somebody is a message to them, and the board does not \
+             reach anybody: use message_agent, which does. What goes here is written for whoever \
+             reads the board next"
+        );
+    }
+    if text.ends_with(['?', '\u{ff1f}']) {
+        bail!(
+            "a note that ends in a question is a question, and nobody owes the board an answer: \
+             ask it with message_agent. A note says what is true"
+        );
+    }
+    let held = text.chars().count();
+    if held < NOTE_MIN_CHARS {
+        bail!(
+            "{held} characters is a remark, not something worth keeping for thirty days. Write it \
+             for somebody who was not here: what is true, what it cost to find out, and what to \
+             do about it — or say it to somebody with message_agent, or put it in your head name \
+             with set_head_name if it is what you are doing right now"
+        );
+    }
+    Ok(())
+}
+
 /// Whether a record is muxloom talking to itself rather than something
 /// somebody wrote down.
 ///
@@ -761,6 +808,12 @@ impl TalkStore {
             true => wire_origin(&origin),
             false => origin.clone(),
         };
+        // What an agent writes down has to be something written down. A person
+        // at a dashboard or on a phone is exempt: it is their board, and the
+        // rules exist to stop a fleet of agents turning it into a feed.
+        if !wire && draft.kind == TalkKind::Note && !draft.author.voice.human {
+            note_discipline(text)?;
+        }
         let mut inner = self.inner();
         // A memory does not need saying twice. The same voice writing the same
         // thing down again is a session that has forgotten it already did —
@@ -2231,7 +2284,7 @@ mod tests {
             .post(note("the lexer keeps its own arena", TalkScope::Global))
             .unwrap();
         store
-            .post(note("the parser does not", scope.clone()))
+            .post(note("the parser keeps no arena of its own", scope.clone()))
             .unwrap();
         let mut other = note("the lexer keeps its own arena", scope);
         other.author.voice.session_id = Some("session-2".into());
@@ -2281,6 +2334,54 @@ mod tests {
             1
         );
         assert_eq!(TalkKind::parse("message").unwrap(), TalkKind::Message);
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn what_an_agent_writes_down_has_to_be_something_written_down() {
+        let store = store("discipline");
+        let note = |text: &str| {
+            let mut draft = draft(text, TalkScope::Global);
+            draft.kind = TalkKind::Note;
+            draft
+        };
+        let refused = |text: &str| {
+            store
+                .post(note(text))
+                .expect_err("not something the board keeps")
+                .to_string()
+        };
+        // Addressed at somebody: that is a message, and the board reaches
+        // nobody. This is the shape that was actually on the board — an agent
+        // handing a file to another agent by posting it to everyone.
+        assert!(
+            refused("@someone (H20): the new mp4 is at /tmp/3.mp4, please switch to it")
+                .contains("message_agent")
+        );
+        // A question nobody owes an answer to.
+        assert!(
+            refused("Has anybody seen the lexer arena leak before?").contains("says what is true")
+        );
+        // And a remark that will mean nothing to anyone tomorrow.
+        assert!(refused("restarted the daemon").contains("is a remark"));
+        assert!(refused("done").contains("is a remark"));
+
+        // What a note is: a fact that stands on its own.
+        store
+            .post(note(
+                "The flaky auth test is clock skew on the CI runner, not the retry logic: it \
+                 fails only when the runner is more than two seconds behind NTP.",
+            ))
+            .unwrap();
+        // Short is fine when it is still a fact rather than a fragment.
+        store.post(note("APFS mtime is nanosecond.")).unwrap();
+        // A person is not lectured about how to write on their own board.
+        let mut theirs = note("done");
+        theirs.author.voice.human = true;
+        theirs.author.voice.session_id = None;
+        store.post(theirs).unwrap();
+        assert_eq!(store.read(&TalkFilter::default()).messages.len(), 3);
 
         fs::remove_dir_all(&store.root).ok();
     }

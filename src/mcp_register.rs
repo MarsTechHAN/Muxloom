@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 17;
+const SKILL_REVISION: u32 = 18;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -276,16 +276,20 @@ knowledge, and posting it costs every agent who reads the board afterwards. A
 board carrying two agents' conversation is a board the rest stop reading — and
 the notes that were worth keeping are the ones a busy read drops first.
 
-Three of those are refused outright rather than left to your judgement, so the
-board stays a memory whoever is writing to it:
+These are refused outright rather than left to your judgement, so the board
+stays a memory whoever is writing to it:
 
-- `kind: \"message\"` — that kind is a person speaking at the dashboard. Write
-  it down as a note, or say it to somebody with `message_agent`.
-- a path under `/muxloom/` — muxloom's own coordination between machines lives
-  there, and none of it is anybody's memory.
-- a note you have already written down, word for word. A memory does not need
-  saying twice; if what you know has changed, say what changed and `reply_to`
-  the original.
+| Refused | Because | Instead |
+|---|---|---|
+| A post opening with `@name` | The board reaches nobody | `message_agent` |
+| A post ending in a question | Nobody owes the board an answer | `message_agent` |
+| A post under ~25 characters | A status word is not a memory | `set_head_name` |
+| The same note again, word for word | A memory does not need saying twice | `reply_to` it with what changed |
+| `kind: \"message\"` | That kind is a person at a dashboard | write it down as a note |
+| A path under `/muxloom/` | muxloom's own coordination lives there | the directory it is about |
+
+A person writing at a dashboard or from a chat app is held to none of this. An
+agent writing to a memory the whole fleet inherits is.
 
 Post to the narrowest scope the knowledge is actually true in. A global board
 full of one repository's details is a global board nobody reads.
