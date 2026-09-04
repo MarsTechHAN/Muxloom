@@ -1712,7 +1712,9 @@ if [ -n "$candidate" ]; then
     version=$("$candidate" --version 2>/dev/null || true)
     version=${{version##* }}
     case "$version" in ''|*[!0-9A-Za-z.+-]*) version=unknown ;; esac
-    printf '{marker} HAVE %s %s %s %s\n' "$os" "$arch" "$fingerprint" "$version"
+    generation=$("$candidate" generation 2>/dev/null || true)
+    case "$generation" in ''|*[!0-9A-Za-z.:@+_-]*) generation=unknown ;; esac
+    printf '{marker} HAVE %s %s %s %s %s\n' "$os" "$arch" "$fingerprint" "$version" "$generation"
 else
     printf '{marker} NEED %s %s\n' "$os" "$arch"
 fi
@@ -1841,7 +1843,9 @@ fn negotiate_remote_companion(
     let fields: Vec<_> = status.split_whitespace().collect();
     match fields.as_slice() {
         [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
-        [marker, "HAVE", os, arch, fingerprint, version] if *marker == BOOTSTRAP_MARKER => {
+        [marker, "HAVE", os, arch, fingerprint, version, generation]
+            if *marker == BOOTSTRAP_MARKER =>
+        {
             let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
                 Err(error) => {
@@ -1868,10 +1872,14 @@ fn negotiate_remote_companion(
             writer.flush()?;
             // The remote already runs exactly this asset, which makes it
             // current only if the asset is this generation. A companion left
-            // behind by an older build matches itself forever, so without the
-            // version the remote stays pinned to it and every capability
-            // added since goes silently missing.
-            if *version == env!("CARGO_PKG_VERSION") {
+            // behind by an older build matches itself forever, so without this
+            // the remote stays pinned to it and every capability added since
+            // goes silently missing.
+            if !remote_companion_is_behind(
+                generation,
+                version,
+                &crate::daemon::current_generation(),
+            ) {
                 debug::log(
                     "bridge",
                     format!("target={alias} remote companion fingerprint is current"),
@@ -1881,13 +1889,13 @@ fn negotiate_remote_companion(
             debug::log(
                 "bridge",
                 format!(
-                    "target={alias} companion asset {} is muxloomd {version}, not {}; the remote cannot be updated from it",
+                    "target={alias} companion asset {} is muxloomd {generation}, not {}; the remote cannot be updated from it",
                     asset.display(),
-                    env!("CARGO_PKG_VERSION")
+                    crate::daemon::current_generation()
                 ),
             );
             Ok(Some(format!(
-                "remote muxloomd {version} is older than this client and the {} companion asset is the same build, so it cannot be updated; rebuild or replace that asset",
+                "remote muxloomd {version} is an older build than this client and the {} companion asset is that same build, so it cannot be updated; rebuild or replace that asset",
                 companion_target_triple(os, arch).unwrap_or_else(|_| format!("{os}/{arch}"))
             )))
         }
@@ -1902,6 +1910,27 @@ fn negotiate_remote_companion(
             status.trim()
         ),
     }
+}
+
+/// Whether the companion a remote is running is an older build than this
+/// controller - which is the only thing that makes an identical fingerprint
+/// worth acting on.
+///
+/// Two builds of one release are told apart by the height in the generation
+/// stamp, never by the version: a fleet running the nightlies between two
+/// releases all answers `0.5.5`, and comparing that alone read every machine as
+/// current however far back it had fallen. A companion too old to name its
+/// generation answers with its version instead, which ranks below any numbered
+/// build - exactly what that silence means.
+///
+/// A controller built by hand ranks above nothing here, so a working tree is
+/// never deployed across a fleet; see [`crate::model::generation_is_behind`].
+fn remote_companion_is_behind(generation: &str, version: &str, current: &str) -> bool {
+    let running = match generation.trim() {
+        "" | "unknown" => version,
+        stamp => stamp,
+    };
+    crate::model::generation_is_behind(running, current)
 }
 
 /// Ask the target to fetch the companion itself, and only when what it would
@@ -3407,16 +3436,48 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_companion_of_the_same_version_is_behind_when_its_build_is_older() {
+        // Every nightly between two releases carries one version, so the height
+        // is the whole answer. A remote 40 commits back used to read as current
+        // and stay pinned there.
+        let current = "0.5.5:protocol-1:bbbbbbb:435:mine";
+        assert!(remote_companion_is_behind(
+            "0.5.5:protocol-1:aaaaaaa:172:theirs",
+            "0.5.5",
+            current
+        ));
+        assert!(!remote_companion_is_behind(
+            "0.5.5:protocol-1:aaaaaaa:435:theirs",
+            "0.5.5",
+            current
+        ));
+        // Too old to name its generation: the version is all it can say, and
+        // that ranks below any counted build - which is what the silence means.
+        assert!(remote_companion_is_behind("unknown", "0.5.5", current));
+        assert!(remote_companion_is_behind("", "0.5.5", current));
+        // A working tree ranks above nothing across the wire, or every remote
+        // would be handed whatever a developer had just compiled.
+        assert!(!remote_companion_is_behind(
+            "0.5.5:protocol-1:aaaaaaa:172:theirs",
+            "0.5.5",
+            "0.5.5:protocol-1:local:local:mine"
+        ));
+    }
+
+    #[test]
     fn bootstrap_script_updates_missing_or_stale_companions_in_place() {
         let script = remote_bootstrap_script("~/.local/bin/muxloomd", &[]);
         assert!(script.contains(BOOTSTRAP_MARKER));
         assert!(script.contains("uname -s"));
         assert!(script.contains("binary-sha256"));
-        assert!(script.contains("HAVE %s %s %s %s"));
-        // The reported version is what keeps a companion left behind by an
-        // older build from matching its own fingerprint forever.
+        assert!(script.contains("HAVE %s %s %s %s %s"));
+        // The reported generation is what keeps a companion left behind by an
+        // older build of this same version from matching its own fingerprint
+        // forever; the version is the fallback for one too old to have this
+        // subcommand at all.
         assert!(script.contains("--version"));
         assert!(script.contains("version=${version##* }"));
+        assert!(script.contains("\"$candidate\" generation"));
         assert!(script.contains("INSTALL "));
         assert!(script.contains("head -c \"$muxloom_size\""));
         assert!(script.contains("mv -f \"$temporary\" \"$installed\""));

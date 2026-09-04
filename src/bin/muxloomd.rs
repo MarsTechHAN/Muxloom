@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, process::ExitCode};
 
 use anyhow::{Result, bail};
 use muxloom::{
-    daemon::{DaemonPaths, bridge, request_status, serve, stop},
+    daemon::{DaemonPaths, bridge, current_generation, request_status, serve, stop},
     daemon_protocol::{DaemonResponse, PROTOCOL_VERSION},
 };
 use sha2::{Digest, Sha256};
@@ -98,6 +98,15 @@ fn run() -> Result<()> {
             println!("{PROTOCOL_VERSION}");
             Ok(())
         }
+        // Which build this is, not merely which release it belongs to. A
+        // controller asks a remote companion this to find out whether it is
+        // behind: two builds of one version are only told apart by the height
+        // in here, and a fleet between two releases that compares versions
+        // alone reads as current however far back it has fallen.
+        Some("generation") => {
+            println!("{}", current_generation());
+            Ok(())
+        }
         Some("binary-sha256") => {
             let mut executable = File::open(std::env::current_exe()?)?;
             let mut digest = Sha256::new();
@@ -114,7 +123,7 @@ fn run() -> Result<()> {
         }
         Some("--help" | "-h" | "help") | None => {
             println!(
-                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd mcp\n    muxloomd register        write this machine's control surface into its agents\n    muxloomd status\n    muxloomd stop            stop the running daemon; sessions keep running\n    muxloomd protocol-version\n    muxloomd binary-sha256",
+                "muxloomd {}\n\nUSAGE:\n    muxloomd serve\n    muxloomd bridge\n    muxloomd mcp\n    muxloomd register        write this machine's control surface into its agents\n    muxloomd status\n    muxloomd stop            stop the running daemon; sessions keep running\n    muxloomd protocol-version\n    muxloomd generation\n    muxloomd binary-sha256",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
