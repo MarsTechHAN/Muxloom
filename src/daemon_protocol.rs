@@ -455,6 +455,11 @@ pub enum DaemonRequest {
     TalkAppend {
         messages: Vec<TalkMessage>,
     },
+    /// Drop everything this machine's board holds, keeping the marks that say
+    /// how far each log reached — so a peer that still holds all of it is
+    /// offering nothing new, rather than refilling the board on the next
+    /// round. Clears this machine only; another machine's copy is its own.
+    TalkClear,
     /// Put a message in front of an agent session on this machine. The draft
     /// says who is speaking and `to` says which session; the daemon renders
     /// the envelope, decides whether the session is free enough to be typed
@@ -696,6 +701,10 @@ pub enum DaemonResponse {
     /// Answers `TalkStatus`.
     TalkBoard {
         state: TalkState,
+    },
+    /// Answers `TalkClear` with how many records were dropped.
+    TalkCleared {
+        dropped: usize,
     },
     /// Answers `TalkFetch`, and `TalkAppend` with how many were new.
     TalkCarry {

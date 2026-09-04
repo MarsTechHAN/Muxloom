@@ -944,6 +944,41 @@ impl TalkStore {
         Ok(true)
     }
 
+    /// Drop everything this board holds, keeping only the mark that says it
+    /// was held.
+    ///
+    /// The mark is the whole of why this is not `rm`. A record dropped from
+    /// the middle of a log leaves a hole that stops the version vector, so
+    /// peers re-send it and it comes straight back; dropping every record and
+    /// forgetting where they ended is worse still, because then every peer
+    /// re-sends everything. Clearing is therefore the same shape as retention:
+    /// a prefix drop that writes down what it dropped, after which a peer
+    /// offering any of it again is simply refused.
+    ///
+    /// It clears this machine's board. Another machine's copy is that
+    /// machine's to clear — the board is replicated, not shared, and nothing
+    /// here can speak for a daemon it cannot see.
+    pub fn clear(&self) -> Result<usize> {
+        let mut inner = self.inner();
+        let root = self.root.join("log");
+        let mut dropped = 0;
+        for (origin, log) in inner.logs.iter_mut() {
+            if log.messages.is_empty() {
+                continue;
+            }
+            dropped += log.messages.len();
+            log.low_water = log.highest();
+            log.messages.clear();
+            rewrite_log(
+                &root.join(format!("{origin}.jsonl")),
+                origin,
+                log.low_water,
+                &log.messages,
+            )?;
+        }
+        Ok(dropped)
+    }
+
     /// Drop what has aged out. Called when the board is opened rather than on
     /// a timer: a daemon that nobody talks to should not be doing work.
     pub fn compact(&self) -> Result<()> {
@@ -2077,6 +2112,63 @@ mod tests {
         assert_eq!(retention_for(&mine), (RETAIN_PER_ORIGIN, RETAIN_MS));
 
         fs::remove_dir_all(&store.root).ok();
+    }
+
+    #[test]
+    fn a_cleared_board_stays_cleared_when_the_fleet_offers_it_back() {
+        let store = store("clear");
+        let root = store.root.clone();
+        store
+            .post(draft("worth keeping", TalkScope::Global))
+            .unwrap();
+        store
+            .post(draft("also worth keeping", TalkScope::Global))
+            .unwrap();
+        let far = |seq: u64| TalkMessage {
+            id: format!("other-1234abcd:{seq}"),
+            origin: "other-1234abcd".into(),
+            seq,
+            ts: now_ms(),
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: "other-1234abcd".into(),
+                machine_label: "gpu-box".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Message,
+            to: None,
+            reply_to: None,
+            text: format!("from elsewhere {seq}"),
+        };
+        store.merge(vec![far(1), far(2)]).unwrap();
+
+        assert_eq!(store.clear().unwrap(), 4);
+        assert!(store.read(&TalkFilter::default()).messages.is_empty());
+        // Cleared, not forgotten: the marks say the board reached here, so a
+        // peer still holding all of it is offering nothing new.
+        assert_eq!(store.state().vector["other-1234abcd"], 2);
+        assert_eq!(store.merge(vec![far(1), far(2)]).unwrap(), 0);
+        // And nothing was said twice: the next post carries on from where the
+        // cleared board left off, so no id is ever minted a second time.
+        assert_eq!(
+            store.post(draft("after", TalkScope::Global)).unwrap().seq,
+            3
+        );
+        drop(store);
+
+        let reopened = TalkStore::open(root.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .read(&TalkFilter::default())
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect::<Vec<_>>(),
+            ["after"]
+        );
+        assert_eq!(reopened.merge(vec![far(1), far(2)]).unwrap(), 0);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A catch-up batch is capped, and what it drops has to be the newest -

@@ -111,6 +111,26 @@ fn real_main() -> Result<()> {
                 io::stdout(),
             )
         }
+        Command::BoardClear => {
+            let config = Config::load(&options.config_path)?;
+            let target = match options.machine.as_deref() {
+                None | Some(muxloom::model::LOCAL_TARGET_ID) => Target::local(),
+                Some(alias) => Target::ssh(alias),
+            };
+            let runtime = Runtime::new(&config);
+            let dropped = runtime
+                .bridge_pool()
+                .talk_clear(&target)
+                .with_context(|| format!("clearing the talk board on {}", target.id))?;
+            // The board is replicated rather than shared, so this says which
+            // copy went: a machine that still holds its own is not wrong, it
+            // just has not been asked.
+            println!(
+                "Cleared {dropped} records from the talk board on {}.",
+                target.id
+            );
+            Ok(())
+        }
         Command::Run => {
             if !options.config_explicit {
                 migrate_legacy_file(&legacy_config_path(), &options.config_path)?;
@@ -688,6 +708,8 @@ enum Command {
     Init,
     Update,
     Mcp,
+    /// `board clear`: empty one machine's talk board.
+    BoardClear,
     Help,
     Version,
 }
@@ -702,6 +724,8 @@ struct CliOptions {
     /// gets installed is stamped with its own stream, so the next check
     /// follows it on its own.
     update_channel: Option<muxloom::update::Channel>,
+    /// `--machine`: which machine a command that names one is aimed at.
+    machine: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<CliOptions> {
@@ -710,12 +734,28 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
     let mut debug_log = None;
     let mut config_explicit = false;
     let mut update_channel = None;
+    let mut machine = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "init" => command = Command::Init,
             "update" => command = Command::Update,
             "mcp" => command = Command::Mcp,
+            "board" => {
+                index += 1;
+                match args.get(index).map(String::as_str) {
+                    Some("clear") => command = Command::BoardClear,
+                    Some(other) => bail!("unknown board command: {other}"),
+                    None => bail!("`board` needs a command: `muxloom board clear`"),
+                }
+            }
+            "--machine" => {
+                index += 1;
+                let Some(name) = args.get(index) else {
+                    bail!("--machine requires a machine id");
+                };
+                machine = Some(name.clone());
+            }
             "--help" | "-h" => command = Command::Help,
             "--version" | "-V" => command = Command::Version,
             "--nightly" => update_channel = Some(muxloom::update::Channel::Nightly),
@@ -743,18 +783,58 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
     if update_channel.is_some() && command != Command::Update {
         bail!("--nightly and --stable only apply to `muxloom update`");
     }
+    if machine.is_some() && command != Command::BoardClear {
+        bail!("--machine only applies to `muxloom board clear`");
+    }
     Ok(CliOptions {
         command,
         config_path,
         debug_log,
         config_explicit,
         update_channel,
+        machine,
     })
 }
 
 fn print_help() {
     println!(
-        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update [--nightly | --stable]\n    muxloom mcp [--config PATH]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --nightly        Update from the rolling nightly build, and stay on it\n        --stable         Update from the tagged releases, and stay on them\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the newest build, if newer\n    mcp                  Serve muxloom's control surface over MCP stdio\n",
+        "muxloom {}\n\nUSAGE:\n    muxloom [--config PATH] [--debug | --debug-log PATH]\n    muxloom init [--config PATH]\n    muxloom update [--nightly | --stable]\n    muxloom mcp [--config PATH]\n    muxloom board clear [--machine ID]\n\nOPTIONS:\n    -h, --help           Show this help\n    -V, --version        Show version\n        --config PATH    Use a custom TOML config\n        --nightly        Update from the rolling nightly build, and stay on it\n        --stable         Update from the tagged releases, and stay on them\n        --machine ID     Which machine `board clear` empties (default: this one)\n        --debug          Write detailed diagnostics to the state directory\n        --debug-log PATH Write diagnostics to a custom file\n\nCOMMANDS:\n    init                 Write an example config file\n    update               Download and install the newest build, if newer\n    mcp                  Serve muxloom's control surface over MCP stdio\n    board clear          Empty one machine's talk board, keeping replication marks\n",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(words: &[&str]) -> Result<CliOptions> {
+        parse_args(
+            &words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn clearing_a_board_names_the_machine_it_empties() {
+        // The board is replicated rather than shared, so emptying one is
+        // always about one machine, and the default is the one you are on.
+        let here = parse(&["board", "clear"]).unwrap();
+        assert_eq!(here.command, Command::BoardClear);
+        assert_eq!(here.machine, None);
+        assert_eq!(
+            parse(&["board", "clear", "--machine", "soil"])
+                .unwrap()
+                .machine
+                .as_deref(),
+            Some("soil")
+        );
+        // A word that is not a command must not be read as one, and a machine
+        // named for anything else is a typo rather than an instruction.
+        assert!(parse(&["board"]).is_err());
+        assert!(parse(&["board", "burn"]).is_err());
+        assert!(parse(&["--machine", "soil"]).is_err());
+        assert!(parse(&["board", "clear", "--machine"]).is_err());
+    }
 }

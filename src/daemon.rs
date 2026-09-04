@@ -3526,6 +3526,10 @@ mod platform {
                     .result(&id, crate::relay::now_ms())?;
                 write_response(writer, request_id, &DaemonResponse::Relayed { answer })
             }
+            DaemonRequest::TalkClear => {
+                let dropped = state.talk()?.clear()?;
+                write_response(writer, request_id, &DaemonResponse::TalkCleared { dropped })
+            }
             DaemonRequest::TalkAppend { messages } => {
                 let added = state.talk()?.merge(messages)?;
                 write_response(

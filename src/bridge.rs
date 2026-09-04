@@ -1009,6 +1009,15 @@ impl BridgeConnection {
         }
     }
 
+    /// Empty this machine's board, keeping the marks that say how far it got.
+    pub fn talk_clear(&self) -> Result<usize> {
+        self.require_capability(TALK_CAPABILITY)?;
+        match self.request(DaemonRequest::TalkClear)?.response {
+            DaemonResponse::TalkCleared { dropped } => Ok(dropped),
+            response => bail!("unexpected talk response: {response:?}"),
+        }
+    }
+
     /// What the board on this machine holds, telling it the name a human uses
     /// for the machine while we are here: the controller is the only thing
     /// that knows it, and a message carries it for reading later.
@@ -2715,6 +2724,10 @@ impl BridgePool {
 
     pub fn talk_post(&self, target: &Target, draft: TalkDraft) -> Result<TalkMessage> {
         self.connection_for_target(target)?.talk_post(draft)
+    }
+
+    pub fn talk_clear(&self, target: &Target) -> Result<usize> {
+        self.connection_for_target(target)?.talk_clear()
     }
 
     pub fn talk_read(&self, target: &Target, filter: TalkFilter) -> Result<TalkPage> {
