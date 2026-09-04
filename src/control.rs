@@ -643,6 +643,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       run, which needs at most a note saying where it is. Posting interrupts \
                       nobody and reaches nobody in particular. If what you have is news rather \
                       than knowledge, that is the sign not to post it.\n\n\
+                      Three of those are refused rather than advised against, so a board stays \
+                      a memory whoever is writing to it: a post of kind \"message\" (that kind \
+                      is a person speaking at the dashboard), a post under the reserved \
+                      /muxloom/ paths (muxloom's own coordination between machines), and a note \
+                      you have already written down word for word — a memory does not need \
+                      saying twice, and if what you know has changed, say what changed and \
+                      reply_to the original.\n\n\
                       `scope` decides who inherits it: \"path\" (default) is one directory on one \
                       machine, which is where anything about a particular codebase belongs; \
                       \"machine\" is everyone on this machine, for how the machine itself \
@@ -662,7 +669,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "text": { "type": "string", "description": "What to say." },
                 "scope": { "type": "string", "enum": ["path", "machine", "task", "global"], "description": "Who it is for. Default path." },
                 "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
-                "kind": { "type": "string", "enum": ["note", "message"], "description": "\"note\" (the default) is knowledge, kept and searched later — what the board is for. \"message\" is the older kind, still carried so a person can type on the dashboard and an older machine's posts still arrive; an agent has no reason to choose it." },
+                "kind": { "type": "string", "enum": ["note"], "description": "\"note\", the default and the only kind a tool call may write: knowledge, kept and searched later — what the board is for. \"message\" is a person speaking at the dashboard and is refused here." },
                 "reply_to": { "type": "string", "description": "Id of the note this corrects or adds to. One hop, and only when the correction matters to whoever reads the original later. A reply that is really an answer to somebody belongs in message_agent." },
             }),
             &["text"],
@@ -2390,21 +2397,47 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
              message_agent instead"
         );
     }
+    // Saying "the board is a memory" and then taking anything that was handed
+    // to it is how a board fills with a fleet's passing remarks. A note is
+    // what is written down; the other kind is a person speaking at the
+    // dashboard, and a tool call is never a person.
+    if kind == TalkKind::Message {
+        bail!(
+            "the board is a memory, and \"message\" is a person speaking at the dashboard. \
+             Write it down as a note if it will still be worth knowing tomorrow; say it to \
+             somebody with message_agent if it will not"
+        );
+    }
     let scope = match optional_str(arguments, "scope").unwrap_or("path") {
         "global" => TalkScope::Global,
         "machine" => TalkScope::Machine {
             machine: String::new(),
         },
-        "path" => TalkScope::Path {
-            machine: String::new(),
-            path: optional_str(arguments, "path")
+        "path" => {
+            let path = optional_str(arguments, "path")
                 .map(str::to_string)
                 .or_else(|| session_env("MUXLOOM_SESSION_PATH"))
                 .context(
                     "scope \"path\" needs a path, and this process is not running inside a \
                      muxloom session that could name one",
-                )?,
-        },
+                )?;
+            // muxloom keeps its own coordination notes under this namespace —
+            // which machine holds a chat account, what a person said about an
+            // approval parked elsewhere. They are on the board because every
+            // machine replicates it, and they are nobody's memory.
+            if path.starts_with(crate::talk::WIRE_PATH_PREFIX) {
+                bail!(
+                    "{} is muxloom's own, for coordination between machines rather than for \
+                     anything anybody wrote down. Post under the directory the knowledge is \
+                     about",
+                    crate::talk::WIRE_PATH_PREFIX
+                );
+            }
+            TalkScope::Path {
+                machine: String::new(),
+                path,
+            }
+        }
         "task" => TalkScope::Task {
             machine: String::new(),
             root_session: task_root().context(
@@ -6536,12 +6569,34 @@ mod tests {
             posted(json!({ "text": "x", "kind": "note" })),
             TalkKind::Note
         );
-        // The older kind still parses: a person types it at the dashboard, and
-        // a machine running an older muxloom posts it at us either way.
-        assert_eq!(
-            posted(json!({ "text": "x", "kind": "message" })),
-            TalkKind::Message
+        // What is not memory is refused rather than advised against, because
+        // a board fills with passing remarks either way.
+        let refused = |mut arguments: Value| {
+            if arguments.get("path").is_none() {
+                arguments["path"] = json!("/work");
+            }
+            talk_draft(&arguments, TalkAuthor::default())
+                .expect_err("not something the board holds")
+                .to_string()
+        };
+        // The other kind is a person speaking at the dashboard. It still
+        // parses off the wire, where an older machine's posts arrive labelled
+        // that way; it is not something a tool call may write.
+        assert!(
+            refused(json!({ "text": "x", "kind": "message" })).contains("person speaking"),
+            "{}",
+            refused(json!({ "text": "x", "kind": "message" }))
         );
+        assert_eq!(TalkKind::parse("message").unwrap(), TalkKind::Message);
+        // A direct message goes to a session, not onto a board.
+        assert!(refused(json!({ "text": "x", "kind": "direct" })).contains("message_agent"));
+        // And muxloom's own coordination paths are not anybody's memory.
+        let reserved = refused(json!({
+            "text": "x",
+            "scope": "path",
+            "path": "/muxloom/channel-leases",
+        }));
+        assert!(reserved.contains("muxloom's own"), "{reserved}");
 
         let tool = |name| {
             specs(Flavor::Controller)
@@ -6552,6 +6607,12 @@ mod tests {
         };
         let post = tool("talk_post");
         assert!(post.contains("memory, not a transport"), "{post}");
+        // The refusals are named, so an agent learns the rule from the tool
+        // rather than from an error after the fact.
+        assert!(
+            post.contains("refused rather than advised against"),
+            "{post}"
+        );
         assert!(post.contains("set_head_name"), "{post}");
         assert!(post.contains("message_agent"), "{post}");
         // And the read side says the same, because an agent that thinks the

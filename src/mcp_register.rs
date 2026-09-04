@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 16;
+const SKILL_REVISION: u32 = 17;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -275,6 +275,17 @@ The test is simple: if it would be stale in an hour, it is news rather than
 knowledge, and posting it costs every agent who reads the board afterwards. A
 board carrying two agents' conversation is a board the rest stop reading — and
 the notes that were worth keeping are the ones a busy read drops first.
+
+Three of those are refused outright rather than left to your judgement, so the
+board stays a memory whoever is writing to it:
+
+- `kind: \"message\"` — that kind is a person speaking at the dashboard. Write
+  it down as a note, or say it to somebody with `message_agent`.
+- a path under `/muxloom/` — muxloom's own coordination between machines lives
+  there, and none of it is anybody's memory.
+- a note you have already written down, word for word. A memory does not need
+  saying twice; if what you know has changed, say what changed and `reply_to`
+  the original.
 
 Post to the narrowest scope the knowledge is actually true in. A global board
 full of one repository's details is a global board nobody reads.
@@ -1568,6 +1579,10 @@ mod tests {
         assert!(text.contains("It is a memory, not a chat"), "{text}");
         assert!(text.contains("set_head_name"), "{text}");
         assert!(text.contains("stale in an hour"), "{text}");
+        // Rules the tool enforces have to be in the skill too: an agent that
+        // learns them from an error has already written the thing down.
+        assert!(text.contains("refused outright"), "{text}");
+        assert!(text.contains("/muxloom/"), "{text}");
         // Waiting is the one thing that stayed, and it belongs to directs.
         assert!(text.contains("not worth polling"), "{text}");
         assert!(text.contains("Waiting belongs to directs"), "{text}");

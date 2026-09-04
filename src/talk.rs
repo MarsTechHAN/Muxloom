@@ -748,11 +748,35 @@ impl TalkStore {
         // Which log this is filed in, which is not the same question as which
         // machine said it: `author.machine` and every address on the record
         // stay this machine's own key, and only the sequence space moves.
-        let log = match is_wire(draft.kind, &draft.scope) {
+        let wire = is_wire(draft.kind, &draft.scope);
+        let log = match wire {
             true => wire_origin(&origin),
             false => origin.clone(),
         };
         let mut inner = self.inner();
+        // A memory does not need saying twice. The same voice writing the same
+        // thing down again is a session that has forgotten it already did —
+        // which is exactly what happens when an agent loses its context and
+        // starts over, and what turned a board into hundreds of copies of the
+        // same sentence. Only its own voice is checked: two agents reaching
+        // the same conclusion is worth having twice, once each.
+        if !wire && draft.kind == TalkKind::Note && draft.author.voice.session_id.is_some() {
+            if let Some(held) = inner.logs.get(&log).and_then(|held| {
+                held.messages.iter().rev().find(|message| {
+                    message.kind == TalkKind::Note
+                        && message.text == text
+                        && message.scope == draft.scope
+                        && message.author.voice.session_id == draft.author.voice.session_id
+                })
+            }) {
+                bail!(
+                    "you already wrote this down, word for word, as {}. A memory does not need \
+                     saying twice; if what you know has changed, say what changed and reply_to \
+                     that one",
+                    held.id
+                );
+            }
+        }
         let seq = inner
             .logs
             .get(&log)
@@ -2169,6 +2193,44 @@ mod tests {
         assert_eq!(reopened.merge(vec![far(1), far(2)]).unwrap(), 0);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_same_voice_does_not_write_the_same_thing_down_twice() {
+        let store = store("repeat");
+        let scope = TalkScope::Path {
+            machine: String::new(),
+            path: "/work/repo".into(),
+        };
+        let note = |text: &str, scope: TalkScope| {
+            let mut draft = draft(text, scope);
+            draft.kind = TalkKind::Note;
+            draft
+        };
+        store
+            .post(note("the lexer keeps its own arena", scope.clone()))
+            .unwrap();
+        let again = store.post(note("the lexer keeps its own arena", scope.clone()));
+        assert!(
+            again
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("already wrote this")),
+            "{again:?}"
+        );
+        // What actually differs is not a repeat: another scope, other words,
+        // and another voice reaching the same conclusion are all worth having.
+        store
+            .post(note("the lexer keeps its own arena", TalkScope::Global))
+            .unwrap();
+        store
+            .post(note("the parser does not", scope.clone()))
+            .unwrap();
+        let mut other = note("the lexer keeps its own arena", scope);
+        other.author.voice.session_id = Some("session-2".into());
+        store.post(other).unwrap();
+        assert_eq!(store.read(&TalkFilter::default()).messages.len(), 4);
+
+        fs::remove_dir_all(&store.root).ok();
     }
 
     /// A catch-up batch is capped, and what it drops has to be the newest -

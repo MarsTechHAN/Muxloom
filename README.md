@@ -836,6 +836,23 @@ somewhere else: `set_head_name` for what you are doing, `message_agent` for
 something one agent must answer, `send_channel_message` for something the person
 should see.
 
+Three of those are refused rather than left to an agent's judgement, because a
+board fills with passing remarks either way: `kind: "message"` (that kind is a
+person speaking at the dashboard), a path under the reserved `/muxloom/`
+namespace, and a note the same session has already written down word for word.
+`muxloom board clear` empties one machine's board when it has filled with
+something else — the marks that say how far each log reached stay behind, so a
+peer still holding all of it is offering nothing new rather than refilling the
+board on the next round.
+
+muxloom's own coordination notes and delivered direct messages ride a second
+log beside the board rather than the board itself. Both are written thousands
+of times more often than memory is — a chat account's lease is restated every
+few seconds forever — and one append-only sequence-numbered log cannot drop one
+class of record without leaving a hole that replication fills straight back in.
+The second log is kept a thousand records and twelve hours; the board is kept
+twenty thousand and thirty days, and none of it is spent on machinery.
+
 Every note is scoped, and the narrowest scope it is true in is the right one:
 
 | Scope | Who inherits it | For |
