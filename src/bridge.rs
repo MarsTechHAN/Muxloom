@@ -2757,8 +2757,18 @@ impl BridgePool {
         {
             return Ok(started);
         }
-        connection.launch(
-            session_id,
+        // Not finding it there does not mean it never landed. The daemon takes
+        // the session into its index at the *end* of a launch it may still be
+        // part way through, and this is a second connection asking - so the
+        // question above can arrive while the first attempt is still running
+        // and get a truthful "no" that stops being true a moment later. Ask
+        // again if the relaunch is refused: whatever the far side says, a
+        // session under this id being there afterwards means the first attempt
+        // did land, and that session is the one this call was asking for. Asked
+        // by looking rather than by reading the refusal, because the wording of
+        // it belongs to whichever generation of muxloomd is on the far side.
+        let error = match connection.launch(
+            session_id.clone(),
             kind,
             path,
             label,
@@ -2771,7 +2781,18 @@ impl BridgePool {
             powers,
             initial_prompt,
             first_prompt,
-        )
+        ) {
+            Ok(session) => return Ok(session),
+            Err(error) => error,
+        };
+        if let Ok(sessions) = connection.list_sessions()
+            && let Some(started) = sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+        {
+            return Ok(started);
+        }
+        Err(error)
     }
 
     pub fn archive(&self, target: &Target, session_id: String) -> Result<()> {
