@@ -200,7 +200,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 19;
+const SKILL_REVISION: u32 = 20;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -418,18 +418,20 @@ arrives as a download named after the file — up to 10 MB for a picture and
 thumbnail the size of a stamp, and an attachment nobody has opened yet has to
 be answerable from the text alone.
 
-**Lark only.** A WeChat channel takes words and refuses a send that names files
-— refuses it whole, before the words go, so a picture never goes missing from a
-message that looks delivered. WeChat carries media through an encrypted CDN
-muxloom does not speak to. If that is the only channel bound, say what the file
-shows and where it is on the machine.
+**Both channels send.** A file that cannot be read or is over the cap stops the
+whole send before the words go, so a picture never goes missing from a message
+that looks delivered. WeChat's own CDN takes media only encrypted, which muxloom
+handles for you — there is nothing extra to pass.
 
-Coming the other way: something they attach in Lark is downloaded onto the
-machine that read the chat, and the message you are woken with names the path —
-`(they attached an image — it is on this machine at /…/channel-files/…)`. Open
-it like any other file; it is deleted after a week. On WeChat you are told what
-arrived and that it could not be fetched, which is your cue to ask what is in it
-rather than to answer around it.
+Coming the other way: anything they attach on either platform — a picture, a
+document, a video — is downloaded onto the machine that read the chat, and the
+message you are woken with names the path — `(they attached an image — it is on
+this machine at /…/channel-files/…)`. Open it like any other file; it is deleted
+after a week. A line saying muxloom could not fetch it is the exception, and it
+is your cue to ask what was in it rather than to answer around it. A WeChat
+voice note is the one thing that never arrives as a file: you get the
+transcription when there is one, and a line saying there was not when there is
+not.
 
 ### Answer them before you start
 
@@ -1662,8 +1664,15 @@ mod tests {
             assert!(text.contains(&said), "the skill must name {said}: {text}");
         }
         // And the one thing that is not a cap but is just as easy to get
-        // wrong: which platform can carry a file at all.
-        assert!(text.contains("**Lark only.**"), "{text}");
+        // wrong: which platform can carry a file at all. Both can now, and an
+        // agent still told "Lark only" would refuse to send a picture it was
+        // perfectly able to send.
+        assert!(text.contains("**Both channels send.**"), "{text}");
+        assert!(!text.contains("Lark only"), "{text}");
+        // And the same for the other direction, which was Lark's alone for
+        // longer: an agent told a WeChat picture cannot be fetched asks the
+        // person to describe a file already sitting on its own disk.
+        assert!(text.contains("on either platform"), "{text}");
         assert_eq!(skill_revision(&text), Some(SKILL_REVISION));
     }
 

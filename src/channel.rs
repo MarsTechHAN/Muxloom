@@ -916,24 +916,23 @@ pub fn send_reply(
     // out, so a path that is wrong costs nothing. Sent the other way round, a
     // bad path leaves a caption on somebody's phone pointing at a picture that
     // never arrives, and the agent is told about it too late to say so.
-    if !message.files.is_empty() && binding.kind == ChannelKind::WeChat {
-        bail!(
-            "this channel is WeChat, which muxloom can only send words through — its files and \
-             pictures go through an encrypted CDN muxloom does not speak to yet. Nothing was \
-             sent. Say what the file shows and where it is on the machine, or send it through a \
-             Lark channel if there is one bound."
-        );
-    }
-    // Uploaded before a word goes out, for the same reason: an upload the
-    // platform refuses is an error worth having while the message is still in
-    // the agent's hand. What is left behind by a card that then fails to send
-    // is an unreferenced key on Lark's side, which nobody ever sees.
+    //
+    // Uploaded up front for the same reason: an upload the platform refuses is
+    // an error worth having while the message is still in the agent's hand.
+    // What is left behind by a card that then fails to send is an unreferenced
+    // object on the platform's side, which nobody ever sees.
     let mut carried = Vec::new();
     for path in &message.files {
         let file = read_attachment(path)?;
-        let key = lark_upload(binding, &file, environment).with_context(|| {
-            format!("nothing was sent; {} could not be uploaded", path.display())
-        })?;
+        // WeChat has no separate upload step that outlives the send — its CDN
+        // wants the conversation named at the moment the bytes go up — so its
+        // files are read here and carried whole to the send below.
+        let key = match binding.kind {
+            ChannelKind::Lark => lark_upload(binding, &file, environment).with_context(|| {
+                format!("nothing was sent; {} could not be uploaded", path.display())
+            })?,
+            ChannelKind::WeChat => String::new(),
+        };
         carried.push((file, key));
     }
     let mut sent = match binding.kind {
@@ -941,11 +940,40 @@ pub fn send_reply(
         ChannelKind::WeChat => send_wechat(binding, message, reply_to, environment),
     }?;
     for (file, key) in &carried {
-        lark_send_media(binding, file, key, environment)
-            .with_context(|| format!("the message went out; {} did not", file.path.display()))?;
+        match binding.kind {
+            ChannelKind::Lark => lark_send_media(binding, file, key, environment),
+            ChannelKind::WeChat => wechat_send_media(binding, file, environment),
+        }
+        .with_context(|| format!("the message went out; {} did not", file.path.display()))?;
         sent.files.push(file.name.clone());
     }
     Ok(sent)
+}
+
+/// Hand one file to WeChat, after the words have gone.
+///
+/// One send per file and the caption already gone ahead of it, because the
+/// protocol carries one item per message: a picture bundled in beside the text
+/// is dropped silently rather than refused, which is the worst way to lose one.
+fn wechat_send_media(
+    binding: &ChannelBinding,
+    file: &Attached,
+    environment: &[(String, String)],
+) -> Result<()> {
+    let medium = match file.kind {
+        MediaKind::Image => ilink::Medium::Image,
+        MediaKind::File => ilink::Medium::File,
+    };
+    ilink::send_media(
+        &wechat_account(binding),
+        binding.context_token.trim(),
+        medium,
+        &file.name,
+        &file.bytes,
+        environment,
+    )
+    .with_context(|| format!("channel {} could not reach WeChat", binding.id))?;
+    Ok(())
 }
 
 /// Lark answers HTTP 200 with a non-zero `code` for everything it refuses, so
@@ -2399,11 +2427,34 @@ fn sweep_received(dir: &Path) {
     }
 }
 
-/// Fetch everything one message carries, and say where each of them landed.
+/// One line about one attachment, whether or not it made it onto the machine.
 ///
 /// A fetch that fails still produces a line. The person attached something and
 /// is waiting; an agent told a picture arrived and could not be read can ask
 /// about it, whereas an agent told nothing answers a message with a hole in it.
+///
+/// Worded the same for both platforms on purpose. An agent reads this without
+/// being told which chat app it came out of, and two dialects of one sentence
+/// is two things for it to learn.
+fn attachment_note(binding: &ChannelBinding, kind: MediaKind, landed: Result<PathBuf>) -> String {
+    let described = kind.description();
+    match landed {
+        Ok(path) => format!(
+            "(they attached {described} — it is on this machine at {})",
+            path.display()
+        ),
+        Err(error) => {
+            debug::log(
+                "channel",
+                format!("{}: could not fetch an attachment: {error:#}", binding.id),
+            );
+            format!("(they attached {described}, which muxloom could not fetch: {error})")
+        }
+    }
+}
+
+/// Fetch everything one Lark message carries, and say where each of them
+/// landed.
 fn collect_attachments(
     binding: &ChannelBinding,
     item: &Value,
@@ -2414,7 +2465,6 @@ fn collect_attachments(
     lark_attachments(item)
         .into_iter()
         .map(|attachment| {
-            let described = attachment.kind.description();
             let landed =
                 lark_fetch(binding, message_id, &attachment, environment).and_then(|bytes| {
                     let name = match attachment.kind {
@@ -2425,19 +2475,41 @@ fn collect_attachments(
                     };
                     save_received(dir, message_id, &name, &bytes)
                 });
-            match landed {
-                Ok(path) => format!(
-                    "(they attached {described} — it is on this machine at {})",
-                    path.display()
-                ),
-                Err(error) => {
-                    debug::log(
-                        "channel",
-                        format!("{}: could not fetch an attachment: {error:#}", binding.id),
-                    );
-                    format!("(they attached {described}, which muxloom could not fetch: {error})")
-                }
-            }
+            attachment_note(binding, attachment.kind, landed)
+        })
+        .collect()
+}
+
+/// The same, for one WeChat message.
+///
+/// Separate from the Lark path because nothing about the fetching is shared —
+/// Lark hands its resources out from behind the same token as everything else,
+/// while WeChat's live on a CDN that has never been told who is asking and
+/// holds them encrypted under a key the message itself carries.
+fn wechat_attachments(
+    binding: &ChannelBinding,
+    media: &[ilink::Enclosure],
+    message_id: &str,
+    dir: &Path,
+    environment: &[(String, String)],
+) -> Vec<String> {
+    media
+        .iter()
+        .map(|enclosure| {
+            let kind = match enclosure.medium {
+                ilink::Medium::Image => MediaKind::Image,
+                ilink::Medium::File => MediaKind::File,
+            };
+            let landed = ilink::fetch(enclosure, environment).and_then(|bytes| {
+                let name = match (kind, enclosure.name.trim()) {
+                    // WeChat sends a picture with no name at all, so the bytes
+                    // are the only thing that can say what it is.
+                    (MediaKind::Image, "") => format!("image.{}", image_extension(&bytes)),
+                    (_, named) => named.to_string(),
+                };
+                save_received(dir, message_id, &name, &bytes)
+            });
+            attachment_note(binding, kind, landed)
         })
         .collect()
 }
@@ -2543,6 +2615,7 @@ const WECHAT_SNOOZE_MS: u64 = 60 * 1000;
 fn wechat_inbox(
     binding: &ChannelBinding,
     inbox: &mut Inbox,
+    files: &Path,
     environment: &[(String, String)],
 ) -> Result<Vec<Incoming>> {
     let held = inbox.cursors.get(&binding.id);
@@ -2571,19 +2644,39 @@ fn wechat_inbox(
     Ok(round
         .said
         .into_iter()
-        .map(|said| Incoming {
-            stale: first,
+        .map(|said| {
             // WeChat does not always number a message. The cursor is what
             // actually keeps a round from repeating itself; this only has to be
             // different from its neighbours.
-            message_id: match said.message_id.is_empty() {
+            let message_id = match said.message_id.is_empty() {
                 true => format!("wechat-{}-{}", binding.id, said.at),
                 false => said.message_id,
-            },
-            reply_to: said.quoted_id,
-            at: said.at,
-            text: said.text,
-            context_token: said.context_token,
+            };
+            // Nothing in a catch-up round is delivered, so nothing in one is
+            // worth fetching: those files would land on this machine for an
+            // agent that is never told they exist, and be swept a week later
+            // having been read by nobody.
+            let mut lines: Vec<String> = Some(said.text)
+                .filter(|text| !text.trim().is_empty())
+                .into_iter()
+                .collect();
+            if !first {
+                lines.extend(wechat_attachments(
+                    binding,
+                    &said.media,
+                    &message_id,
+                    files,
+                    environment,
+                ));
+            }
+            Incoming {
+                stale: first,
+                message_id,
+                reply_to: said.quoted_id,
+                at: said.at,
+                text: lines.join("\n"),
+                context_token: said.context_token,
+            }
         })
         .collect())
 }
@@ -2601,7 +2694,7 @@ fn read_chat(
     environment: &[(String, String)],
 ) -> Result<Vec<Incoming>> {
     match binding.kind {
-        ChannelKind::WeChat => wechat_inbox(binding, inbox, environment),
+        ChannelKind::WeChat => wechat_inbox(binding, inbox, files, environment),
         ChannelKind::Lark => {
             let Some(&since) = inbox.seen.get(&binding.id) else {
                 // First sight of this chat. Start from now, for the same reason
@@ -4359,6 +4452,32 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_reads_the_same_whichever_chat_app_it_came_from() {
+        // The line an agent is woken with must not say which platform it came
+        // out of: one of the two used to say "muxloom cannot fetch this",
+        // which taught agents to ask a person to describe a file that is now
+        // downloaded onto the same disk they are reading from.
+        let dir = scratch("worded-the-same");
+        let landed = save_received(&dir, "wechat-1-9", "screenshot.png", b"bytes");
+        let arrived = attachment_note(&wechat("w1"), MediaKind::Image, landed);
+        assert!(
+            arrived.contains("they attached an image — it is on"),
+            "{arrived}"
+        );
+        assert!(arrived.contains("screenshot.png"), "{arrived}");
+        let lost = attachment_note(
+            &lark("l1"),
+            MediaKind::File,
+            Err(anyhow!("the CDN would not say")),
+        );
+        assert_eq!(
+            lost,
+            "(they attached a file, which muxloom could not fetch: the CDN would not say)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn everything_a_person_attaches_to_a_lark_message_is_found() {
         let message = |kind: &str, content: Value| json!({ "msg_type": kind, "body": { "content": content.to_string() } });
         assert_eq!(
@@ -4481,16 +4600,24 @@ mod tests {
     }
 
     #[test]
-    fn wechat_refuses_a_send_that_carries_a_file_rather_than_half_doing_it() {
-        // WeChat's media goes through an encrypted CDN muxloom does not speak
-        // to. The refusal has to come before the words go out: an agent that
-        // sees a message delivered assumes the picture went with it.
+    fn wechat_weighs_a_file_before_the_words_go_out_rather_than_half_doing_it() {
+        // WeChat now carries pictures and documents, so a send naming one is
+        // no longer refused for the channel it is on — but it is still weighed
+        // first. A path that is wrong has to be an error while the message is
+        // still in the agent's hand: an agent that sees a message delivered
+        // assumes the picture went with it, and by then it is too late to say
+        // otherwise.
+        let missing = std::env::temp_dir().join(format!(
+            "muxloom-absent-{}-{}.png",
+            std::process::id(),
+            line!()
+        ));
         let error = send_reply(
             &wechat("wechat-1"),
             &Outgoing {
                 title: "look".into(),
                 text: "look at this".into(),
-                files: vec!["/tmp/shot.png".into()],
+                files: vec![missing.clone()],
                 ..Default::default()
             },
             None,
@@ -4498,8 +4625,12 @@ mod tests {
         )
         .unwrap_err();
         let error = format!("{error:#}");
-        assert!(error.contains("Nothing was sent"), "{error}");
-        assert!(error.contains("Lark"), "{error}");
+        // The complaint is about the file, not about the channel.
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        assert!(
+            !error.contains("muxloom does not speak"),
+            "the CDN is spoken to now: {error}"
+        );
     }
 
     #[test]

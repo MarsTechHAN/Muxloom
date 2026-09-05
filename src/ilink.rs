@@ -38,10 +38,10 @@ const BOT_TYPE: &str = "3";
 
 /// A text item, in the protocol's numbering.
 const ITEM_TEXT: i64 = 1;
-/// The item types that are not words. Pictures and documents muxloom now both
-/// sends and names; a voice note or a video it can only name, because those
-/// arrive already encoded in formats (silk, in particular) nothing here can
-/// produce.
+/// The item types that are not words. Pictures and documents muxloom both
+/// sends and receives, and a video it receives; a voice note it can only name,
+/// because silk is a format nothing here decodes and none of the alternatives
+/// is worth carrying a codec for.
 const ITEM_IMAGE: i64 = 2;
 const ITEM_VOICE: i64 = 3;
 const ITEM_FILE: i64 = 4;
@@ -138,6 +138,28 @@ pub struct Said {
     /// to its sender. `None` when they simply typed — the common case, and
     /// what every message looked like before this was read.
     pub quoted_id: Option<String>,
+    /// What they attached, still on WeChat's CDN. Empty for the ordinary
+    /// message, which is words and nothing else.
+    pub media: Vec<Enclosure>,
+}
+
+/// One thing a person attached, as the message that carries it names it.
+///
+/// The bytes are not in here: they are on the CDN, encrypted, and [`fetch`] is
+/// what turns one of these into a file. The handle and the key stay private on
+/// purpose — the first is opaque and the second is a secret, and neither is
+/// anything a caller has business holding or logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enclosure {
+    /// Whether the phone showed it in the conversation or as a row to tap.
+    pub medium: Medium,
+    /// What the person called it, when the message says. A picture arrives
+    /// with no name at all and gets one from what its bytes turn out to be.
+    pub name: String,
+    /// The CDN's handle for the stored object.
+    query_param: String,
+    /// The AES key, in whichever of its spellings the message used.
+    key: String,
 }
 
 /// What one round of asking for messages found.
@@ -813,7 +835,14 @@ fn parse_said(msgs: &[Value]) -> Vec<Said> {
         .iter()
         .filter(|message| message.get("message_type").and_then(Value::as_i64) == Some(1))
         .filter_map(|message| {
-            let text = spoken(message)?;
+            // Words, an attachment, or both. Neither is not a message: a
+            // reaction or a card being edited comes through this same window,
+            // and waking an agent with nothing in hand is worse than silence.
+            let media = enclosures(message);
+            let text = spoken(message).unwrap_or_default();
+            if text.trim().is_empty() && media.is_empty() {
+                return None;
+            }
             Some(Said {
                 message_id: number_or_text(message, "message_id"),
                 from: text_at(message, "from_user_id"),
@@ -824,6 +853,7 @@ fn parse_said(msgs: &[Value]) -> Vec<Said> {
                     .unwrap_or_default(),
                 context_token: text_at(message, "context_token"),
                 quoted_id: quoted(message),
+                media,
             })
         })
         .collect::<Vec<_>>();
@@ -831,9 +861,9 @@ fn parse_said(msgs: &[Value]) -> Vec<Said> {
     said
 }
 
-/// The words out of one message, with everything that is not words left behind.
-/// A picture or a file has nothing to route, and waking an agent with an empty
-/// message is worse than saying nothing.
+/// The words out of one message, and only those. What is not words is either
+/// fetched — see [`enclosures`] — or, in the one case nothing here can open,
+/// named by [`missing`].
 fn spoken(message: &Value) -> Option<String> {
     let text = message
         .get("item_list")
@@ -849,9 +879,10 @@ fn spoken(message: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .filter(|said| !said.trim().is_empty());
-            // Anything else, the person sent and muxloom cannot open. Saying so
-            // is worth doing: the alternative is that a photograph reaches the
-            // machine as silence, and whoever sent it watches nobody answer.
+            // Anything else is either fetched elsewhere or, for the one kind
+            // that cannot be, named. Saying so is worth doing: the alternative
+            // is that something reaches the machine as silence, and whoever
+            // sent it watches nobody answer.
             said.or_else(|| Some(missing(item.get("type").and_then(Value::as_i64)?)?.to_string()))
         })
         .collect::<Vec<_>>()
@@ -859,27 +890,201 @@ fn spoken(message: &Value) -> Option<String> {
     Some(text).filter(|text| !text.trim().is_empty())
 }
 
-/// What to say instead of an item muxloom cannot read.
+/// What to say instead of an item nothing here can open.
 ///
-/// Each one names what it is and what to do about it, because the agent reading
-/// it has to answer the person without ever seeing the thing they sent.
+/// A voice note that came without a transcription is the whole of that list.
+/// It arrives as silk, which no codec on this machine decodes, so the honest
+/// thing is to say it arrived: the agent reading this has to answer the person
+/// without ever hearing it. Everything else non-textual is fetched.
 fn missing(kind: i64) -> Option<&'static str> {
-    Some(match kind {
-        ITEM_IMAGE => {
-            "(they sent a picture. muxloom cannot fetch pictures from WeChat — ask them what \
-             is in it, or ask them to send it to a Lark chat if one is bound.)"
+    match kind {
+        ITEM_VOICE => Some("(they sent a voice message that arrived without a transcription.)"),
+        _ => None,
+    }
+}
+
+/// Everything one message carries that can actually be had.
+///
+/// Deliberately not everything that is not words. A voice note is left out: it
+/// is silk, and a file nobody on this machine can open is worse than a line
+/// saying one arrived, because the line at least tells an agent to ask.
+fn enclosures(message: &Value) -> Vec<Enclosure> {
+    message
+        .get("item_list")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let (body, medium, name) = match item.get("type").and_then(Value::as_i64)? {
+                ITEM_IMAGE => (item.get("image_item")?, Medium::Image, String::new()),
+                ITEM_FILE => {
+                    let body = item.get("file_item")?;
+                    let name = text_at(body, "file_name");
+                    (body, Medium::File, name)
+                }
+                // A video is a document as far as this end is concerned. It
+                // arrives unnamed, and mp4 is what the phone sends.
+                ITEM_VIDEO => (
+                    item.get("video_item")?,
+                    Medium::File,
+                    "video.mp4".to_string(),
+                ),
+                _ => return None,
+            };
+            let media = body.get("media")?;
+            let query_param = text_at(media, "encrypt_query_param");
+            let key = match medium {
+                // A picture names its key twice — `aeskey` beside the item, in
+                // hex, and `media.aes_key` in base64 — and the two have been
+                // seen to disagree. WeChat's own client reads the first, so
+                // this does too, and falls back rather than failing.
+                Medium::Image => Some(text_at(body, "aeskey")).filter(|key| !key.is_empty()),
+                Medium::File => None,
+            }
+            .unwrap_or_else(|| text_at(media, "aes_key"));
+            match query_param.is_empty() {
+                true => None,
+                false => Some(Enclosure {
+                    medium,
+                    name,
+                    query_param,
+                    key,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Fetch what somebody attached, and hand back the bytes they attached.
+///
+/// One round trip and then the undoing of what [`send_media`] does going the
+/// other way. The CDN holds ciphertext and has never held the key: that
+/// travels in the message, which is why this is reachable at all without
+/// asking the API for permission first.
+pub fn fetch(enclosure: &Enclosure, environment: &[(String, String)]) -> Result<Vec<u8>> {
+    let bytes = http::get_bytes(
+        &format!(
+            "{CDN}/download?encrypted_query_param={}",
+            urlencode(&enclosure.query_param)
+        ),
+        &[],
+        environment,
+    )?;
+    if enclosure.key.trim().is_empty() {
+        // Nothing named a key, so there is nothing to undo: an object stored
+        // in the clear comes back usable as it stands.
+        return Ok(bytes);
+    }
+    decrypt(&bytes, &parse_key(&enclosure.key)?)
+}
+
+/// The sixteen bytes of an AES key, out of however the message spelled it.
+///
+/// Three spellings are in the wild for the same key and nothing in the message
+/// says which one it used: thirty-two hex characters as they stand, base64 of
+/// the sixteen raw bytes, and base64 of those same thirty-two hex characters.
+/// Only the length tells them apart, which is why this is a function rather
+/// than a call to a decoder.
+fn parse_key(spelling: &str) -> Result<[u8; BLOCK]> {
+    let spelling = spelling.trim();
+    let bytes = match unhex(spelling) {
+        Some(raw) if raw.len() == BLOCK => raw,
+        _ => {
+            let decoded = unbase64(spelling)
+                .ok_or_else(|| anyhow!("this message spells its key in neither hex nor base64"))?;
+            match unhex(&String::from_utf8_lossy(&decoded)) {
+                Some(raw) if raw.len() == BLOCK => raw,
+                _ => decoded,
+            }
         }
-        ITEM_VOICE => "(they sent a voice message that arrived without a transcription.)",
-        ITEM_FILE => {
-            "(they sent a file. muxloom cannot fetch files from WeChat — ask them what it is, \
-             or ask them to send it to a Lark chat if one is bound.)"
-        }
-        ITEM_VIDEO => {
-            "(they sent a video. muxloom cannot fetch videos from WeChat — ask them what is \
-             in it, or ask them to send it to a Lark chat if one is bound.)"
-        }
-        _ => return None,
+    };
+    <[u8; BLOCK]>::try_from(bytes.as_slice()).map_err(|_| {
+        anyhow!(
+            "this message's key is {} bytes rather than {BLOCK}",
+            bytes.len()
+        )
     })
+}
+
+/// Bytes out of hex, or nothing at all. Half an answer is not useful here: a
+/// key decoded part of the way is a file silently ruined.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() || text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
+}
+
+/// The inverse of [`base64`]. Padding and whitespace are ignored and the
+/// url-safe alphabet is accepted, because the far side is several
+/// implementations and they do not agree; anything else outside the alphabet
+/// makes the whole thing a refusal rather than a shorter answer.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut block = 0u32;
+    let mut held = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        let index = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 26,
+            b'0'..=b'9' => u32::from(byte - b'0') + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        block = (block << 6) | index;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((block >> held) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The undoing of [`encrypt`]: AES-128-ECB, with the padding checked rather
+/// than merely trimmed off.
+///
+/// The check is the point. A wrong key decrypts every bit as happily as a
+/// right one and hands back noise, and noise ending in a byte between 1 and 16
+/// would be written to disk as somebody's photograph. Padding that does not
+/// hold together is the only signal that the key was wrong, and this is the
+/// last place to catch it before the file is on the machine and broken.
+fn decrypt(bytes: &[u8], key: &[u8; BLOCK]) -> Result<Vec<u8>> {
+    use aes::Aes128;
+    use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+    if bytes.is_empty() || bytes.len() % BLOCK != 0 {
+        bail!(
+            "WeChat's CDN answered with {} bytes, which is not whole AES blocks",
+            bytes.len()
+        );
+    }
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut out = bytes.to_vec();
+    for block in out.chunks_mut(BLOCK) {
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+    }
+    let pad = usize::from(out.last().copied().unwrap_or_default());
+    let padded = (1..=BLOCK).contains(&pad)
+        && out.len() >= pad
+        && out[out.len() - pad..]
+            .iter()
+            .all(|byte| usize::from(*byte) == pad);
+    if !padded {
+        bail!(
+            "this file did not decrypt — the key on the message does not fit the bytes the CDN held"
+        );
+    }
+    out.truncate(out.len() - pad);
+    Ok(out)
 }
 
 /// The message one of these quotes, when the person replied by quoting one.
@@ -1076,20 +1281,17 @@ mod tests {
             spoken(&json!({ "item_list": [{ "type": 3, "voice_item": { "text": "开会去了" } }] })),
             Some("开会去了".into())
         );
-        // A picture has nothing in it to read, but a message that reached the
-        // machine as silence is a person watching nobody answer — so it is
-        // reported as what it is, with what to do about it.
-        let picture = spoken(&json!({ "item_list": [{ "type": 2, "image_item": {} }] }))
-            .expect("a picture must not arrive as silence");
-        assert!(picture.contains("picture"), "{picture}");
-        assert!(picture.contains("Lark"), "{picture}");
-        // Words alongside it are still the message; the note only adds to them.
-        let both = spoken(&json!({ "item_list": [
-            { "type": 1, "text_item": { "text": "看这个" } },
-            { "type": 2, "image_item": {} },
-        ] }))
-        .expect("words with a picture attached are still words");
-        assert!(both.starts_with("看这个\n("), "{both}");
+        // A picture is not words. It is not lost either — `enclosures` has it
+        // — and saying something here as well would describe it twice.
+        assert_eq!(
+            spoken(&json!({ "item_list": [{ "type": 2, "image_item": {} }] })),
+            None
+        );
+        // A voice note with no transcription is the one thing left that
+        // nothing here can open, so it is still named rather than dropped.
+        let voice = spoken(&json!({ "item_list": [{ "type": 3, "voice_item": {} }] }))
+            .expect("an untranscribed voice note must not arrive as silence");
+        assert!(voice.contains("voice message"), "{voice}");
         // An item type nobody has seen stays silent rather than inventing a
         // description of something that might be structural.
         assert_eq!(spoken(&json!({ "item_list": [{ "type": 97 }] })), None);
@@ -1463,5 +1665,98 @@ mod tests {
             endpoint("https://example.com", "sendmessage"),
             "https://example.com/ilink/bot/sendmessage"
         );
+    }
+
+    #[test]
+    fn what_a_person_attached_is_read_off_the_message_they_attached_it_to() {
+        let message = json!({ "item_list": [
+            { "type": 1, "text_item": { "text": "看这个" } },
+            { "type": 2, "image_item": {
+                "aeskey": "000102030405060708090a0b0c0d0e0f",
+                "media": { "encrypt_query_param": "handle-1", "aes_key": "unused" },
+            } },
+            { "type": 4, "file_item": {
+                "file_name": "季度报表.xlsx",
+                "media": { "encrypt_query_param": "handle-2", "aes_key": "AAECAwQFBgcICQoLDA0ODw==" },
+            } },
+        ] });
+        let found = enclosures(&message);
+        assert_eq!(found.len(), 2, "{found:?}");
+        // A picture is named by its bytes later, so it carries no name now —
+        // and its key is the one beside the item, not the one under `media`,
+        // which is the pair WeChat's own client disagrees about.
+        assert_eq!(found[0].medium, Medium::Image);
+        assert_eq!(found[0].name, "");
+        assert_eq!(found[0].key, "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(found[1].medium, Medium::File);
+        assert_eq!(found[1].name, "季度报表.xlsx");
+        assert_eq!(found[1].query_param, "handle-2");
+        // Both spellings of that one key are the same sixteen bytes.
+        assert_eq!(
+            parse_key(&found[0].key).unwrap(),
+            parse_key(&found[1].key).unwrap()
+        );
+        // A voice note is left out on purpose: silk is a file nobody here can
+        // open, and `missing` says so in words instead.
+        assert!(enclosures(&json!({ "item_list": [{ "type": 3, "voice_item": {} }] })).is_empty());
+        // Nothing to fetch it by is nothing to offer.
+        assert!(enclosures(&json!({ "item_list": [{ "type": 2, "image_item": {} }] })).is_empty());
+    }
+
+    #[test]
+    fn a_message_that_is_only_a_picture_is_still_a_message() {
+        // It used to take words to survive this, which meant a photograph sent
+        // with nothing typed alongside it reached the machine as silence.
+        let said = parse_said(&[json!({
+            "message_type": 1,
+            "message_id": 7,
+            "create_time_ms": 4,
+            "item_list": [{ "type": 2, "image_item": {
+                "aeskey": "000102030405060708090a0b0c0d0e0f",
+                "media": { "encrypt_query_param": "handle" },
+            } }],
+        })]);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].text, "");
+        assert_eq!(said[0].media.len(), 1);
+        // A message with neither words nor anything attached still goes.
+        assert!(parse_said(&[json!({ "message_type": 1, "item_list": [] })]).is_empty());
+    }
+
+    #[test]
+    fn one_key_is_read_the_same_however_the_message_spelled_it() {
+        let raw = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        // Thirty-two hex characters as they stand.
+        assert_eq!(parse_key(&hex(&raw)).unwrap(), raw);
+        // Base64 of the sixteen bytes.
+        assert_eq!(parse_key(&base64(&raw)).unwrap(), raw);
+        // And base64 of those same thirty-two hex characters, which is the
+        // spelling that looks like a key twice as long as it is.
+        assert_eq!(parse_key(&base64(hex(&raw).as_bytes())).unwrap(), raw);
+        // Anything else is refused rather than half-read into a wrong key.
+        assert!(parse_key("").is_err());
+        assert!(parse_key("not a key at all!").is_err());
+        assert!(parse_key(&hex(&[0u8; 8])).is_err());
+    }
+
+    #[test]
+    fn a_file_survives_the_round_trip_and_a_wrong_key_is_caught() {
+        let key = [7u8; BLOCK];
+        let plain = b"\x89PNG\r\n\x1a\n and then some bytes that do not divide evenly".to_vec();
+        assert_eq!(decrypt(&encrypt(&plain, &key), &key).unwrap(), plain);
+        // A file that is exactly whole blocks still comes back whole, which is
+        // what the extra padding block is for.
+        let round = vec![3u8; BLOCK * 2];
+        assert_eq!(decrypt(&encrypt(&round, &key), &key).unwrap(), round);
+        // The wrong key decrypts just as happily and gives back noise. Padding
+        // is the only thing that catches it, and it has to.
+        let wrong = decrypt(&encrypt(&plain, &key), &[8u8; BLOCK]);
+        assert!(wrong.is_err(), "a wrong key must not produce a file");
+        // Not whole blocks is not something the CDN was ever going to send.
+        assert!(decrypt(b"short", &key).is_err());
+        assert!(decrypt(b"", &key).is_err());
     }
 }

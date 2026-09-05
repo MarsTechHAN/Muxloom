@@ -711,9 +711,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              back to you as a direct message: watch for it with talk_read {{ scope: \"direct\", \
              wait_seconds }}. `files` sends what you cannot describe — a plot, a screenshot, a \
              short log — from paths on the machine you are running on; a picture arrives shown in \
-             the conversation and anything else as a download, after the words. Lark only: a \
-             WeChat channel is words, and a send naming files there is refused rather than \
-             quietly dropping them. This is a second surface, independent of the talk board: it \
+             the conversation and anything else as a download, after the words. Both Lark and \
+             WeChat carry them, and a file that cannot be read stops the whole send rather than \
+             quietly dropping it. This is a second surface, independent of the talk board: it \
              posts nothing there and reads nothing from it, so do not use talk_post to reply to a \
              person — answer them here, on the surface they wrote to.",
             text = crate::channel::READABLE_LIMIT,
@@ -726,7 +726,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "title": { "type": "string", "description": format!("A few words saying what this is about, at most {} characters. Shown as the card's title; taken from a leading \"# \" line if you leave it out.", crate::channel::TITLE_LIMIT) },
                 "channel": { "type": "string", "description": "Which bound channel, by id. Defaults to the one marked default, or to the only one there is." },
                 "reply_to": { "type": "string", "description": "Optional platform id of a message this one answers — the message_id from an earlier send_channel_message receipt, or the id a quote-relayed message named. WeChat draws the answer as a quote of that message; other kinds ignore it." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": format!("Absolute paths on the machine you are running on, sent after the words as their own messages. An image ({image}) arrives shown in the conversation; anything else arrives as a download named after the file. Lark only, and at most {picture} MB for a picture and {other} MB for anything else — a WeChat channel takes words alone and refuses a send that names files.", image = "png/jpg/gif/bmp/webp/tiff/ico", picture = crate::channel::cap_in_mb(crate::channel::LARK_IMAGE_BYTES), other = crate::channel::cap_in_mb(crate::channel::LARK_FILE_BYTES)) },
+                "files": { "type": "array", "items": { "type": "string" }, "description": format!("Absolute paths on the machine you are running on, sent after the words as their own messages. An image ({image}) arrives shown in the conversation; anything else arrives as a download named after the file. Lark and WeChat both carry them, at most {picture} MB for a picture and {other} MB for anything else — a file over the cap or one that cannot be read stops the whole send before the words go out.", image = "png/jpg/gif/bmp/webp/tiff/ico", picture = crate::channel::cap_in_mb(crate::channel::LARK_IMAGE_BYTES), other = crate::channel::cap_in_mb(crate::channel::LARK_FILE_BYTES)) },
             }),
             &["text"],
         ),
