@@ -7333,6 +7333,78 @@ mod platform {
             .clamp(least.max(1).min(most), most)
     }
 
+    /// How far into a window to look for a byte it is safe to start reading at.
+    ///
+    /// A window opens at whatever byte the seek landed on, which is as likely
+    /// to be the middle of an escape sequence as anywhere else. The bytes after
+    /// the cut are not a sequence any more — the ESC that introduced them is
+    /// behind the window — so a parser prints them, and a page came back with
+    /// `38;2;136;136;136m` sitting in its oldest row as though the session had
+    /// typed it. Starting instead at the next ESC or line feed throws away that
+    /// fragment and begins somewhere a sequence can begin.
+    ///
+    /// Bounded so that a window into a stream with neither (a long run of plain
+    /// text with no escapes) starts where it was going to start rather than
+    /// hunting through the whole thing.
+    const RESYNC_LIMIT: usize = 8 * 1024;
+
+    /// Where in `file` a window beginning at `start` can safely be read from.
+    fn resync_offset(file: &mut File, start: u64, end: u64) -> Result<u64> {
+        if start == 0 {
+            return Ok(start);
+        }
+        let reach = RESYNC_LIMIT.min(usize::try_from(end.saturating_sub(start)).unwrap_or(0));
+        if reach == 0 {
+            return Ok(start);
+        }
+        file.seek(SeekFrom::Start(start))?;
+        let mut head = vec![0u8; reach];
+        let read = read_fully(file, &mut head)?;
+        let head = &head[..read];
+        // A control sequence is parameter bytes and then one final byte. If the
+        // window opens on a run of parameters that ends in a final byte, that
+        // is the tail of a sequence the seek cut, and everything the session
+        // meant by it is behind the window: resume just past it and lose the
+        // sequence rather than the words after it. Parameters only, so a line
+        // of ordinary text that happens to start with digits is not mistaken
+        // for one - a space is an intermediate byte and would let almost any
+        // sentence match.
+        // A seek that landed exactly on the `[` is inside a sequence too: the
+        // ESC that introduced it is the byte behind the window.
+        let from = usize::from(head.first() == Some(&b'['));
+        let cut = head[from..]
+            .iter()
+            .position(|byte| !(0x30..=0x3f).contains(byte))
+            .map(|at| at + from)
+            .filter(|at| *at > from && (0x40..=0x7e).contains(&head[*at]));
+        if let Some(at) = cut {
+            return Ok(start + at as u64 + 1);
+        }
+        Ok(
+            match head.iter().position(|byte| *byte == 0x1b || *byte == b'\n') {
+                // Past the line feed, but *at* the escape: one is a boundary
+                // between rows and the other is where a sequence begins.
+                Some(at) if head[at] == b'\n' => start + at as u64 + 1,
+                Some(at) => start + at as u64,
+                None => start,
+            },
+        )
+    }
+
+    /// Fill `buffer` as far as the file goes, returning how much was read.
+    fn read_fully(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(filled)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_history_file(
         path: &Path,
@@ -7351,7 +7423,9 @@ mod platform {
         let mut window = seed_window(wanted, columns, least, most);
         let mut reached: Option<usize> = None;
         loop {
-            let start = end.saturating_sub(window);
+            // Where the window opens, moved forward off any escape sequence the
+            // seek landed in the middle of.
+            let start = resync_offset(&mut file, end.saturating_sub(window), end)?;
             // What width this window has to be replayed at, asked of the window
             // rather than assumed from the pane. A session is drawn at whatever
             // size the last client attached at, and history written wider than
@@ -8896,6 +8970,82 @@ mod platform {
                 !order.contains(&"master".to_string()),
                 "the root is closed by its caller, not by the walk"
             );
+        }
+
+        /// The bytes a seek lands in the middle of are not text, and must not
+        /// be read as text.
+        #[test]
+        fn a_page_does_not_show_the_tail_of_a_sequence_the_seek_cut() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloom-cut-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("cut.ansi");
+            // A window of exactly 24 bytes will open inside the colour
+            // sequence, whose parameters would otherwise be printed.
+            let colour = "\x1b[38;2;136;136;136m";
+            let log = format!("older\r\n{colour}kept\r\n");
+            fs::write(&path, &log).unwrap();
+            let window = 24u64;
+            let opens_at = log.len() as u64 - window;
+            assert!(
+                (7..7 + colour.len() as u64).contains(&opens_at),
+                "the window has to open inside the sequence to test anything: {opens_at}"
+            );
+
+            let read =
+                render_history_file(&path, 40, 5, 0, 4, window, window, Anchor::Drawn).unwrap();
+            let text = String::from_utf8_lossy(&read.rows).to_string();
+            assert!(
+                text.contains("kept"),
+                "the words after the cut survive: {text:?}"
+            );
+            assert!(
+                !text.contains("136;136;136m") && !text.contains("38;2"),
+                "the cut sequence must not be read as text: {text:?}"
+            );
+
+            fs::remove_dir_all(&root).ok();
+        }
+
+        #[test]
+        fn a_window_opens_where_a_sequence_can_begin_rather_than_inside_one() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloom-resync-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("cut.ansi");
+            // A colour sequence, then a word. A window opening inside that
+            // sequence would print the rest of it as though the session had
+            // typed it.
+            fs::write(&path, "abc\x1b[38;2;136;136;136mword\n").unwrap();
+            let mut file = File::open(&path).unwrap();
+            let end = file.metadata().unwrap().len();
+
+            // Landing inside the sequence resumes just past its final byte,
+            // so the sequence is lost and the word after it is not.
+            assert_eq!(resync_offset(&mut file, 6, end).unwrap(), 22);
+            // Landing on plain text moves to where a sequence can begin.
+            assert_eq!(resync_offset(&mut file, 1, end).unwrap(), 3);
+            // Landing in the word after it finds no sequence to step over, so
+            // it opens past the line feed: a boundary between rows.
+            assert_eq!(resync_offset(&mut file, 24, end).unwrap(), end);
+            // The beginning of the log is already a place a sequence can
+            // begin, and is never moved.
+            assert_eq!(resync_offset(&mut file, 0, end).unwrap(), 0);
+
+            // With neither an escape nor a line feed to find, the window opens
+            // where it was going to.
+            let plain = root.join("plain.ansi");
+            fs::write(&plain, "x".repeat(64)).unwrap();
+            let mut file = File::open(&plain).unwrap();
+            assert_eq!(resync_offset(&mut file, 8, 64).unwrap(), 8);
+
+            fs::remove_dir_all(&root).ok();
         }
 
         /// A pane that narrows must not take the history with it.
