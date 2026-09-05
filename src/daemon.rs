@@ -4345,14 +4345,15 @@ mod platform {
         // it starts would otherwise sit on the first approval prompt with no
         // one to answer it.
         //
-        // Only ever onto the runtime's own executable, though: these are that
-        // CLI's flags and mean nothing to anything else. Whatever a wrapper
-        // wants said to the agent it wraps, it is the one that knows how. The
-        // flags go in front, because Codex reads a `resume` further along as
-        // its subcommand and options come before it.
+        // Which flags those are, and whether this executable is the runtime
+        // itself rather than a wrapper around it, is
+        // `runtime::missing_unattended_arguments`'s to answer - the same answer
+        // the side that composed this command line got. They go in front,
+        // because Codex reads a `resume` further along as its subcommand and
+        // options come before it.
         if let Ok(kind) = kind.parse::<AgentKind>()
-            && Path::new(&executable).file_name() == Some(kind.as_str().as_ref())
-            && let Some(unattended) = crate::runtime::missing_unattended_arguments(kind, &args)
+            && let Some(unattended) =
+                crate::runtime::missing_unattended_arguments(kind, &executable, &args)
         {
             args.splice(
                 0..0,

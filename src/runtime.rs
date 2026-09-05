@@ -133,6 +133,15 @@ fn unattended_mode(kind: AgentKind) -> Option<UnattendedMode> {
 /// configured one or because whoever built this command line has been here
 /// already.
 ///
+/// Only ever onto the runtime's own executable, though: these are that CLI's
+/// flags, and anything else named here is a wrapper that has already decided
+/// how the agent inside it runs. A `cdx` that execs
+/// `codex --dangerously-bypass-approvals-and-sandbox "$@"` says so nowhere this
+/// side can read, and Codex refuses that flag beside `--ask-for-approval` - so
+/// a session started with both dies on its own argument parser before it draws
+/// anything. Whatever a wrapper wants said to the agent it wraps, it is the one
+/// that knows how.
+///
 /// Asked twice about the same launch, because both ends ask: the client builds
 /// the command line, and the daemon that spawns it checks the answer again
 /// rather than trusting it. A muxloom left running from an older build is still
@@ -140,9 +149,13 @@ fn unattended_mode(kind: AgentKind) -> Option<UnattendedMode> {
 /// unattended for that - so the side that outlives it has the last word.
 pub(crate) fn missing_unattended_arguments(
     kind: AgentKind,
+    executable: &str,
     args: &[String],
 ) -> Option<&'static [&'static str]> {
     let mode = unattended_mode(kind)?;
+    if Path::new(executable).file_name() != Some(kind.as_str().as_ref()) {
+        return None;
+    }
     let decided = mode
         .conflicts
         .iter()
@@ -4830,7 +4843,7 @@ pub(crate) fn launch_arguments(
     // asked to run unattended unless the configured arguments already choose a
     // mode. Like the flags below, this must precede Codex's `resume`
     // subcommand, so it goes on first.
-    if let Some(unattended) = missing_unattended_arguments(kind, &args) {
+    if let Some(unattended) = missing_unattended_arguments(kind, &command.command, &args) {
         args.extend(unattended.iter().map(|argument| (*argument).to_string()));
     }
     // Keep this session-local instead of changing the user's global Codex
@@ -6751,6 +6764,38 @@ mod tests {
             ["--auto"]
         );
         assert!(launch_arguments(&bare("pi"), AgentKind::Pi, false, None, None).is_empty());
+    }
+
+    /// A wrapper is not the runtime, however faithfully it passes its arguments
+    /// along. It exists to say how the agent inside it runs — a `cdx` that execs
+    /// `codex --dangerously-bypass-approvals-and-sandbox` has already answered
+    /// this question, out of sight — and Codex refuses that flag beside the pair
+    /// muxloom would otherwise add, so a session started with both never gets
+    /// past its own argument parser. A path that ends in the runtime's own name
+    /// is still the runtime.
+    #[test]
+    fn a_wrapper_around_a_runtime_is_left_to_say_how_it_runs() {
+        let bare = |command: &str| CommandConfig {
+            command: command.into(),
+            args: Vec::new(),
+            ..CommandConfig::default()
+        };
+
+        assert_eq!(
+            launch_arguments(&bare("cdx"), AgentKind::Codex, false, None, None),
+            with_codex_terminal(&["--no-alt-screen"])
+        );
+        assert!(launch_arguments(&bare("ccd"), AgentKind::Claude, false, None, None).is_empty());
+        assert_eq!(
+            launch_arguments(
+                &bare("/home/tiger/.local/bin/claude"),
+                AgentKind::Claude,
+                false,
+                None,
+                None
+            ),
+            ["--permission-mode", "auto"]
+        );
     }
 
     /// A mode written into the config is a decision somebody made on purpose,
