@@ -147,7 +147,8 @@ mod platform {
             TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
-            Anchor, InlineScrollback, page_has_content, render_history_page, resize_parser,
+            Anchor, InlineScrollback, REPLAY_COLUMNS_LIMIT, page_has_content, render_history_page,
+            resize_parser, widest_column,
         },
     };
 
@@ -3574,6 +3575,14 @@ mod platform {
                         (history, session.columns, session.rows)
                     };
                 write_chunks(writer, stream::HISTORY, request_id, &history.rows)?;
+                // The width the page was drawn at, which a rendered read may
+                // have widened past the session's so nothing in the window was
+                // clamped. A reader laying these rows out against the pane
+                // would cut them at the wrong column.
+                let columns = match history.columns {
+                    0 => columns,
+                    drawn => drawn,
+                };
                 write_response(
                     writer,
                     request_id,
@@ -7182,6 +7191,8 @@ mod platform {
                 rows: page,
                 total_lines: rows.len(),
                 offset_from_bottom: 0,
+                // Off the live grid, so the session's own width is the width.
+                columns,
                 // A full-screen program's grid is all there is; a screen that
                 // scrolls has a log under it this page did not look at.
                 reached_start: alternate_screen,
@@ -7270,6 +7281,12 @@ mod platform {
         /// program holding the whole terminal, whose drawing never scrolls
         /// into history. Only a rendered read can tell.
         alternate_screen: bool,
+        /// The width the page was actually drawn at, which is not always the
+        /// session's: a window is replayed wide enough that nothing in it is
+        /// clamped, so a reader is told what it is looking at rather than
+        /// laying the rows out against a width they were not drawn for. Zero
+        /// when the read drew nothing.
+        columns: u16,
     }
 
     impl HistoryRead {
@@ -7281,6 +7298,7 @@ mod platform {
                 offset_from_bottom: 0,
                 reached_start: true,
                 alternate_screen: false,
+                columns: 0,
             }
         }
     }
@@ -7334,10 +7352,19 @@ mod platform {
         let mut reached: Option<usize> = None;
         loop {
             let start = end.saturating_sub(window);
+            // What width this window has to be replayed at, asked of the window
+            // rather than assumed from the pane. A session is drawn at whatever
+            // size the last client attached at, and history written wider than
+            // that is not reflowed by a narrower replay: a program that
+            // positions its text by absolute column has that text clamped onto
+            // the last cell and destroyed. See `widest_column`.
+            file.seek(SeekFrom::Start(start))?;
+            let asked = widest_column(BufReader::new(&mut file).take(end - start))?;
+            let replay_columns = columns.max(asked).min(REPLAY_COLUMNS_LIMIT);
             file.seek(SeekFrom::Start(start))?;
             let rendered = render_history_page(
                 BufReader::new(&mut file).take(end - start),
-                columns,
+                replay_columns,
                 rows,
                 offset_from_bottom,
                 wanted,
@@ -7393,6 +7420,7 @@ mod platform {
                     offset_from_bottom: actual_offset,
                     reached_start: start == 0,
                     alternate_screen: rendered.alternate_screen,
+                    columns: replay_columns,
                 });
             }
             reached = Some(total_lines);
@@ -7425,6 +7453,7 @@ mod platform {
                 offset_from_bottom: actual_offset,
                 reached_start: true,
                 alternate_screen: false,
+                columns: 0,
             });
         }
         let start = end.saturating_sub(lines);
@@ -7474,6 +7503,9 @@ mod platform {
             // the session rather than the reach of one page.
             reached_start: true,
             alternate_screen: false,
+            // A raw read hands back log lines rather than a drawn grid, so it
+            // has no width of its own to report.
+            columns: 0,
         })
     }
 
@@ -8864,6 +8896,83 @@ mod platform {
                 !order.contains(&"master".to_string()),
                 "the root is closed by its caller, not by the walk"
             );
+        }
+
+        /// A pane that narrows must not take the history with it.
+        ///
+        /// A session is drawn at whatever size the last client attached at, so
+        /// a person who shrinks the agent pane used to lose every earlier page
+        /// of a Claude Code session outright: it lays out each word at an
+        /// absolute column, and a narrower replay clamps every column past the
+        /// edge onto the last cell, so the words there overwrite each other.
+        /// Not reflowed - destroyed.
+        #[test]
+        fn history_written_wider_than_the_pane_is_still_read_back_whole() {
+            let root = std::env::temp_dir().join(format!(
+                "muxloom-width-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("wide.ansi");
+            let words = [
+                "the",
+                "dashboard",
+                "and",
+                "a",
+                "person",
+                "still",
+                "minted",
+                "one",
+                "so",
+                "the",
+                "board",
+                "was",
+                "a",
+                "place",
+                "where",
+                "nobody",
+                "answered",
+                "anything",
+            ];
+            let mut log = String::new();
+            let mut column = 1;
+            for word in words {
+                log.push_str(&format!("\x1b[{column}G{word}"));
+                column += word.len() + 1;
+            }
+            log.push_str("\r\n");
+            assert!(column > 80, "the line has to reach past the narrow pane");
+            fs::write(&path, &log).unwrap();
+
+            // Read back on a pane that has since narrowed to 80.
+            let read =
+                render_history_file(&path, 80, 5, 0, 5, 4 * 1024, 1024 * 1024, Anchor::Drawn)
+                    .unwrap();
+            let text = String::from_utf8_lossy(&read.rows).to_string();
+            for word in words {
+                assert!(
+                    text.contains(word),
+                    "{word} was lost from the page: {text:?}"
+                );
+            }
+            // On one row, as it was written: wide enough that the line did
+            // not have to be broken, and the page says what width that was so
+            // a reader does not cut the rows at the pane's column.
+            assert!(
+                !read
+                    .rows
+                    .windows(crate::terminal_session::WRAPPED_ROW_MARK.len())
+                    .any(|window| window == crate::terminal_session::WRAPPED_ROW_MARK),
+                "the line was rebuilt whole rather than wrapped: {text:?}"
+            );
+            assert!(
+                read.columns > 80,
+                "drawn wider than the pane: {}",
+                read.columns
+            );
+
+            fs::remove_dir_all(&root).ok();
         }
 
         #[test]

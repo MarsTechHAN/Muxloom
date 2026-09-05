@@ -830,6 +830,117 @@ fn buffered_rows(parser: &mut vt100::Parser, columns: u16, rows: u16) -> Vec<(Ve
         .collect()
 }
 
+/// The widest column any absolute cursor move in `stream` reaches.
+///
+/// A terminal's history only reconstructs at the width it was written at, and
+/// for one kind of program that is not a matter of where lines wrap but of
+/// whether the text survives at all. Claude Code lays out every word with
+/// `ESC [ <n> G` — cursor character absolute — at columns computed for the pane
+/// it had at the time. Replayed on a narrower grid, every column past the edge
+/// is clamped onto the last cell, so those words overwrite each other there and
+/// what comes back is the first few characters of the line and a single
+/// surviving letter at the right margin. Not reflowed, not truncated: destroyed.
+///
+/// The log says what it needs, so it is asked rather than guessed at: this is
+/// the widest column the window addresses, and rendering at least that wide
+/// clamps nothing. Rendering wider than a line was written only moves where it
+/// would have wrapped, which is a layout difference; rendering narrower loses
+/// the text.
+///
+/// Bounded by [`REPLAY_COLUMNS_LIMIT`], because the number comes out of a log
+/// that anything at all may have written into.
+#[cfg(any(unix, test))]
+pub(crate) fn widest_column(mut stream: impl Read) -> Result<u16> {
+    // Only text that follows an absolute move is measured. A program that
+    // lets the terminal wrap for it never says how wide it is, and the length
+    // of what it printed is the length of a line the terminal was expected to
+    // break - counting that would replay ordinary shell output on a grid wide
+    // enough to stop it wrapping at all, which moves every line that was
+    // correct before. A program that positions its own text does know the
+    // width, and what it needs is where its rightmost word ends.
+    let mut widest = 0u16;
+    let mut escape = false;
+    let mut bracket = false;
+    let mut parameters: Vec<u16> = Vec::new();
+    let mut digits: Option<u16> = None;
+    // The column the next printed character will land on, while text is being
+    // placed by absolute moves rather than left to wrap.
+    let mut placed: Option<u16> = None;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to scan session history"),
+        };
+        for &byte in &buffer[..read] {
+            if escape {
+                if !bracket {
+                    // Only a control sequence carries a column; anything else
+                    // is stepped over, and its bytes are not text either.
+                    bracket = byte == b'[';
+                    escape = bracket;
+                    continue;
+                }
+                match byte {
+                    b'0'..=b'9' => {
+                        let held = digits.unwrap_or(0);
+                        digits = Some(
+                            held.saturating_mul(10)
+                                .saturating_add(u16::from(byte - b'0')),
+                        );
+                    }
+                    b';' => parameters.push(digits.take().unwrap_or(0)),
+                    _ => {
+                        parameters.push(digits.take().unwrap_or(0));
+                        let column = match byte {
+                            // Column only, and row-then-column.
+                            b'G' | b'`' => parameters.first().copied(),
+                            b'H' | b'f' => parameters.get(1).copied(),
+                            _ => None,
+                        };
+                        if let Some(column) = column.filter(|column| *column > 0) {
+                            placed = Some(column.min(REPLAY_COLUMNS_LIMIT));
+                            widest = widest.max(column.min(REPLAY_COLUMNS_LIMIT));
+                        }
+                        parameters.clear();
+                        escape = false;
+                        bracket = false;
+                    }
+                }
+                continue;
+            }
+            match byte {
+                0x1b => escape = true,
+                // The line ends, and with it what was placed on it.
+                b'\r' | b'\n' => placed = None,
+                // A continuation byte is the rest of a character already
+                // counted, and a control byte occupies no column.
+                byte if byte < 0x20 || byte == 0x7f || (byte & 0xc0) == 0x80 => {}
+                _ => {
+                    if let Some(column) = placed {
+                        // This character occupies that column; the next one is
+                        // one further along. A character two cells wide is
+                        // counted as one, which can only make the answer
+                        // narrower than the truth, and the caller takes the
+                        // wider of this and the pane either way.
+                        widest = widest.max(column);
+                        placed = Some(column.saturating_add(1).min(REPLAY_COLUMNS_LIMIT));
+                    }
+                }
+            }
+        }
+    }
+    Ok(widest)
+}
+
+/// The widest grid a history read will build, however wide the log asks for.
+/// A column is a number read out of a file that any program may have written
+/// into, and a grid is allocated per row, so it is not something to take on
+/// trust.
+pub const REPLAY_COLUMNS_LIMIT: u16 = 1000;
+
 /// Marks a rendered row that ran off the right edge and carried on in the row
 /// under it. It is an application program command, which every emulator and
 /// [`crate::ui`]'s own painter discard unseen, so a page carrying it draws the
@@ -1867,6 +1978,108 @@ mod tests {
         let mut blank = b"\x1b[m".to_vec();
         blank.extend_from_slice(WRAPPED_ROW_MARK);
         assert!(!page_has_content(&blank));
+    }
+
+    /// Claude Code does not let the terminal wrap its text. It positions every
+    /// word with an absolute column - `ESC [ <n> G` - computed for the width
+    /// the pane had when it wrote them, which is what its capture is full of.
+    /// Replayed narrower than that, every column past the edge is clamped onto
+    /// the last cell, so the words there overwrite each other and the line is
+    /// destroyed rather than reflowed.
+    #[test]
+    fn absolutely_positioned_history_needs_the_width_it_was_written_at() {
+        let words = [
+            "the",
+            "dashboard",
+            "and",
+            "a",
+            "person",
+            "all",
+            "from",
+            "a",
+            "chat",
+            "app",
+            "still",
+            "minted",
+            "one",
+            "so",
+            "the",
+            "board",
+            "was",
+            "a",
+            "place",
+            "where",
+        ];
+        let mut stream = String::new();
+        let mut column = 1;
+        for word in words {
+            stream.push_str(&format!("\x1b[{column}G{word}"));
+            column += word.len() + 1;
+        }
+        stream.push_str("\r\x1b[1B");
+        let reached = column;
+        assert!(
+            (81..=120).contains(&reached),
+            "the line has to reach past 80 to make the point: {reached}"
+        );
+
+        let words_at = |columns: u16| -> Vec<&'static str> {
+            let text = page_text(
+                &render_history_page(stream.as_bytes(), columns, 8, 0, 8, Anchor::Drawn)
+                    .unwrap()
+                    .page,
+            );
+            words
+                .into_iter()
+                .filter(|word| text.contains(word))
+                .collect()
+        };
+        // At the width it was written at, every word is where it was put.
+        assert_eq!(words_at(120).len(), words.len());
+        // Narrower, the tail of the line is gone: not wrapped onto the next
+        // row, not truncated at a word boundary - overwritten in place.
+        let narrow = words_at(80);
+        assert!(
+            !narrow.contains(&"where"),
+            "the last word should have been clamped away: {narrow:?}"
+        );
+        assert!(
+            narrow.len() < words.len(),
+            "a narrower replay loses the tail: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn the_width_a_window_needs_is_read_off_what_placed_its_text() {
+        // Text put at an absolute column needs the grid to reach where that
+        // text ends, not where it starts.
+        let placed = "\x1b[40Ganything";
+        assert_eq!(widest_column(placed.as_bytes()).unwrap(), 47);
+        // Row-then-column too, and the widest of several wins whatever order
+        // they came in.
+        let jumped = "\x1b[3;90Hx\x1b[2;10Hyyyy";
+        assert_eq!(widest_column(jumped.as_bytes()).unwrap(), 90);
+
+        // A line ends what was placed on it, so the next line starts over.
+        let two = "\x1b[70Gabc\r\ndefghij";
+        assert_eq!(widest_column(two.as_bytes()).unwrap(), 72);
+
+        // A program that lets the terminal wrap for it says nothing about its
+        // width, and the length of what it printed is not an answer: counting
+        // that would replay ordinary shell output on a grid wide enough to
+        // stop it wrapping, moving every line that was already correct.
+        let soft = "x".repeat(400);
+        assert_eq!(widest_column(soft.as_bytes()).unwrap(), 0);
+        // Colour in the middle of placed text does not end it, and a
+        // multi-byte character is one column rather than its bytes.
+        let coloured = "\x1b[30G\x1b[1max\x1b[m\u{4f60}\u{597d}";
+        assert_eq!(widest_column(coloured.as_bytes()).unwrap(), 33);
+        // And a column out of a log that anything may have written is bounded.
+        let absurd = "\x1b[99999Gx";
+        assert_eq!(
+            widest_column(absurd.as_bytes()).unwrap(),
+            REPLAY_COLUMNS_LIMIT
+        );
     }
 
     #[test]
