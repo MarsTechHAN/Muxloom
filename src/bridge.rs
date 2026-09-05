@@ -2767,6 +2767,10 @@ impl BridgePool {
         // did land, and that session is the one this call was asking for. Asked
         // by looking rather than by reading the refusal, because the wording of
         // it belongs to whichever generation of muxloomd is on the far side.
+        // This look cannot be early the way the first one was: the daemon
+        // refuses a resume only once it has found the session in the very index
+        // `list_sessions` reads back, so a refusal in hand means the answer to
+        // this question had already settled before it was sent.
         let error = match connection.launch(
             session_id.clone(),
             kind,
