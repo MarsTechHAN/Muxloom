@@ -968,9 +968,24 @@ fn is_our_table(header: &str) -> bool {
     name == ours || name.starts_with(&format!("{ours}."))
 }
 
+/// What Codex is told to do when the model reaches for a muxloom tool.
+///
+/// Codex asks before every MCP tool call it has not been told about, and a
+/// session muxloom starts is started with `--ask-for-approval never`, because
+/// nobody is sitting in front of it. Those two together are not a prompt that
+/// goes unanswered - they are a refusal: every call comes back "MCP tool call
+/// requires approval, but approval policy is never", and the agent cannot reach
+/// the fleet at all. `approve` is the only spelling that lets one through;
+/// `auto` still asks for anything the server has not annotated read-only.
+///
+/// It loosens nothing. What may be done through these tools is muxloom's own
+/// question, and the ones that touch another machine are still put to the person
+/// before they run.
+const CODEX_TOOL_APPROVAL: &str = "approve";
+
 fn codex_table(entry: &ServerEntry) -> String {
     let mut table = format!(
-        "[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{}]\n",
+        "[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{}]\ndefault_tools_approval_mode = \"{CODEX_TOOL_APPROVAL}\"\n",
         toml_string(&entry.command),
         entry
             .args
@@ -999,6 +1014,16 @@ fn codex_entry_matches(current: &toml::Value, entry: &ServerEntry) -> bool {
         .map(|args| args.iter().filter_map(toml::Value::as_str).collect())
         .unwrap_or_default();
     if arguments != entry.args {
+        return false;
+    }
+    // An entry written before muxloom knew to ask for this is an entry whose
+    // Codex sessions cannot call a single tool in it, so it is rewritten rather
+    // than left as it stands.
+    if current
+        .get("default_tools_approval_mode")
+        .and_then(toml::Value::as_str)
+        != Some(CODEX_TOOL_APPROVAL)
+    {
         return false;
     }
     let environment: BTreeMap<String, String> = current
@@ -1349,6 +1374,12 @@ mod tests {
             codex["mcp_servers"]["muxloom"]["command"].as_str(),
             Some("/opt/muxloomd")
         );
+        // Without this, a Codex session muxloom starts is refused every tool in
+        // the surface it was just handed.
+        assert_eq!(
+            codex["mcp_servers"]["muxloom"]["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
         let opencode: Value = serde_json::from_str(
             &fs::read_to_string(home.join(".config/opencode/opencode.json")).unwrap(),
         )
@@ -1415,6 +1446,35 @@ mod tests {
             codex["mcp_servers"]["muxloom"]["args"][0].as_str(),
             Some("mcp")
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// An entry written before muxloom knew to ask Codex for tool approval
+    /// points at the right daemon and is still useless: every call into it comes
+    /// back refused. Registration has to notice that and rewrite it, or the fix
+    /// only reaches machines that never had muxloom on them.
+    #[test]
+    fn an_entry_codex_would_refuse_every_tool_in_is_rewritten() {
+        let home = scratch("stale-approval");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[mcp_servers.muxloom]\ncommand = \"/opt/muxloomd\"\nargs = [\"mcp\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(register(&home, &entry()).unwrap().len(), 3);
+
+        let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert_eq!(text.matches("[mcp_servers.muxloom]").count(), 1, "{text}");
+        let codex: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            codex["mcp_servers"]["muxloom"]["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
+
+        // And now it is what registration would write, so it is left alone.
+        assert!(register(&home, &entry()).unwrap().is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 
