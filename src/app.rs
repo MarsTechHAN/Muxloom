@@ -4291,8 +4291,11 @@ impl App {
             return false;
         };
         if terminal.max_scrollback() == 0 {
-            // No buffered history: the agent is paging its own view.
-            return false;
+            // Full-screen TUIs keep no primary-screen scrollback. Let
+            // Muxloom page the active session's rendered history in that one
+            // case; otherwise PageUp has nowhere to go and the view appears
+            // completely stuck.
+            return older;
         }
         if older {
             true
@@ -8193,6 +8196,12 @@ impl App {
         // the emulator so paging never jumps from one coordinate system into
         // a daemon-rendered page with a missing seam. Archived sessions use
         // `request_history` below because they have no attached emulator.
+        if older && boundary == 0 {
+            self.history_offset = desired;
+            self.release_selection_for_scroll();
+            self.request_history();
+            return;
+        }
         if older && desired > boundary {
             desired = boundary;
             self.status_message = if boundary == 0 {
@@ -14722,8 +14731,9 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
 
-        // An alt-screen TUI keeps an empty local buffer: active paging stays
-        // at the live frame instead of mixing daemon history into the pane.
+        // An alt-screen TUI keeps an empty local buffer, so active paging
+        // falls back to the daemon's rendered history rather than getting
+        // stuck at the live frame.
         let (mut app, rx, root, _boundary) = prepped("alt-wheel-empty");
         app.terminal = Some(TerminalSession::detached(20, 5));
         app.terminal
@@ -14731,10 +14741,10 @@ mod tests {
             .unwrap()
             .process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
         app.handle_mouse(wheel(KeyModifiers::ALT));
-        assert_eq!(app.history_offset, 0);
+        assert_eq!(app.history_offset, 1);
         assert!(
-            rx.try_recv().is_err(),
-            "active alt+wheel never captures history"
+            matches!(rx.try_recv(), Ok(Request::Capture { .. })),
+            "active alt+wheel must request rendered history when the local buffer is empty"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -15496,24 +15506,26 @@ mod tests {
         terminal.process_output_for_test(b"\x1b[?1049h".as_ref());
         assert_eq!(terminal.max_scrollback(), 0);
         app.terminal = Some(terminal);
+        app.history_offset = 0;
 
-        // An alt-screen app has no scrollback of its own, so it remains at the
-        // live frame and no daemon history page is mixed into the active view.
+        // An alt-screen app has no local scrollback, so active history starts
+        // from the daemon's rendered rows.
         app.scroll_history(true, 3);
-        assert_eq!(app.history_offset, 0);
-        assert!(app.attached_history_is_buffered());
+        assert_eq!(app.history_offset, 3);
+        assert!(!app.attached_history_is_buffered());
+        assert!(matches!(request_rx.try_recv(), Ok(Request::Capture { .. })));
 
         // A frame draws - this is the `app.sync_terminal_scrollback()` call
         // ui.rs:1047 makes before every terminal pane is drawn.
         let settled = app.sync_terminal_scrollback();
-        assert_eq!(app.history_offset, 0);
-        assert_eq!(settled, 0);
-        assert!(app.attached_history_is_buffered());
+        assert_eq!(app.history_offset, 3);
+        assert_eq!(settled, 3);
+        assert!(!app.attached_history_is_buffered());
 
         // And a second frame cannot snap it either.
         let settled = app.sync_terminal_scrollback();
-        assert_eq!(app.history_offset, 0);
-        assert_eq!(settled, 0);
+        assert_eq!(app.history_offset, 3);
+        assert_eq!(settled, 3);
         drop(request_rx);
         let _ = std::fs::remove_dir_all(root);
     }
