@@ -6453,7 +6453,21 @@ mod platform {
                         let busy = snapshot.pid.is_some_and(has_child_process);
                         terminal_status(&activity, busy, &self.cursor_row())
                     } else {
-                        let status = agent_status(&activity);
+                        let mut status = agent_status(&activity);
+                        let dialog = dialog_question(&visible_screen);
+                        // A hidden cursor is also used during Claude's full
+                        // screen redraws. Once that redraw has gone quiet,
+                        // require an actual dialog (or a runtime notice)
+                        // before exposing the generic waiting state.
+                        if status == Status::Waiting
+                            && activity.cursor_hidden
+                            && !activity.blinking
+                            && activity.notice.is_none()
+                            && dialog.is_none()
+                            && activity.quiet_ms >= crate::activity::TERMINAL_ASK_QUIET_MS
+                        {
+                            status = Status::Idle;
+                        }
                         let reason = (status == Status::Waiting).then(|| {
                             // The runtime's own notification names the
                             // question best; the dialog's prose is next; the
@@ -6464,7 +6478,7 @@ mod platform {
                                 .as_ref()
                                 .filter(|notice| notice.at > last_input)
                                 .map(|notice| notice.text.clone())
-                                .or_else(|| dialog_question(&visible_screen))
+                                .or(dialog)
                                 .unwrap_or_else(|| WAITING_FOR_INPUT.to_string())
                         });
                         (status, reason)

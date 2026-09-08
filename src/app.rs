@@ -4530,7 +4530,14 @@ impl App {
             return;
         }
         match outcome {
-            Ok(terminal) => {
+            Ok(mut terminal) => {
+                // A re-attach can receive a differential TUI snapshot between
+                // frames. Nudge the child through one real size change so it
+                // paints a complete frame before the pending terminal is
+                // committed to the pane.
+                if let Err(error) = terminal.refresh() {
+                    debug::log("pty", format!("attach refresh failed: {error:#}"));
+                }
                 self.pending_terminal = Some(terminal);
                 self.pending_terminal_session_id = Some(pending.session_id);
                 self.pending_terminal_started_at = Some(Instant::now());
@@ -4614,6 +4621,11 @@ impl App {
         self.terminal = Some(terminal);
         self.terminal_session_id = Some(id);
         self.sync_terminal_size();
+        if let Some(terminal) = self.terminal.as_mut()
+            && let Err(error) = terminal.refresh()
+        {
+            debug::log("pty", format!("cached terminal refresh failed: {error:#}"));
+        }
         self.refresh_terminal_screen();
         self.history_offset = 0;
         self.terminal_retry_at = None;
@@ -4889,13 +4901,23 @@ impl App {
         let Some(activity) = activity else {
             return;
         };
-        let status = agent_status(&activity);
+        let dialog = dialog_question(screen);
+        let mut status = agent_status(&activity);
+        if status == Status::Waiting
+            && activity.cursor_hidden
+            && !activity.blinking
+            && activity.notice.is_none()
+            && dialog.is_none()
+            && activity.quiet_ms >= crate::activity::TERMINAL_ASK_QUIET_MS
+        {
+            status = Status::Idle;
+        }
         let attention = (status == Status::Waiting).then(|| {
             activity
                 .notice
                 .as_ref()
                 .map(|notice| notice.text.clone())
-                .or_else(|| dialog_question(screen))
+                .or(dialog)
                 .unwrap_or_else(|| WAITING_FOR_INPUT.to_string())
         });
         let working = status == Status::Working;
@@ -5163,7 +5185,8 @@ impl App {
                 if self
                     .selected_session()
                     .is_some_and(|session| session.target_id == target_id)
-                    && (!self.has_terminal_for_selected() || self.history_offset > 0)
+                    && (!self.has_terminal_for_selected()
+                        || (self.history_offset > 0 && !self.attached_terminal_for_selected()))
                 {
                     self.request_history();
                 }
@@ -8042,10 +8065,11 @@ impl App {
                     .history_cache
                     .entry(history_cache_key(target_id, session_id))
                     .or_default();
-                if !pages
-                    .iter()
-                    .any(|cached| cached.offset_from_bottom == page.offset_from_bottom)
-                {
+                if !pages.iter().any(|cached| {
+                    cached.offset_from_bottom == page.offset_from_bottom
+                        && cached.rendered == page.rendered
+                        && cached.pane_width == page.pane_width
+                }) {
                     pages.push(page);
                 }
                 true
@@ -8165,52 +8189,26 @@ impl App {
             .terminal
             .as_mut()
             .map_or(0, TerminalSession::max_scrollback);
-        // Once the daemon has read the session whole there is nothing above its
-        // oldest row to ask for, so stop there rather than send the view -- and
-        // a capture request per step -- past the top of the history. The
-        // emulator's own buffer still counts: it wraps at the pane's width
-        // rather than the session's, so it can hold rows the daemon does not.
-        if older
-            && let Some(oldest) = self.history_reach().map(|oldest| oldest.max(boundary))
-            && desired > oldest
-        {
-            desired = oldest;
-            self.status_message = if oldest == 0 {
+        // A live terminal owns its scrollback. Keep the entire active view in
+        // the emulator so paging never jumps from one coordinate system into
+        // a daemon-rendered page with a missing seam. Archived sessions use
+        // `request_history` below because they have no attached emulator.
+        if older && desired > boundary {
+            desired = boundary;
+            self.status_message = if boundary == 0 {
                 "This terminal has no older scrollback".into()
             } else {
-                format!("Reached the oldest available history ({oldest} lines)")
+                format!("Reached the oldest buffered line ({boundary} up)")
             };
         }
-        let mut buffered = false;
         if let Some(terminal) = self.terminal.as_mut() {
-            terminal.set_scrollback(desired.min(boundary));
-            if desired <= boundary {
-                self.history_offset = terminal.scrollback();
-                self.terminal_scrollback_pin = self.history_offset;
-                buffered = true;
-            } else {
-                self.history_offset = desired;
-            }
+            terminal.set_scrollback(desired);
+            self.history_offset = terminal.scrollback();
+            self.terminal_scrollback_pin = self.history_offset;
         }
         self.release_selection_for_scroll();
-        if buffered {
-            self.history_loading = false;
-            self.history_message.clear();
-            return;
-        }
-        if self.daemon_history_continues_terminal() {
-            self.request_history();
-            return;
-        }
-        self.clamp_history_to_buffered_rows();
-    }
-
-    /// Whether daemon history pages carry on where the attached emulator's
-    /// buffer ends. They do once the daemon renders them into rows, which is
-    /// what its pages are asked for; a daemon too old to do that answers in raw
-    /// log lines and its offsets count something else entirely.
-    fn daemon_history_continues_terminal(&self) -> bool {
-        self.history.rendered || self.history.total_lines() == 0
+        self.history_loading = false;
+        self.history_message.clear();
     }
 
     /// Pull the view back to the oldest row the attached emulator buffers.
@@ -14724,8 +14722,8 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
 
-        // An alt-screen TUI keeps an empty local buffer: alt+wheel must page
-        // the daemon's history, exactly the way PageUp does.
+        // An alt-screen TUI keeps an empty local buffer: active paging stays
+        // at the live frame instead of mixing daemon history into the pane.
         let (mut app, rx, root, _boundary) = prepped("alt-wheel-empty");
         app.terminal = Some(TerminalSession::detached(20, 5));
         app.terminal
@@ -14733,16 +14731,8 @@ mod tests {
             .unwrap()
             .process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
         app.handle_mouse(wheel(KeyModifiers::ALT));
-        assert_eq!(
-            app.history_offset, 1,
-            "alt+wheel enters history beyond an empty local buffer"
-        );
-        match receive_request(&rx) {
-            Request::Capture { .. } => {}
-            other => {
-                panic!("alt+wheel beyond an empty local buffer must page the daemon, got {other:?}")
-            }
-        }
+        assert_eq!(app.history_offset, 0);
+        assert!(rx.try_recv().is_err(), "active alt+wheel never captures history");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -14950,6 +14940,47 @@ mod tests {
             Some(2)
         );
         assert!(app.cached_history_page("local", "s-1", 0, 3).is_some());
+        let _ = std::fs::remove_dir_all(&app.history_cache_dir);
+    }
+
+    #[test]
+    fn a_rendered_page_at_an_offset_is_not_hidden_by_an_old_raw_page() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.history_cache_dir = std::env::temp_dir().join(format!(
+            "muxloom-history-kind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let raw = HistoryPage {
+            text: "raw redraw fragment".into(),
+            history_size: 500,
+            pane_height: 20,
+            pane_width: 0,
+            offset_from_bottom: 460,
+            rendered: false,
+            more_history: false,
+        };
+        let rendered = HistoryPage {
+            text: "complete terminal row".into(),
+            history_size: 500,
+            pane_height: 20,
+            pane_width: 80,
+            offset_from_bottom: 460,
+            rendered: true,
+            more_history: true,
+        };
+        app.store_history_page("local", "s-1", raw);
+        app.store_history_page("local", "s-1", rendered);
+        app.history = HistoryPage::default();
+        app.agent_viewport_width = 80;
+        let page = app
+            .cached_history_page("local", "s-1", 460, 20)
+            .expect("the rendered page must survive beside the raw fallback");
+        assert!(page.rendered);
+        assert_eq!(page.text, "complete terminal row");
         let _ = std::fs::remove_dir_all(&app.history_cache_dir);
     }
 
@@ -15376,38 +15407,21 @@ mod tests {
     }
 
     #[test]
-    fn attached_claude_pages_into_daemon_history_past_emulator_buffer() {
+    fn attached_claude_paging_stays_inside_the_agent_scrollback() {
         let (mut app, request_rx, root, buffered_boundary) = attached_claude_app("history");
 
         app.scroll_history(true, 3);
 
-        assert_eq!(app.history_offset, buffered_boundary + 3);
-        assert!(!app.attached_history_is_buffered());
-        let requested_offset = match receive_request(&request_rx) {
-            Request::Capture {
-                session_id,
-                offset_from_bottom,
-                ..
-            } => {
-                assert_eq!(session_id, "muxloomd-claude-long-history");
-                assert!(offset_from_bottom <= app.history_offset);
-                offset_from_bottom
-            }
-            request => panic!("expected history capture, got {request:?}"),
-        };
-        app.handle_worker_event(Event::Captured {
-            target_id: "local".into(),
-            session_id: "muxloomd-claude-long-history".into(),
-            result: Ok(daemon_page(requested_offset, true)),
-        });
-        assert_eq!(app.history.offset_from_bottom, buffered_boundary + 3);
-        assert!(app.history.text.contains("daemon-line"));
-        assert!(!app.attached_history_is_buffered());
-
-        app.scroll_history(false, 3);
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(app.attached_history_is_buffered());
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            request_rx.try_recv().is_err(),
+            "active paging never captures history"
+        );
+
+        app.scroll_history(false, 3);
+        assert_eq!(app.history_offset, buffered_boundary.saturating_sub(3));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15419,17 +15433,6 @@ mod tests {
         let (mut app, request_rx, root, buffered_boundary) = attached_claude_app("log-lines");
 
         app.scroll_history(true, 3);
-        let requested_offset = match receive_request(&request_rx) {
-            Request::Capture {
-                offset_from_bottom, ..
-            } => offset_from_bottom,
-            request => panic!("expected history capture, got {request:?}"),
-        };
-        app.handle_worker_event(Event::Captured {
-            target_id: "local".into(),
-            session_id: "muxloomd-claude-long-history".into(),
-            result: Ok(daemon_page(requested_offset, false)),
-        });
 
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(app.attached_history_is_buffered(), "back on the emulator");
@@ -15443,7 +15446,7 @@ mod tests {
         app.scroll_history(true, 3);
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(request_rx.try_recv().is_err(), "no further capture");
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15454,34 +15457,18 @@ mod tests {
         // spending a capture per keystroke on the same reply -- which is what
         // paging off the top of a session looked like.
         let (mut app, request_rx, root, boundary) = attached_claude_app("history-top");
-        let top = boundary + 6;
 
         app.scroll_history(true, 3);
-        let requested_offset = match receive_request(&request_rx) {
-            Request::Capture {
-                offset_from_bottom, ..
-            } => offset_from_bottom,
-            request => panic!("expected history capture, got {request:?}"),
-        };
-        let mut page = daemon_page(requested_offset, true);
-        page.history_size = top;
-        page.more_history = false;
-        app.handle_worker_event(Event::Captured {
-            target_id: "local".into(),
-            session_id: "muxloomd-claude-long-history".into(),
-            result: Ok(page),
-        });
-        assert_eq!(app.history_offset, boundary + 3, "still short of the top");
 
-        app.scroll_history(true, 20);
-
-        assert_eq!(app.history_offset, top, "stopped on the oldest row");
+        assert_eq!(
+            app.history_offset, boundary,
+            "stopped on the oldest buffered row"
+        );
         assert!(
-            app.status_message.contains("oldest available history"),
+            app.status_message.contains("oldest buffered line"),
             "said so: {}",
             app.status_message
         );
-        assert!(app.history.text.contains("daemon-line"), "still showing it");
         assert!(
             request_rx.try_recv().is_err(),
             "no capture for missing rows"
@@ -15489,24 +15476,16 @@ mod tests {
 
         // And it stays there, however long the key is held.
         app.scroll_history(true, 20);
-        assert_eq!(app.history_offset, top);
+        assert_eq!(app.history_offset, boundary);
         assert!(
             request_rx.try_recv().is_err(),
             "no capture for missing rows"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_daemon_paged_offset_survives_the_draw_sync_on_an_alt_screen_attach() {
-        // The real render blocker behind "opencode 终端切回后 UI 未完整渲染": the
-        // per-frame `sync_terminal_scrollback` used to hand `history_offset` to
-        // the emulator and then take the emulator's clamped answer back. An
-        // alt-screen agent keeps no emulator scrollback (max_scrollback() == 0),
-        // so each frame set_scrollback clawed back to 0, history_offset was
-        // overwritten to live, `attached_history_is_buffered` flipped true, and
-        // the daemon-paged rows were hidden a frame after they were asked for.
-        // The paged offset must survive a frame.
+    fn an_alt_screen_attach_keeps_active_paging_local() {
         let (mut app, request_rx, root, _boundary) = attached_claude_app("altsync");
         // Sit the attached terminal on the alternate screen, exactly as a full
         // screen TUI agent does - the emulator keeps no scrollback there.
@@ -15515,52 +15494,25 @@ mod tests {
         assert_eq!(terminal.max_scrollback(), 0);
         app.terminal = Some(terminal);
 
-        // Scroll up: the emulator holds nothing, so the daemon is asked for a
-        // page and the view lands deep in daemon history (well past max 0).
+        // An alt-screen app has no scrollback of its own, so it remains at the
+        // live frame and no daemon history page is mixed into the active view.
         app.scroll_history(true, 3);
-        let paged = app.history_offset;
-        assert!(paged > 0);
-        assert!(!app.attached_history_is_buffered());
+        assert_eq!(app.history_offset, 0);
+        assert!(app.attached_history_is_buffered());
 
         // A frame draws - this is the `app.sync_terminal_scrollback()` call
         // ui.rs:1047 makes before every terminal pane is drawn.
         let settled = app.sync_terminal_scrollback();
-        assert_eq!(
-            app.history_offset, paged,
-            "a daemon-paged offset must survive the draw sync, not snap to 0"
-        );
-        assert_eq!(settled, paged);
-        assert!(
-            !app.attached_history_is_buffered(),
-            "still a daemon-paged view, not the emulator's live frame"
-        );
+        assert_eq!(app.history_offset, 0);
+        assert_eq!(settled, 0);
+        assert!(app.attached_history_is_buffered());
 
         // And a second frame cannot snap it either.
         let settled = app.sync_terminal_scrollback();
-        assert_eq!(
-            app.history_offset, paged,
-            "the offset must not recur on later frames"
-        );
-        assert_eq!(settled, paged);
+        assert_eq!(app.history_offset, 0);
+        assert_eq!(settled, 0);
         drop(request_rx);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A page of history as the daemon hands one back, either rendered into
-    /// rows or read off as raw log lines.
-    fn daemon_page(offset_from_bottom: usize, rendered: bool) -> HistoryPage {
-        HistoryPage {
-            text: (0..500)
-                .map(|line| format!("daemon-line-{line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            history_size: 1_000,
-            pane_height: 5,
-            pane_width: 20,
-            offset_from_bottom,
-            rendered,
-            more_history: rendered,
-        }
     }
 
     #[test]
