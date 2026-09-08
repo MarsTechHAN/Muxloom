@@ -14732,7 +14732,10 @@ mod tests {
             .process_output_for_test(b"\x1b[?1000h\x1b[?1006h");
         app.handle_mouse(wheel(KeyModifiers::ALT));
         assert_eq!(app.history_offset, 0);
-        assert!(rx.try_recv().is_err(), "active alt+wheel never captures history");
+        assert!(
+            rx.try_recv().is_err(),
+            "active alt+wheel never captures history"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

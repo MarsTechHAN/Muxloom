@@ -741,28 +741,11 @@ pub(crate) fn render_scrollback_seed(
         return Ok(Vec::new());
     }
     let (mut parser, inline) = replay_history(stream, columns, rows, keep)?;
-    // An application on the alternate screen is the whole of what an attaching
-    // client has to be shown, so its grid is taken before stepping off it.
-    //
-    // Handing over the history underneath and trusting the app to draw itself
-    // was the older reading, and it is wrong in the one case it has to serve.
-    // A client replays what the session writes from the byte it attached at,
-    // and an agent sitting at its prompt writes nothing at all: the picture on
-    // its screen was painted long before, and a full-screen app never re-emits
-    // what it has already drawn. So nothing arrived to paint, and the alternate
-    // screen carries no scrollback to seed from either — an attach handed over
-    // an empty seed and the pane stayed blank until something forced a repaint.
-    let application = parser.screen().alternate_screen().then(|| {
-        let screen = parser.screen();
-        (
-            screen.rows_formatted(0, columns).collect::<Vec<_>>(),
-            screen.cursor_position(),
-            screen.input_mode_formatted(),
-        )
-    });
-    if application.is_some() {
-        // Off it, so the scrollback below is what seeds the history. The app is
-        // painted back over the top once that is done.
+    if parser.screen().alternate_screen() {
+        // vt100 only reaches the scrollback of the grid it is showing, and a
+        // full-screen app is drawn on one that has none. Step off it so the
+        // history underneath is what gets seeded; the client's own replay of
+        // the newest raw output repaints the app over it.
         parser.process(b"\x1b[?1049l");
     }
     let (cursor_row, cursor_column) = parser.screen().cursor_position();
@@ -776,9 +759,8 @@ pub(crate) fn render_scrollback_seed(
     let depth = parser.screen().scrollback();
     if depth == 0 {
         // Nothing has scrolled off yet, so the raw output the client is about
-        // to replay is the whole session and this would only repeat it — unless
-        // an application is holding the screen, which no replay will redraw.
-        return Ok(application.map(paint_application).unwrap_or_default());
+        // to replay is the whole session and this would only repeat it.
+        return Ok(Vec::new());
     }
 
     // vt100 0.15 reads rows past the first screenful of scrollback through a
@@ -826,39 +808,7 @@ pub(crate) fn render_scrollback_seed(
         seed.extend_from_slice(region.as_bytes());
     }
     seed.extend_from_slice(format!("\x1b[{};{}H", cursor_row + 1, cursor_column + 1).as_bytes());
-    // The history is in place underneath; put the application back on top of
-    // it, where the session left it.
-    if let Some(application) = application {
-        seed.extend_from_slice(&paint_application(application));
-    }
     Ok(seed)
-}
-
-/// The alternate screen written out as the bytes that reproduce it: onto it,
-/// cleared, painted row by row, with the cursor and input modes the
-/// application left set.
-///
-/// It carries no scrollback of its own, so this is the whole of it.
-///
-/// Gated to match its only caller, `render_scrollback_seed`: outside a test
-/// build nothing reaches it, and an ungated one is only dead code.
-#[cfg(test)]
-fn paint_application(
-    (rows, (cursor_row, cursor_column), input_modes): (Vec<Vec<u8>>, (u16, u16), Vec<u8>),
-) -> Vec<u8> {
-    let mut painted = b"\x1b[?1049h\x1b[m\x1b[2J\x1b[H".to_vec();
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            painted.extend_from_slice(b"\r\n");
-        }
-        painted.extend_from_slice(row);
-        // Every row is rendered as if the terminal started it with default
-        // attributes, so leave it that way for the next one.
-        painted.extend_from_slice(b"\x1b[m");
-    }
-    painted.extend_from_slice(&input_modes);
-    painted.extend_from_slice(format!("\x1b[{};{}H", cursor_row + 1, cursor_column + 1).as_bytes());
-    painted
 }
 
 /// Replay `stream` into a throwaway emulator that keeps `keep` rows of
