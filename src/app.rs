@@ -8192,23 +8192,47 @@ impl App {
             .terminal
             .as_mut()
             .map_or(0, TerminalSession::max_scrollback);
-        // A live terminal owns its scrollback. Keep the entire active view in
-        // the emulator so paging never jumps from one coordinate system into
-        // a daemon-rendered page with a missing seam. Archived sessions use
-        // `request_history` below because they have no attached emulator.
-        if older && boundary == 0 {
-            self.history_offset = desired;
-            self.release_selection_for_scroll();
-            self.request_history();
-            return;
-        }
-        if older && desired > boundary {
-            desired = boundary;
-            self.status_message = if boundary == 0 {
-                "This terminal has no older scrollback".into()
+        // The emulator answers for as far back as it has buffered, and the
+        // daemon's pages carry on from there. Stopping at the buffer instead
+        // is what an attached session cannot afford: an attach seeds no
+        // scrollback, so that buffer starts empty and holds only what has
+        // scrolled off since. One row of output is enough to make it
+        // non-empty, and a view clamped to it scrolls up exactly one line,
+        // which is what a live agent's history came to look like.
+        if desired > boundary {
+            if !self.daemon_history_continues_terminal() {
+                // Raw log lines are not rows: an agent writes tens of them per
+                // row it puts on screen, so handing that offset over would drop
+                // the view somewhere near the live screen showing a fragment of
+                // a redraw. Stay on the oldest row actually held.
+                desired = boundary;
+                self.status_message = if boundary == 0 {
+                    "This terminal has no older scrollback".into()
+                } else {
+                    format!("Reached the oldest buffered line ({boundary} up)")
+                };
+            } else if let Some(oldest) = self.history_reach().filter(|oldest| desired > *oldest) {
+                // A page that read the log from its beginning measures the
+                // session, so there is nothing above its oldest row to ask for
+                // and a held key must not spend a capture per repeat on the
+                // same reply.
+                self.status_message = if oldest == 0 {
+                    "This terminal has no older scrollback".into()
+                } else {
+                    format!("Reached the oldest available history ({oldest} lines)")
+                };
+                desired = oldest;
+                if desired > boundary {
+                    self.history_offset = desired;
+                    self.release_selection_for_scroll();
+                    return;
+                }
             } else {
-                format!("Reached the oldest buffered line ({boundary} up)")
-            };
+                self.history_offset = desired;
+                self.release_selection_for_scroll();
+                self.request_history();
+                return;
+            }
         }
         if let Some(terminal) = self.terminal.as_mut() {
             terminal.set_scrollback(desired);
@@ -8218,6 +8242,16 @@ impl App {
         self.release_selection_for_scroll();
         self.history_loading = false;
         self.history_message.clear();
+    }
+
+    /// Whether daemon history pages carry on where the attached emulator's
+    /// buffer ends. They do once the daemon renders them into rows, which is
+    /// what its pages are asked for and the same unit the emulator counts in;
+    /// a daemon too old to do that answers in raw log lines, whose offsets
+    /// count something else entirely, and the view stops at the buffer rather
+    /// than jump into them.
+    fn daemon_history_continues_terminal(&self) -> bool {
+        self.history.rendered || self.history.total_lines() == 0
     }
 
     /// Pull the view back to the oldest row the attached emulator buffers.
@@ -15419,22 +15453,64 @@ mod tests {
         assert!(app.status_message.contains("oldest available history"));
     }
 
+    /// An attach seeds no scrollback, so the emulator's buffer holds only what
+    /// has scrolled off since. Paging has to carry on into the daemon's pages
+    /// past that, or a live agent's history reaches back exactly as far as the
+    /// session has scrolled since you looked at it - one line, for the session
+    /// that reported this.
     #[test]
-    fn attached_claude_paging_stays_inside_the_agent_scrollback() {
+    fn attached_claude_pages_into_daemon_history_past_the_emulator_buffer() {
         let (mut app, request_rx, root, buffered_boundary) = attached_claude_app("history");
 
         app.scroll_history(true, 3);
 
+        assert_eq!(app.history_offset, buffered_boundary + 3);
+        assert!(
+            !app.attached_history_is_buffered(),
+            "past the buffer, so the daemon's page is what is shown"
+        );
+        let requested = match receive_request(&request_rx) {
+            Request::Capture {
+                session_id,
+                offset_from_bottom,
+                ..
+            } => {
+                assert_eq!(session_id, "muxloomd-claude-long-history");
+                assert!(offset_from_bottom <= app.history_offset);
+                offset_from_bottom
+            }
+            request => panic!("expected a history capture, got {request:?}"),
+        };
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(daemon_page(requested, true)),
+        });
+        assert_eq!(app.history_offset, buffered_boundary + 3);
+        assert!(app.history.text.contains("daemon-line"));
+
+        // And back down again crosses the seam into the emulator's own rows.
+        app.scroll_history(false, 3);
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(app.attached_history_is_buffered());
-        assert!(
-            request_rx.try_recv().is_err(),
-            "active paging never captures history"
-        );
-
-        app.scroll_history(false, 3);
-        assert_eq!(app.history_offset, buffered_boundary.saturating_sub(3));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A page of history as the daemon hands one back, either rendered into
+    /// rows or read off as raw log lines.
+    fn daemon_page(offset_from_bottom: usize, rendered: bool) -> HistoryPage {
+        HistoryPage {
+            text: (0..500)
+                .map(|line| format!("daemon-line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            history_size: 1_000,
+            pane_height: 5,
+            pane_width: 20,
+            offset_from_bottom,
+            rendered,
+            more_history: rendered,
+        }
     }
 
     #[test]
@@ -15445,7 +15521,20 @@ mod tests {
         // fragment of a redraw, so the view stays on the oldest row it holds.
         let (mut app, request_rx, root, buffered_boundary) = attached_claude_app("log-lines");
 
+        // Which kind of page the daemon hands back is not known until one
+        // arrives, so the first step past the buffer asks.
         app.scroll_history(true, 3);
+        let requested = match receive_request(&request_rx) {
+            Request::Capture {
+                offset_from_bottom, ..
+            } => offset_from_bottom,
+            request => panic!("expected a history capture, got {request:?}"),
+        };
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(daemon_page(requested, false)),
+        });
 
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(app.attached_history_is_buffered(), "back on the emulator");
@@ -15470,29 +15559,47 @@ mod tests {
         // spending a capture per keystroke on the same reply -- which is what
         // paging off the top of a session looked like.
         let (mut app, request_rx, root, boundary) = attached_claude_app("history-top");
+        let top = boundary + 6;
 
         app.scroll_history(true, 3);
+        let requested = match receive_request(&request_rx) {
+            Request::Capture {
+                offset_from_bottom, ..
+            } => offset_from_bottom,
+            request => panic!("expected a history capture, got {request:?}"),
+        };
+        // The page read the log whole, so its size is the top of the session.
+        let mut page = daemon_page(requested, true);
+        page.history_size = top;
+        page.more_history = false;
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(page),
+        });
+        assert_eq!(app.history_offset, boundary + 3, "still short of the top");
 
+        app.scroll_history(true, 20);
         assert_eq!(
-            app.history_offset, boundary,
-            "stopped on the oldest buffered row"
+            app.history_offset, top,
+            "stopped on the oldest row there is"
         );
         assert!(
-            app.status_message.contains("oldest buffered line"),
+            app.status_message.contains("oldest available history"),
             "said so: {}",
             app.status_message
         );
         assert!(
             request_rx.try_recv().is_err(),
-            "no capture for missing rows"
+            "no capture for rows the session does not have"
         );
 
         // And it stays there, however long the key is held.
         app.scroll_history(true, 20);
-        assert_eq!(app.history_offset, boundary);
+        assert_eq!(app.history_offset, top);
         assert!(
             request_rx.try_recv().is_err(),
-            "no capture for missing rows"
+            "no capture for rows the session does not have"
         );
         let _ = std::fs::remove_dir_all(root);
     }
