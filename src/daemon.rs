@@ -6758,6 +6758,19 @@ mod platform {
                 // grid every bit as much as output does.
                 self.screen_seq.fetch_add(1, Ordering::AcqRel);
                 resize_parser(&mut screen, rows, columns);
+                // And the region the app had set is measured in the grid that
+                // just stopped existing. The parser's own copy is clamped by
+                // the resize, but this one is handed to every client that
+                // attaches from here on - see `screen_preamble` - and a client
+                // that installs a region shorter than its grid has an agent
+                // walking down with `ESC[1B` clamp at the region's last row,
+                // piling every remaining row of its interface onto that one
+                // and leaving everything below it blank. Forget it, and track
+                // the region the app sets next.
+                self.inline
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reset();
             }
             let mut payload = [0u8; 4];
             payload[..2].copy_from_slice(&columns.to_be_bytes());
@@ -12148,6 +12161,80 @@ mod platform {
             }
 
             fs::remove_dir_all(&state.paths.root).ok();
+        }
+
+        /// What an attaching client is told about the scroll region has to be
+        /// measured in the grid that client is about to draw on.
+        ///
+        /// A resize leaves the tracked region describing a grid that no longer
+        /// exists. The daemon's own parser is clamped by the resize and keeps
+        /// rendering correctly, which is what made this hard to see - the fault
+        /// only shows up in front of a person, because the region travels to
+        /// every attaching client in the preamble. A client that installs a
+        /// region shorter than its grid has an agent walking down with `ESC[1B`
+        /// clamp at the region's last row: every remaining row of its interface
+        /// piles onto that one and everything below it stays blank.
+        #[test]
+        fn an_attach_is_not_handed_a_scroll_region_from_a_grid_that_is_gone() {
+            let state = test_state("stale-region");
+            let paths = state.paths.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-stale-region".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                120,
+                40,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            // The agent pins a footer: rows 1..36 scroll, the last four are its
+            // composer. Tracked, and handed to a client attaching at this size.
+            session.record_output(b"\x1b[1;36r");
+            assert!(
+                session
+                    .screen_preamble()
+                    .windows(7)
+                    .any(|w| w == b"\x1b[1;36r"),
+                "the region is handed over while it still describes the grid"
+            );
+
+            // The pane grows. The region now describes forty rows of a grid
+            // that has eighty, and nothing has re-stated it.
+            session.resize(120, 80).unwrap();
+            let preamble = session.screen_preamble();
+            let text = String::from_utf8_lossy(&preamble).to_string();
+            assert!(
+                !text.contains(";36r"),
+                "a region from the old grid must not reach a client: {text:?}"
+            );
+            assert!(
+                !text.contains('r') || !text.contains("\x1b["),
+                "nothing at all is claimed about the region until the app says: {text:?}"
+            );
+
+            // And once the agent states it again, at the size it now has, it
+            // travels once more.
+            session.record_output(b"\x1b[1;76r");
+            assert!(
+                session
+                    .screen_preamble()
+                    .windows(7)
+                    .any(|w| w == b"\x1b[1;76r"),
+                "the region the app set at this size is handed over"
+            );
+
+            session.stop().unwrap();
+            discard_root(paths.root);
         }
 
         #[test]

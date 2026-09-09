@@ -560,7 +560,12 @@ impl InlineScrollback {
     /// agent is about to overwrite anyway, and guessing wrong would move rows
     /// the agent never asked to move, so start over and rewrite nothing until
     /// the next `ESC[...r`.
-    fn reset(&mut self) {
+    ///
+    /// Every emulator fed by a session has to do this on resize, not just the
+    /// one in front of a person: the daemon hands its tracked region to each
+    /// attaching client, and a region measured in a grid that no longer exists
+    /// is worse than no region at all.
+    pub(crate) fn reset(&mut self) {
         self.scan = Scan::Ground;
         self.params.clear();
         self.private = false;
