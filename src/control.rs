@@ -70,8 +70,15 @@ pub trait ControlSurface: Send + Sync {
     }
 }
 
-/// How many rendered rows a screen read returns when the caller does not say.
-const DEFAULT_SCREEN_LINES: usize = 200;
+/// How many rendered rows a screen read returns when the caller does not say:
+/// a screen and a little of what scrolled off it. Every row read stays in the
+/// reader's context, and an agent looking in on a subagent wants where it is
+/// now; the trailer says how to page back for more.
+const DEFAULT_SCREEN_LINES: usize = 80;
+/// How many board messages a read returns when the caller does not say. The
+/// board is read once, at the start of a piece of work, and `query` is the way
+/// to more of it than this.
+const TALK_DEFAULT_LIMIT: usize = 20;
 /// A cursor jump wider than any terminal is a corrupt row, not indentation.
 const SCREEN_COLUMNS_LIMIT: usize = 1_000;
 /// Per-session match budget for history searches, matching the daemon's cap.
@@ -493,7 +500,7 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global", "direct"], "description": "One room, or \"direct\" for the mailbox. Default: every room in front of you, never the mailbox." },
                 "since_cursor": { "type": "string", "description": "`cursor` of an earlier read: only what is newer." },
                 "wait_seconds": { "type": "integer", "description": "Wait this long for something new. Default 0." },
-                "limit": { "type": "integer", "description": "Most messages. Default 50." },
+                "limit": { "type": "integer", "description": format!("Most messages. Default {TALK_DEFAULT_LIMIT}.") },
                 "before": { "type": "integer", "description": "Epoch ms: page backwards from here." },
                 "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "Default notes; \"message\" is the older kind." },
                 "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
@@ -2187,7 +2194,7 @@ fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
             .or_else(|| session_env("MUXLOOM_SESSION_PATH")),
         task: task_root(),
         before: arguments.get("before").and_then(Value::as_u64),
-        limit: optional_usize(arguments, "limit", 50),
+        limit: optional_usize(arguments, "limit", TALK_DEFAULT_LIMIT),
         // An agent reads the board as the session it runs in. Seeing every
         // direct message on the machine is the dashboard's privilege, and it
         // is not something a caller can ask for.
@@ -5369,6 +5376,31 @@ mod tests {
             || panic!("explained an explained error"),
         );
         assert_eq!(again.to_string(), explained);
+    }
+
+    /// Every row and note an answer carries stays in the reader's context, so
+    /// a read that names no size hands back one page, and says how to get
+    /// more, rather than everything there is.
+    #[test]
+    fn a_read_that_names_no_size_hands_back_one_page() {
+        assert_eq!(DEFAULT_SCREEN_LINES, 80);
+        let filter = talk_filter(&json!({ "path": "/work" })).unwrap();
+        assert_eq!(filter.limit, TALK_DEFAULT_LIMIT);
+        assert_eq!(
+            talk_filter(&json!({ "path": "/work", "limit": 200 }))
+                .unwrap()
+                .limit,
+            200
+        );
+        let read = specs(Flavor::Daemon)
+            .into_iter()
+            .find(|tool| tool.name == "read_screen")
+            .unwrap();
+        assert!(
+            read.description.contains("default 80"),
+            "{}",
+            read.description
+        );
     }
 
     #[test]
