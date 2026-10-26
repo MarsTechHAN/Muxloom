@@ -8509,6 +8509,24 @@ impl App {
             self.show_history_page(page);
             return;
         }
+        // The chunk this offset falls in is already in hand and cannot show
+        // it: the machine answered it short, having read back as far as it
+        // could from there. Asking again gets the same rows, and waiting on
+        // them is how the pane said loading for good. Stop at the oldest row
+        // the pages in hand can show.
+        if self.history_chunk_known(&session.target_id, &session.id, capture_offset)
+            && let Some(deepest) =
+                self.deepest_cached_history_offset(&session.target_id, &session.id, viewport_lines)
+            && deepest < desired_offset
+            && let Some(page) =
+                self.cached_history_page(&session.target_id, &session.id, deepest, viewport_lines)
+        {
+            self.history_offset = deepest;
+            self.status_message =
+                format!("Reached the oldest history the machine could read back ({deepest} lines)");
+            self.show_history_page(page);
+            return;
+        }
         if self.pending_capture.is_some() {
             self.history_loading = true;
             return;
@@ -8589,6 +8607,24 @@ impl App {
                 page.offset_from_bottom == offset
                     || page.oldest_offset().is_some_and(|oldest| offset > oldest)
             })
+    }
+
+    /// The deepest offset the cached pages can fill a `viewport_lines` view
+    /// at, which is as far back as anything in hand reaches.
+    fn deepest_cached_history_offset(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        viewport_lines: usize,
+    ) -> Option<usize> {
+        self.reusable_history_pages(target_id, session_id)
+            .map(|page| {
+                let rows = page.text.lines().count();
+                let reach = page.offset_from_bottom + rows - viewport_lines.min(rows);
+                page.oldest_offset()
+                    .map_or(reach, |oldest| reach.min(oldest))
+            })
+            .max()
     }
 
     fn cached_history_page(
@@ -16649,6 +16685,30 @@ mod tests {
             assert!(
                 captures <= 4,
                 "one capture per chunk of 440 rows, not {captures}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_that_came_back_short_ends_the_scroll_instead_of_loading_forever() {
+        // A daemon that can read back only so far answers with what it found
+        // and says there is more. The next page rounds back to the same
+        // offset and gets the same rows, so asking again only ever waited on
+        // a page that would never be longer: the pane said loading for good,
+        // a couple of hundred lines up.
+        for (step_lines, delay) in [(1, 0), (1, 3), (38, 2)] {
+            let steps = 1_000 / step_lines;
+            let (offset, captures, status) = page_back_through(260, step_lines, delay, steps)
+                .unwrap_or_else(|stuck| panic!("{step_lines}-line steps: {stuck}"));
+            assert!(
+                offset <= 260,
+                "no further than the rows there are: {offset}"
+            );
+            assert!(offset >= 200, "but as far as they go: {offset}");
+            assert!(captures <= 3, "and it is not asked for again: {captures}");
+            assert!(
+                status.contains("oldest history"),
+                "and the footer says why it stopped: {status}"
             );
         }
     }
