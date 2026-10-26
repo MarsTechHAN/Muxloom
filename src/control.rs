@@ -1483,8 +1483,12 @@ fn wait_loop(
     }
 
     // What the session was showing when the wait ended is the context the
-    // caller needs next, and it is cheap enough to fetch once.
-    if !watches_screen {
+    // caller needs next, and it is cheap enough to fetch once. Not when the
+    // wait only ran out: nothing happened, and an agent waiting ten minutes on
+    // a subagent calls this a dozen times and was handed a dozen copies of the
+    // same screen. The session's recap still says where it is.
+    let timed_out = outcome == "timeout";
+    if !watches_screen && !timed_out {
         screen = read().unwrap_or_default();
     }
     let satisfied = match outcome {
@@ -1517,7 +1521,7 @@ fn wait_loop(
         "waited_ms": started.elapsed().as_millis() as u64,
         "matched": matched,
         "session": session.as_ref().map(|session| session_json(machine, session)),
-        "screen_tail": screen_tail(&screen),
+        "screen_tail": (!timed_out).then(|| screen_tail(&screen)),
         "note": note,
     })))
 }
@@ -2153,13 +2157,11 @@ fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) 
         "delivery": delivery,
         "reason": reason,
         "note": match delivery {
-            "delivered" => "it is in that agent's prompt now, and it reads it when the turn it is \
-                            in ends. An answer comes back as a direct message: wait for it with \
-                            talk_read { scope: \"direct\", wait_seconds }, and call that again \
-                            each time it returns nothing rather than sending this a second time",
-            "queued" => "muxloom types it in as soon as that session can take it, and tells you \
-                         above why it cannot yet. Do not send it again — wait for the answer with \
-                         talk_read { scope: \"direct\", wait_seconds }",
+            "delivered" => "in their prompt, read when their turn ends. Do not send it again: \
+                            wait for the answer with talk_read { scope: \"direct\", wait_seconds }",
+            "queued" => "typed in as soon as that session can take it (`reason` says why not \
+                         yet). Do not send it again: wait for the answer with talk_read { scope: \
+                         \"direct\", wait_seconds }",
             _ => "the message is on the board, but nothing was typed into that session",
         },
     }))
@@ -5471,6 +5473,8 @@ mod tests {
                 .contains("has not started yet"),
             "{answer}"
         );
+        // A wait that only ran out hands back no screen: nothing happened.
+        assert!(answer.get("screen_tail").is_none(), "{answer}");
 
         // Seen working, then idle: that is the turn done.
         let mut looks = 0;
