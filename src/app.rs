@@ -12789,7 +12789,10 @@ impl App {
         }
         self.focus = Focus::Recap;
         let column = mouse.column.saturating_sub(area.x + 1);
-        let row = mouse.row.saturating_sub(area.y + 1);
+        let row = mouse
+            .row
+            .saturating_sub(area.y + 1)
+            .saturating_add(self.terminal_view_top());
         if let Some(terminal) = self.terminal.as_mut() {
             match terminal.write_mouse(mouse, column, row) {
                 Ok(forwarded) => forwarded,
@@ -12802,6 +12805,16 @@ impl App {
         } else {
             false
         }
+    }
+
+    /// The emulator row drawn on the terminal pane's first row: zero unless
+    /// the pane is shorter than the grid. See
+    /// [`crate::terminal_session::view_top`], which the painter uses too.
+    fn terminal_view_top(&self) -> u16 {
+        let (Some(terminal), Some(area)) = (self.terminal.as_ref(), self.pane_layout.recap) else {
+            return 0;
+        };
+        crate::terminal_session::view_top(terminal.screen(), area.height.saturating_sub(2))
     }
 
     fn terminal_cell_at(&self, column: u16, row: u16) -> Option<TerminalPoint> {
@@ -12920,15 +12933,16 @@ impl App {
         }
         let (start, end) = selection.normalized();
         let text = if self.attached_history_is_buffered() {
+            let top = self.terminal_view_top();
             let screen = self.terminal.as_ref()?.screen();
             let (rows, columns) = screen.size();
             if rows == 0 || columns == 0 {
                 return None;
             }
             screen.contents_between(
-                start.row.min(rows - 1),
+                start.row.saturating_add(top).min(rows - 1),
                 start.column.min(columns - 1),
-                end.row.min(rows - 1),
+                end.row.saturating_add(top).min(rows - 1),
                 end.column.saturating_add(1).min(columns),
             )
         } else {
@@ -15516,6 +15530,86 @@ mod tests {
             "active alt+wheel must request rendered history when the local buffer is empty"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A pane four rows tall in front of the five-row grid an emulator never
+    /// goes below, attached to a shell that asked for the mouse and sits at
+    /// its prompt on the last of them. The pane shows rows two to five.
+    fn app_with_a_pane_shorter_than_its_grid() -> (App, crate::terminal_session::RecordedInput) {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloomd-terminal-short".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Terminal,
+            path: "/work".into(),
+            label: "shell".into(),
+            created_at: 1,
+            archived_at: None,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+            used_at: None,
+        });
+        app.selected_session_id = Some("muxloomd-terminal-short".into());
+        app.terminal_session_id = Some("muxloomd-terminal-short".into());
+        let (mut terminal, input) = TerminalSession::recording(20, 5);
+        terminal.process_output_for_test(
+            b"\x1b[?1000h\x1b[?1006hrow1\r\nrow2\r\nrow3\r\nrow4\r\n$ row5",
+        );
+        app.terminal = Some(terminal);
+        app.interactive = true;
+        app.pane_layout.recap = Some(Rect::new(0, 0, 22, 6));
+        (app, input)
+    }
+
+    #[test]
+    fn a_pane_shorter_than_its_grid_reports_the_mouse_on_the_row_it_shows() {
+        let (mut app, input) = app_with_a_pane_shorter_than_its_grid();
+
+        // The wheel over the pane's bottom row, where the prompt is drawn.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            String::from_utf8(input.take()).unwrap(),
+            "\x1b[<64;3;5M",
+            "the program hears about its fifth row, the one under the pointer"
+        );
+    }
+
+    #[test]
+    fn a_pane_shorter_than_its_grid_copies_the_rows_it_shows() {
+        let (mut app, _input) = app_with_a_pane_shorter_than_its_grid();
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TerminalPoint { row: 2, column: 0 },
+            cursor: TerminalPoint { row: 3, column: 5 },
+            dragging: false,
+        });
+
+        assert_eq!(
+            app.selected_terminal_text().as_deref(),
+            Some("row4\n$ row5"),
+            "what is copied is what is highlighted"
+        );
     }
 
     #[test]

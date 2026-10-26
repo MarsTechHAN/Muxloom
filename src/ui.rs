@@ -1337,22 +1337,34 @@ fn highlight_terminal_selection(
 
 fn render_vt_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, area: Rect, show_cursor: bool) {
     let (rows, cols) = screen.size();
+    // A pane shorter than the grid shows the rows that end at the cursor.
+    let top = crate::terminal_session::view_top(screen, area.height);
     let cursor = if show_cursor && !screen.hide_cursor() {
         let (row, col) = screen.cursor_position();
-        (row < area.height && col < area.width).then_some((area.x + col, area.y + row))
+        row.checked_sub(top)
+            .filter(|row| *row < area.height && col < area.width)
+            .map(|row| (area.x + col, area.y + row))
     } else {
         None
     };
     {
         let buffer = frame.buffer_mut();
-        for row in 0..area.height.min(rows) {
+        for row in 0..area.height.min(rows - top) {
             for col in 0..area.width.min(cols) {
-                let Some(source) = screen.cell(row, col) else {
+                let Some(source) = screen.cell(top + row, col) else {
                     continue;
                 };
                 let destination = &mut buffer[(area.x + col, area.y + row)];
                 let contents = source.contents();
-                destination.set_symbol(if contents.is_empty() { " " } else { &contents });
+                // A pane narrower than the grid ends where it ends: a wide
+                // glyph whose second half lies past it would be drawn over
+                // the border.
+                let clipped = source.is_wide() && col + 1 >= area.width;
+                destination.set_symbol(if contents.is_empty() || clipped {
+                    " "
+                } else {
+                    &contents
+                });
                 destination.set_style(vt_style(source));
             }
         }
@@ -7063,6 +7075,82 @@ mod tests {
         assert!(compact_layout(true, Rect::new(0, 0, 74, 40), false));
         assert!(!compact_layout(false, Rect::new(0, 0, 74, 40), false));
         assert!(!compact_layout(true, Rect::new(0, 0, 76, 40), false));
+    }
+
+    /// An app showing an attached shell that has printed five lines and sits
+    /// at the end of the fifth: the bottom row of the smallest grid an
+    /// emulator is ever given.
+    fn app_attached_to_a_full_shell() -> App {
+        let config = Config::default();
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.sessions.push(AgentSession {
+            id: "muxloomd-terminal-short".into(),
+            target_id: "local".into(),
+            kind: AgentKind::Terminal,
+            path: "/work".into(),
+            label: "shell".into(),
+            created_at: 1,
+            archived_at: None,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+            used_at: None,
+        });
+        app.selected_session_id = Some("muxloomd-terminal-short".into());
+        app.terminal_session_id = Some("muxloomd-terminal-short".into());
+        let mut terminal = crate::terminal_session::TerminalSession::detached(20, 5);
+        terminal.process_output_for_test(b"row1\r\nrow2\r\nrow3\r\nrow4\r\n$ row5");
+        app.terminal = Some(terminal);
+        app.interactive = true;
+        app
+    }
+
+    #[test]
+    fn a_terminal_pane_shorter_than_its_grid_shows_the_rows_at_the_cursor() {
+        // Eight rows leave the terminal pane four inside its border, and an
+        // emulator is never given fewer than five. The prompt and the cursor
+        // are on the fifth.
+        let mut app = app_attached_to_a_full_shell();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let recap = app.pane_layout.recap.expect("a terminal pane");
+        assert_eq!(recap.height, 6, "this is the size the test is about");
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (recap.y + 1..recap.y + recap.height - 1)
+            .map(|y| {
+                (recap.x + 1..recap.x + recap.width - 1)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            ["row2", "row3", "row4", "$ row5"],
+            "the rows that do not fit are the oldest, never the prompt"
+        );
+        terminal
+            .backend_mut()
+            .assert_cursor_position((recap.x + 1 + 6, recap.y + 4));
     }
 
     #[test]

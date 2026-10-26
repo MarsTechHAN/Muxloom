@@ -336,6 +336,16 @@ impl TerminalSession {
         }
     }
 
+    /// A session with no process behind it that keeps every byte written to
+    /// it, for tests of what reaches the program.
+    #[cfg(test)]
+    pub(crate) fn recording(width: u16, height: u16) -> (Self, RecordedInput) {
+        let input = RecordedInput::default();
+        let mut session = Self::detached(width, height);
+        session.writer = Some(Box::new(input.clone()));
+        (session, input)
+    }
+
     #[cfg(test)]
     pub(crate) fn process_output_for_test(&mut self, bytes: &[u8]) {
         self.inline.process(&mut self.parser, bytes);
@@ -1215,6 +1225,52 @@ fn past_escape(body: &[u8]) -> &[u8] {
 #[cfg(all(test, unix))]
 pub(crate) fn past_escape_for_test(body: &[u8]) -> &[u8] {
     past_escape(body)
+}
+
+/// What [`TerminalSession::recording`] was asked to send to its program.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RecordedInput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl RecordedInput {
+    pub(crate) fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+#[cfg(test)]
+impl Write for RecordedInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The first of `screen`'s rows a pane `height` rows tall shows.
+///
+/// An emulator is never given fewer than five rows, whatever the pane has
+/// room for, so a pane in a window eight or nine rows tall cannot show its
+/// whole grid. Its top rows are the oldest; the newest, and the prompt with
+/// the cursor on it, are at the bottom. So the pane shows the rows that end
+/// at the cursor's, and stays at the top only while the cursor is up there.
+/// Zero whenever the grid fits, which is every pane of a usable size.
+pub(crate) fn view_top(screen: &vt100::Screen, height: u16) -> u16 {
+    let (rows, _) = screen.size();
+    if height == 0 || rows <= height {
+        return 0;
+    }
+    // Scrolled back, the live rows sit lower in the view by as many rows as
+    // it has moved up.
+    let offset = u16::try_from(screen.scrollback()).unwrap_or(u16::MAX);
+    let (cursor_row, _) = screen.cursor_position();
+    (cursor_row.saturating_add(offset).saturating_add(1))
+        .saturating_sub(height)
+        .min(rows - height)
 }
 
 pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16) {
@@ -2275,6 +2331,35 @@ mod tests {
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
+    }
+
+    #[test]
+    fn a_pane_shorter_than_its_grid_follows_the_cursor_down_and_no_further() {
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        assert_eq!(
+            view_top(parser.screen(), 3),
+            0,
+            "a fresh shell, prompt on top"
+        );
+        parser.process(b"one\r\ntwo\r\nthree");
+        assert_eq!(
+            view_top(parser.screen(), 3),
+            0,
+            "the cursor is on the third row"
+        );
+        parser.process(b"\r\nfour");
+        assert_eq!(view_top(parser.screen(), 3), 1, "and now on the fourth");
+        parser.process(b"\r\nfive\r\nsix\r\nseven");
+        assert_eq!(view_top(parser.screen(), 3), 2, "never past the last row");
+        assert_eq!(
+            view_top(parser.screen(), 5),
+            0,
+            "a pane that fits shows it all"
+        );
+        // Scrolled back, the live rows have moved down the view, so a pane
+        // following the cursor shows the bottom of what the view holds.
+        parser.set_scrollback(1);
+        assert_eq!(view_top(parser.screen(), 3), 2);
     }
 
     #[test]
