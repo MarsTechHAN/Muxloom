@@ -1297,26 +1297,52 @@ fn shrink_excess(parser: &mut vt100::Parser, height: u16) -> u16 {
     excess
 }
 
+/// Clear every wide glyph the new right edge is about to cut in half, on the
+/// grid the parser is drawing on.
+///
+/// Only those: the cell under the edge is otherwise a character that still
+/// fits, and an agent that redraws only what changed would never put it back.
+/// A reattach widens the grid a column and narrows it again to make the agent
+/// repaint, so wiping the column every time took the last character off every
+/// row the agent left alone. The erase is made in default attributes, so a
+/// colour the agent had active at that moment is not painted down the edge,
+/// and the agent's own attributes are put back afterwards.
 fn scrub_shrink_boundary(parser: &mut vt100::Parser, rows: u16, new_width: u16) {
     use std::fmt::Write as _;
 
     if new_width == 0 {
         return;
     }
-    let (cursor_row, cursor_col) = parser.screen().cursor_position();
-    let mut sequence = String::with_capacity(usize::from(rows) * 12 + 16);
-    for row in 1..=rows {
-        let _ = write!(sequence, "\x1b[{row};{new_width}H\x1b[X");
+    let offset = parser.screen().scrollback();
+    parser.set_scrollback(0);
+    let screen = parser.screen();
+    let cut: Vec<u16> = (0..rows)
+        .filter(|&row| {
+            screen
+                .cell(row, new_width - 1)
+                .is_some_and(|cell| cell.is_wide())
+        })
+        .collect();
+    if !cut.is_empty() {
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let attributes = screen.attributes_formatted();
+        let mut sequence = String::with_capacity(cut.len() * 12 + 16);
+        sequence.push_str("\x1b[m");
+        for row in cut {
+            let _ = write!(sequence, "\x1b[{};{new_width}H\x1b[X", row + 1);
+        }
+        let _ = write!(
+            sequence,
+            "\x1b[{};{}H",
+            cursor_row.saturating_add(1),
+            cursor_col
+                .min(new_width.saturating_sub(1))
+                .saturating_add(1)
+        );
+        parser.process(sequence.as_bytes());
+        parser.process(&attributes);
     }
-    let _ = write!(
-        sequence,
-        "\x1b[{};{}H",
-        cursor_row.saturating_add(1),
-        cursor_col
-            .min(new_width.saturating_sub(1))
-            .saturating_add(1)
-    );
-    parser.process(sequence.as_bytes());
+    parser.set_scrollback(offset);
 }
 
 impl Drop for TerminalSession {
@@ -2215,6 +2241,57 @@ mod tests {
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
+    }
+
+    #[test]
+    fn a_narrower_pane_keeps_what_was_written_in_its_new_last_column() {
+        let mut parser = vt100::Parser::new(3, 30, 0);
+        parser.process(b"the quick brown fox\r\n");
+        parser.process("界".repeat(10).as_bytes());
+        // An agent mid-frame, with a background colour still active.
+        parser.process(b"\r\n\x1b[44m");
+
+        resize_parser(&mut parser, 3, 19);
+
+        let screen = parser.screen();
+        assert_eq!(
+            screen.contents_between(0, 0, 0, 19),
+            "the quick brown fox",
+            "a narrow character that still fits is not erased to make room for a wide one"
+        );
+        assert!(
+            screen.cell(1, 18).is_some_and(|cell| !cell.is_wide()),
+            "a wide glyph cut in half by the new edge is still cleared"
+        );
+        assert_eq!(screen.contents_between(1, 0, 1, 18), "界".repeat(9));
+        for row in 0..3 {
+            assert_eq!(
+                screen.cell(row, 18).map(|cell| cell.bgcolor()),
+                Some(vt100::Color::Default),
+                "clearing the edge leaves no trace of the colour the agent was drawing in"
+            );
+        }
+        // And what the agent goes on to draw is in the colour it chose.
+        parser.process(b"x");
+        assert_eq!(
+            parser.screen().cell(2, 0).map(|cell| cell.bgcolor()),
+            Some(vt100::Color::Idx(4))
+        );
+    }
+
+    #[test]
+    fn the_repaint_nudge_leaves_the_last_column_as_it_was() {
+        // A reattach asks the agent for a full frame by widening the grid a
+        // column and narrowing it back. The agent may redraw only what moved,
+        // so the column the nudge passes over has to come back intact.
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"0123456789abcdefghij\x1b[2;1H| box edge, right  |");
+        let before = parser.screen().contents();
+
+        resize_parser(&mut parser, 2, 21);
+        resize_parser(&mut parser, 2, 20);
+
+        assert_eq!(parser.screen().contents(), before);
     }
 
     /// A shell has printed ten lines and sits at its prompt on the eleventh
