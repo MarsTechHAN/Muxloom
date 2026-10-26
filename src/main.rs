@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -274,52 +274,92 @@ fn run_loop(terminal: &mut Tui, app: &mut App, shutdown: &AtomicBool) -> Result<
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
-        let action = match event::read()? {
-            Event::FocusGained => {
-                // Terminal regained OS focus – the visible screen may have been
-                // cleared or corrupted while we were in the background.  Force
-                // a full repaint on the next frame so the whole UI reappears.
-                terminal.clear()?;
-                Action::Continue
-            }
-            Event::Resize(_, _) => {
-                // Ratatui re-queries the backend size on the next draw, but
-                // explicitly clearing avoids a one-frame flash of stale content.
-                terminal.clear()?;
-                Action::Continue
-            }
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // Manual full-redraw (fallback for terminals without focus events)
-                if key.code == KeyCode::F(5) {
-                    let _ = terminal.clear();
-                    Action::Continue
-                } else {
-                    log_navigation_key(key);
-                    app.handle_key(key)
-                }
-            }
-            Event::Mouse(mouse) => app.handle_mouse(mouse),
-            Event::Paste(text) => {
-                if debug::enabled() {
-                    debug::log(
-                        "input",
-                        format!(
-                            "committed text chars={} bytes={} interactive={}",
-                            text.chars().count(),
-                            text.len(),
-                            app.interactive
-                        ),
-                    );
-                }
-                app.handle_paste(text);
-                Action::Continue
-            }
-            _ => Action::Continue,
-        };
+        // A wheel flick, a trackpad swipe or a burst of typing hands over
+        // dozens of events at once. Drawing a frame between each of them left
+        // the view crawling after the hand for a good while after it stopped,
+        // and every frame of a scroll moves every row of the pane, so over SSH
+        // the whole pane went down the wire once per line scrolled. Take what
+        // is already waiting, for up to a frame's time, and draw once.
+        let action = drain_events(
+            || Ok(event::read()?),
+            || Ok(event::poll(Duration::ZERO)?),
+            |event| handle_event(terminal, app, event),
+            EVENT_BATCH_BUDGET,
+        )?;
         if matches!(action, Action::Quit) {
             return Ok(());
         }
     }
+}
+
+/// How long one turn of the loop spends on events that are already waiting
+/// before it draws what they did: about a frame, so a burst is taken in whole
+/// and a key pressed during a long one is still answered within a frame.
+const EVENT_BATCH_BUDGET: Duration = Duration::from_millis(16);
+
+/// Handle the event `read` has waiting and every one after it that `ready`
+/// says is already there, until one quits or `budget` runs out. At least one
+/// is always handled: the caller only comes here once something is waiting.
+fn drain_events(
+    mut read: impl FnMut() -> Result<Event>,
+    mut ready: impl FnMut() -> Result<bool>,
+    mut handle: impl FnMut(Event) -> Result<Action>,
+    budget: Duration,
+) -> Result<Action> {
+    let started = Instant::now();
+    loop {
+        if matches!(handle(read()?)?, Action::Quit) {
+            return Ok(Action::Quit);
+        }
+        if started.elapsed() >= budget || !ready()? {
+            return Ok(Action::Continue);
+        }
+    }
+}
+
+fn handle_event(terminal: &mut Tui, app: &mut App, event: Event) -> Result<Action> {
+    Ok(match event {
+        Event::FocusGained => {
+            // Terminal regained OS focus – the visible screen may have been
+            // cleared or corrupted while we were in the background.  Force
+            // a full repaint on the next frame so the whole UI reappears.
+            terminal.clear()?;
+            Action::Continue
+        }
+        Event::Resize(_, _) => {
+            // Ratatui re-queries the backend size on the next draw, but
+            // explicitly clearing avoids a one-frame flash of stale content.
+            terminal.clear()?;
+            Action::Continue
+        }
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Manual full-redraw (fallback for terminals without focus events)
+            if key.code == KeyCode::F(5) {
+                let _ = terminal.clear();
+                Action::Continue
+            } else {
+                log_navigation_key(key);
+                app.handle_key(key)
+            }
+        }
+        Event::Mouse(mouse) => app.handle_mouse(mouse),
+        Event::Paste(text) => {
+            if debug::enabled() {
+                debug::log(
+                    "input",
+                    format!(
+                        "committed text chars={} bytes={} interactive={}",
+                        text.chars().count(),
+                        text.len(),
+                        app.interactive
+                    ),
+                );
+            }
+            app.handle_paste(text);
+            Action::Continue
+        }
+        _ => Action::Continue,
+    })
 }
 
 /// Watch the controlling terminal and force the dashboard to exit if it hangs
@@ -806,6 +846,68 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wheel() -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    /// Drain `events` the way the loop does, handing each to `handle`, and
+    /// say what came of it and how many were left waiting.
+    fn drain(
+        events: Vec<Event>,
+        budget: Duration,
+        mut handle: impl FnMut(&Event) -> Action,
+    ) -> (Action, usize) {
+        let queue = std::cell::RefCell::new(std::collections::VecDeque::from(events));
+        let action = drain_events(
+            || Ok(queue.borrow_mut().pop_front().expect("an event is waiting")),
+            || Ok(!queue.borrow().is_empty()),
+            |event| Ok(handle(&event)),
+            budget,
+        )
+        .unwrap();
+        let left = queue.borrow().len();
+        (action, left)
+    }
+
+    #[test]
+    fn a_burst_of_wheel_events_is_taken_in_before_the_next_frame() {
+        // One flick of a trackpad: sixty lines, all waiting at once.
+        let mut handled = 0;
+        let (action, left) = drain(vec![wheel(); 60], Duration::from_secs(5), |_| {
+            handled += 1;
+            Action::Continue
+        });
+        assert_eq!(handled, 60, "every one of them before anything is drawn");
+        assert_eq!(left, 0);
+        assert!(matches!(action, Action::Continue));
+    }
+
+    #[test]
+    fn a_frame_is_drawn_when_the_budget_runs_out_or_something_quits() {
+        // Out of time, one is still handled - something was waiting - and the
+        // rest wait for the frame after.
+        let (_, left) = drain(vec![wheel(); 3], Duration::ZERO, |_| Action::Continue);
+        assert_eq!(left, 2);
+
+        // A quit ends the batch where it is.
+        let mut seen = 0;
+        let (action, left) = drain(vec![wheel(); 5], Duration::from_secs(5), |_| {
+            seen += 1;
+            if seen == 2 {
+                Action::Quit
+            } else {
+                Action::Continue
+            }
+        });
+        assert!(matches!(action, Action::Quit));
+        assert_eq!(left, 3);
+    }
 
     fn parse(words: &[&str]) -> Result<CliOptions> {
         parse_args(
