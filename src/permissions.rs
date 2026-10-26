@@ -233,7 +233,7 @@ pub(crate) fn authorize(
     }
     match act(tool) {
         Act::TellPerson => check_may_reach_person(own),
-        Act::Post => check_may_post(own, optional_str(arguments, "scope").unwrap_or("path")),
+        Act::Post => check_may_post(own, optional_str(arguments, "scope").unwrap_or("folder")),
         Act::Start => {
             // A kind this build cannot read is the tool's own to refuse, in its
             // own words, a moment from now.
@@ -679,7 +679,7 @@ fn check_may_reach_person(own: &Powers) -> Result<()> {
 /// hand it to a controller. A word that names no scope is the draft's to
 /// refuse, with the list of ones that do.
 fn check_may_post(own: &Powers, scope: &str) -> Result<()> {
-    let allowed = match scope.trim() {
+    let allowed = match crate::talk::scope_word(scope).unwrap_or("") {
         "task" => true,
         "path" => own.reach != Reach::Parent,
         "machine" | "global" => own.reach == Reach::Fleet,
@@ -690,13 +690,13 @@ fn check_may_post(own: &Powers, scope: &str) -> Result<()> {
     }
     match own.reach {
         Reach::Parent => bail!(
-            "this session posts to its own task's board and nowhere else: the agent that started \
-             it set that. Use scope \"task\", or report to that agent."
+            "this session posts to its own thread's board and nowhere else: the agent that \
+             started it set that. Use scope \"thread\", or report to that agent."
         ),
         _ => bail!(
-            "this session speaks within its own task and the folder it works in: the agent that \
-             started it set that. Use scope \"task\" or \"path\", or ask that agent to say it \
-             more widely."
+            "this session speaks within its own thread and the folder it works in: the agent \
+             that started it set that. Use scope \"thread\" or \"folder\", or ask that agent to \
+             say it more widely."
         ),
     }
 }
@@ -1309,32 +1309,36 @@ mod tests {
     }
 
     /// The board is rooms, and the same dial says which of them a session may
-    /// be heard in: its own task always, the folder it works in when it may
+    /// be heard in: its own thread always, the folder it works in when it may
     /// talk to the others there, the machine and the world only at full reach.
+    /// The rooms answer to their old names as well as the board's.
     #[test]
     fn a_narrowed_session_posts_to_its_own_rooms_and_no_wider() {
         let _lock = test_env::lock();
         let _subagent = as_subagent("muxloomd-claude-hand", "muxloomd-claude-lead");
 
         let own = own_powers();
-        check_may_post(&own, "task").unwrap();
-        check_may_post(&own, "path").unwrap();
+        for room in ["thread", "task", "folder", "path"] {
+            check_may_post(&own, room).unwrap();
+        }
         let error = check_may_post(&own, "machine").err().unwrap().to_string();
-        assert!(error.contains("scope \"task\" or \"path\""), "{error}");
+        assert!(error.contains("scope \"thread\" or \"folder\""), "{error}");
         assert!(check_may_post(&own, "global").is_err());
         // A word that names no room is the draft's to refuse, with the list.
         check_may_post(&own, "everywhere").unwrap();
 
         let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
         let own = own_powers();
-        check_may_post(&own, "task").unwrap();
-        let error = check_may_post(&own, "path").err().unwrap().to_string();
-        assert!(error.contains("its own task's board"), "{error}");
+        check_may_post(&own, "thread").unwrap();
+        for room in ["folder", "path"] {
+            let error = check_may_post(&own, room).err().unwrap().to_string();
+            assert!(error.contains("its own thread's board"), "{error}");
+        }
 
         // Nothing said about this session: a person's agent, and every room
         // is open to it.
         let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
-        for scope in ["task", "path", "machine", "global"] {
+        for scope in ["thread", "folder", "machine", "global"] {
             check_may_post(&own_powers(), scope).unwrap();
         }
     }
@@ -1356,7 +1360,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("scope \"task\" or \"path\""), "{error}");
+        assert!(error.contains("scope \"thread\" or \"folder\""), "{error}");
         authorize(
             &own,
             "talk_post",

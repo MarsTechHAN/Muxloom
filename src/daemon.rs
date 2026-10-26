@@ -3343,7 +3343,21 @@ mod platform {
                 }
                 write_response(writer, request_id, &DaemonResponse::Ack)
             }
-            DaemonRequest::TalkPost { draft } => {
+            DaemonRequest::TalkPost { mut draft } => {
+                // The board keeps notes. A post of the older kind is refused
+                // from an agent — whatever build of the tools it holds, which
+                // is why it is said here and not only in the tool — and taken
+                // from a person as what it is, something written down.
+                if draft.kind == TalkKind::Message {
+                    if !draft.author.voice.human {
+                        bail!(
+                            "the board keeps notes, written down for whoever comes later. Post \
+                             it as a note if it will still be worth knowing tomorrow; say it to \
+                             somebody with message_agent if it will not"
+                        );
+                    }
+                    draft.kind = TalkKind::Note;
+                }
                 let message = state.talk()?.post(draft)?;
                 write_response(
                     writer,

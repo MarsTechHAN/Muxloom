@@ -3697,11 +3697,11 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
         ),
         help_row(
             "Tab / Left / Right",
-            "All, Global, Machine, Path, Task, Direct",
+            "All, Thread, Folder, Machine, Global — notes only",
         ),
         help_row(
-            "Task tab",
-            "What the selected agent's whole task said, indented by who started whom",
+            "Thread tab",
+            "What was written down for the selected agent's thread, by who started whom",
         ),
         help_row("Enter in board", "Expand the selected message in full"),
         help_row(
@@ -4307,14 +4307,10 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
     }
 }
 
-/// The colour a scope reads in. Global is the accent everyone shares, a machine
-/// borrows the header's cyan, a directory takes the green the terminals use, a
-/// task takes magenta because it cuts across all three, and a direct message is
-/// yellow because it was aimed at someone.
+/// The colour a room reads in. Global is the accent everyone shares, a machine
+/// borrows the header's cyan, a folder takes the green the terminals use, and a
+/// thread takes magenta because it cuts across all three.
 fn board_scope_color(message: &TalkMessage) -> Color {
-    if message.kind == TalkKind::Direct {
-        return Color::Yellow;
-    }
     match message.scope {
         TalkScope::Global => ACCENT,
         TalkScope::Machine { .. } => CODEX,
@@ -4323,13 +4319,9 @@ fn board_scope_color(message: &TalkMessage) -> Color {
     }
 }
 
-/// How a message names where it was said: the tab it would sit under.
+/// How a note names where it was written: the tab it sits under.
 fn board_scope_tag(message: &TalkMessage) -> &'static str {
-    if message.kind == TalkKind::Direct {
-        "direct"
-    } else {
-        message.scope.name()
-    }
+    message.scope.board_name()
 }
 
 /// How deep in the task a message sits, for the indentation on the Task tab.
@@ -4397,7 +4389,7 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
     let view = app.board_view(form.tab, &form.query);
     // Who is working with whom, for the Task tab's indentation. The other tabs
     // have no hierarchy to draw and do not pay for one.
-    let task = if form.tab == BoardTab::Task {
+    let task = if form.tab == BoardTab::Thread {
         app.selected_task()
     } else {
         BTreeMap::new()
@@ -4503,8 +4495,8 @@ fn draw_board_modal(frame: &mut Frame<'_>, app: &App, form: &mut BoardForm, oute
         frame.render_widget(
             Paragraph::new(if !form.query.trim().is_empty() {
                 "Nothing here matches."
-            } else if form.tab == BoardTab::Task && task.is_empty() {
-                "Select an agent to see the task it is part of."
+            } else if form.tab == BoardTab::Thread && task.is_empty() {
+                "Select an agent to see the thread it is part of."
             } else {
                 "Nothing said here yet."
             })
@@ -6635,7 +6627,7 @@ mod tests {
                     channel_quote: None,
                 },
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: text.into(),
@@ -6647,7 +6639,7 @@ mod tests {
         ]);
 
         let mut form = BoardForm {
-            tab: BoardTab::Task,
+            tab: BoardTab::Thread,
             ..BoardForm::default()
         };
         let backend = TestBackend::new(114, 36);
@@ -6679,7 +6671,7 @@ mod tests {
         // And the tab says which task it is showing, since the answer changes
         // with whatever the agent list is standing on.
         assert!(
-            drawn.iter().any(|text| text.contains("[Task]")),
+            drawn.iter().any(|text| text.contains("[Thread]")),
             "{drawn:?}"
         );
     }

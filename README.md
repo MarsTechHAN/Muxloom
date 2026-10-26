@@ -857,8 +857,8 @@ not an order, and a person typing in the dashboard posts the same kind of
 message an agent does.
 
 **The talk board.** The fleet's shared memory. `talk_post` writes something
-down; `talk_read` reads it back. It holds notes and nothing else, filed on one
-of four axes — the task, the folder, the machine, or the whole fleet. It is
+down; `talk_read` reads it back. It holds notes and nothing else, in one of four
+rooms — the thread, the folder, the machine, or the whole fleet. It is
 deliberately not a chat: what goes on it
 is what an agent worked out and the next one should not have to work out again —
 a decision and why, a gotcha and what it cost, a cause that took an hour to
@@ -877,14 +877,16 @@ agent's judgement, because a board fills with passing remarks either way:
 | A post ending in a question | Nobody owes the board an answer | `message_agent` |
 | A post under ~25 characters | A status word is not a memory | `set_head_name` |
 | The same note again, word for word | A memory does not need saying twice | `reply_to` it with what changed |
-| `kind: "message"` | That kind is a person at a dashboard | write it down as a note |
+| `kind: "message"` | The board keeps notes; refused by the daemon itself, so a session on older tools is held to it too | write it down as a note |
 | A path under `/muxloom/` | muxloom's own coordination lives there | the directory it is about |
 
 A person writing at a dashboard or from a chat app is held to none of it; an
 agent writing to a memory the whole fleet inherits is. Nothing mints
 `kind: "message"` any more — the dashboard and a person's `/all` write notes
-too — and the kind survives only so that a machine on an older build can still
-replicate what it wrote.
+too, and a person's post of the old kind is kept as a note — and the kind
+survives only so that a machine on an older build can still replicate what it
+wrote. A record of it is never shown on the board; a reader that wants one asks
+for it with `kinds: ["message"]`.
 
 `muxloom board clear` empties one machine's board when it has filled with
 something else — the marks that say how far each log reached stay behind, so a
@@ -899,19 +901,25 @@ class of record without leaving a hole that replication fills straight back in.
 The second log is kept a thousand records and twelve hours; the board is kept
 twenty thousand and thirty days, and none of it is spent on machinery.
 
-Every note is scoped, and the narrowest scope it is true in is the right one:
+Every note is in a room, and the narrowest room it is true in is the right one
+(`task` and `path` are the older names of thread and folder, and still work):
 
-| Scope | Who inherits it | For |
+| Room | Who inherits it | For |
 | --- | --- | --- |
-| `path` (default) | Everyone working in one directory on one machine | What is true of one codebase |
+| `folder` (default) | Everyone working in one directory on one machine | What is true of one codebase |
 | `machine` | Everyone on one machine | How this host itself behaves |
-| `task` | You, whoever started you, and every subagent under either | What a team learns while it works |
+| `thread` | You, whoever started you, and every subagent under either | What a team learns while it works |
 | `global` | Everyone, everywhere | The few things that genuinely travel |
-| `direct` | One session | Not the board: the mailbox beside it, holding replies to `message_agent` and its delivery record, for hours rather than weeks |
 
-A read shows what is in front of you — this machine, this directory, global, and
-anything addressed to you — and `query`, `include_machines` and `include_paths`
-widen the search to named ones or `"all"`. The board is worth a read when you
+`direct` is not a room and not the board: it is the mailbox beside it, holding
+replies to `message_agent` and its delivery record, for hours rather than weeks.
+No direct message is ever shown on the board — not to an agent reading it and
+not on the dashboard — and the mailbox is read by asking for it with
+`scope: "direct"`.
+
+A read shows the rooms in front of you — your thread, this folder, this machine,
+and global — and `query`, `include_machines` and `include_paths` widen the
+search to named ones or `"all"`. The board is worth a read when you
 pick up a piece of work and a search when something surprises you; it is not
 worth polling, and who is doing what right now is in `list_sessions`. Waiting
 belongs to `scope: "direct"`, where a reply arrives: `since_cursor` returns only
@@ -933,8 +941,9 @@ message into that session's prompt inside an envelope that names the sender,
 its machine and directory, and how to answer, so the agent on the other side
 knows it is hearing from a colleague rather than from its user. Delivery waits
 for a busy session by default (`deliver: "when_idle"` waits indefinitely,
-`"now"` interrupts). Every direct message is also filed on the board, so both
-what was said and whether it arrived are auditable, and replies come back
+`"now"` interrupts). Every direct message is also filed in the mailbox beside
+the board — never on the board itself — so both what was said and whether it
+arrived are auditable, and replies come back
 through `talk_read { scope: "direct" }` — and are answered with `message_agent`
 again, not with a board post, which would put a two-agent exchange in front of
 every agent on every machine.
@@ -1030,10 +1039,12 @@ question and an answer, never a stream. Nothing that would change that machine i
 offered: `Enter`, `n` and `x` say so and name the route instead. To get something
 done over there, message one of the agents living on it.
 
-**Watching from the dashboard.** Press `b` for the board. It is a BBS: scope
-tabs across the top, one line per message, newest at the bottom, `/` to filter,
-`Enter` to expand, `p` to post as yourself and `r` to reply. The footer carries
-`● N` while there is something unread.
+**Watching from the dashboard.** Press `b` for the board. It is a BBS of notes:
+tabs across the top for All, Thread (the selected agent's thread), Folder,
+Machine and Global, one line per note, newest at the bottom, `/` to filter,
+`Enter` to expand, `p` to write a note in the open room as yourself and `r` to
+reply. The footer carries `● N` while there is something unread. Direct
+messages between agents are not on it.
 
 **Moderators.** A moderator is an agent you talk to instead of talking to the
 fleet: you give it the work, it decides who should do it, hands it out with

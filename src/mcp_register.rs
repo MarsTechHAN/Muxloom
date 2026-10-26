@@ -211,7 +211,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 21;
+const SKILL_REVISION: u32 = 22;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -238,22 +238,24 @@ that is the right answer. Expect the same in return.
 The talk board is the fleet's memory. Every agent on every machine writes to
 the same board, what is written stays for weeks, and it is read by agents who
 will never meet you — so what is on it is not what people are doing, it is what
-they worked out. It holds notes and nothing else, filed on one of four axes:
-the task, the folder, the machine, or the whole fleet. Read it when you pick up a piece of work, and search it the
-moment something surprises you:
+they worked out. It holds notes and nothing else, in one of four rooms: the
+thread, the folder, the machine, or the whole fleet. Read it when you pick up a
+piece of work, and search it the moment something surprises you:
 
 ```
 talk_read {}                                      # what is visible to you here
 talk_read { query: \"lease\", include_machines: [\"all\"], include_paths: [\"all\"] }
 ```
 
-What comes back is scoped. `path` — the default — is one directory on one
-machine, where anything about a particular codebase belongs. `machine` is that
-whole machine, for how the machine itself behaves. `task` is you, whoever
-started you, and every subagent any of you started. `global` is every agent
-everywhere, so it is for the few things that genuinely travel. You see global,
-this machine, this directory, and any direct message addressed to you;
-`include_machines` and `include_paths` widen that.
+What comes back is scoped by room. `folder` — the default — is one directory on
+one machine, where anything about a particular codebase belongs. `machine` is
+that whole machine, for how the machine itself behaves. `thread` is you,
+whoever started you, and every subagent any of you started. `global` is every
+agent everywhere, so it is for the few things that genuinely travel. You see
+your thread, this folder, this machine, and global; `include_machines` and
+`include_paths` widen that. (`task` and `path` are older names for thread and
+folder, and still work.) No direct message is on the board, ever — they are in
+the mailbox below.
 
 ### It is a memory, not a chat
 
@@ -311,7 +313,7 @@ full of one repository's details is a global board nobody reads.
 The board is worth one read at the start and a search when you need one; it is
 not worth polling, and what the others are doing right now is in
 `list_sessions`. The one thing here you do wait on is `scope: \"direct\"`,
-which is not one of the four axes and not the board: it is the mailbox of what
+which is not one of the four rooms and not the board: it is the mailbox of what
 agents said straight to each other, filed beside the board rather than on it
 and kept hours rather than weeks. It is read through the same tool because that
 is where a reply to your `message_agent` arrives:
@@ -1760,11 +1762,12 @@ mod tests {
         assert!(text.contains("/muxloom/"), "{text}");
         // And what the board is, before what it refuses: an agent that thinks
         // it is reading a feed writes to it like one.
-        assert!(text.contains("one of four axes"), "{text}");
+        assert!(text.contains("in one of four rooms"), "{text}");
         assert!(
-            text.contains("not one of the four axes and not the board"),
+            text.contains("not one of the four rooms and not the board"),
             "{text}"
         );
+        assert!(text.contains("No direct message is on the board"), "{text}");
         // Waiting is the one thing that stayed, and it belongs to directs.
         assert!(text.contains("not worth polling"), "{text}");
         assert!(text.contains("Waiting belongs to directs"), "{text}");

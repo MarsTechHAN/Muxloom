@@ -1013,71 +1013,63 @@ impl Board {
     }
 }
 
-/// Which slice of the board is on screen. The tabs are the scopes, plus the
-/// directs agents sent each other and the everything view they all fold into.
+/// Which room of the board is on screen: the thread the agent list is standing
+/// in, a folder, a machine, or everyone — and the view they all fold into.
+///
+/// The board is the fleet's memory and holds notes and nothing else. What two
+/// sessions said to each other is the mailbox beside it, and is not a tab: a
+/// board that showed every direct on the machine was a feed, and the notes
+/// worth keeping were the lines a reader scrolled past.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BoardTab {
     #[default]
     All,
-    Global,
+    Thread,
+    Folder,
     Machine,
-    Path,
-    Task,
-    Direct,
+    Global,
 }
 
 impl BoardTab {
-    pub const ORDER: [BoardTab; 6] = [
+    pub const ORDER: [BoardTab; 5] = [
         BoardTab::All,
-        BoardTab::Global,
+        BoardTab::Thread,
+        BoardTab::Folder,
         BoardTab::Machine,
-        BoardTab::Path,
-        BoardTab::Task,
-        BoardTab::Direct,
+        BoardTab::Global,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::All => "All",
-            Self::Global => "Global",
+            Self::Thread => "Thread",
+            Self::Folder => "Folder",
             Self::Machine => "Machine",
-            Self::Path => "Path",
-            Self::Task => "Task",
-            Self::Direct => "Direct",
+            Self::Global => "Global",
         }
     }
 
-    /// Whether a message belongs on this tab. A direct message answers for its
-    /// delivery rather than for the scope it was filed under: it was said to
-    /// one session, not to everyone standing in that directory.
+    /// Whether a message belongs on this tab. Only a note belongs on any of
+    /// them: the daemon does not hand the board anything else, and a record
+    /// from a build that did is left off here too.
     ///
-    /// `task` is the task the agent list is standing in, from
-    /// [`App::selected_task`]. Only the Task tab reads it, and it is the one
-    /// tab a message cannot answer for on its own: whether something belongs
-    /// to a piece of work is a fact about who started whom, which lives in the
-    /// session list rather than on the message.
+    /// `task` is the thread the agent list is standing in, from
+    /// [`App::selected_task`]. Only the Thread tab reads it, and it is the one
+    /// tab a message cannot answer for on its own: which thread is in front of
+    /// the person is a fact about the session list rather than the message.
     pub fn admits(self, message: &TalkMessage, task: &BTreeMap<String, usize>) -> bool {
-        let direct = message.kind == TalkKind::Direct;
+        if message.kind != TalkKind::Note {
+            return false;
+        }
         match self {
             Self::All => true,
-            Self::Direct => direct,
-            Self::Global => !direct && matches!(message.scope, TalkScope::Global),
-            Self::Machine => !direct && matches!(message.scope, TalkScope::Machine { .. }),
-            Self::Path => !direct && matches!(message.scope, TalkScope::Path { .. }),
-            // Everything the task said and everything said to it, whichever
-            // board it was filed under: a task is a set of agents, and what
-            // they are doing is scattered across the scopes they used. The
-            // scope check catches a message from a session the machine has
-            // since forgotten, which the author check no longer can.
-            Self::Task => {
-                let member = |id: Option<&str>| id.is_some_and(|id| task.contains_key(id));
-                member(message.author.voice.session_id.as_deref())
-                    || member(message.to.as_ref().map(|to| to.session_id.as_str()))
-                    || message
-                        .scope
-                        .task()
-                        .is_some_and(|root| task.contains_key(root))
-            }
+            Self::Global => matches!(message.scope, TalkScope::Global),
+            Self::Machine => matches!(message.scope, TalkScope::Machine { .. }),
+            Self::Folder => matches!(message.scope, TalkScope::Path { .. }),
+            Self::Thread => message
+                .scope
+                .task()
+                .is_some_and(|root| task.contains_key(root)),
         }
     }
 
@@ -7121,7 +7113,7 @@ impl App {
         // Only the Task tab needs to know who is working with whom, and
         // working it out costs a pass over the session list, so the other
         // tabs do not pay for it.
-        let task = if tab == BoardTab::Task {
+        let task = if tab == BoardTab::Thread {
             self.selected_task()
         } else {
             BTreeMap::new()
@@ -7186,7 +7178,7 @@ impl App {
             BoardTab::Machine => TalkScope::Machine {
                 machine: String::new(),
             },
-            BoardTab::Path => TalkScope::Path {
+            BoardTab::Folder => TalkScope::Path {
                 machine: String::new(),
                 path: env::current_dir()
                     .map(|path| path.to_string_lossy().into_owned())
@@ -7194,24 +7186,17 @@ impl App {
                         format!("this directory has no name to post under: {error}")
                     })?,
             },
-            // Both of these are views rather than channels a person can speak
-            // into. A task's channel belongs to the agents doing the work, and
-            // this tab gathers what they said across every scope they used, so
-            // there is no one board a new message here would land on. Replying
-            // to something still works: a reply goes where the message it
-            // answers went, which for a task message is that task.
-            BoardTab::Task => {
-                return Err(
-                    "A task is the agents doing one piece of work — reply to something \
-                            they said, or message one of them directly"
-                        .into(),
-                );
-            }
-            BoardTab::Direct => {
-                return Err(
-                    "A direct message is between two sessions — open the session to answer it"
-                        .into(),
-                );
+            // The thread the agent list is standing in: whatever the person
+            // writes down here is inherited by every session working on it.
+            BoardTab::Thread => {
+                let task = self.selected_task();
+                let Some((root, _)) = task.iter().find(|(_, depth)| **depth == 0) else {
+                    return Err("Select an agent to write in its thread".into());
+                };
+                TalkScope::Task {
+                    machine: String::new(),
+                    root_session: root.clone(),
+                }
             }
         })
     }
@@ -7333,10 +7318,6 @@ impl App {
                     .and_then(|id| self.board.messages.iter().find(|held| held.id == id));
                 match answered {
                     None => form.error = Some("Nothing here to reply to".into()),
-                    Some(message) if message.kind == TalkKind::Direct => {
-                        form.error =
-                            Some("That was said to one session — open it and answer there".into());
-                    }
                     Some(message) => {
                         form.reply_to = Some(message.id.clone());
                         form.compose = Some(String::new());
@@ -21310,11 +21291,11 @@ mod tests {
         assert_eq!(app.selected_session_id.as_deref(), Some("last-one"));
     }
 
-    /// The Task tab is the one view keyed to the agent list rather than to the
-    /// board: whichever session is selected, it gathers what that whole piece
-    /// of work has said, across every scope its members used.
+    /// The Thread tab is the one room keyed to the agent list rather than to
+    /// the message: whichever session is selected, it holds what was written
+    /// down for that whole piece of work — and a person can write there too.
     #[test]
-    fn the_task_tab_gathers_what_one_piece_of_work_said_wherever_it_said_it() {
+    fn the_thread_tab_holds_what_was_written_down_for_one_piece_of_work() {
         let (mut app, _requests) = board_app();
         let under = |id: &str, parent: Option<&str>| AgentSession {
             parent: parent.map(Into::into),
@@ -21335,10 +21316,10 @@ mod tests {
                     session_id: Some(session.into()),
                     ..TalkVoice::default()
                 },
-                ..said(seq, seq * 10, TalkScope::Global, TalkKind::Message, text).author
+                ..said(seq, seq * 10, TalkScope::Global, TalkKind::Note, text).author
             },
             scope,
-            ..said(seq, seq * 10, TalkScope::Global, TalkKind::Message, text)
+            ..said(seq, seq * 10, TalkScope::Global, TalkKind::Note, text)
         };
         let here = || TalkScope::Path {
             machine: "mars".into(),
@@ -21349,21 +21330,18 @@ mod tests {
             root_session: root.into(),
         };
         app.board.merge(vec![
-            from(1, "lead", here(), "starting on the parser"),
-            from(2, "scout", task("lead"), "the retry lives in client.rs"),
-            from(3, "digger", TalkScope::Global, "and the pool is fine"),
-            from(4, "stranger", here(), "unrelated work in the same folder"),
-            // A member that has since gone still answers for its task,
+            from(1, "scout", task("lead"), "the retry lives in client.rs"),
+            // Written by a member, but for the folder: it is in that room.
+            from(2, "lead", here(), "the parser is in src/parse"),
+            // A member that has since gone still answers for its thread,
             // because the scope says which one it was.
-            from(5, "forgotten", task("lead"), "left before anyone looked"),
-            // And so does a message aimed at a member from outside.
-            TalkMessage {
-                to: Some(crate::talk::TalkAddress {
-                    machine: "mars".into(),
-                    session_id: "scout".into(),
-                }),
-                ..from(6, "stranger", here(), "asking the scout something")
-            },
+            from(
+                3,
+                "forgotten",
+                task("lead"),
+                "the pool is fine, it was the retry",
+            ),
+            from(4, "stranger", task("stranger"), "somebody else's finding"),
         ]);
         let texts = |app: &App, tab| {
             app.board_view(tab, "")
@@ -21371,35 +21349,35 @@ mod tests {
                 .map(|message| message.text.clone())
                 .collect::<Vec<_>>()
         };
-        // Nothing selected is no task, and an empty tab says so rather than
+        // Nothing selected is no thread, and an empty tab says so rather than
         // guessing at one.
-        assert!(texts(&app, BoardTab::Task).is_empty());
+        assert!(texts(&app, BoardTab::Thread).is_empty());
+        assert!(app.board_scope(BoardTab::Thread).is_err());
 
-        // Selecting anywhere in the task shows the whole of it: the tab is
+        // Selecting anywhere in the thread shows the whole of it: the tab is
         // keyed to the work, not to the row the cursor happens to be on.
         for standing in ["lead", "scout", "digger"] {
             app.selected_session_id = Some(standing.into());
             assert_eq!(
-                texts(&app, BoardTab::Task),
+                texts(&app, BoardTab::Thread),
                 [
-                    "starting on the parser",
                     "the retry lives in client.rs",
-                    "and the pool is fine",
-                    "left before anyone looked",
-                    "asking the scout something",
+                    "the pool is fine, it was the retry"
                 ],
                 "standing on {standing}"
+            );
+            // And a person writing there writes for the thread's root.
+            assert_eq!(
+                app.board_scope(BoardTab::Thread).unwrap(),
+                TalkScope::Task {
+                    machine: String::new(),
+                    root_session: "lead".into(),
+                }
             );
         }
         // Somebody else's work is somebody else's.
         app.selected_session_id = Some("stranger".into());
-        assert_eq!(
-            texts(&app, BoardTab::Task),
-            [
-                "unrelated work in the same folder",
-                "asking the scout something",
-            ]
-        );
+        assert_eq!(texts(&app, BoardTab::Thread), ["somebody else's finding"]);
 
         // How deep each member sits, which is what the tab indents by.
         app.selected_session_id = Some("digger".into());
@@ -21408,48 +21386,31 @@ mod tests {
         assert_eq!(shape.get("scout"), Some(&1));
         assert_eq!(shape.get("digger"), Some(&2));
         assert_eq!(shape.get("stranger"), None);
-
-        // A task is a view of what was said, not a channel a person can speak
-        // into, and saying so beats a message that lands nowhere.
-        assert!(app.board_scope(BoardTab::Task).is_err());
     }
 
+    /// Each tab is one room, and the board holds notes: a direct message, or a
+    /// record of the older kind from a build before notes, is on no tab at all.
     #[test]
-    fn each_board_tab_holds_the_scope_it_names() {
+    fn each_board_tab_holds_the_room_it_names_and_only_notes() {
         let (mut app, _requests) = board_app();
+        let folder = || TalkScope::Path {
+            machine: "mars".into(),
+            path: "/work/terminal".into(),
+        };
         app.board.merge(vec![
-            said(1, 10, TalkScope::Global, TalkKind::Message, "fleet-wide"),
+            said(1, 10, TalkScope::Global, TalkKind::Note, "fleet-wide"),
             said(
                 2,
                 20,
                 TalkScope::Machine {
                     machine: "mars".into(),
                 },
-                TalkKind::Message,
+                TalkKind::Note,
                 "this machine",
             ),
-            said(
-                3,
-                30,
-                TalkScope::Path {
-                    machine: "mars".into(),
-                    path: "/work/terminal".into(),
-                },
-                TalkKind::Note,
-                "left for later",
-            ),
-            // A direct message is filed under a scope like anything else, but
-            // it was said to one session, so it answers on its own tab.
-            said(
-                4,
-                40,
-                TalkScope::Path {
-                    machine: "mars".into(),
-                    path: "/work/terminal".into(),
-                },
-                TalkKind::Direct,
-                "just for you",
-            ),
+            said(3, 30, folder(), TalkKind::Note, "left for later"),
+            said(4, 40, folder(), TalkKind::Direct, "just for you"),
+            said(5, 50, TalkScope::Global, TalkKind::Message, "hello all"),
         ]);
         let texts = |app: &App, tab| {
             app.board_view(tab, "")
@@ -21459,14 +21420,17 @@ mod tests {
         };
         assert_eq!(texts(&app, BoardTab::Global), ["fleet-wide"]);
         assert_eq!(texts(&app, BoardTab::Machine), ["this machine"]);
-        assert_eq!(texts(&app, BoardTab::Path), ["left for later"]);
-        assert_eq!(texts(&app, BoardTab::Direct), ["just for you"]);
-        assert_eq!(texts(&app, BoardTab::All).len(), 4);
+        assert_eq!(texts(&app, BoardTab::Folder), ["left for later"]);
+        assert_eq!(
+            texts(&app, BoardTab::All),
+            ["fleet-wide", "this machine", "left for later"]
+        );
+        assert_eq!(BoardTab::ORDER.len(), 5, "no tab for the mailbox");
         // The filter looks at what was said and who said it, not at the scope.
         assert_eq!(
             app.board_view(BoardTab::All, "review-bot").len(),
-            4,
-            "every message here has the same author"
+            3,
+            "every note here has the same author"
         );
         assert_eq!(
             app.board_view(BoardTab::All, "LATER")
@@ -21859,7 +21823,7 @@ mod tests {
     }
 
     #[test]
-    fn the_board_refuses_to_answer_a_direct_message_in_public() {
+    fn a_direct_message_is_not_on_the_board_to_be_answered_there() {
         let (mut app, _requests) = board_app();
         app.board.merge(vec![said(
             1,
@@ -21869,17 +21833,12 @@ mod tests {
             "just for you",
         )]);
         app.open_board();
+        assert!(app.board_view(BoardTab::All, "").is_empty());
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         let Some(Modal::Board(form)) = app.modal.as_ref() else {
             panic!("the board closed");
         };
         assert!(form.compose.is_none(), "nothing should be being written");
-        assert!(
-            form.error
-                .as_deref()
-                .is_some_and(|error| error.contains("open it and answer there")),
-            "the board has to say why: {:?}",
-            form.error
-        );
+        assert_eq!(form.error.as_deref(), Some("Nothing here to reply to"));
     }
 }

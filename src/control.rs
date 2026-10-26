@@ -575,14 +575,14 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
              where a surprising thing lives. It is knowledge rather than news, so it is worth \
              one read at the start and a search when you hit something odd; it is not worth \
              polling, and what the others are doing right now is in list_sessions, not here.\n\n\
-             By default it shows what is in front of you — this machine's board, this \
-             directory's board, what was written for everyone, and direct messages addressed to \
-             you. `query` searches the text and is usually the better way in than reading the \
-             lot; `include_machines` and `include_paths` widen the search to named machines and \
-             directories, or to \"all\" to look everywhere. scope \"task\" narrows it to you, \
-             whoever started you, and the subagents any of you started.\n\n\
+             The board holds notes and nothing else, in four rooms: your thread (you, whoever \
+             started you, and the subagents any of you started), your folder, this machine, and \
+             global. By default you read the ones in front of you — your thread, this folder, \
+             this machine, and global. `query` searches the text and is usually the better way \
+             in than reading the lot; `include_machines` and `include_paths` widen it to named \
+             machines and folders, or to \"all\" to look everywhere; `scope` reads one room.\n\n\
              scope \"direct\" is the exception to all of that, and the one thing here worth \
-             waiting on. It is not one of the four axes and not the board: it is the mailbox of \
+             waiting on. It is not one of the four rooms and not the board: it is the mailbox of \
              what agents said straight to each other, filed beside the board rather than on it \
              and kept hours rather than weeks. It is read through this tool because that is \
              where a reply to your message_agent arrives. `since_cursor` takes the `cursor` from \
@@ -600,12 +600,12 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         input_schema: schema(
             multi,
             json!({
-                "scope": { "type": "string", "enum": ["path", "machine", "task", "global", "direct"], "description": "Only one kind of board. Default: all of them." },
+                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global", "direct"], "description": "One room of the board, or \"direct\" for the mailbox beside it. Default: the board's rooms in front of you, and never the mailbox." },
                 "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
                 "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
                 "limit": { "type": "integer", "description": "Most messages to return. Default 50. A page too large to hand back is cut whatever this says." },
                 "before": { "type": "integer", "description": "Epoch ms: read backwards from here, for paging into the past." },
-                "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "\"note\" is what agents write down, \"message\" the older kind and what a person types at the dashboard, \"direct\" what agents said straight to each other." },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "\"note\" is what the board holds. \"message\" is the older kind, from before notes, and is read only when named here; \"direct\" is the mailbox, read with scope \"direct\"." },
                 "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
                 "query": { "type": "string", "description": "Only messages containing this text." },
                 "include_machines": { "type": "array", "items": { "type": "string" }, "description": "Also read these machines' boards, or [\"all\"] for every machine." },
@@ -651,12 +651,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       dashboard) and the reserved /muxloom/ paths (muxloom's own coordination \
                       between machines). A person writing at a dashboard or from a chat app is \
                       held to none of this; an agent writing to a shared memory is.\n\n\
-                      `scope` decides who inherits it: \"path\" (default) is one directory on one \
-                      machine, which is where anything about a particular codebase belongs; \
-                      \"machine\" is everyone on this machine, for how the machine itself \
-                      behaves; \"task\" is you, whoever started you, and every subagent any of you \
-                      started, for what a team learns while it works; \"global\" is every agent on \
-                      every machine, so keep it for things that genuinely travel. Prefer the \
+                      `scope` is which of the board's four rooms it goes in, and so who inherits \
+                      it: \"folder\" (default) is one directory on one machine, which is where \
+                      anything about a particular codebase belongs; \"machine\" is everyone on \
+                      this machine, for how the machine itself behaves; \"thread\" is you, \
+                      whoever started you, and every subagent any of you started, for what a team \
+                      learns while it works; \"global\" is every agent on every machine, so keep \
+                      it for things that genuinely travel. Prefer the \
                       narrowest scope the knowledge is true in — a global board full of one \
                       repository's details is a global board nobody reads.\n\n\
                       This writes only to the talk board: it never reaches a person's chat app, \
@@ -668,8 +669,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             multi,
             json!({
                 "text": { "type": "string", "description": "What to say." },
-                "scope": { "type": "string", "enum": ["path", "machine", "task", "global"], "description": "Who it is for. Default path." },
-                "path": { "type": "string", "description": "For scope=path: which directory. Defaults to the session's own." },
+                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global"], "description": "Which room it goes in. Default folder. (\"task\" and \"path\" are older names for thread and folder.)" },
+                "path": { "type": "string", "description": "For scope=folder: which directory. Defaults to the session's own." },
                 "kind": { "type": "string", "enum": ["note"], "description": "\"note\", the default and the only kind a tool call may write: knowledge, kept and searched later — what the board is for. \"message\" is a person speaking at the dashboard and is refused here." },
                 "reply_to": { "type": "string", "description": "Id of the note this corrects or adds to. One hop, and only when the correction matters to whoever reads the original later. A reply that is really an answer to somebody belongs in message_agent." },
             }),
@@ -2027,7 +2028,8 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
              somebody with message_agent if it will not"
         );
     }
-    let scope = match optional_str(arguments, "scope").unwrap_or("path") {
+    let named = optional_str(arguments, "scope").unwrap_or("folder");
+    let scope = match crate::talk::scope_word(named).unwrap_or(named) {
         "global" => TalkScope::Global,
         "machine" => TalkScope::Machine {
             machine: String::new(),
@@ -2037,7 +2039,7 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
                 .map(str::to_string)
                 .or_else(|| session_env("MUXLOOM_SESSION_PATH"))
                 .context(
-                    "scope \"path\" needs a path, and this process is not running inside a \
+                    "scope \"folder\" needs a path, and this process is not running inside a \
                      muxloom session that could name one",
                 )?;
             // muxloom keeps its own coordination notes under this namespace —
@@ -2060,11 +2062,17 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
         "task" => TalkScope::Task {
             machine: String::new(),
             root_session: task_root().context(
-                "scope \"task\" is the agents working on one piece of work, and this process is \
-                 not running inside a muxloom session that could say which one",
+                "scope \"thread\" is the agents working on one piece of work, and this process \
+                 is not running inside a muxloom session that could say which one",
             )?,
         },
-        other => bail!("unknown scope {other}: use path, machine, task, or global"),
+        "direct" => bail!(
+            "direct is the mailbox, not a room on the board: say it to one session with \
+             message_agent"
+        ),
+        _ => {
+            bail!("unknown scope {named}: the board's rooms are thread, folder, machine and global")
+        }
     };
     Ok(TalkDraft {
         scope,
@@ -2168,10 +2176,13 @@ fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) 
 fn talk_filter(arguments: &Value) -> Result<TalkFilter> {
     let scope = match optional_str(arguments, "scope") {
         None => None,
-        Some(scope @ ("global" | "machine" | "path" | "task" | "direct")) => {
-            Some(scope.to_string())
-        }
-        Some(other) => bail!("unknown scope {other}: use path, machine, task, global, or direct"),
+        Some(scope) => match crate::talk::scope_word(scope) {
+            Some(stored) => Some(stored.to_string()),
+            None => bail!(
+                "unknown scope {scope}: the board's rooms are thread, folder, machine and global, \
+                 and direct is the mailbox beside it"
+            ),
+        },
     };
     Ok(TalkFilter {
         since: optional_str(arguments, "since_cursor")
@@ -2237,7 +2248,7 @@ fn talk_json(message: &TalkMessage) -> Value {
     json!({
         "id": message.id,
         "ts": message.ts,
-        "scope": message.scope.name(),
+        "scope": message.scope.board_name(),
         "scope_machine": message.scope.machine(),
         "scope_path": message.scope.path(),
         "kind": message.kind.name(),
@@ -6906,6 +6917,7 @@ mod tests {
             config::Config,
             daemon::DaemonPaths,
             daemon_protocol::{DaemonRequest, DaemonResponse, Frame, FrameKind},
+            talk::{TalkAddress, TalkAuthor, TalkKind, TalkScope, TalkVoice},
         };
         use serde_json::{Value, json};
 
@@ -7289,6 +7301,107 @@ mod tests {
             );
         }
 
+        /// The board is notes in four rooms, named the board's way or the old
+        /// way; the mailbox is read by asking for it; and an agent's post of
+        /// the older kind is refused by the daemon itself, whatever build of
+        /// the tools sent it, while a person's is kept as the note it is.
+        #[test]
+        fn the_board_is_notes_in_four_rooms_and_the_mailbox_is_beside_it() {
+            let _env_lock = test_env::lock();
+            let _nobody = test_env::nobody();
+            let (mut surface, paths) = surface_and_paths("rooms", Config::default());
+            let here = "/tmp/muxloom-rooms-here";
+            let posted: Value = serde_json::from_str(&call(
+                &mut surface,
+                "talk_post",
+                json!({ "text": "the release script needs the nightly toolchain",
+                        "scope": "folder", "path": here }),
+            ))
+            .unwrap();
+            assert_eq!(posted["scope"], "folder", "{posted:#}");
+            let posted: Value = serde_json::from_str(&call(
+                &mut surface,
+                "talk_post",
+                json!({ "text": "the CI cache is keyed by the lockfile hash only",
+                        "scope": "path", "path": here }),
+            ))
+            .unwrap();
+            assert_eq!(posted["scope"], "folder", "the old name is the same room");
+
+            // A direct sitting in the mailbox.
+            let draft = |kind: TalkKind, human: bool| crate::talk::TalkDraft {
+                scope: TalkScope::Global,
+                author: TalkAuthor {
+                    voice: TalkVoice {
+                        session_id: (!human).then(|| "muxloomd-claude-9-1-0".to_string()),
+                        human,
+                        ..TalkVoice::default()
+                    },
+                    ..TalkAuthor::default()
+                },
+                kind,
+                to: Some(TalkAddress {
+                    machine: String::new(),
+                    session_id: "muxloomd-claude-8-1-0".into(),
+                }),
+                reply_to: None,
+                text: "the fixture you asked about is in tests/data".into(),
+            };
+            assert!(matches!(
+                ask(
+                    &paths,
+                    &DaemonRequest::TalkPost {
+                        draft: draft(TalkKind::Direct, false)
+                    }
+                ),
+                DaemonResponse::Talk { .. }
+            ));
+
+            let texts = |page: &Value| -> Vec<String> {
+                page["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message["text"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let read = |surface: &mut DaemonControl, arguments: Value| -> Value {
+                serde_json::from_str(&call(surface, "talk_read", arguments)).unwrap()
+            };
+            let board = read(&mut surface, json!({ "path": here }));
+            assert_eq!(texts(&board).len(), 2, "two notes, no direct: {board:#}");
+            let folder = read(&mut surface, json!({ "path": here, "scope": "folder" }));
+            assert_eq!(texts(&folder).len(), 2, "{folder:#}");
+            let mailbox = read(&mut surface, json!({ "scope": "direct" }));
+            assert_eq!(
+                texts(&mailbox),
+                ["the fixture you asked about is in tests/data"],
+                "{mailbox:#}"
+            );
+            assert!(
+                surface
+                    .call("talk_read", &json!({ "scope": "everywhere" }))
+                    .is_err()
+            );
+
+            // The daemon is where the older kind is refused, so a session
+            // holding tools from before the refusal is held to it too.
+            let mut said = draft(TalkKind::Message, false);
+            said.to = None;
+            assert!(matches!(
+                ask(&paths, &DaemonRequest::TalkPost { draft: said.clone() }),
+                DaemonResponse::Error { message } if message.contains("keeps notes")
+            ));
+            said.author.voice.human = true;
+            said.author.voice.session_id = None;
+            match ask(&paths, &DaemonRequest::TalkPost { draft: said }) {
+                DaemonResponse::Talk { page } => {
+                    assert_eq!(page.messages[0].kind, TalkKind::Note);
+                }
+                other => panic!("a person's post was not kept: {other:?}"),
+            }
+        }
+
         #[test]
         fn a_post_lands_on_the_board_the_reader_is_standing_on() {
             let mut surface = surface("talk");
@@ -7301,7 +7414,8 @@ mod tests {
                 json!({ "text": "the kettle boils dry above 4000m", "path": here }),
             ))
             .unwrap();
-            assert_eq!(posted["scope"], "path");
+            // Named the way the board names its rooms.
+            assert_eq!(posted["scope"], "folder");
             assert_eq!(posted["scope_path"], here);
             // Nothing said what kind this was, and the board is a memory: what
             // an agent writes on it is a note unless it says otherwise.

@@ -180,6 +180,21 @@ impl TalkScope {
         }
     }
 
+    /// What the board calls this room, which is what a person and an agent
+    /// read and type: a thread, a folder, a machine, or everyone. [`name`] is
+    /// the word the store and the wire keep using, so a record written by one
+    /// build reads the same in every other.
+    ///
+    /// [`name`]: Self::name
+    pub fn board_name(&self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Machine { .. } => "machine",
+            Self::Path { .. } => "folder",
+            Self::Task { .. } => "thread",
+        }
+    }
+
     pub fn machine(&self) -> Option<&str> {
         match self {
             Self::Global => None,
@@ -1104,21 +1119,20 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
             return false;
         }
     }
-    // A direct message is between two sessions. It is on the board so the
-    // machine it happened on can be read later, not so anyone can be part of
-    // it: only its two ends see it unless someone asks for directs by name.
+    // The board is the fleet's memory, kept in four rooms, and it holds notes.
+    // A direct message is the mailbox beside it — two sessions talking, kept
+    // hours rather than weeks — and is read by asking for the mailbox, never
+    // by reading the board: a board that showed every message one agent sent
+    // another was a feed, and the notes worth keeping were the ones a reader
+    // scrolled past.
     if message.kind == TalkKind::Direct {
-        let addressed = message.to.as_ref().is_some_and(|to| {
-            to.machine == mine
-                && filter
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|session| session == to.session_id)
-        });
-        let sent = message.author.machine == mine
-            && message.author.voice.session_id == filter.session_id
-            && filter.session_id.is_some();
-        return addressed || sent || filter.owner || filter.scope.as_deref() == Some("direct");
+        return filter.scope.as_deref() == Some("direct");
+    }
+    // Nor is the older kind, "message": a person speaking at a dashboard, or a
+    // build from before notes. Kept, because a log cannot have holes in it, and
+    // shown only to a reader that asks for it by kind.
+    if message.kind == TalkKind::Message && !filter.kinds.iter().any(|kind| kind == "message") {
+        return false;
     }
     match &message.scope {
         TalkScope::Global => true,
@@ -1158,6 +1172,21 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
         TalkScope::Task { root_session, .. } => {
             filter.owner || filter.task.as_deref() == Some(root_session.as_str())
         }
+    }
+}
+
+/// The stored name of the scope a caller named, in the board's words or the
+/// older ones: `thread` or `task`, `folder` or `path`, `machine`, `global` — and
+/// `direct`, which names the mailbox rather than a room on the board. `None` for
+/// a word that is none of them.
+pub fn scope_word(word: &str) -> Option<&'static str> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "thread" | "task" => Some("task"),
+        "folder" | "path" => Some("path"),
+        "machine" => Some("machine"),
+        "global" => Some("global"),
+        "direct" => Some("direct"),
+        _ => None,
     }
 }
 
@@ -1932,6 +1961,9 @@ mod tests {
         TalkStore::open(root).unwrap()
     }
 
+    /// A note, which is what the board holds. Signed as a person so these
+    /// tests' short sentences are not held to the discipline an agent's notes
+    /// are; the tests for that discipline build their own drafts.
     fn draft(text: &str, scope: TalkScope) -> TalkDraft {
         TalkDraft {
             scope,
@@ -1940,13 +1972,13 @@ mod tests {
                     session_id: Some("session-1".into()),
                     label: Some("builder".into()),
                     kind: Some("claude".into()),
-                    human: false,
+                    human: true,
                     channel: None,
                     channel_quote: None,
                 },
                 ..TalkAuthor::default()
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: text.into(),
@@ -2005,7 +2037,7 @@ mod tests {
                 machine_label: "gpu-box".into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("message {seq}"),
@@ -2056,7 +2088,7 @@ mod tests {
                 machine_label: "gpu-box".into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("message {seq}"),
@@ -2169,7 +2201,8 @@ mod tests {
             !seen.iter().any(|text| text.contains("channel-lease")),
             "the board is not muxloom's own traffic: {seen:?}"
         );
-        assert_eq!(seen.len(), 3, "two notes and the direct it sent: {seen:?}");
+        // The direct it sent is in the mailbox, not on the board.
+        assert_eq!(seen.len(), 2, "two notes: {seen:?}");
         // Even to the person the machines belong to, who sees everything else.
         let owned = texts(TalkFilter {
             owner: true,
@@ -2220,7 +2253,7 @@ mod tests {
                 machine_label: "gpu-box".into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("from elsewhere {seq}"),
@@ -2318,10 +2351,9 @@ mod tests {
             text: "said on a build that still had the other kind".into(),
         };
         assert_eq!(store.merge(vec![far.clone()]).unwrap(), 1);
-        let page = store.read(&TalkFilter::default());
-        assert_eq!(page.messages.len(), 1);
-        assert_eq!(page.messages[0].kind, TalkKind::Message);
         assert_eq!(store.state().vector["other-1234abcd"], 1);
+        // Kept, but the board holds notes: an ordinary read does not show it.
+        assert!(store.read(&TalkFilter::default()).messages.is_empty());
         // And a reader can still ask for that kind by name.
         assert_eq!(
             store
@@ -2344,6 +2376,7 @@ mod tests {
         let note = |text: &str| {
             let mut draft = draft(text, TalkScope::Global);
             draft.kind = TalkKind::Note;
+            draft.author.voice.human = false;
             draft
         };
         let refused = |text: &str| {
@@ -2406,7 +2439,7 @@ mod tests {
                 machine_label: origin.into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("{origin} {seq}"),
@@ -2480,7 +2513,7 @@ mod tests {
                 machine_label: origin.into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("at {ts}"),
@@ -2559,7 +2592,7 @@ mod tests {
                 machine_label: "elsewhere".into(),
                 voice: TalkVoice::default(),
             },
-            kind: TalkKind::Message,
+            kind: TalkKind::Note,
             to: None,
             reply_to: None,
             text: format!("said {seq}"),
@@ -2650,7 +2683,7 @@ mod tests {
                     machine_label: "gpu-box".into(),
                     voice: TalkVoice::default(),
                 },
-                kind: TalkKind::Message,
+                kind: TalkKind::Note,
                 to: None,
                 reply_to: None,
                 text: "the pool is fine".into(),
@@ -2748,7 +2781,7 @@ mod tests {
                     machine_label: "gpu-box".into(),
                     voice: TalkVoice::default(),
                 },
-                kind: TalkKind::Message,
+                kind: TalkKind::Note,
                 to: None,
                 reply_to: None,
                 text: "far away".into(),
@@ -2829,22 +2862,28 @@ mod tests {
         fs::remove_dir_all(&store.root).ok();
     }
 
+    /// A direct message is the mailbox beside the board, not something on it:
+    /// a reader of the board does not see it, whoever they are, and the mailbox
+    /// is read by asking for it.
     #[test]
-    fn a_direct_message_is_only_between_its_two_ends() {
+    fn a_direct_message_is_read_from_the_mailbox_and_never_from_the_board() {
         let store = store("direct");
         let mine = store.origin();
         let mut sent = draft("look at line 40", TalkScope::Global);
         sent.kind = TalkKind::Direct;
+        sent.author.voice.human = false;
         sent.to = Some(TalkAddress {
             machine: mine.clone(),
             session_id: "session-2".into(),
         });
         store.post(sent).unwrap();
 
-        let texts = |session: &str| -> Vec<String> {
+        let read = |session: &str, scope: Option<&str>, owner: bool| -> Vec<String> {
             store
                 .read(&TalkFilter {
                     session_id: Some(session.into()),
+                    scope: scope.map(Into::into),
+                    owner,
                     ..TalkFilter::default()
                 })
                 .messages
@@ -2852,32 +2891,19 @@ mod tests {
                 .map(|message| message.text)
                 .collect()
         };
-        assert_eq!(texts("session-2"), ["look at line 40"]);
-        assert_eq!(texts("session-1"), ["look at line 40"]);
-        assert!(texts("session-3").is_empty());
-        // Asking for directs by name is how the board is audited.
+        // Reading the board: not there, for either end or for the dashboard.
+        for session in ["session-1", "session-2", "session-3"] {
+            assert!(read(session, None, false).is_empty(), "{session}");
+        }
+        assert!(read("session-3", None, true).is_empty());
+        // Reading the mailbox: there.
         assert_eq!(
-            store
-                .read(&TalkFilter {
-                    session_id: Some("session-3".into()),
-                    scope: Some("direct".into()),
-                    ..TalkFilter::default()
-                })
-                .messages
-                .len(),
-            1
+            read("session-2", Some("direct"), false),
+            ["look at line 40"]
         );
-        // And the dashboard, which is the person the machine belongs to, sees
-        // it among everything else without having to ask for it by name.
         assert_eq!(
-            store
-                .read(&TalkFilter {
-                    owner: true,
-                    ..TalkFilter::default()
-                })
-                .messages
-                .len(),
-            1
+            read("session-1", Some("direct"), false),
+            ["look at line 40"]
         );
 
         fs::remove_dir_all(&store.root).ok();
@@ -2939,6 +2965,7 @@ mod tests {
             },
         );
         sent.kind = TalkKind::Direct;
+        sent.author.voice.human = false;
         sent.author.machine = "far-away".into();
         sent.author.machine_label = "gpu-box".into();
         sent.to = Some(TalkAddress {

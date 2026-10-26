@@ -171,6 +171,12 @@ preserve.
   with the name of the way there. `local` is what a daemon calls the machine it
   runs on, so a controller names its own machine to the fleet by its hostname
   and reads that name back as itself.
+- The talk board is the fleet's memory and holds notes in four rooms — thread,
+  folder, machine, global — and nothing else. Direct messages are a mailbox
+  beside it, read only by asking for it, and never shown on the board to an
+  agent or on the dashboard; the older `message` kind is kept for replication
+  and shown to nobody who does not ask for it by kind. The daemon refuses an
+  agent's post of that kind itself, so sessions on older tools are held to it.
 - The talk store is append-only per origin, idempotent by message id, and
   replicated by version vector. Only the controller drives a sync round, since
   it is the only side that can open a connection. Compaction raises the low
