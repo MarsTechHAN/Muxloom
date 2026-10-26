@@ -21,11 +21,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BoardForm, BoardTab, ChannelChats, ChannelKeys, ChannelScan, ChannelStep,
-        ChannelsForm, FileManagerForm, Focus, HELP_CONTENT_ROWS, HelpForm, KeysField, LaunchField,
-        LaunchForm, MachineRow, Modal, ModeratorForm, ModeratorRow, PaneLayout, PathPickerForm,
-        PortForwardForm, ResumeForm, ScanState, SearchForm, SettingsForm, SettingsRow,
-        SettingsScope,
+        APPROVAL_ARMING, App, ApprovalPrompt, BoardForm, BoardTab, ChannelChats, ChannelKeys,
+        ChannelScan, ChannelStep, ChannelsForm, FileManagerForm, Focus, HELP_CONTENT_ROWS,
+        HelpForm, KeysField, LaunchField, LaunchForm, MachineRow, Modal, ModeratorForm,
+        ModeratorRow, PaneLayout, PathPickerForm, PortForwardForm, ResumeForm, ScanState,
+        SearchForm, SettingsForm, SettingsRow, SettingsScope,
     },
     channel::ChannelKind,
     debug,
@@ -1586,6 +1586,7 @@ fn ansi_basic_color(index: u16, bright: bool) -> Color {
 
 fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.board_chip = None;
+    app.approvals_chip = None;
     let busy = if app.busy_operations > 0 {
         "  [working]"
     } else {
@@ -1725,15 +1726,36 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         format!(" ● {} board ", app.board.unread)
     };
+    // A write waiting on the person comes first of all the chips: an agent is
+    // stopped until they answer it, and this dashboard is where they can. It
+    // opens the dialog, and is drawn however narrow the footer, because the
+    // one thing worse than a crowded footer is an approval nobody can see.
+    let waiting = app.approvals.len();
+    let approvals = match (waiting, area.width < 72) {
+        (0, _) => String::new(),
+        (_, true) => format!(" ⚑ {waiting} "),
+        (1, false) => " ⚑ 1 approval — ! ".to_string(),
+        (_, false) => format!(" ⚑ {waiting} approvals — ! "),
+    };
     let help_width = UnicodeWidthStr::width(help);
+    let approvals_width = UnicodeWidthStr::width(approvals.as_str());
     let chip_width = UnicodeWidthStr::width(chip.as_str());
     let board_width = UnicodeWidthStr::width(board.as_str());
     let status_width = (area.width as usize)
-        .saturating_sub(help_width + chip_width + board_width + busy.len() + 2);
+        .saturating_sub(help_width + approvals_width + chip_width + board_width + busy.len() + 2);
     let status = format!(" {}{busy}", truncate(&app.status_message, status_width));
-    // The spans are laid out left to right rather than right-aligned, so the
-    // chip's rectangle is whatever the three widths before it add up to.
-    let board_x = UnicodeWidthStr::width(status.as_str()) + help_width + chip_width;
+    // The spans are laid out left to right rather than right-aligned, so each
+    // chip's rectangle is whatever the widths before it add up to.
+    let approvals_x = UnicodeWidthStr::width(status.as_str()) + help_width;
+    if approvals_width > 0 && approvals_x + approvals_width <= area.width as usize {
+        app.approvals_chip = Some(Rect::new(
+            area.x + approvals_x as u16,
+            area.y,
+            approvals_width as u16,
+            1,
+        ));
+    }
+    let board_x = approvals_x + approvals_width + chip_width;
     if board_width > 0 && board_x + board_width <= area.width as usize {
         app.board_chip = Some(Rect::new(
             area.x + board_x as u16,
@@ -1746,12 +1768,88 @@ fn draw_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled(status, status_style),
             Span::styled(help, Style::default().fg(MUTED)),
+            Span::styled(
+                approvals,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(chip, Style::default().fg(Color::Yellow)),
             Span::styled(
                 board,
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ])),
+        area,
+    );
+}
+
+/// A cross-machine write waiting on the person: who is asking, where it would
+/// land, what it would actually do, and the keys that answer it. The keys are
+/// drawn faint until they count, so a dialog that came up mid-sentence says
+/// why the next letter did nothing.
+fn draw_approval_modal(frame: &mut Frame<'_>, prompt: &ApprovalPrompt, outer: Rect) {
+    let area = centered_rect(76, 16, outer);
+    frame.render_widget(Clear, area);
+    let ask = &prompt.ask;
+    let at = match ask.machine.is_empty() {
+        true => "another machine",
+        false => ask.machine.as_str(),
+    };
+    let from = match ask.origin.is_empty() {
+        true => String::new(),
+        false => format!(" on {}", ask.origin),
+    };
+    let mut text = vec![
+        Line::raw(""),
+        Line::styled(
+            format!(
+                "{}{from} wants to run {} on {at}",
+                crate::app::approval_asker(ask),
+                ask.tool
+            ),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Line::raw(""),
+    ];
+    if !ask.detail.trim().is_empty() {
+        text.push(Line::raw(ask.detail.trim().to_string()));
+        text.push(Line::raw(""));
+    }
+    if ask.via != crate::approvals::AskVia::Dashboard {
+        text.push(Line::styled(
+            "Also asked in chat — answering in either place settles it.",
+            Style::default().fg(MUTED),
+        ));
+    }
+    let keys = match crate::permissions::approval_may_stand(&ask.tool) {
+        true => "y allow once    a allow for this conversation    n refuse    Esc later",
+        false => "y allow this once    n refuse    Esc later",
+    };
+    let armed = prompt.armed_at.elapsed() >= APPROVAL_ARMING;
+    text.push(Line::styled(
+        keys,
+        match armed {
+            true => Style::default().fg(ACCENT),
+            false => Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+        },
+    ));
+    if prompt.position.1 > 1 {
+        text.push(Line::styled(
+            format!(
+                "{} of {} waiting — Tab for the next",
+                prompt.position.0, prompt.position.1
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
+    let title = format!(" Approval needed · {} ", prompt.id);
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(panel(&title, true)),
         area,
     );
 }
@@ -1763,6 +1861,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, outer: Rect, kinds: &[Ag
         Modal::Moderator(form) => draw_moderator_modal(frame, form, outer, kinds),
         Modal::PortForward(form) => draw_port_forward_modal(frame, form, outer),
         Modal::Channels(form) => draw_channels_modal(frame, form, outer),
+        Modal::Approval(prompt) => draw_approval_modal(frame, prompt, outer),
         Modal::ConfirmKill { label, archive, .. } => {
             let area = centered_rect(54, 7, outer);
             frame.render_widget(Clear, area);
@@ -3610,6 +3709,16 @@ fn draw_help_modal(frame: &mut Frame<'_>, form: &mut HelpForm, outer: Rect) {
             "Post to the open scope; reply to the selection",
         ),
         help_row("/ in board", "Narrow to messages matching what you type"),
+        Line::raw(""),
+        help_header("Approvals"),
+        help_row(
+            "! / footer ⚑ chip",
+            "Review cross-machine writes agents are waiting on you to allow",
+        ),
+        help_row(
+            "y / a / n / Esc",
+            "Allow once; allow for the conversation; refuse; decide later",
+        ),
         Line::raw(""),
         help_header("File Manager"),
         help_row(

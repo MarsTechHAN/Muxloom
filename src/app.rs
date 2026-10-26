@@ -832,6 +832,39 @@ pub enum Modal {
         session_id: String,
         value: String,
     },
+    /// A cross-machine write an agent asked for, waiting on the person here.
+    Approval(ApprovalPrompt),
+}
+
+/// One approval in front of the person, and enough about the others to say
+/// how many there are.
+#[derive(Debug, Clone)]
+pub struct ApprovalPrompt {
+    pub id: String,
+    /// The ask as the ledger holds it, refreshed every errand round so an
+    /// answer given elsewhere — in chat, by another dashboard — closes it.
+    pub ask: crate::approvals::Pending,
+    /// Which of the open asks this is, counting from one, and how many there
+    /// are.
+    pub position: (usize, usize),
+    /// When the keys began to count. A dialog that comes up while the person
+    /// is typing into a session would otherwise take whatever they were in the
+    /// middle of as an answer — `y` from "yes, and…" approving a shell on
+    /// another machine — so keys arriving before this has been still for a
+    /// moment are swallowed, and each one starts the wait again.
+    pub armed_at: Instant,
+}
+
+/// How long an approval has to sit undisturbed before its keys count.
+pub const APPROVAL_ARMING: Duration = Duration::from_millis(600);
+
+/// The asking session as the person should read it: what the controller found
+/// it called when it asked, or its id when there was nothing better.
+pub fn approval_asker(ask: &crate::approvals::Pending) -> String {
+    match ask.asker.trim() {
+        "" => ask.session.clone(),
+        name => name.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -839,7 +872,7 @@ pub struct HelpForm {
     pub offset: usize,
 }
 
-pub const HELP_CONTENT_ROWS: usize = 92;
+pub const HELP_CONTENT_ROWS: usize = 96;
 
 /// Wall-clock milliseconds each agent-spinner frame is shown. Deriving the
 /// frame index from elapsed time divided by this keeps the animation speed
@@ -1637,6 +1670,15 @@ pub struct App {
     /// that opens it.
     pub board: Board,
     pub board_chip: Option<Rect>,
+    /// Cross-machine writes waiting on the person, oldest first, as the last
+    /// errand round left them, and where the footer drew the chip that opens
+    /// them. Every ask is here, wherever else it was put: this dashboard runs
+    /// the errands, so it is the one place each can always be answered.
+    pub approvals: Vec<(String, crate::approvals::Pending)>,
+    pub approvals_chip: Option<Rect>,
+    /// Asks already brought to the person's attention once, so one they put
+    /// off with Esc stays a chip rather than coming back every round.
+    approvals_raised: HashSet<String>,
     pub attention_banner: Option<Rect>,
     pub terminal_back: Option<Rect>,
     pub layout_debug_signature: Option<(u16, u16, u16, u16, bool, bool)>,
@@ -1849,6 +1891,9 @@ impl App {
             pane_layout: PaneLayout::default(),
             board: Board::default(),
             board_chip: None,
+            approvals: Vec::new(),
+            approvals_chip: None,
+            approvals_raised: HashSet::new(),
             attention_banner: None,
             terminal_back: None,
             layout_debug_signature: None,
@@ -2638,6 +2683,10 @@ impl App {
                 self.open_board();
                 Action::Continue
             }
+            KeyCode::Char('!') => {
+                self.open_approval(0);
+                Action::Continue
+            }
             KeyCode::Char(',') => {
                 self.open_machine_settings();
                 Action::Continue
@@ -3054,6 +3103,14 @@ impl App {
                         .is_some_and(|area| inside(area, mouse.column, mouse.row))
                 {
                     self.open_board();
+                    return Action::Continue;
+                }
+                if button == MouseButton::Left
+                    && self
+                        .approvals_chip
+                        .is_some_and(|area| inside(area, mouse.column, mouse.row))
+                {
+                    self.open_approval(0);
                     return Action::Continue;
                 }
                 // Right-click is the clipboard button over the terminal:
@@ -6069,6 +6126,11 @@ impl App {
                     self.absorb_board(page);
                 }
             }
+            Event::Approvals { open } => self.absorb_approvals(open),
+            Event::ApprovalSettled { id, result } => match result {
+                Ok(told) => self.status_message = format!("{id}: {told}"),
+                Err(error) => self.set_error(format!("{id}: {error}")),
+            },
             Event::RelayPumped { forwarded } => {
                 self.relay_in_flight = false;
                 // A machine this dashboard has of its own is not forwarded,
@@ -6860,6 +6922,163 @@ impl App {
             self.board.unread = 0;
         } else {
             self.board.unread += added;
+        }
+    }
+
+    /// Take in what the last errand round left waiting on the person.
+    ///
+    /// A new ask is brought to their attention once: a terminal notification,
+    /// and — when the agent said the person is here, or could not say — the
+    /// dialog itself, unless another dialog is already up. An ask the agent
+    /// said went to the person's phone is only listed: the chip says it is
+    /// there, and nothing opens on a screen nobody may be looking at.
+    pub fn absorb_approvals(&mut self, open: Vec<(String, crate::approvals::Pending)>) {
+        self.approvals_raised
+            .retain(|id| open.iter().any(|(held, _)| held == id));
+        let fresh: Vec<(String, crate::approvals::Pending)> = open
+            .iter()
+            .filter(|(id, _)| !self.approvals_raised.contains(id))
+            .cloned()
+            .collect();
+        self.approvals = open;
+        // A dialog showing an ask follows it: refreshed while it is still
+        // waiting, and moved on to the next once it has been answered
+        // somewhere else.
+        if let Some(Modal::Approval(prompt)) = self.modal.as_ref() {
+            let id = prompt.id.clone();
+            let armed_at = prompt.armed_at;
+            self.modal = match self.approval_at(&id) {
+                Some(index) => self.approval_prompt(index, armed_at),
+                None => None,
+            };
+        }
+        for (id, ask) in fresh {
+            self.approvals_raised.insert(id.clone());
+            if !ask.via.raises_dashboard() {
+                continue;
+            }
+            self.notifications.push(format!(
+                "approval needed: {} wants {} on {}",
+                approval_asker(&ask),
+                ask.tool,
+                if ask.machine.is_empty() {
+                    "another machine"
+                } else {
+                    ask.machine.as_str()
+                }
+            ));
+            if self.modal.is_none()
+                && let Some(index) = self.approval_at(&id)
+            {
+                self.modal = self.approval_prompt(index, Instant::now());
+            }
+        }
+    }
+
+    fn approval_at(&self, id: &str) -> Option<usize> {
+        self.approvals.iter().position(|(held, _)| held == id)
+    }
+
+    fn approval_prompt(&self, index: usize, armed_at: Instant) -> Option<Modal> {
+        let (id, ask) = self.approvals.get(index)?;
+        Some(Modal::Approval(ApprovalPrompt {
+            id: id.clone(),
+            ask: ask.clone(),
+            position: (index + 1, self.approvals.len()),
+            armed_at,
+        }))
+    }
+
+    /// Put the `index`th open approval in front of the person, the oldest when
+    /// it is out of range: the chip and `!` open the queue at its front.
+    pub fn open_approval(&mut self, index: usize) {
+        if self.approvals.is_empty() {
+            self.status_message = "Nothing is waiting on your approval".into();
+            return;
+        }
+        let index = if index < self.approvals.len() {
+            index
+        } else {
+            0
+        };
+        self.modal = self.approval_prompt(index, Instant::now());
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent, prompt: ApprovalPrompt) {
+        // Putting it off is never an answer, so Esc works at once.
+        if key.code == KeyCode::Esc {
+            let waiting = self.approvals.len();
+            self.status_message = format!(
+                "{waiting} {} waiting on your approval — ! to review",
+                if waiting == 1 { "write" } else { "writes" }
+            );
+            return;
+        }
+        if prompt.armed_at.elapsed() < APPROVAL_ARMING {
+            self.modal = Some(Modal::Approval(ApprovalPrompt {
+                armed_at: Instant::now(),
+                ..prompt
+            }));
+            return;
+        }
+        let Some(index) = self.approval_at(&prompt.id) else {
+            return;
+        };
+        let verdict = match key.code {
+            KeyCode::Char('y') => Some(crate::approvals::Verdict::Yes),
+            KeyCode::Char('a') if crate::permissions::approval_may_stand(&prompt.ask.tool) => {
+                Some(crate::approvals::Verdict::Always)
+            }
+            KeyCode::Char('n') => Some(crate::approvals::Verdict::No),
+            _ => None,
+        };
+        let Some(verdict) = verdict else {
+            let step = match key.code {
+                KeyCode::Tab | KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => 1,
+                KeyCode::BackTab | KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+                    self.approvals.len().saturating_sub(1)
+                }
+                _ => 0,
+            };
+            let next = (index + step) % self.approvals.len().max(1);
+            self.modal = self.approval_prompt(next, prompt.armed_at);
+            return;
+        };
+        let targets: Vec<Target> = self
+            .targets
+            .iter()
+            .filter(|status| status.enabled && status.target.id != LOCAL_TARGET_ID)
+            .map(|status| status.target.clone())
+            .collect();
+        if self
+            .worker
+            .requests
+            .send(crate::worker::Request::SettleApproval {
+                id: prompt.id.clone(),
+                verdict,
+                targets,
+            })
+            .is_err()
+        {
+            self.set_error("the worker is gone; the approval was not recorded");
+            self.modal = Some(Modal::Approval(prompt));
+            return;
+        }
+        // Off the list at once, so the next one comes up without waiting for
+        // the round that will say the same.
+        self.approvals.remove(index);
+        self.status_message = format!(
+            "{}: {} {}",
+            prompt.id,
+            match verdict {
+                crate::approvals::Verdict::Yes => "allowing once",
+                crate::approvals::Verdict::Always => "allowing for the conversation",
+                crate::approvals::Verdict::No => "refusing",
+            },
+            prompt.ask.tool
+        );
+        if !self.approvals.is_empty() {
+            self.modal = self.approval_prompt(index.min(self.approvals.len() - 1), Instant::now());
         }
     }
 
@@ -11146,6 +11365,7 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::ConfirmHistoryReference { form, candidate }),
             },
+            Modal::Approval(prompt) => self.handle_approval_key(key, prompt),
             Modal::LegacyFallback { target_id, detail } => match key.code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {}
                 _ => self.modal = Some(Modal::LegacyFallback { target_id, detail }),
@@ -21055,6 +21275,107 @@ mod tests {
             matches!(receive_request(&requests), Request::RelayPump { .. }),
             "errands are asked for while the board round is still running"
         );
+    }
+
+    fn parked(
+        id: &str,
+        tool: &str,
+        via: crate::approvals::AskVia,
+    ) -> (String, crate::approvals::Pending) {
+        (
+            id.into(),
+            crate::approvals::Pending {
+                session: "muxloomd-claude-1-1-0".into(),
+                machine: "gpu".into(),
+                origin: "laptop".into(),
+                tool: tool.into(),
+                detail: "Run: rm -rf build".into(),
+                asker: "release notes".into(),
+                via,
+                at_ms: 1,
+                open: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn settle_old_enough(app: &mut App) {
+        if let Some(Modal::Approval(prompt)) = app.modal.as_mut() {
+            prompt.armed_at = Instant::now() - APPROVAL_ARMING;
+        }
+    }
+
+    /// An ask the agent said the person is here for comes up in front of them;
+    /// one it said went to their phone is listed and opens nothing. Whichever it
+    /// is, a key typed in the moment it appeared is not an answer — the person
+    /// was in the middle of saying something to a session — and Enter never is.
+    #[test]
+    fn an_approval_comes_up_where_the_agent_said_the_person_is() {
+        use crate::approvals::{AskVia, Verdict};
+        let (mut app, requests) = board_app();
+        let shell = parked("approve-1", "run_shell", AskVia::Chat);
+        app.handle_worker_event(Event::Approvals {
+            open: vec![shell.clone()],
+        });
+        assert!(app.modal.is_none(), "a chat ask opens nothing here");
+        assert_eq!(app.approvals.len(), 1, "but it is listed");
+        assert!(app.take_notifications().is_empty());
+
+        let launch = parked("approve-2", "launch_session", AskVia::Dashboard);
+        app.handle_worker_event(Event::Approvals {
+            open: vec![shell.clone(), launch.clone()],
+        });
+        match &app.modal {
+            Some(Modal::Approval(prompt)) => {
+                assert_eq!(prompt.id, "approve-2");
+                assert_eq!(prompt.position, (2, 2));
+            }
+            other => panic!("the dashboard ask did not come up: {other:?}"),
+        }
+        let told = app.take_notifications();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("release notes"), "{told:?}");
+
+        // Mid-sentence: swallowed, and the wait starts again.
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Approval(_))));
+        assert!(requests.try_recv().is_err(), "a stray y approved a launch");
+
+        // Sat still, Enter is still nothing and y answers it.
+        settle_old_enough(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err(), "Enter approved a launch");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(
+            receive_request(&requests),
+            Request::SettleApproval { id, verdict: Verdict::Yes, .. } if id == "approve-2"
+        ));
+        // The next one comes up by itself.
+        assert!(matches!(&app.modal, Some(Modal::Approval(prompt)) if prompt.id == "approve-1"));
+
+        // A shell is approved a run at a time, so `a` is not an answer to it.
+        settle_old_enough(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            requests.try_recv().is_err(),
+            "a shell was approved for good"
+        );
+
+        // Esc puts it off: still listed, and not brought up again by the next
+        // round, which the person would read as the dialog refusing to close.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        app.handle_worker_event(Event::Approvals {
+            open: vec![shell.clone()],
+        });
+        assert!(app.modal.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(matches!(&app.modal, Some(Modal::Approval(prompt)) if prompt.id == "approve-1"));
+
+        // Answered somewhere else — in chat, say — and it closes.
+        app.handle_worker_event(Event::Approvals { open: Vec::new() });
+        assert!(app.modal.is_none());
+        assert!(app.approvals.is_empty());
     }
 
     fn far_peer(id: &str, via: &str) -> crate::relay::Forwarded {

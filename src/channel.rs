@@ -3023,6 +3023,7 @@ fn settle_approval(
     verdict: crate::approvals::Verdict,
 ) -> Option<(crate::approvals::Pending, String)> {
     let pending = ledger.take(id)?;
+    ledger.record_settled(id, &pending.tool, verdict, now_ms());
     let told = match verdict {
         crate::approvals::Verdict::No => "· denied".to_string(),
         crate::approvals::Verdict::Yes => {
@@ -3050,6 +3051,46 @@ fn settle_approval(
         }
     };
     Some((pending, told))
+}
+
+/// Settle an ask the person answered on the dashboard, and tell the agent that
+/// asked — exactly what a chat answer does, from the other place an ask can be
+/// answered.
+///
+/// The words the person is shown come back, or an error saying the ask is no
+/// longer open: answered already in chat, or lapsed.
+pub fn settle_at_dashboard(
+    runtime: &Runtime,
+    targets: &[Target],
+    id: &str,
+    verdict: crate::approvals::Verdict,
+) -> Result<String> {
+    let path = crate::approvals::Approvals::default_path();
+    let held = crate::approvals::hold();
+    let mut ledger = crate::approvals::Approvals::load(&path);
+    let Some((pending, told)) = settle_approval(&mut ledger, id, verdict) else {
+        match ledger.answered(id) {
+            Some(answered) => bail!("{id} was already answered: {}", said_word(answered.verdict)),
+            None => bail!("{id} is no longer waiting on anybody"),
+        }
+    };
+    ledger
+        .save(&path)
+        .with_context(|| format!("recording the answer to {id}"))?;
+    drop(held);
+    // Only once it is written down: an agent told to go ahead on a grant that
+    // was never recorded is refused all over again.
+    wake_asker(runtime, targets, &pending, verdict);
+    Ok(told.trim_start_matches("· ").to_string())
+}
+
+/// The word a person said, as a person would read it back.
+fn said_word(verdict: crate::approvals::Verdict) -> &'static str {
+    match verdict {
+        crate::approvals::Verdict::Yes => "allowed once",
+        crate::approvals::Verdict::Always => "allowed for the conversation",
+        crate::approvals::Verdict::No => "refused",
+    }
 }
 
 /// Tell the session that asked that the person has answered.
@@ -3169,8 +3210,11 @@ fn asker_told(pending: &crate::approvals::Pending, verdict: crate::approvals::Ve
 /// nothing to do and the person is told once.
 fn take_forwarded_verdicts(runtime: &Runtime, targets: &[Target]) -> Vec<String> {
     let path = crate::approvals::Approvals::default_path();
-    let mut ledger = crate::approvals::Approvals::load(&path);
-    if !ledger.pending.values().any(|pending| pending.open) {
+    if !crate::approvals::Approvals::load(&path)
+        .pending
+        .values()
+        .any(|pending| pending.open)
+    {
         return Vec::new();
     }
     let notes = match read_path_notes(runtime, VERDICT_PATH, 64) {
@@ -3183,6 +3227,11 @@ fn take_forwarded_verdicts(runtime: &Runtime, targets: &[Target]) -> Vec<String>
             return Vec::new();
         }
     };
+    // Read, settled and written back under the ledger's lock, and read only
+    // now: the board was a call to the daemon, and an answer given at the
+    // dashboard meanwhile must not be written over by a copy from before it.
+    let held = crate::approvals::hold();
+    let mut ledger = crate::approvals::Approvals::load(&path);
     let now = now_ms();
     let mut said = Vec::new();
     let mut woken = Vec::new();
@@ -3214,6 +3263,7 @@ fn take_forwarded_verdicts(runtime: &Runtime, targets: &[Target]) -> Vec<String>
         debug::log("approval", format!("could not save: {error:#}"));
         return Vec::new();
     }
+    drop(held);
     // Only once it is written down. An agent told to go ahead on the strength
     // of a grant that was never recorded gets refused all over again.
     for (pending, verdict) in woken {
@@ -4229,8 +4279,20 @@ fn handle(
         }
         Route::Approval { id, verdict } => {
             let path = crate::approvals::Approvals::default_path();
+            let held = crate::approvals::hold();
             let mut ledger = crate::approvals::Approvals::load(&path);
             let Some((pending, out)) = settle_approval(&mut ledger, &id, verdict) else {
+                drop(held);
+                // An ask can be up in two places at once, and the dashboard may
+                // have answered the one this card is about. The card does not
+                // know that; the ledger does, and says so rather than sending
+                // the reply round the fleet looking for an ask that is gone.
+                if let Some(answered) = ledger.answered(&id) {
+                    return format!(
+                        "· {id} was already answered — {}",
+                        said_word(answered.verdict)
+                    );
+                }
                 // Nothing open here by that name, which in a connected fleet
                 // says little about whether anyone is waiting: the account has
                 // one voice and it is not chosen by who asked. Write it down
@@ -4250,6 +4312,7 @@ fn handle(
             if let Err(error) = ledger.save(&path) {
                 return format!("· could not record that: {error:#}");
             }
+            drop(held);
             // The agent asked hours ago and its turn ended long since; nothing
             // is going to try the call again unless it is told to.
             wake_asker(desk.runtime, &desk.machines.clone(), &pending, verdict);
@@ -6124,6 +6187,7 @@ mod tests {
             ask: String::new(),
             at_ms: 1,
             open: true,
+            ..Default::default()
         };
         let yes = asker_told(&ask("macmini"), Verdict::Yes);
         assert!(yes.contains("approved"), "{yes}");
@@ -6664,6 +6728,7 @@ mod tests {
                     ask: "start a session".into(),
                     at_ms: 1,
                     open: true,
+                    ..Default::default()
                 },
             ));
             ledger
@@ -6685,6 +6750,14 @@ mod tests {
         // that has been waiting on it gets told.
         assert_eq!(said.map(|(ask, _)| ask.origin), Some("g3".to_string()));
         assert!(ledger.pending.is_empty());
+        // It is remembered as answered, so the card for it still on the
+        // person's phone — answered at the dashboard instead — is told so
+        // rather than sent round the fleet looking for an ask that is gone.
+        assert_eq!(
+            ledger.answered("approve-7").map(|held| held.verdict),
+            Some(Verdict::Yes)
+        );
+        assert_eq!(settle_approval(&mut ledger, "approve-7", Verdict::No), None);
         assert_eq!(
             ledger.once,
             vec![(

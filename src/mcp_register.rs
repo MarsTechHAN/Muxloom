@@ -211,7 +211,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 20;
+const SKILL_REVISION: u32 = 21;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -558,6 +558,31 @@ shed by dying and coming back.
 If a tool refuses you with \"the agent that started it set that\", that is this,
 and the flag is not yours to change — say what you need to whoever started you
 and let them carry it, or ask them to start the next session wider.
+
+A session another agent started closes and resumes only its own: itself and
+the sessions it started. Anything else is refused, whatever its dials say —
+tell whoever owns it that it is done with, and let them close it.
+
+## Changes on another machine wait on the person
+
+Starting, typing into, archiving or deleting a session on another machine,
+arming a trigger there, or running a shell there comes back as an approval id
+instead of a result. Say where the person is, so they are asked there:
+
+```
+launch_session { machine: \"gpu-1\", kind: \"claude\", path: \"/srv/app\",
+                 ask_via: \"dashboard\" }   # they typed this to you in muxloom
+run_shell { machine: \"gpu-1\", script: \"...\", ask_via: \"chat\" }
+                                          # it reached you from their chat app
+```
+
+`dashboard` when the request was typed straight into your terminal, or posted
+by a person on the dashboard's board. `chat` when it arrived in a muxloom
+envelope saying a person sent it from their chat app. Leave it out when you
+cannot tell — a subagent hears from the agent that started it, not from the
+person — and both are asked. You are told in your prompt when they answer;
+make the call again then, not before, and do not ask them a second time in
+the meantime.
 
 ## Ask the human first
 
@@ -1679,6 +1704,20 @@ mod tests {
         // Waiting is the one thing that stayed, and it belongs to directs.
         assert!(text.contains("not worth polling"), "{text}");
         assert!(text.contains("Waiting belongs to directs"), "{text}");
+    }
+
+    /// Where the person is asked to approve a change on another machine is the
+    /// agent's to say, and only the skill can tell it how to judge: the tool
+    /// schema names the two words, the skill says which envelope means which.
+    /// It ships under a stamp newer than the one that did not say it.
+    #[test]
+    fn the_skill_says_how_to_choose_where_the_person_is_asked() {
+        let text = skill_document();
+        assert!(text.contains("ask_via"), "{text}");
+        assert!(text.contains("ask_via: \"dashboard\""), "{text}");
+        assert!(text.contains("ask_via: \"chat\""), "{text}");
+        assert!(text.contains("Leave it out when you"), "{text}");
+        assert!(text.contains("closes and resumes only its own"), "{text}");
     }
 
     /// The person is on a phone with no screen to look at, so an agent that

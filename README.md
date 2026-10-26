@@ -481,6 +481,7 @@ the full categorized help inside the TUI.
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
 | `b` | Open the talk board every machine and agent shares; the footer shows `● N` when it has unread messages |
+| `!` | Review the cross-machine writes waiting on your approval; the footer shows `⚑ N` while any are |
 | `Ctrl-f` | Open or close Files in the current context |
 | `,` / `Ctrl-,` | Edit the selected machine's / global configuration; read its `muxloomd` version and force a `⟳` daemon update |
 | `f` | Toggle grouped and flat session views |
@@ -976,11 +977,27 @@ the controller runs the call over there. Looking and saying go straight through
 — screens, files, sessions, history, conversation recall, `message_agent`, the
 board. Changing something on another machine is put to you first: starting a
 session, typing into one, archiving or deleting one, arming a trigger, running a
-shell. Those come back as an approval id, and the agent asked for them again
-once you have answered in chat. If the ask cannot reach you — no chat bound, or
-a chat that took it and never delivered it — nothing is parked at all: the agent
-is told plainly that nobody was asked, rather than left waiting on an approval
-you never saw. `launch_session` needs an absolute `path` when
+shell. The card says who is asking and what the yes would do — the folder a
+launch lands in, the script, the words that would be typed — and a close, a
+shell or a trigger is approved one run at a time, never for the rest of the
+conversation.
+
+Where you are asked is the asking agent's call, because it knows how the work
+reached it: a request typed into its own terminal came from someone at the
+dashboard, and one that arrived in a chat-app envelope came from a phone. It
+says so with `ask_via` — `dashboard` puts the ask up on the dashboard and keeps
+your phone quiet, `chat` sends the card to the chat — and an agent that cannot
+tell, such as a subagent hearing from its parent, says nothing and you are asked
+in both. Every ask is listed on the dashboard either way, behind a `⚑ N` chip
+and `!`: the dashboard runs the errands, so it is the one place an ask can
+always be answered. A dialog that comes up while you are typing ignores keys
+until it has been still for a moment, so a sentence in progress is not read as
+an answer, and `Enter` never answers it. If the chat cannot carry an ask — none
+bound, or a WeChat conversation that took it and never delivered it — it waits
+on the dashboard instead and the agent is told so. Answering in either place
+settles it, a card answered at the dashboard says so if you reply to it later,
+and the agent is told in its prompt when you have answered, so it makes the call
+again then. `launch_session` needs an absolute `path` when
 it names another machine — the caller's own folder is on this one. `wait_for`
 never travels; it watches the machine it runs on. Machine enablement and SSH
 edits are never relayed at all. With no dashboard attached, every cross-machine
@@ -1124,6 +1141,7 @@ old frame visible until the new stream produces its first frame.
 | `src/talk.rs` | Talk board: messages, scopes, version-vector store, delivery envelopes |
 | `src/moderator.rs` | Moderator folders and the briefing an agent finds in one |
 | `src/permissions.rs` | Who may do what: subagent limits, closing and resuming, what crosses machines |
+| `src/approvals.rs` | The ledger of cross-machine writes waiting on the person, and where each was asked |
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |

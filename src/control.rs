@@ -206,9 +206,12 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
             "- A remote machine is only ever reached through the controller. If it is not \
              attached you are told so immediately — that is the whole answer, not a reason to \
              retry. A change over there waits on the person: you get back an approval id rather \
-             than a result, and the call runs when they answer, so make it again after they do. \
-             When there is already an agent living over there, saying what you want with \
-             message_agent is quicker than driving its machine from here.\n"
+             than a result. Say where they are with `ask_via` — \"dashboard\" when they typed \
+             the request to you in muxloom, \"chat\" when it reached you from their chat app, \
+             nothing when you cannot tell — and the ask is put to them there. You are told in \
+             your prompt when they answer; make the call again then. When there is already an \
+             agent living over there, saying what you want with message_agent is quicker than \
+             driving its machine from here.\n"
         }
     };
     // Only a session has a head name of its own: the daemon flavor runs inside one,
@@ -1018,6 +1021,28 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 &["name"],
             ),
         });
+        // A change aimed at another machine waits on the person, and the one
+        // thing muxloom cannot work out for itself is where they are. The
+        // agent can: it knows how the request reached it.
+        for tool in tools
+            .iter_mut()
+            .filter(|tool| crate::permissions::needs_approval(tool.name))
+        {
+            tool.input_schema["properties"][crate::approvals::ASK_VIA] = json!({
+                "type": "string",
+                "enum": ["dashboard", "chat"],
+                "description": "Where to ask the person, when this call names another machine \
+                                and so waits on their approval. \"dashboard\": the request was \
+                                typed to you directly — into your own terminal, or posted by a \
+                                person on the dashboard's board — so they are at the screen, \
+                                the ask comes up there, and their phone stays quiet. \"chat\": \
+                                it reached you in a muxloom envelope saying a person sent it \
+                                from their chat app, so the ask goes to that chat. Leave it out \
+                                when you cannot tell — a subagent hears from the agent that \
+                                started it, not from the person — and both are asked. Nothing \
+                                on this machine waits on approval, so here it is ignored.",
+            });
+        }
     }
     tools
 }
@@ -3980,8 +4005,8 @@ mod daemon_surface {
     };
     use crate::permissions::{
         Act, Lineage, act, authorize, check_may_launch, granted_powers, launch_path_within,
-        launching_session, lineage, lineage_of_answer, own_powers, resumed_powers, session_env,
-        stamp_powers, travels,
+        launching_session, lineage, lineage_of_answer, needs_approval, own_powers, resumed_powers,
+        session_env, stamp_powers, travels,
     };
     use crate::{
         channel::ChannelSet,
@@ -4952,6 +4977,12 @@ mod daemon_surface {
                 }
             })?;
             if crossing {
+                // Where to put the approval to the person, said by the one
+                // agent that knows where they are, and refused here if it is
+                // neither word rather than after a round trip.
+                if needs_approval(name) {
+                    crate::approvals::AskVia::from_arguments(arguments)?;
+                }
                 // The one argument that cannot be defaulted across the wire:
                 // a launch here falls back to the caller's own folder, and
                 // over there that folder is somebody else's or nobody's. Said
@@ -5884,6 +5915,7 @@ mod tests {
                 // for it, which is a local answer: naming another machine
                 // takes the folder back off the surface's hands.
                 assert!(tool.input_schema["properties"]["machine"].is_object());
+                assert!(tool.input_schema["properties"][crate::approvals::ASK_VIA].is_object());
                 continue;
             }
             // Machine addressing is the difference between the surfaces: the
@@ -5895,6 +5927,21 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("machine");
+            // Where to ask the person is a daemon-side question: a moderator's
+            // own calls are a person's, and the controller asks nobody. It is
+            // offered on exactly the calls that can wait on an approval.
+            let asks = tool_schema["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove(crate::approvals::ASK_VIA)
+                .is_some();
+            assert_eq!(
+                asks,
+                crate::permissions::needs_approval(tool.name),
+                "{} offers ask_via wrongly",
+                tool.name
+            );
+            assert!(!twin.input_schema["properties"][crate::approvals::ASK_VIA].is_object());
             if tool_schema["properties"]
                 .as_object_mut()
                 .unwrap()

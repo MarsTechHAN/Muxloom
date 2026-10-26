@@ -35,12 +35,12 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    approvals::{Approvals, Pending as ApprovalsPending},
+    approvals::{Approvals, AskVia, Pending as ApprovalsPending},
     config::Config,
     control::{ControlSurface, ControllerControl},
     debug,
     model::Target,
-    permissions::{needs_approval, travels},
+    permissions::{approval_may_stand, needs_approval, travels},
     runtime::Runtime,
 };
 
@@ -186,24 +186,206 @@ fn routable(fleet: &[String], machine: &str) -> bool {
     machine.is_empty() || fleet.iter().any(|id| id.eq_ignore_ascii_case(machine))
 }
 
-/// What the person is shown when a cross-machine write is waiting on them,
-/// and the words they answer it with.
+/// What the person is shown in chat when a cross-machine write is waiting on
+/// them, and the words they answer it with.
 ///
 /// The words carry the bare number, not the ledger's key. The ledger files the
 /// ask under `approve-7` and the person types `approve-7`, so quoting the key
 /// would ask them for `approve-approve-7`. The chat side reads that form now,
 /// but a card is what a person answers off their phone and it should say the
 /// thing they type.
-fn approval_ask(tool: &str, machine: &str, number: u64) -> String {
+///
+/// It says who is asking and what the call would do, not only which tool: a
+/// yes to `run_shell` without the script is a yes to anything. And `always` is
+/// only offered where a yes may stand — a person told they can approve a
+/// delete for the rest of a conversation, and then finding they approved it
+/// once, has been told something untrue.
+fn approval_ask(tool: &str, machine: &str, number: u64, asker: &str, detail: &str) -> String {
     let at = match machine.is_empty() {
         true => "another machine".to_string(),
         false => format!("{machine} (cross-machine)"),
     };
-    format!(
-        "An agent wants to run `{tool}` on {at}.\nReply `approve-{number}` to allow it once, \
-         `always-{number}` for the rest of that agent's conversation, or `reject-{number}` to \
-         refuse."
-    )
+    let who = match asker.trim().is_empty() {
+        true => "An agent".to_string(),
+        false => format!("\"{}\"", asker.trim()),
+    };
+    let what = match detail.trim().is_empty() {
+        true => String::new(),
+        false => format!("\n{}", detail.trim()),
+    };
+    let reply = match approval_may_stand(tool) {
+        true => format!(
+            "Reply `approve-{number}` to allow it once, `always-{number}` for the rest of that \
+             agent's conversation, or `reject-{number}` to refuse."
+        ),
+        false => {
+            format!(
+                "Reply `approve-{number}` to allow it this once, or `reject-{number}` to refuse."
+            )
+        }
+    };
+    format!("{who} wants to run `{tool}` on {at}.{what}\n{reply}")
+}
+
+/// What a call would do, in the words a person decides on.
+///
+/// Read off the arguments the way the tool itself reads them, and clipped: a
+/// card is read on a phone, and the decision turns on the first line of a
+/// script, not the hundredth.
+fn describe(tool: &str, arguments: &serde_json::Value) -> String {
+    const SHOWN: usize = 400;
+    let text = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let session = text("session_id").unwrap_or("a session");
+    let said = match tool {
+        "launch_session" => {
+            let mut said = format!(
+                "Start {} in {}",
+                text("kind").unwrap_or("a session"),
+                text("path").unwrap_or("a folder it did not name")
+            );
+            if let Some(label) = text("label") {
+                said.push_str(&format!(" as \"{label}\""));
+            }
+            match (text("resume_id"), text("initial_prompt")) {
+                (Some(resume), _) => said.push_str(&format!(", resuming {resume}")),
+                (None, Some(prompt)) => said.push_str(&format!(", told: {prompt}")),
+                (None, None) => {}
+            }
+            said
+        }
+        "send_input" => {
+            let mut parts = Vec::new();
+            if let Some(typed) = arguments.get("text").and_then(serde_json::Value::as_str) {
+                parts.push(format!("type {typed:?}"));
+            }
+            let keys: Vec<&str> = arguments
+                .get("keys")
+                .and_then(serde_json::Value::as_array)
+                .map(|keys| keys.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            if !keys.is_empty() {
+                parts.push(format!("press {}", keys.join(" ")));
+            }
+            if arguments
+                .get("submit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                parts.push("press Enter".into());
+            }
+            match parts.is_empty() {
+                true => format!("Type into {session}"),
+                false => format!("Into {session}: {}", parts.join(", then ")),
+            }
+        }
+        "run_shell" => format!("Run: {}", text("script").unwrap_or("(no script)")),
+        "archive_session" => format!("Archive {session} and every session it started"),
+        "delete_session" => {
+            format!("Delete {session} for good — its history too — and every session it started")
+        }
+        "trigger" => match text("action").unwrap_or("") {
+            "set" => format!(
+                "Watch {session} for {:?}, then {} {:?}",
+                text("pattern").unwrap_or(""),
+                match text("action_kind").unwrap_or("notify") {
+                    "send_input" => "type",
+                    _ => "flag it with",
+                },
+                text("text").unwrap_or("")
+            ),
+            "delete" => format!("Remove trigger {}", text("id").unwrap_or("?")),
+            other => format!("{other} triggers on {session}"),
+        },
+        _ => String::new(),
+    };
+    match said.chars().count() > SHOWN {
+        true => format!("{}…", said.chars().take(SHOWN).collect::<String>()),
+        false => said,
+    }
+}
+
+/// The asking session as a person knows it: the name on its row, or failing
+/// that its runtime and folder. Its id is the last resort, because a person
+/// reading `muxloomd-claude-1787996682-39374-2` can do nothing with it.
+fn asker_name(record: Option<crate::daemon_protocol::DaemonSession>, session: &str) -> String {
+    let Some(record) = record else {
+        return session.to_string();
+    };
+    let named = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    named(&record.label)
+        .or_else(|| record.title.as_deref().and_then(named))
+        .unwrap_or_else(|| {
+            let folder = std::path::Path::new(record.path.trim_end_matches('/'))
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match folder.is_empty() {
+                true => record.kind.clone(),
+                false => format!("{} · {folder}", record.kind),
+            }
+        })
+}
+
+/// What the agent is told when its call has just been put to the person.
+///
+/// It says where, because the agent chose and should hear what came of the
+/// choice — in particular that a chat which could not carry the ask left it on
+/// the dashboard instead. And it says the agent will be told, because it will:
+/// an answer is delivered to its prompt, and an agent that polls in the
+/// meantime asks a person the same question again.
+fn put_to_person(tool: &str, number: u64, via: AskVia, chat_failed: Option<&str>) -> String {
+    let then = "You will be told in your prompt when they answer; make this call again then, \
+                not before.";
+    match (via, chat_failed) {
+        (AskVia::Dashboard, Some(why)) => format!(
+            "{tool} needs the person's approval, and the chat could not carry the ask: {why}. It \
+             is waiting on the muxloom dashboard instead, where they approve it with a key. {then}"
+        ),
+        (AskVia::Dashboard, None) => format!(
+            "{tool} needs the person's approval, and it is up on the muxloom dashboard in front \
+             of them. {then}"
+        ),
+        (AskVia::Chat | AskVia::Both, _) => format!(
+            "{tool} needs the person's approval and they have been asked in chat{}. They answer \
+             there with `approve-{number}` or `reject-{number}`, or with a key on the dashboard. \
+             {then}",
+            match via {
+                AskVia::Both => " and on the muxloom dashboard",
+                _ => "",
+            }
+        ),
+    }
+}
+
+/// What a retry is told while the person has still not answered.
+///
+/// Spell the words out. Naming the ledger's key and leaving the agent to work
+/// out the reply from it is how a person came to be told to type
+/// `always-approve-19870001`.
+fn still_waiting(tool: &str, id: &str, via: AskVia) -> String {
+    let number = id.strip_prefix("approve-").unwrap_or(id);
+    match via {
+        AskVia::Dashboard => format!(
+            "{tool} is still waiting on the person at the muxloom dashboard, and they have not \
+             answered yet. You will be told in your prompt when they do; make this call again \
+             then."
+        ),
+        AskVia::Chat | AskVia::Both => format!(
+            "{tool} is waiting on the person and they have not answered yet. They were asked in \
+             chat, and they answer it there with `approve-{number}` or `reject-{number}` — those \
+             exact words, not the id {id} — or with a key on the dashboard. You will be told in \
+             your prompt when they do; make this call again then."
+        ),
+    }
 }
 
 /// The controller surface this round runs calls through, built the first time
@@ -559,6 +741,10 @@ pub struct RelayRound {
     /// smaller than it is; the way there belongs to the controller named on
     /// each, and is borrowed by leaving an errand on the daemon that named it.
     pub heard: Vec<Forwarded>,
+    /// Every approval still waiting on the person, oldest first. The round
+    /// runs inside the dashboard, and the dashboard is the one place every ask
+    /// can always be answered at — whether or not it also went to the chat.
+    pub asks: Vec<(String, ApprovalsPending)>,
 }
 
 /// A machine this controller cannot reach, and the daemon it heard about it
@@ -665,77 +851,56 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
             }
         };
         hear(&mut round.heard, known, &reach, &via, &target.id);
-        let mut approvals = Approvals::load(&Approvals::default_path());
+        let ledger = Approvals::default_path();
         // An ask a day old is not what the next try is waiting on. Left in the
         // ledger it answers every one of them with the id of a card the person
         // scrolled past on Thursday, and the write never happens again.
-        let mut approval_dirty = approvals.forget_stale(now_ms()) > 0;
+        //
+        // Every change below is its own short read-change-write under the
+        // ledger's lock, never one held across a call to a machine: an answer
+        // the person gives at the dashboard or in chat while this round is out
+        // talking to the fleet lands in the file, and is not written over by a
+        // copy this round read before it.
+        if let Err(error) = Approvals::update(&ledger, |approvals| {
+            ((), approvals.forget_stale(now_ms()) > 0)
+        }) {
+            debug::log("approval", format!("could not save: {error:#}"));
+        }
         for job in jobs {
             // A WRITE tool held behind the approval gate runs only after the
             // person has said so — remembered for the session, or asked now.
             let machine = job_machine(&job);
-            if needs_approval(&job.tool) && !approvals.remembered(&job.session, &machine, &job.tool)
-            {
+            if needs_approval(&job.tool) {
                 let tool = job.tool.clone();
                 // An agent asks again while the person is still deciding, and
                 // every retry has to land on the ask already in front of them
                 // rather than put another copy of it on their phone.
-                let output = match approvals.open_ask(&job.session, &machine, &tool) {
-                    // Spell the words out. Naming the ledger's key and leaving
-                    // the agent to work out the reply from it is how a person
-                    // came to be told to type `always-approve-19870001`.
-                    Some(id) => {
-                        let number = id.strip_prefix("approve-").unwrap_or(id);
-                        format!(
-                            "{tool} is waiting on the person and they have not answered yet. They \
-                             were asked in chat, and they answer it there with `approve-{number}`, \
-                             `always-{number}` or `reject-{number}` — those exact words, not the \
-                             id {id}. Make this call again once they have."
-                        )
-                    }
-                    None => {
-                        let number = approvals.mint();
-                        let id = format!("approve-{number}");
-                        let ask = approval_ask(&tool, &machine, number);
-                        // Parked only once it has actually gone out. An entry
-                        // nobody was shown is an ask nobody can answer, and
-                        // leaving one behind would tell every later attempt it
-                        // is waiting on a person who never heard.
-                        match try_chat_ask(&mut surface, config, runtime, &ask) {
-                            Ok(()) => {
-                                approval_dirty |= approvals.park(
-                                    id,
-                                    ApprovalsPending {
-                                        session: job.session.clone(),
-                                        machine: machine.clone(),
-                                        // Where the asking session lives, so
-                                        // the answer has somewhere to go back
-                                        // to. The job came off this daemon.
-                                        origin: target.id.clone(),
-                                        tool: tool.clone(),
-                                        ask,
-                                        at_ms: now_ms(),
-                                        open: true,
-                                    },
-                                );
-                                format!(
-                                    "{tool} needs the person's approval and they have been asked \
-                                     in chat. They answer `approve-{number}`, `always-{number}` \
-                                     or `reject-{number}`; make this call again once they have."
-                                )
-                            }
-                            Err(why) => format!(
-                                "{tool} needs the person's approval and the ask never reached \
-                                 them: {why}. Nobody has been asked and nothing is parked \
-                                 waiting on an answer, so making this call again will only ask \
-                                 again. Ask them yourself, or have an agent on that machine do \
-                                 the work instead."
-                            ),
-                        }
-                    }
+                let gate = Approvals::load(&ledger);
+                let waiting = match gate.remembered(&job.session, &machine, &tool) {
+                    true => None,
+                    false => Some(gate.open_ask(&job.session, &machine, &tool).map(|id| {
+                        let via = gate.pending.get(id).map(|ask| ask.via);
+                        still_waiting(&tool, id, via.unwrap_or_default())
+                    })),
                 };
-                let _ = pool.relay_complete(target, job.id.clone(), false, output);
-                continue;
+                let output = match waiting {
+                    // Already approved: on to run it.
+                    None => None,
+                    Some(Some(waiting)) => Some(waiting),
+                    Some(None) => Some(put_to_person_now(
+                        &ledger,
+                        &mut surface,
+                        config,
+                        runtime,
+                        target,
+                        &job,
+                        &machine,
+                    )),
+                };
+                if let Some(output) = output {
+                    let _ = pool.relay_complete(target, job.id.clone(), false, output);
+                    continue;
+                }
             }
             let (ok, output) = if travels(&job.tool) {
                 let surface = surface_for(&mut surface, config, runtime)?;
@@ -744,12 +909,17 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                         round.ran += 1;
                         // A one-shot grant is spent by the run it let through.
                         if needs_approval(&job.tool)
-                            && approvals.once.iter().any(|(s, m, t)| {
-                                s == &job.session && m == &machine && t == &job.tool
+                            && let Err(error) = Approvals::update(&ledger, |approvals| {
+                                let held = approvals.once.iter().any(|(s, m, t)| {
+                                    s == &job.session && m == &machine && t == &job.tool
+                                });
+                                if held {
+                                    approvals.spend_once(&job.session, &machine, &job.tool);
+                                }
+                                ((), held)
                             })
                         {
-                            approvals.spend_once(&job.session, &machine, &job.tool);
-                            approval_dirty = true;
+                            debug::log("approval", format!("could not save: {error:#}"));
                         }
                         (true, output)
                     }
@@ -772,14 +942,96 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 );
             }
         }
-        if approval_dirty {
-            let path = Approvals::default_path();
-            if let Err(error) = approvals.save(&path) {
-                debug::log("approval", format!("could not save: {error:#}"));
-            }
-        }
     }
+    // Whatever is still waiting on the person, for the dashboard that ran this
+    // round to put in front of them. Read after every target, because each
+    // one may have parked or spent something, and the chat round answers
+    // asks between pumps.
+    round.asks = Approvals::load(&Approvals::default_path()).open_asks(now_ms());
     Ok(round)
+}
+
+/// Put a new ask to the person, and say what the agent should be told.
+///
+/// Parked first, then sent: the dashboard running this round lists it the
+/// moment it is in the ledger, and can always answer it, so there is never an
+/// ask that went out to a phone and is answerable nowhere. The chat is written
+/// to only when the person might be on it; one that could not carry the card
+/// leaves the ask waiting on the dashboard, and the agent is told which.
+fn put_to_person_now(
+    ledger: &std::path::Path,
+    surface: &mut Option<ControllerControl>,
+    config: &Config,
+    runtime: &Runtime,
+    target: &Target,
+    job: &RelayJob,
+    machine: &str,
+) -> String {
+    let tool = job.tool.as_str();
+    let arguments = serde_json::from_str(&job.arguments)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let asked_via = AskVia::lenient(&arguments);
+    let detail = describe(tool, &arguments);
+    let asker = asker_name(
+        runtime
+            .bridge_pool()
+            .live_session(target, &job.session)
+            .ok()
+            .flatten(),
+        &job.session,
+    );
+    let parked = Approvals::update(ledger, |approvals| {
+        let number = approvals.mint();
+        let id = format!("approve-{number}");
+        let ask = approval_ask(tool, machine, number, &asker, &detail);
+        let parked = approvals.park(
+            id.clone(),
+            ApprovalsPending {
+                session: job.session.clone(),
+                machine: machine.to_string(),
+                // Where the asking session lives, so the answer has somewhere
+                // to go back to. The job came off this daemon.
+                origin: target.id.clone(),
+                tool: tool.to_string(),
+                ask: ask.clone(),
+                detail: detail.clone(),
+                asker: asker.clone(),
+                via: asked_via,
+                at_ms: now_ms(),
+                open: true,
+            },
+        );
+        ((parked, id, number, ask), parked)
+    });
+    let (id, number, ask) = match parked {
+        Ok((true, id, number, ask)) => (id, number, ask),
+        Ok((false, ..)) | Err(_) => {
+            return format!(
+                "{tool} needs the person's approval, and muxloom could not record the ask, so \
+                 nobody has been asked. Try the call again in a moment."
+            );
+        }
+    };
+    let chat_failed = match asked_via.chat() {
+        true => try_chat_ask(surface, config, runtime, &ask).err(),
+        false => None,
+    };
+    let via = match chat_failed {
+        Some(_) => {
+            // Still in front of whoever sits at the dashboard; only the
+            // chat is out of it.
+            let _ = Approvals::update(ledger, |approvals| match approvals.pending.get_mut(&id) {
+                Some(open) => {
+                    open.via = AskVia::Dashboard;
+                    ((), true)
+                }
+                None => ((), false),
+            });
+            AskVia::Dashboard
+        }
+        None => asked_via,
+    };
+    put_to_person(tool, number, via, chat_failed.as_deref())
 }
 
 /// What a daemon's answer adds to the list of machines this controller cannot
@@ -845,6 +1097,9 @@ fn run(
 fn bounded(mut arguments: serde_json::Value) -> serde_json::Value {
     if let Some(map) = arguments.as_object_mut() {
         map.remove("wait_seconds");
+        // Where the person was to be asked has been answered by now; the tool
+        // that runs has no use for it.
+        map.remove(crate::approvals::ASK_VIA);
         if map.get("deliver").and_then(serde_json::Value::as_str) == Some("when_idle") {
             map.insert("deliver".into(), "auto".into());
         }
@@ -888,9 +1143,19 @@ mod tests {
     /// nobody could give.
     #[test]
     fn the_words_an_ask_offers_are_words_the_chat_side_answers_with() {
-        let ask = approval_ask("launch_session", "seed", 7);
+        let ask = approval_ask(
+            "launch_session",
+            "seed",
+            7,
+            "release notes",
+            "Start claude in /works",
+        );
         assert!(ask.contains("launch_session"), "{ask}");
         assert!(ask.contains("seed"), "{ask}");
+        // Who is asking and what the yes would do are on the card, not only
+        // which tool: a person cannot weigh a launch without its folder.
+        assert!(ask.contains("\"release notes\""), "{ask}");
+        assert!(ask.contains("Start claude in /works"), "{ask}");
         for (reply, verdict) in [
             ("approve-7", crate::approvals::Verdict::Yes),
             ("always-7", crate::approvals::Verdict::Always),
@@ -909,9 +1174,85 @@ mod tests {
         }
         // A job whose arguments named no machine still has to say something a
         // person can act on.
-        let vague = approval_ask("run_shell", "", 12);
+        let vague = approval_ask("run_shell", "", 12, "", "");
         assert!(vague.contains("another machine"), "{vague}");
+        assert!(vague.contains("An agent"), "{vague}");
         assert!(vague.contains("approve-12"), "{vague}");
+        // A yes to a shell is a yes to one run, and the card does not offer
+        // the person a word that would mean otherwise.
+        assert!(!vague.contains("always-12"), "{vague}");
+    }
+
+    /// The person decides on what the call would do, not on a tool name: the
+    /// folder a launch lands in, the script, the words that would be typed,
+    /// and how much a close takes down with it.
+    #[test]
+    fn a_card_says_what_the_yes_would_actually_do() {
+        let said = |tool: &str, arguments: serde_json::Value| describe(tool, &arguments);
+        assert_eq!(
+            said(
+                "launch_session",
+                serde_json::json!({ "kind": "codex", "path": "/srv/app", "label": "fix ci",
+                                    "initial_prompt": "make the build green" }),
+            ),
+            "Start codex in /srv/app as \"fix ci\", told: make the build green"
+        );
+        assert_eq!(
+            said(
+                "send_input",
+                serde_json::json!({ "session_id": "s-1", "text": "y", "keys": ["enter"] }),
+            ),
+            "Into s-1: type \"y\", then press enter"
+        );
+        assert_eq!(
+            said("run_shell", serde_json::json!({ "script": "rm -rf build" })),
+            "Run: rm -rf build"
+        );
+        assert!(
+            said("delete_session", serde_json::json!({ "session_id": "s-1" }))
+                .contains("every session it started")
+        );
+        let long = said(
+            "run_shell",
+            serde_json::json!({ "script": "x".repeat(2_000) }),
+        );
+        assert!(long.chars().count() <= 401 && long.ends_with('…'), "{long}");
+    }
+
+    /// The agent chose where the person was asked, and hears where it went —
+    /// in particular that a chat which could not carry it left it on the
+    /// dashboard rather than nowhere — and that it will be told the answer, so
+    /// it does not ask the person the same thing again in the meantime.
+    #[test]
+    fn the_agent_hears_where_its_ask_went_and_that_the_answer_will_come_to_it() {
+        let here = put_to_person("launch_session", 4, AskVia::Dashboard, None);
+        assert!(here.contains("dashboard"), "{here}");
+        assert!(!here.contains("approve-4"), "{here}");
+        let fell_back = put_to_person(
+            "launch_session",
+            4,
+            AskVia::Dashboard,
+            Some("no chat is bound"),
+        );
+        assert!(fell_back.contains("no chat is bound"), "{fell_back}");
+        assert!(fell_back.contains("dashboard instead"), "{fell_back}");
+        let chat = put_to_person("run_shell", 5, AskVia::Chat, None);
+        assert!(
+            chat.contains("approve-5") && chat.contains("reject-5"),
+            "{chat}"
+        );
+        let both = put_to_person("run_shell", 5, AskVia::Both, None);
+        assert!(
+            both.contains("in chat and on the muxloom dashboard"),
+            "{both}"
+        );
+        for told in [&here, &fell_back, &chat, &both] {
+            assert!(told.contains("You will be told in your prompt"), "{told}");
+        }
+        let waiting = still_waiting("run_shell", "approve-5", AskVia::Chat);
+        assert!(waiting.contains("`approve-5`"), "{waiting}");
+        assert!(!waiting.contains("`approve-approve-5`"), "{waiting}");
+        assert!(still_waiting("run_shell", "approve-5", AskVia::Dashboard).contains("dashboard"));
     }
 
     #[test]

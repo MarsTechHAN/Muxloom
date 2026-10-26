@@ -156,7 +156,10 @@ preserve.
   the ones that say something, may be relayed; starting a session on a far
   machine and typing into one may be relayed too, but the controller holds
   each such call behind the person's approval (one-shot, or remembered for
-  the asking session) and asks over the bound chat; deny ends it, and the most
+  the asking session) and asks where the asking agent says the person is — on
+  the dashboard running the errand, over the bound chat, or both when it cannot
+  tell. The dashboard lists every open ask whichever it was, and an ask the
+  chat cannot carry waits there rather than nowhere. Deny ends it, and the most
   destructive writes are never remembered across a cart approval. Everything
   else that alters the far machine belongs to the agents living there.
   Nothing that waits is relayed either — a relayed job runs on the controller's

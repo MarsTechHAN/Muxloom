@@ -33,7 +33,10 @@
 //!    person's approval; and some things never travel at all.
 //!
 //! The approval is the one question nothing here can answer, because only the
-//! person can; the controller that runs the errand asks it (see `relay`).
+//! person can. Where to put it to them is the asking agent's call — it knows
+//! whether the work was typed into its terminal at the dashboard or arrived
+//! from a phone — and `approvals::AskVia` carries that judgement to the
+//! controller that asks.
 //!
 //! A moderator is not an exception to any of this. It is a session a person
 //! started in a folder muxloom owns, and it holds everything because a person

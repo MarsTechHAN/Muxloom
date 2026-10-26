@@ -1,12 +1,19 @@
 //! Cross-machine write approvals.
 //!
 //! A daemon-flavoured agent reaches another machine only by relaying through
-//! an attached muxloom controller. muxloom's relay deliberately lets only
-//! look-and-speak tools through (see `permissions::crossing`); a WRITE tool —
-//! starting a session, typing into one, deleting one — must not run on a
-//! remote machine without a person saying so. That person is usually not at
-//! the dashboard, so the ask goes out over the bound chat, and the answer
-//! comes back through the same chat.
+//! an attached muxloom controller. muxloom's relay lets looking and speaking
+//! through freely (see `permissions::crossing`); a WRITE tool — starting a
+//! session, typing into one, deleting one — must not run on a remote machine
+//! without a person saying so.
+//!
+//! Where to ask them is not muxloom's to guess. The agent asking is the one
+//! that knows how the work reached it: typed into its own terminal by someone
+//! sitting at the dashboard, or carried in from their phone in a chat-app
+//! envelope. So the call says ([`AskVia`]), and the controller asks there —
+//! on the dashboard, over the bound chat, or both when the agent cannot tell.
+//! The dashboard always lists what is open, because it is the one running the
+//! errand and can always be answered at; the chat is only written to when the
+//! person might be on it.
 //!
 //! This module owns the ledger that ask leaves in. It is per-daemon and
 //! persisted to `<state>/approvals.json`, because the human takes far longer
@@ -26,6 +33,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use anyhow::{Context, Result};
@@ -53,6 +61,20 @@ pub struct Pending {
     /// person instead of a raw argument blob.
     #[serde(default)]
     pub ask: String,
+    /// What the call would actually do — the folder a launch lands in, the
+    /// script a shell would run, the words that would be typed. A person asked
+    /// to approve `run_shell` without the script is asked to approve anything.
+    #[serde(default)]
+    pub detail: String,
+    /// The asking session as a person knows it: its name, or its runtime and
+    /// folder. Empty when it could not be looked up, and then the id is all
+    /// there is to show.
+    #[serde(default)]
+    pub asker: String,
+    /// Where the person was asked. A ledger written before this was recorded
+    /// only ever asked over the chat.
+    #[serde(default)]
+    pub via: AskVia,
     /// When the ask went out.
     pub at_ms: u64,
     /// Whether this pending entry has not yet been decided.
@@ -62,6 +84,77 @@ pub struct Pending {
 
 fn default_true() -> bool {
     true
+}
+
+/// The argument an approval-gated call names where the person is with.
+pub const ASK_VIA: &str = "ask_via";
+
+/// Where a cross-machine write is put to the person.
+///
+/// The agent asking chooses, because it is the only one that knows: a request
+/// typed straight into its terminal came from somebody at the dashboard, and
+/// one that arrived in a muxloom envelope saying a person sent it from their
+/// chat app came from their phone. A subagent hears from its parent rather
+/// than from the person and cannot tell, and says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AskVia {
+    /// On the dashboard alone. Its phone stays quiet: the person is in front
+    /// of the screen the ask comes up on.
+    Dashboard,
+    /// Over the bound chat. The dashboard still lists it, without putting it
+    /// in front of whoever is there.
+    #[default]
+    Chat,
+    /// The agent could not say, so both: the chat, and the dashboard opening
+    /// it for whoever is sitting there.
+    Both,
+}
+
+impl AskVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Chat => "chat",
+            Self::Both => "both",
+        }
+    }
+
+    /// What a call said, refusing a word that is neither: an agent that
+    /// misspelt `dashboard` should hear so before the person is asked
+    /// somewhere it did not mean. Saying nothing is `Both`.
+    pub fn from_arguments(arguments: &serde_json::Value) -> Result<Self> {
+        match arguments.get(ASK_VIA).and_then(serde_json::Value::as_str) {
+            None => Ok(Self::Both),
+            Some(word) => match word.trim().to_ascii_lowercase().as_str() {
+                "" => Ok(Self::Both),
+                "dashboard" | "tui" | "terminal" => Ok(Self::Dashboard),
+                "chat" | "channel" => Ok(Self::Chat),
+                other => anyhow::bail!(
+                    "{ASK_VIA} is \"dashboard\" (the person typed this to you in muxloom) or \
+                     \"chat\" (it reached you from their chat app); {other:?} is neither. Leave \
+                     it out if you cannot tell."
+                ),
+            },
+        }
+    }
+
+    /// The same, read on the controller, where a word it does not know is a
+    /// newer build's and the safe reading is to ask everywhere.
+    pub fn lenient(arguments: &serde_json::Value) -> Self {
+        Self::from_arguments(arguments).unwrap_or(Self::Both)
+    }
+
+    /// Whether the chat is written to.
+    pub fn chat(self) -> bool {
+        self != Self::Dashboard
+    }
+
+    /// Whether the dashboard puts it in front of whoever is there, rather than
+    /// only listing it.
+    pub fn raises_dashboard(self) -> bool {
+        self != Self::Chat
+    }
 }
 
 /// Everything the approval gate remembers. Written atomically (tmp + rename)
@@ -83,14 +176,62 @@ pub struct Approvals {
     /// rather than in the process, so a restart carries on counting.
     #[serde(default)]
     pub minted: u64,
+    /// The last few asks answered, newest last, and what was said. An ask can
+    /// be in two places at once — on the dashboard and on the phone — and the
+    /// card on the phone does not vanish when the dashboard answers it. A
+    /// person who replies to it afterwards is owed "already answered", not a
+    /// search of the fleet for an ask that no longer exists.
+    #[serde(default)]
+    pub settled: Vec<Settled>,
 }
+
+/// One answered ask, remembered just long enough to recognise a late reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settled {
+    pub id: String,
+    pub tool: String,
+    pub verdict: Verdict,
+    pub at_ms: u64,
+}
+
+/// How many answered asks are kept for recognising a late reply.
+const SETTLED_KEPT: usize = 32;
 
 /// The number an id names, when it is one of ours.
 fn id_number(id: &str) -> Option<u64> {
     id.strip_prefix("approve-")?.parse().ok()
 }
 
+/// The one lock every change to the ledger in this process is made under.
+///
+/// The errand round, the chat round and an answer given at the dashboard each
+/// run on a thread of their own, and each reads the whole file, changes it, and
+/// writes the whole file back. Two of them interleaved is an answer silently
+/// lost: the person says yes at the dashboard while a round that read the file
+/// a moment earlier parks an ask, and the round's write puts back the file from
+/// before the yes. Held for one read, change and write, and never across a
+/// call to another machine.
+pub fn hold() -> MutexGuard<'static, ()> {
+    static LEDGER: Mutex<()> = Mutex::new(());
+    LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Approvals {
+    /// Read the ledger at `path`, change it, and write it back when `change`
+    /// says it changed anything — all under [`hold`], so nothing else in this
+    /// process can write in between.
+    pub fn update<T>(path: &Path, change: impl FnOnce(&mut Self) -> (T, bool)) -> Result<T> {
+        let _held = hold();
+        let mut ledger = Self::load(path);
+        let (answer, changed) = change(&mut ledger);
+        if changed {
+            ledger.save(path)?;
+        }
+        Ok(answer)
+    }
+
     pub fn load(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
@@ -159,6 +300,40 @@ impl Approvals {
             // one they have been looking at longest. Map order is arbitrary.
             .min_by_key(|(id, p)| (p.at_ms, id.as_str()))
             .map(|(id, _)| id.as_str())
+    }
+
+    /// Every ask still waiting on the person, oldest first, which is the order
+    /// a dashboard puts them in front of somebody.
+    pub fn open_asks(&self, now: u64) -> Vec<(String, Pending)> {
+        let mut open: Vec<(String, Pending)> = self
+            .pending
+            .iter()
+            .filter(|(_, ask)| ask.open && now.saturating_sub(ask.at_ms) < ASK_STANDS_MS)
+            .map(|(id, ask)| (id.clone(), ask.clone()))
+            .collect();
+        open.sort_by(|(left_id, left), (right_id, right)| {
+            (left.at_ms, left_id).cmp(&(right.at_ms, right_id))
+        });
+        open
+    }
+
+    /// Note that an ask was answered, so a reply that arrives after it can be
+    /// told so.
+    pub fn record_settled(&mut self, id: &str, tool: &str, verdict: Verdict, now: u64) {
+        self.settled.retain(|held| held.id != id);
+        self.settled.push(Settled {
+            id: id.to_string(),
+            tool: tool.to_string(),
+            verdict,
+            at_ms: now,
+        });
+        let over = self.settled.len().saturating_sub(SETTLED_KEPT);
+        self.settled.drain(..over);
+    }
+
+    /// How an ask that is no longer open was answered, if it was answered here.
+    pub fn answered(&self, id: &str) -> Option<&Settled> {
+        self.settled.iter().rev().find(|held| held.id == id)
     }
 
     /// The number for the next ask, counted from the file.
@@ -272,7 +447,8 @@ pub const ASK_STANDS_MS: u64 = 24 * 60 * 60 * 1_000;
 ///
 /// Accepts the plain words and the numbered form the ask presents, and
 /// lower-case aliases for a phone that cannot trust its case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Verdict {
     /// Run it this once.
     Yes,
@@ -334,6 +510,7 @@ mod tests {
             ask: String::new(),
             at_ms,
             open: true,
+            ..Default::default()
         };
         assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
         assert!(a.park("approve-1".into(), ask("s1", "seed", "launch_session", 10)));
@@ -376,6 +553,7 @@ mod tests {
             ask: String::new(),
             at_ms: 1,
             open: true,
+            ..Default::default()
         };
 
         let mut a = Approvals::default();
@@ -421,6 +599,7 @@ mod tests {
             ask: String::new(),
             at_ms,
             open: true,
+            ..Default::default()
         };
         let now = 10 * ASK_STANDS_MS;
         assert!(a.park("approve-1".into(), ask(now - ASK_STANDS_MS)));
@@ -441,6 +620,109 @@ mod tests {
         );
         assert_eq!(a.forget_stale(now + 2 * ASK_STANDS_MS), 2);
         assert_eq!(a.open_ask("s1", "seed", "launch_session"), None);
+    }
+
+    /// The agent says where the person is, in one of two words, and an agent
+    /// that cannot tell says nothing. A word that is neither is refused on the
+    /// asking side, before anybody is asked anywhere, and read as "both" on
+    /// the controller, where it can only be a newer build's.
+    #[test]
+    fn where_to_ask_is_two_words_or_nothing() {
+        let said = |word: &str| AskVia::from_arguments(&serde_json::json!({ ASK_VIA: word }));
+        assert_eq!(
+            AskVia::from_arguments(&serde_json::json!({})).unwrap(),
+            AskVia::Both
+        );
+        assert_eq!(said("dashboard").unwrap(), AskVia::Dashboard);
+        assert_eq!(said(" Dashboard ").unwrap(), AskVia::Dashboard);
+        assert_eq!(said("chat").unwrap(), AskVia::Chat);
+        assert_eq!(said("").unwrap(), AskVia::Both);
+        let error = said("phone").unwrap_err().to_string();
+        assert!(error.contains("\"dashboard\""), "{error}");
+        assert!(error.contains("Leave it out"), "{error}");
+        assert_eq!(
+            AskVia::lenient(&serde_json::json!({ ASK_VIA: "hologram" })),
+            AskVia::Both
+        );
+        // Only an ask the agent said is on the person's phone leaves the
+        // dashboard quiet; only one it said is at the dashboard leaves the
+        // phone quiet.
+        assert!(!AskVia::Chat.raises_dashboard());
+        assert!(AskVia::Both.raises_dashboard() && AskVia::Both.chat());
+        assert!(!AskVia::Dashboard.chat());
+        // A ledger from before anyone said parks every ask as a chat one,
+        // which is what all of them were.
+        let old: Pending = serde_json::from_str(r#"{"tool":"run_shell","at_ms":1}"#).unwrap();
+        assert_eq!(old.via, AskVia::Chat);
+    }
+
+    /// What a dashboard lists is every ask still waiting, oldest first, and
+    /// what it remembers answering is bounded.
+    #[test]
+    fn the_open_asks_come_oldest_first_and_the_answered_are_kept_briefly() {
+        let mut a = Approvals::default();
+        let now = 10 * ASK_STANDS_MS;
+        let ask = |at_ms: u64| Pending {
+            tool: "launch_session".into(),
+            at_ms,
+            open: true,
+            ..Default::default()
+        };
+        assert!(a.park("approve-2".into(), ask(now - 5)));
+        assert!(a.park("approve-1".into(), ask(now - 10)));
+        assert!(a.park("approve-9".into(), ask(now - ASK_STANDS_MS)));
+        let open: Vec<String> = a.open_asks(now).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(open, ["approve-1", "approve-2"]);
+
+        for number in 0..40 {
+            a.record_settled(&format!("approve-{number}"), "run_shell", Verdict::No, now);
+        }
+        assert_eq!(a.settled.len(), SETTLED_KEPT);
+        assert!(a.answered("approve-0").is_none(), "the oldest went first");
+        assert_eq!(
+            a.answered("approve-39").map(|held| held.verdict),
+            Some(Verdict::No)
+        );
+    }
+
+    /// The errand round, the chat round and the dashboard each change the
+    /// ledger from a thread of their own. Every change has to survive the
+    /// others: a yes written over by a round that read the file before it is a
+    /// yes the person gave and the agent never gets.
+    #[test]
+    fn changes_from_two_threads_at_once_all_land() {
+        let path = scratch("concurrent");
+        let _ = std::fs::remove_file(&path);
+        let threads: Vec<_> = ["round", "dashboard"]
+            .into_iter()
+            .map(|who| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for number in 0..25 {
+                        Approvals::update(&path, |ledger| {
+                            let id = format!("approve-{who}-{number}");
+                            let parked = ledger.park(
+                                id,
+                                Pending {
+                                    tool: "send_input".into(),
+                                    at_ms: 1,
+                                    open: true,
+                                    ..Default::default()
+                                },
+                            );
+                            ((), parked)
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(Approvals::load(&path).pending.len(), 50);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
 
     #[test]
@@ -469,6 +751,7 @@ mod tests {
                 ask: "run launch_session on seed".into(),
                 at_ms: 1,
                 open: true,
+                ..Default::default()
             },
         );
         a.save(&path).unwrap();

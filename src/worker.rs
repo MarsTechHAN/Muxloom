@@ -250,6 +250,14 @@ pub enum Request {
         /// serves, policy included, so the config travels with them.
         config: Box<Config>,
     },
+    /// The person at this dashboard answered an approval: settle it in the
+    /// ledger and tell the agent that asked, exactly as a reply in chat does.
+    /// `targets` are where the asking session might live.
+    SettleApproval {
+        id: String,
+        verdict: crate::approvals::Verdict,
+        targets: Vec<Target>,
+    },
     /// Borrow another controller's reach for one look, on behalf of the person
     /// at this dashboard. The errand is left on `through` — the machine whose
     /// daemon named the one being asked about, which is where the controller
@@ -503,6 +511,17 @@ pub enum Event {
         /// Machines another controller told one of these daemons it could
         /// reach, which this one cannot, each with the daemon that named it.
         forwarded: Vec<crate::relay::Forwarded>,
+    },
+    /// What is waiting on the person's approval now, oldest first: read after
+    /// every errand round, which is where asks are parked, and after an answer
+    /// given at this dashboard.
+    Approvals {
+        open: Vec<(String, crate::approvals::Pending)>,
+    },
+    /// An approval answered at this dashboard was recorded, or could not be.
+    ApprovalSettled {
+        id: String,
+        result: Result<String, String>,
     },
     /// An errand this dashboard left for another controller came back.
     RelayErranded {
@@ -1519,19 +1538,44 @@ impl Worker {
                         // Errands run whether or not anything else is due: an
                         // agent waiting on one is waiting on this round, and
                         // this is the only round it waits on.
-                        let forwarded = match crate::relay::run_pump(&runtime, &config, &targets) {
-                            Ok(round) => {
-                                if round.busy() {
-                                    debug::log("relay", round.to_string());
+                        let (forwarded, asks) =
+                            match crate::relay::run_pump(&runtime, &config, &targets) {
+                                Ok(round) => {
+                                    if round.busy() {
+                                        debug::log("relay", round.to_string());
+                                    }
+                                    (round.heard, Some(round.asks))
                                 }
-                                round.heard
-                            }
-                            Err(error) => {
-                                debug::log("relay", format!("errands failed: {error:#}"));
-                                Vec::new()
-                            }
-                        };
+                                Err(error) => {
+                                    debug::log("relay", format!("errands failed: {error:#}"));
+                                    (Vec::new(), None)
+                                }
+                            };
+                        // Before the round is reported done, so the dashboard
+                        // never hears the round ended without hearing what it
+                        // left waiting on the person.
+                        if let Some(open) = asks {
+                            let _ = events.send(Event::Approvals { open });
+                        }
                         let _ = events.send(Event::RelayPumped { forwarded });
+                    }
+                    Request::SettleApproval {
+                        id,
+                        verdict,
+                        targets,
+                    } => {
+                        let result =
+                            crate::channel::settle_at_dashboard(&runtime, &targets, &id, verdict)
+                                .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            debug::log("approval", format!("{id}: {error}"));
+                        }
+                        let open = crate::approvals::Approvals::load(
+                            &crate::approvals::Approvals::default_path(),
+                        )
+                        .open_asks(crate::relay::now_ms());
+                        let _ = events.send(Event::ApprovalSettled { id, result });
+                        let _ = events.send(Event::Approvals { open });
                     }
                     Request::RelayErrand {
                         through,
