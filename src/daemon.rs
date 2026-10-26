@@ -140,7 +140,7 @@ mod platform {
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
             DAEMON_SESSION_PREFIX, WAITING_FOR_INPUT, composer, composer_text, dialog_question,
-            is_temporary_session_id,
+            dialog_shown, is_temporary_session_id,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
@@ -6502,7 +6502,7 @@ mod platform {
                         let dialog = dialog_question(&visible_screen);
                         let status = agent_status_on_screen(
                             &activity,
-                            dialog.is_some(),
+                            dialog.is_some() || dialog_shown(&visible_screen),
                             kind == AgentKind::Claude,
                         );
                         let reason = (status == Status::Waiting).then(|| {

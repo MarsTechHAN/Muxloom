@@ -27,7 +27,8 @@ use crate::{
     },
     port_forward::{PortForwardManager, PortForwardState, PortForwardSummary},
     runtime::{
-        Runtime, WAITING_FOR_INPUT, dialog_question, is_daemon_session_id, is_temporary_session_id,
+        Runtime, WAITING_FOR_INPUT, dialog_question, dialog_shown, is_daemon_session_id,
+        is_temporary_session_id,
     },
     ssh_config,
     talk::{TalkAuthor, TalkDraft, TalkKind, TalkMessage, TalkPage, TalkScope, TalkVoice},
@@ -5234,7 +5235,11 @@ impl App {
             return;
         };
         let dialog = dialog_question(screen);
-        let status = agent_status_on_screen(&activity, dialog.is_some(), kind == AgentKind::Claude);
+        let status = agent_status_on_screen(
+            &activity,
+            dialog.is_some() || dialog_shown(screen),
+            kind == AgentKind::Claude,
+        );
         let attention = (status == Status::Waiting).then(|| {
             activity
                 .notice

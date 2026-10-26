@@ -3710,29 +3710,52 @@ pub(crate) fn dialog_question(screen: &str) -> Option<String> {
 const DIALOG_TAIL_LINES: usize = 24;
 
 fn question_line(rows: &[&str]) -> Option<String> {
-    let last = rows.iter().rposition(|line| numbered_option_line(line))?;
-    // Back to the top of this block of options: everything from there down is
-    // the answers, and the question is above all of them.
-    let mut first = last;
-    while first > 0 {
-        let above = rows[first - 1];
-        if above.trim().is_empty() || numbered_option_line(above) {
-            first -= 1;
-            continue;
-        }
-        break;
-    }
     // A dialog marks the option the keyboard is on (`❯ 1. Yes`, `› 1. Yes`); a
-    // numbered list in an answer marks none. Without this, an idle agent whose
-    // last answer ended in a list read as waiting on the sentence above it.
-    if !rows[first..=last].iter().any(|line| selector_line(line)) {
-        return None;
-    }
-    rows[..first]
+    // numbered list in an answer marks none, and an idle agent whose last
+    // answer ended in one read as waiting on the sentence above it. So the
+    // marked option is what the dialog is found by, not the last numbered row:
+    // a dialog can end in an option of its own below a rule ("4. Chat about
+    // this"), and reading up from that one took an option's description for
+    // the question.
+    let marked = rows.iter().rposition(|line| selector_line(line))?;
+    let depth = option_depth(rows[marked]);
+    // Up past the other options, the rows that carry an option's description
+    // on, and the blank rows between them: the question is the first row of
+    // prose above all of them.
+    rows[..marked]
         .iter()
         .rev()
-        .filter_map(|line| dialog_prose(line))
-        .next()
+        .filter(|line| {
+            !(line.trim().is_empty() || numbered_option_line(line) || indent(line) >= depth)
+        })
+        .find_map(|line| dialog_prose(line))
+}
+
+/// Whether the bottom of what was drawn is a dialog: a block of numbered
+/// options with one of them marked, whether or not a question can be read
+/// above it.
+pub(crate) fn dialog_shown(screen: &str) -> bool {
+    let mut rows: Vec<&str> = screen.lines().collect();
+    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+        rows.pop();
+    }
+    rows[rows.len().saturating_sub(DIALOG_TAIL_LINES)..]
+        .iter()
+        .any(|line| selector_line(line))
+}
+
+/// The column an option's number starts at: what its description is indented
+/// past, and what the question is not.
+fn option_depth(line: &str) -> usize {
+    line.chars()
+        .position(|glyph| glyph.is_ascii_digit())
+        .unwrap_or(0)
+}
+
+fn indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|glyph| glyph.is_whitespace())
+        .count()
 }
 
 /// One row of a dialog with its chrome taken off, if what is left reads as
@@ -6155,6 +6178,33 @@ mod tests {
             rule()
         );
         assert_eq!(dialog_question(&answered), None);
+        assert!(!dialog_shown(&answered));
+        // Claude Code asking a question of its own: options with descriptions
+        // under them, a free-text option, and one more below a rule. The last
+        // numbered row is not the dialog; the marked one is.
+        let asked = format!(
+            "  Two calls are yours before I push:\n{}\n←  ☐ Push target  ☐ E2E test  ✔ Submit  →\n\n\
+             Where should I push the commit?\n\n❯ 1. New branch + MR (recommended)\n     Push to \
+             feature/alloc_conf_ordering and you open an MR.\n  2. Direct to the shared branch\n     \
+             Clean, but live for every teammate at once, and\n     awkward to undo.\n  3. Type \
+             something.\n{}\n  4. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · \
+             Esc to cancel\n",
+            rule(),
+            rule()
+        );
+        assert!(dialog_shown(&asked));
+        assert_eq!(
+            dialog_question(&asked).as_deref(),
+            Some("Where should I push the commit?")
+        );
+        // With the keyboard on a later option, the question is the same.
+        let moved = asked
+            .replace("❯ 1. New branch", "  1. New branch")
+            .replace("  2. Direct", "❯ 2. Direct");
+        assert_eq!(
+            dialog_question(&moved).as_deref(),
+            Some("Where should I push the commit?")
+        );
         // OpenCode draws its answers as buttons on one row, not as options,
         // so its question is not read: the state still says it waits.
         let opencode = concat!(
