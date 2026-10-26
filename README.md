@@ -773,7 +773,8 @@ once; the skill carries the worked examples and the etiquette, and says it is
 for coordination — fanning work out, messaging, the board, the person, other
 machines — so an agent doing plain work in its own folder never loads it. A
 delivered message and a subagent alert are a header, the message between
-delimiters, and the call that answers it.
+delimiters, and the call that answers it. Tool answers are compact JSON with null fields
+left out, since an agent reads an absent field and a null one the same way.
 Set `MUXLOOM_MCP_REGISTER=0` in the daemon's environment to turn all of it off,
 or `MUXLOOM_SKILL=0` to keep the server entry and drop the skill.
 

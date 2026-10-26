@@ -1432,7 +1432,7 @@ fn wait_loop(
         }
         _ => None,
     };
-    Ok(pretty(&json!({
+    Ok(tool_json(&json!({
         "outcome": outcome,
         "satisfied": satisfied,
         "until": until,
@@ -1865,7 +1865,7 @@ fn send_channel(
             "delivery_confirmed": v.delivery_confirmed,
         })
     });
-    Ok(pretty(&json!({
+    Ok(tool_json(&json!({
         "channel": sent.channel,
         "through": sent.through,
         "message_id": sent.message_id,
@@ -2070,7 +2070,7 @@ fn direct_draft(arguments: &Value, author: TalkAuthor) -> Result<(TalkDraft, Tal
 /// What became of a direct message, in the words the sender needs: whether it
 /// was typed in, and where to look for an answer.
 fn delivery_json(message: &TalkMessage, delivery: &str, reason: Option<String>) -> String {
-    pretty(&json!({
+    tool_json(&json!({
         "message_id": message.id,
         "delivery": delivery,
         "reason": reason,
@@ -2240,7 +2240,7 @@ fn talk_wait(
                 page.cursor = encode_cursor(&cursor_through(&page.messages, &filter.since));
             }
             let messages: Vec<Value> = page.messages.iter().map(talk_json).collect();
-            return Ok(pretty(&json!({
+            return Ok(tool_json(&json!({
                 "messages": messages,
                 "cursor": page.cursor,
                 "truncated": page.truncated || overflowed,
@@ -2480,8 +2480,28 @@ fn outstanding_note(outstanding: &[Value]) -> Option<String> {
     ))
 }
 
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+/// What a tool answers with, as the agent will read it: compact, and without
+/// the fields that are null. Every answer lands in a conversation's context
+/// and stays there, so the indentation of a pretty print and a column of
+/// `"title": null` were paid for on every call by an agent that reads them as
+/// nothing; an absent field and a null one mean the same to it.
+fn tool_json(value: &Value) -> String {
+    serde_json::to_string(&without_nulls(value.clone())).unwrap_or_else(|_| value.to_string())
+}
+
+/// `value` with every null object field removed, at any depth. Nulls inside an
+/// array stay: there a position means something.
+fn without_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, without_nulls(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        other => other,
+    }
 }
 
 fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) -> Value {
@@ -2959,7 +2979,7 @@ impl ControllerControl {
                 "connected": self.runtime.bridge_pool().is_connected(&alias),
             }));
         }
-        Ok(pretty(&Value::Array(machines)))
+        Ok(tool_json(&Value::Array(machines)))
     }
 
     /// Add a machine to the reachable set or take it out of it. The state file
@@ -2994,7 +3014,7 @@ impl ControllerControl {
             state.save(&self.state_path)?;
         }
         *self.state() = state;
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "machine": crate::model::machine_read_as(&machine),
             "enabled": enabled,
             "changed": changed,
@@ -3037,7 +3057,7 @@ impl ControllerControl {
                         })
                     })
                     .collect();
-                Ok(pretty(&json!({
+                Ok(tool_json(&json!({
                     "ssh_config": ssh_path.display().to_string(),
                     "managed_file": managed_path.display().to_string(),
                     "hosts": hosts,
@@ -3097,7 +3117,7 @@ impl ControllerControl {
                 // Only once the file is there: an Include of nothing is not an
                 // Include muxloom can recognise on the next call.
                 let included = ssh_config::ensure_include(&ssh_path, &managed_path)?;
-                Ok(pretty(&json!({
+                Ok(tool_json(&json!({
                     "host": alias,
                     "options": options
                         .iter()
@@ -3137,7 +3157,7 @@ impl ControllerControl {
                     state.save(&self.state_path)?;
                 }
                 *self.state() = state;
-                Ok(pretty(&json!({
+                Ok(tool_json(&json!({
                     "host": alias,
                     "removed": true,
                     "disabled": disabled,
@@ -3177,7 +3197,7 @@ impl ControllerControl {
                 })),
             }
         }
-        Ok(pretty(&Value::Array(rendered)))
+        Ok(tool_json(&Value::Array(rendered)))
     }
 
     fn read_screen(&self, arguments: &Value) -> Result<String> {
@@ -3221,14 +3241,14 @@ impl ControllerControl {
         match required_str(arguments, "action")? {
             "set" => {
                 let stored = pool.set_trigger(&target, trigger_spec(arguments)?)?;
-                Ok(pretty(&trigger_json(&target.id, &stored)))
+                Ok(tool_json(&trigger_json(&target.id, &stored)))
             }
             "list" => {
                 let triggers = pool.list_triggers(
                     &target,
                     optional_str(arguments, "session_id").map(Into::into),
                 )?;
-                Ok(pretty(&Value::Array(
+                Ok(tool_json(&Value::Array(
                     triggers
                         .iter()
                         .map(|trigger| trigger_json(&target.id, trigger))
@@ -3250,7 +3270,7 @@ impl ControllerControl {
         let now = session_name_now(|id| pool.live_session(&Target::local(), id));
         let author = message_author(now, || pool.talk_status(&Target::local(), None));
         let message = pool.talk_post(&target, talk_draft(arguments, author)?)?;
-        Ok(pretty(&talk_json(&message)))
+        Ok(tool_json(&talk_json(&message)))
     }
 
     fn talk_read(&self, arguments: &Value) -> Result<String> {
@@ -3350,7 +3370,7 @@ impl ControllerControl {
         let command = self.config.command_for(&target.id, kind).clone();
         let environment = self.config.environment_for(&target.id)?;
         let session_id = self.runtime.launch(&request, &command, &environment)?;
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "session_id": session_id,
             "machine": crate::model::machine_read_as(&target.id),
             "kind": kind.as_str(),
@@ -3526,7 +3546,7 @@ impl ControllerControl {
                 Some(note) => error.context(note),
                 None => error,
             })?;
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "session_id": session.id,
             "machine": crate::model::machine_read_as(&target.id),
             "kind": session.kind,
@@ -3565,7 +3585,7 @@ impl ControllerControl {
                 })
             })
             .collect();
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "candidates": rendered,
             "warnings": warnings,
         })))
@@ -3656,7 +3676,7 @@ impl ControllerControl {
                 }));
             }
         }
-        Ok(pretty(&Value::Array(results)))
+        Ok(tool_json(&Value::Array(results)))
     }
 
     /// The backup partitions an agent here may look in: one per enabled
@@ -3730,7 +3750,7 @@ impl ControllerControl {
                 })
             })
             .collect();
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "query": query,
             "machines_searched": machines,
             "hits": rendered,
@@ -3783,7 +3803,7 @@ impl ControllerControl {
         let next_cursor = next
             .filter(|resume| *resume < total)
             .or((after < total).then_some(after));
-        Ok(pretty(&json!({
+        Ok(tool_json(&json!({
             "machine": crate::model::machine_read_as(&record.target_id),
             "session_id": record.session_id,
             "kind": record.kind,
@@ -3909,7 +3929,7 @@ impl ControllerControl {
                 let target = self.target(arguments)?;
                 let path = required_str(arguments, "path")?;
                 let listing = self.runtime.list_directory(&target, path)?;
-                Ok(pretty(&json!({
+                Ok(tool_json(&json!({
                     "path": listing.path,
                     "directories": listing.directories,
                 })))
@@ -3918,14 +3938,14 @@ impl ControllerControl {
                 let target = self.target(arguments)?;
                 let path = required_str(arguments, "path")?;
                 let listing = self.runtime.list_files(&target, path)?;
-                Ok(pretty(&serde_json::to_value(&listing)?))
+                Ok(tool_json(&serde_json::to_value(&listing)?))
             }
             "search_files" => {
                 let target = self.target(arguments)?;
                 let root = required_str(arguments, "root")?;
                 let pattern = required_str(arguments, "pattern")?;
                 let listing = self.runtime.search_files(&target, root, pattern)?;
-                Ok(pretty(&serde_json::to_value(&listing)?))
+                Ok(tool_json(&serde_json::to_value(&listing)?))
             }
             "preview_file" => {
                 let target = self.target(arguments)?;
@@ -3987,9 +4007,9 @@ mod daemon_surface {
         WAIT_SCREEN_LINES, allowed_specs, build_input, delivery_json, direct_draft, enforce_policy,
         explain_unknown_session, fleet_already_back, fleet_outcome_json, fleet_resume_caption,
         fleet_resume_plan, fleet_resume_target, instructions, message_author, native_resume_id,
-        optional_bool, optional_str, optional_usize, plain_screen, pretty, preview_text,
-        required_str, screen_page, send_channel, session_json, session_kind, session_name_now,
-        shell_report, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
+        optional_bool, optional_str, optional_usize, plain_screen, preview_text, required_str,
+        screen_page, send_channel, session_json, session_kind, session_name_now, shell_report,
+        synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait, tool_json,
         trigger_json, trigger_spec, wait_loop, waited_session,
     };
     use crate::permissions::{
@@ -4252,7 +4272,7 @@ mod daemon_surface {
                             .context("muxloomd stored the trigger but did not report it back")?,
                         response => bail!("unexpected trigger response: {response:?}"),
                     };
-                    Ok(pretty(&trigger_json(LOCAL_TARGET_ID, &stored)))
+                    Ok(tool_json(&trigger_json(LOCAL_TARGET_ID, &stored)))
                 }
                 "list" => {
                     let triggers: Vec<Trigger> = match self
@@ -4264,7 +4284,7 @@ mod daemon_surface {
                         DaemonResponse::Triggers { triggers } => triggers,
                         response => bail!("unexpected trigger response: {response:?}"),
                     };
-                    Ok(pretty(&Value::Array(
+                    Ok(tool_json(&Value::Array(
                         triggers
                             .iter()
                             .map(|trigger| trigger_json(LOCAL_TARGET_ID, trigger))
@@ -4296,7 +4316,7 @@ mod daemon_surface {
                         .into_iter()
                         .next()
                         .context("muxloomd took the post but did not report it back")?;
-                    Ok(pretty(&talk_json(&message)))
+                    Ok(tool_json(&talk_json(&message)))
                 }
                 response => bail!("unexpected talk response: {response:?}"),
             }
@@ -4462,7 +4482,7 @@ mod daemon_surface {
                     "connected": attached,
                 }));
             }
-            Ok(pretty(&Value::Array(machines)))
+            Ok(tool_json(&Value::Array(machines)))
         }
 
         fn message_agent(&self, arguments: &Value) -> Result<String> {
@@ -4569,7 +4589,7 @@ mod daemon_surface {
                 })?
                 .0;
             match response {
-                DaemonResponse::Launched { session } => Ok(pretty(&json!({
+                DaemonResponse::Launched { session } => Ok(tool_json(&json!({
                     "session_id": session.id,
                     "machine": crate::model::own_machine_name(),
                     "kind": session.kind,
@@ -4761,7 +4781,7 @@ mod daemon_surface {
                 })?
                 .0;
             match response {
-                DaemonResponse::Launched { session } => Ok(pretty(&json!({
+                DaemonResponse::Launched { session } => Ok(tool_json(&json!({
                     "session_id": session.id,
                     "machine": crate::model::own_machine_name(),
                     "kind": session.kind,
@@ -4888,7 +4908,7 @@ mod daemon_surface {
                         .collect::<Vec<_>>(),
                 }));
             }
-            Ok(pretty(&Value::Array(results)))
+            Ok(tool_json(&Value::Array(results)))
         }
 
         fn run_shell(&self, arguments: &Value) -> Result<String> {
@@ -5016,7 +5036,7 @@ mod daemon_surface {
                         .filter(|session| include_archived || !session.archived)
                         .map(|session| session_json(LOCAL_TARGET_ID, session))
                         .collect();
-                    Ok(pretty(&Value::Array(rendered)))
+                    Ok(tool_json(&Value::Array(rendered)))
                 }
                 "read_screen" => self.read_screen(arguments),
                 "wait_for" => self.wait_for(arguments),
@@ -5058,7 +5078,7 @@ mod daemon_surface {
                         .transact(&DaemonRequest::ListDirectory { path: path.into() })?
                         .0
                     {
-                        DaemonResponse::Directory { listing } => Ok(pretty(&json!({
+                        DaemonResponse::Directory { listing } => Ok(tool_json(&json!({
                             "path": listing.path,
                             "directories": listing.directories,
                         }))),
@@ -5072,7 +5092,7 @@ mod daemon_surface {
                         .0
                     {
                         DaemonResponse::Files { listing } => {
-                            Ok(pretty(&serde_json::to_value(&listing)?))
+                            Ok(tool_json(&serde_json::to_value(&listing)?))
                         }
                         response => bail!("unexpected file-list response: {response:?}"),
                     }
@@ -5306,7 +5326,7 @@ mod tests {
             || Ok(String::new()),
         )
         .unwrap();
-        assert!(answer.contains("\"outcome\": \"exit\""), "{answer}");
+        assert!(answer.contains("\"outcome\":\"exit\""), "{answer}");
     }
 
     #[test]
