@@ -1019,14 +1019,33 @@ fn is_our_table(header: &str) -> bool {
 /// before they run.
 const CODEX_TOOL_APPROVAL: &str = "approve";
 
+/// Which of the agent's environment Codex hands the muxloom server.
+///
+/// Codex starts an MCP server with a filtered environment — `HOME`, `PATH` and
+/// a few more of its own choosing — and passes on anything else only when the
+/// server table names it. Left unnamed, every variable a launch wrote into the
+/// session (`MUXLOOM_SESSION_ID` and the rest) stops at Codex: the server reads
+/// as running in no session at all, so `set_head_name` is refused, a subagent's
+/// limits read as full powers, and what it starts has no parent. Measured with
+/// codex-cli 0.162: without this line the server saw `HOME` and `PATH` and no
+/// `MUXLOOM_*` at all; with it, all of them.
+fn codex_passed_through() -> Vec<&'static str> {
+    crate::permissions::SESSION_ENVIRONMENT.to_vec()
+}
+
 fn codex_table(entry: &ServerEntry) -> String {
     let mut table = format!(
-        "[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{}]\ndefault_tools_approval_mode = \"{CODEX_TOOL_APPROVAL}\"\n",
+        "[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{}]\ndefault_tools_approval_mode = \"{CODEX_TOOL_APPROVAL}\"\nenv_vars = [{}]\n",
         toml_string(&entry.command),
         entry
             .args
             .iter()
             .map(|argument| toml_string(argument))
+            .collect::<Vec<_>>()
+            .join(", "),
+        codex_passed_through()
+            .into_iter()
+            .map(toml_string)
             .collect::<Vec<_>>()
             .join(", "),
     );
@@ -1059,6 +1078,19 @@ fn codex_entry_matches(current: &toml::Value, entry: &ServerEntry) -> bool {
         .get("default_tools_approval_mode")
         .and_then(toml::Value::as_str)
         != Some(CODEX_TOOL_APPROVAL)
+    {
+        return false;
+    }
+    // Likewise one that does not pass the session's own variables through: its
+    // agents' tools cannot tell which session is calling.
+    let passed: Vec<&str> = current
+        .get("env_vars")
+        .and_then(toml::Value::as_array)
+        .map(|names| names.iter().filter_map(toml::Value::as_str).collect())
+        .unwrap_or_default();
+    if codex_passed_through()
+        .iter()
+        .any(|name| !passed.contains(name))
     {
         return false;
     }
@@ -1517,6 +1549,38 @@ mod tests {
 
         // And now it is what registration would write, so it is left alone.
         assert!(register(&home, &entry()).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Codex hands an MCP server `HOME` and `PATH` and little else. Everything a
+    /// launch tells a session about itself has to be named in the table, or the
+    /// muxloom tools inside a Codex session cannot tell which session is calling
+    /// — and an entry that names some of them and not all is rewritten.
+    #[test]
+    fn codex_is_told_to_pass_every_session_variable_through() {
+        let home = scratch("codex-env-vars");
+        assert!(!register(&home, &entry()).unwrap().is_empty());
+        let text = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        let codex: toml::Value = toml::from_str(&text).unwrap();
+        let passed: Vec<&str> = codex["mcp_servers"]["muxloom"]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        for name in crate::permissions::SESSION_ENVIRONMENT {
+            assert!(
+                passed.contains(name),
+                "{name} is not passed through: {text}"
+            );
+        }
+        assert!(register(&home, &entry()).unwrap().is_empty());
+
+        // An entry from before, short of one, is brought up to date.
+        let short = text.replace("\"MUXLOOM_MAY_LAUNCH\", ", "");
+        assert_ne!(short, text);
+        fs::write(home.join(".codex/config.toml"), short).unwrap();
+        assert!(!register(&home, &entry()).unwrap().is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 

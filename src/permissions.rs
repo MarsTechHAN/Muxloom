@@ -262,6 +262,28 @@ pub(crate) fn authorize(
     }
 }
 
+/// Every variable a launch writes into a session's environment for the muxloom
+/// tools inside it to read: who the session is, where, whose, and what it may
+/// do.
+///
+/// One list, because a runtime that starts its MCP servers with a filtered
+/// environment has to be told each of these by name — Codex passes on only a
+/// short list of its own unless its server table names more — and a variable
+/// left off is a session that reads as nobody's, holding everything.
+pub const SESSION_ENVIRONMENT: &[&str] = &[
+    "MUXLOOM_SESSION_ID",
+    "MUXLOOM_SESSION_KIND",
+    "MUXLOOM_SESSION_PATH",
+    "MUXLOOM_SESSION_PARENT",
+    "MUXLOOM_SESSION_LABEL",
+    "MUXLOOM_TASK_ROOT",
+    "MUXLOOM_MACHINE",
+    "MUXLOOM_MACHINE_LABEL",
+    "MUXLOOM_MAY_MESSAGE",
+    "MUXLOOM_MAY_LAUNCH",
+    "MUXLOOM_MAY_REACH_PERSON",
+];
+
 /// What muxloom told this process about the session it is running in.
 ///
 /// `launch_session` puts these in a session's environment, so an agent that
@@ -918,6 +940,41 @@ mod tests {
             "format_disk",
         ] {
             assert!(!travels(tool), "{tool} must never cross a machine");
+        }
+    }
+
+    /// The list a filtered runtime is told to pass through has to be the list
+    /// a launch writes. A variable the daemon adds and this list does not name
+    /// reaches Claude's tools and never Codex's, and nothing else would say so.
+    #[test]
+    fn the_session_environment_is_every_muxloom_variable_a_launch_writes() {
+        let daemon = include_str!("daemon.rs");
+        let mut written = Vec::new();
+        for (at, _) in daemon.match_indices("keeper_environment.push((") {
+            let rest = &daemon[at..];
+            let Some(open) = rest.find('"') else { continue };
+            let name: String = rest[open + 1..]
+                .chars()
+                .take_while(|character| *character != '"')
+                .collect();
+            if name.starts_with("MUXLOOM_") {
+                written.push(name);
+            }
+        }
+        written.sort();
+        written.dedup();
+        assert!(written.len() >= 10, "found only {written:?}");
+        for name in &written {
+            assert!(
+                SESSION_ENVIRONMENT.contains(&name.as_str()),
+                "the daemon writes {name} into a session and the list does not pass it on"
+            );
+        }
+        for name in SESSION_ENVIRONMENT {
+            assert!(
+                written.iter().any(|held| held == name),
+                "{name} is never written"
+            );
         }
     }
 
