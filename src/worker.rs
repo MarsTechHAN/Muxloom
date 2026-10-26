@@ -1873,9 +1873,7 @@ fn parent_alert_text(alert: &ParentAlert, machine: &str) -> String {
     };
     format!(
         "Your subagent {named}, kind {}, on machine {machine}, needs attention: {reason}.{said} \
-         It is sitting at its prompt waiting for you — check with read_screen and answer it, or it \
-         will wait there for its next minute of nothing. You are its parent ({}); message_agent \
-         reaches it.",
+         Look with read_screen and answer it with message_agent; you are its parent ({}).",
         alert.kind, alert.parent_session_id
     )
 }

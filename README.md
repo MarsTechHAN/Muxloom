@@ -765,6 +765,15 @@ behaviour learned in one agent works in the others. It carries a revision stamp
 and is rewritten only while that stamp is Muxloom's and out of date, so a file
 you edit is yours from then on. OpenCode has no skill directory and gets the
 short version through the MCP `instructions` field, as every agent does.
+
+What muxloom puts into an agent's context is kept small, because every session
+pays for it whether or not it ever talks to another agent. The `instructions`
+and the tool descriptions carry the rules in a few thousand tokens, each said
+once; the skill carries the worked examples and the etiquette, and says it is
+for coordination — fanning work out, messaging, the board, the person, other
+machines — so an agent doing plain work in its own folder never loads it. A
+delivered message and a subagent alert are a header, the message between
+delimiters, and the call that answers it.
 Set `MUXLOOM_MCP_REGISTER=0` in the daemon's environment to turn all of it off,
 or `MUXLOOM_SKILL=0` to keep the server entry and drop the skill.
 

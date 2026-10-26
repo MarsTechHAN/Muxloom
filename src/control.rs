@@ -184,133 +184,68 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
              the `machine` argument; see list_machines)"
         }
         Flavor::Daemon => {
-            "on this machine, which a muxloom controller may be watching along with others. \
-             list_machines shows the others as `remote`: while the controller is attached the \
-             whole fleet is yours to work in — name one with the `machine` argument and the \
-             controller runs the call over there. Looking and saying go straight through; \
-             starting a session, typing into one, ending one, or running a shell command is put \
-             to the person first and runs once they say so. Only wait_for stays here, watching \
-             this machine"
+            "on this machine. list_machines also shows `remote` machines a muxloom controller \
+             carries for you: while it is attached the whole fleet is yours to work in — name one \
+             with the `machine` argument. Looking and saying go straight through; starting, \
+             typing into or ending a session, or running a shell, over there is put to the \
+             person first. wait_for watches this machine only"
         }
     };
     // Which machines exist, and how to reach them, is only the controller's to
     // change — and changing it reaches past muxloom into the user's own tools.
     let manage = match flavor {
         Flavor::Controller => {
-            "- The set of machines and the user's SSH configuration belong to them. \
-             set_machine_enabled changes what every agent on this controller can reach, and \
-             ssh_host edits a file every ssh command on this machine reads. Run either only \
-             when the human asked for that change.\n"
+            "- set_machine_enabled and ssh_host change what every agent can reach and the \
+             user's own SSH config: run them only when the person asked for that change.\n"
         }
         Flavor::Daemon => {
-            "- A remote machine is only ever reached through the controller. If it is not \
-             attached you are told so immediately — that is the whole answer, not a reason to \
-             retry. A change over there waits on the person: you get back an approval id rather \
-             than a result. Say where they are with `ask_via` — \"dashboard\" when they typed \
-             the request to you in muxloom, \"chat\" when it reached you from their chat app, \
-             nothing when you cannot tell — and the ask is put to them there. You are told in \
-             your prompt when they answer; make the call again then. When there is already an \
-             agent living over there, saying what you want with message_agent is quicker than \
-             driving its machine from here.\n"
+            "- A remote machine is reached only through the controller. If it is not attached \
+             you are told at once — that is the answer, not a reason to retry. A change there \
+             returns an approval id (say where the person is with `ask_via`); you are told when \
+             they answer, then call again. If an agent already lives there, message_agent is \
+             quicker than driving its machine.\n"
         }
     };
     // Only a session has a head name of its own: the daemon flavor runs inside one,
     // while the controller is the user's fleet-wide view and has no row to name.
-    let headname = match flavor == Flavor::Daemon
-        || crate::permissions::launching_session().is_some()
-    {
-        true => {
-            "- Keep your head name honest: set_head_name {{ name: \"...\" }} updates the name on \
-             your row in the dashboard, so a person watching sees your current task at a glance. \
-             Update it when the shape of your work changes, not on every step; keep it a whole- \
-             task phrase under 60 characters.\n"
-        }
-        // The controller run by hand, outside any session, has no row of its
-        // own to name. A moderator is a session like any other, and has one.
-        false => "",
-    };
-    let channel_limit = crate::channel::READABLE_LIMIT;
+    let headname =
+        match flavor == Flavor::Daemon || crate::permissions::launching_session().is_some() {
+            true => {
+                "- Keep your head name honest with set_head_name: a whole-task phrase under 60 \
+             characters on your dashboard row, changed when the work changes shape.\n"
+            }
+            // The controller run by hand, outside any session, has no row of its
+            // own to name. A moderator is a session like any other, and has one.
+            false => "",
+        };
     let mut text = format!(
-        "muxloom manages long-lived terminal sessions — Codex, Claude Code, pi, OpenCode, and \
-         plain shells — \
-         {reach}. Sessions outlive this conversation and the muxloom dashboard, and a human may \
-         be watching any of them right now.\n\n\
-         Work through the sessions rather than around them:\n\
-          - To get work done on a machine, talk to the agent session that lives there: \
-          message_agent to say something to another agent, send_input for raw keystrokes and for \
-          plain shells, then wait_for or read_screen to see what came of it. Treat a session as a \
-          colleague you are messaging, not as a subprocess you drive.\n\
-          - Subagents are sessions too. To fan work out, launch one with launch_session so it \
-          shows up in the dashboard and on the task board where you and the person watching can \
-          both follow it. Do not reach for your harness's built-in subagent or task tool: those \
-          are invisible, untracked, and die with your process.\n\
-          - Being handed more than one task is the signal to fan out. Split the list before you \
-          start, give each session a brief specific enough to need no follow-up question, and \
-          keep the coordinating and the aggregating for yourself. Work them one after another \
-          only when they genuinely depend on each other.\n\
-          - A message lands in the session's prompt box and is read when its turn ends. For pi and \
-         OpenCode the box is read off their screen like the others: if it already holds an \
-         unsent sentence your message is held until it clears, and if a model or effort picker is \
-         up it waits rather than answering the dialog. When unsure whether a message went in, \
-         read_screen or check list_sessions' working/needs_attention before sending another.\n\
-         - run_shell is a last resort. Reach for it only for a short, non-interactive, ideally \
-         read-only query that no other tool covers. Never start long-running or interactive work \
-         with it — that is what launch_session is for — and never use it to do something a \
-         session you could talk to would do better.\n\
-          - Prefer the narrow tools (list_sessions, read_screen, list_files, preview_file, \
-          search_history) over shell equivalents: they are bounded, paged, and safe to repeat.\n\
-          - read_screen returns the read result by default (chrome stripped, content in \
-          reading order); pass raw: true for the raw vt100 grid.\n\n\
-          Work with the others out in the open:\n\
-          {headname}\
-          - The talk board is the fleet's shared memory, not a chat. talk_read it once when you \
-         pick up a piece of work, and search it when something surprises you: what is on it is \
-         what other agents worked out and wrote down, on every machine, long after their \
-         sessions ended. talk_post back to it only what will still be worth knowing when this \
-         conversation is over — a decision and why, a gotcha and what it cost, a cause that took \
-         real work to find. Status, progress, questions, answers, and anything true only for the \
-         next hour do not go on it: your head name says what you are doing, message_agent \
-         reaches the one agent who needs an answer, and send_channel_message reaches the person. \
-         Post to the narrowest scope the knowledge is actually true in.\n\
-         - message_agent is how you ask one agent for something: it lands in that session's \
-         prompt in an envelope that names you, and it is read when the turn it is in ends. Its \
-         answer comes back as a direct message — wait for it with talk_read {{ scope: \
-         \"direct\", wait_seconds: {TALK_MAX_WAIT_SECONDS} }}, and call that again each time it \
-         returns nothing rather than asking twice. Minutes is normal. When you are the one asked, \
-         answer even if the answer is no: the agent waiting on you cannot act on silence.\n\
-         - Nobody here is in charge of anyone else, and nothing you send has to be obeyed. Ask, \
-         say why, and leave the other agent to judge it against what it is already doing.\n\
-         - send_channel_message reaches the human themselves, on their phone, through the chat \
-         app they bound to muxloom. It is for the end of something they are waiting on and for a \
-         decision only they can make — one summary they can act on, never a progress log. Keep \
-         it short: the text is capped at {channel_limit} characters and a longer one is refused \
-         rather than trimmed, because a trim would silently take whatever you put last. Send the \
-         conclusion, the numbers that matter, and the ask; say where the rest already is instead \
-         of repeating it. Their answer comes back to you as a direct message. This and the talk \
-         board are independent surfaces: a channel message posts nothing to the board, and a \
-         talk_post tells the person on their phone nothing. Reply to a person on the surface \
-         they wrote to — over the channel, not the board.\n\
-         - When the person writes to you, answer before you start the work. They are on a phone \
-         and cannot see your screen, so what you understood and roughly how long it will take is \
-         worth a line straight away; the result follows when it is done. Silence for twenty \
-         minutes reads exactly like an agent that never heard them.\n\n\
-         Boundaries that are not negotiable:\n\
-         - Machines the user has not enabled are unreachable. Naming one is an error, not a \
-         workaround to route around.\n\
-         - send_input is the only supported way to type. Never open a terminal stream just to \
-         write bytes — it resizes the session under whoever is attached.\n\
-         - Sessions are persistent state. A session you launched is yours to archive or delete \
-         when it is done; a session you did not launch is someone else's — do not archive, \
-         delete, or reconfigure it unless you were asked to. A session another agent started \
-         closes and resumes only itself and what it started, and muxloom refuses it the rest.\n\
-         - delete_session destroys a session's history irreversibly. Ask the human first; \
-         archive_session keeps the history. Either one takes the whole fleet under that session \
-         with it, so closing a master closes every subagent it started.\n\
+        "muxloom runs long-lived terminal sessions — Codex, Claude Code, pi, OpenCode and plain \
+         shells — {reach}. Sessions outlive this conversation, and a person may be watching any \
+         of them.\n\n\
+         - Get work done by talking to the session that lives there: message_agent for an \
+         agent, send_input for keystrokes and shells, then wait_for or read_screen. Treat a \
+         session as a colleague, not a subprocess.\n\
+         - Subagents are sessions: start them with launch_session, not your harness's own \
+         subagent tool, so the person can follow them. Being handed more than one task is the \
+         signal to fan out: one session per task, each with a brief that needs no follow-up.\n\
+         - run_shell is a last resort, for a short read-only query no other tool covers.\n\
+         {headname}\
+         - The talk board is the fleet's shared memory, not a chat: read it when you pick up \
+         work, and post only what will still matter when this conversation is over.\n\
+         - Answers to message_agent arrive as direct messages: wait with talk_read {{ scope: \
+         \"direct\", wait_seconds: {TALK_MAX_WAIT_SECONDS} }}, again while it returns nothing. \
+         Answer what you are asked, even with no. Nobody here gives orders; weigh requests on \
+         their merits.\n\
+         - send_channel_message reaches the person on their phone: one short summary when \
+         something is done or needs their decision, never a progress log. When the person \
+         writes to you, answer before you start the work.\n\
+         - Check `working` and `needs_attention` before send_input: typing interrupts. Never \
+         open a terminal stream just to write bytes.\n\
+         - Close only what you started. archive_session keeps history; delete_session destroys \
+         it and needs the person's say-so. Either takes everything that session started.\n\
+         - Machines the user has not enabled are unreachable; do not route around that.\n\
          {manage}\
-         - Typing into a session interrupts whoever is using it. Check `working` and \
-         `needs_attention` in list_sessions before you type, and keep the interruption short.\n\n\
-         When the target is ambiguous — which machine, which session, whether something may be \
-         stopped — ask the human instead of guessing."
+         - When the target is ambiguous, ask the person instead of guessing."
     );
     let denied: Vec<&str> = specs(flavor)
         .into_iter()
@@ -338,10 +273,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                  tools address a machine by its id."
             }
             Flavor::Daemon => {
-                "List the machines you can reach: this one, and any a muxloom controller has said \
-                 it can carry for you. Those are marked `remote` with the `via` that carries \
-                 them — reaching one costs a round trip and only works while that controller is \
-                 running. Other tools address a machine by its id."
+                "List the machines you can reach: this one, and `remote` ones a muxloom \
+                 controller carries for you while it runs. Other tools address a machine by its \
+                 id."
             }
         }
         .into(),
@@ -400,13 +334,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     }
     tools.push(ToolSpec {
         name: "list_sessions",
-        description: "List managed agent sessions with fresh status: kind (codex/claude/pi/\
-                      opencode/terminal), working directory, whether the agent is working, \
-                      whether it waits for input (needs_attention plus the matched reason), and \
-                      a recap line. A terminal works while its shell is running something and \
-                      waits when that program asks on its last row; it has no recap - \
-                      read_screen is how a shell is read. Archived sessions are included only \
-                      with include_archived."
+        description: "List sessions with fresh status: kind, folder, label, working, \
+                      needs_attention with its reason, a recap line, and the parent that \
+                      started it. A terminal has no recap; read it with read_screen."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -419,48 +349,39 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "read_screen",
         description: format!(
-            "Read a session's terminal. Returns the screen's read result by default: \
-             the text a person would read off the screen — borders and the bottom \
-             status/footer bar stripped, internal whitespace collapsed, content in \
-             reading order, a line that wrapped joined back together. The visible \
-             screen plus scrollback, up to `lines` rows (default {DEFAULT_SCREEN_LINES}) \
-             ending `offset_from_bottom` rows above the last row anything was drawn on. \
-             The trailer says how many rows the page holds, whether there is older \
-             history above it, and the `offset_from_bottom` that reaches the page before \
-             it — pass that back to page older output. A full-screen program (OpenCode) \
-             is named as one: the terminal keeps nothing it drew before, so its earlier \
-             turns are read with read_conversation. Pass `raw: true` for the raw vt100 \
-             grid (ANSI stripped, column positions intact) when you need the exact \
-             layout."
+            "Read a session's terminal as text a person would read: chrome stripped, wrapped \
+             lines joined, in reading order. Up to `lines` rows (default \
+             {DEFAULT_SCREEN_LINES}) ending `offset_from_bottom` rows above the bottom; the \
+             trailer gives the offset of the page before. A full-screen program (OpenCode) keeps \
+             no scrollback: read its earlier turns with read_conversation. `raw: true` returns \
+             the vt100 grid with columns intact."
         ),
         input_schema: schema_across(
             flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
                 "lines": { "type": "integer", "description": "Rows to return." },
-                "offset_from_bottom": { "type": "integer", "description": "Rows above the last drawn row to end at; the previous page's trailer names the one that reaches the page before it." },
-                "raw": { "type": "boolean", "description": "Return the raw vt100 grid instead of the read result." },
+                "offset_from_bottom": { "type": "integer", "description": "Rows above the bottom to end at." },
+                "raw": { "type": "boolean", "description": "Return the vt100 grid." },
             }),
             &["session_id"],
         ),
     });
     tools.push(ToolSpec {
         name: "send_input",
-        description: "Talk to a session: type into its terminal without disturbing an attached \
-                      viewer. This is the main way to get work done on a machine — ask the agent \
-                      that lives there. `text` is written verbatim, then each named key in `keys` \
-                      (enter, esc, tab, backspace, space, delete, up, down, left, right, home, \
-                      end, page-up, page-down, or ctrl-a…ctrl-z), then submit=true appends Enter. \
-                      Typing interrupts whoever is using the session, so check `working` and \
-                      `needs_attention` first. Prompts take effect asynchronously: poll \
-                      list_sessions or read_screen to watch the result."
+        description: "Type into a session's terminal without disturbing whoever is attached: \
+                      `text` verbatim, then each key in `keys` (enter, esc, tab, backspace, \
+                      space, delete, up, down, left, right, home, end, page-up, page-down, \
+                      ctrl-a…ctrl-z), then Enter if `submit`. For an agent, message_agent is \
+                      usually better. Typing interrupts: check working and needs_attention \
+                      first, and watch the result with wait_for."
             .into(),
         input_schema: schema_across(
             flavor,
             json!({
                 "session_id": { "type": "string", "description": "Session id from list_sessions." },
-                "text": { "type": "string", "description": "Bytes to type verbatim." },
-                "keys": { "type": "array", "items": { "type": "string" }, "description": "Named keys to press after the text." },
+                "text": { "type": "string", "description": "Typed verbatim." },
+                "keys": { "type": "array", "items": { "type": "string" }, "description": "Keys to press after the text." },
                 "submit": { "type": "boolean", "description": "Press Enter at the end." },
             }),
             &["session_id"],
@@ -468,31 +389,22 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "message_agent",
-        description: "Say something to another agent: muxloom types your message into that \
-                      session's prompt inside an envelope naming you, so the agent there knows it \
-                      is hearing from an agent and how to answer. Use this to ask for work, hand \
-                      something over, answer a question you were asked, or warn someone off a file \
-                      you are changing — and use send_input instead only when you need raw \
-                      keystrokes rather than a message. The target must be a codex, claude, pi \
-                      or opencode session; a terminal has nobody in it to read. Replies come back the same \
-                      way, as direct messages: read yours with talk_read { scope: \"direct\" }, \
-                      and answer with message_agent again. Never answer one of these with \
-                      talk_post — that puts a private exchange on a board every agent on every \
-                      machine has to read past. \
-                      A message lands whole even while that agent is mid-turn; it is read when \
-                      the turn ends, so one message should say everything you have to say. There \
-                      is a rate limit per session and it will tell you. \"auto\" is almost always \
-                      right; \"when_idle\" holds it back until the turn ends; \"now\" skips the \
-                      checks that keep a message out of a dialog box."
+        description: "Say something to another agent — a codex, claude, pi or opencode \
+                      session. It is typed into their prompt in an envelope naming you and how \
+                      to answer, and read when their current turn ends, so say everything in one \
+                      message. Replies arrive as direct messages (talk_read { scope: \"direct\" \
+                      }); answer one with message_agent and its reply_to, never with talk_post. \
+                      `deliver`: \"auto\" is almost always right; \"when_idle\" holds it until \
+                      the turn ends; \"now\" skips the checks that keep it out of a dialog box."
             .into(),
         input_schema: schema_across(
             flavor,
             json!({
-                "session_id": { "type": "string", "description": "Session id from list_sessions: who to tell." },
-                "text": { "type": "string", "description": "What to say. Say it as you would to a colleague: what you want, and what you already know." },
-                "deliver": { "type": "string", "enum": ["auto", "now", "when_idle"], "description": "When to put it in front of them. Default auto." },
-                "reply_expected": { "type": "boolean", "description": "Say that you are waiting on an answer, and ask for one even if it is no. Then wait with talk_read { scope: \"direct\", wait_seconds }, calling it again each time it returns nothing: an answer often takes several minutes." },
-                "reply_to": { "type": "string", "description": "The message_id this answers. Set it whenever you are replying — it is how the agent waiting on you knows its answer arrived." },
+                "session_id": { "type": "string", "description": "Who to tell, from list_sessions." },
+                "text": { "type": "string", "description": "What you want, and what you already know." },
+                "deliver": { "type": "string", "enum": ["auto", "now", "when_idle"], "description": "Default auto." },
+                "reply_expected": { "type": "boolean", "description": "Ask for an answer even if it is no." },
+                "reply_to": { "type": "string", "description": "The message_id this answers. Set it whenever you reply." },
             }),
             &["session_id", "text"],
         ),
@@ -500,22 +412,19 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "wait_for",
         description: format!(
-            "Wait for a session to reach a state, instead of calling read_screen in a loop. \
-             `until` is one of: idle (not working and not waiting on anything), attention (it is \
-             waiting for a human — a prompt, a permission question), output_matches (`pattern` \
-             appears on the screen, matched case-insensitively), silence (the screen stops \
-             changing for `quiet_seconds`), exit (the session ends). Returns the moment it \
-             happens, or with outcome \"timeout\" after `timeout_seconds` (default \
-             {WAIT_DEFAULT_TIMEOUT_SECONDS}, max {WAIT_MAX_TIMEOUT_SECONDS}) — a timeout is not a \
-             failure, call it again to keep waiting. This is the tool to reach for after \
-             send_input; to be told about something you will not be here for, use trigger.{}",
+            "Block until a session reaches a state, instead of polling read_screen. `until`: \
+             idle, attention (waiting on a person), output_matches (`pattern` on screen, \
+             case-insensitive), silence (screen unchanged for `quiet_seconds`), or exit. Answers \
+             when it happens, or with outcome \"timeout\" after `timeout_seconds` (default and \
+             max {WAIT_MAX_TIMEOUT_SECONDS}) — not a failure: call again. For something you will \
+             not be here to see, use trigger.{}",
             match flavor {
                 Flavor::Controller => "",
                 // The one watcher that cannot travel: it would sit here
                 // waiting on a session that is somewhere else.
                 Flavor::Daemon =>
-                    " It watches this machine only. For a session on another one, look with \
-                     read_screen { machine } or list_sessions { machine } instead.",
+                    " It watches this machine only; look at another with read_screen or \
+                     list_sessions and `machine`.",
             }
         ),
         input_schema: schema(
@@ -526,41 +435,36 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                     "type": "string",
                     "enum": ["idle", "attention", "output_matches", "silence", "exit"],
                 },
-                "pattern": { "type": "string", "description": "Text to wait for; required by until=output_matches." },
-                "timeout_seconds": { "type": "integer", "description": "How long to wait before answering \"timeout\"." },
-                "poll_ms": { "type": "integer", "description": "How often to look, 200-5000. Default 800." },
-                "quiet_seconds": { "type": "integer", "description": "For until=silence: how long the screen must stay unchanged. Default 5." },
+                "pattern": { "type": "string", "description": "For until=output_matches." },
+                "timeout_seconds": { "type": "integer" },
+                "poll_ms": { "type": "integer", "description": "200-5000. Default 800." },
+                "quiet_seconds": { "type": "integer", "description": "For until=silence. Default 5." },
             }),
             &["session_id", "until"],
         ),
     });
     tools.push(ToolSpec {
         name: "trigger",
-        description: "Leave a standing watch on a session with muxloom, for what you will not be \
-                      around to see: when `pattern` appears on that session's screen, muxloom \
-                      runs `action_kind` even though this conversation is over. `set` arms one \
-                      and returns its id, `list` reports them, `delete` removes one. \
-                      action_kind \"send_input\" types `text` back into the session (with Enter \
-                      unless submit is false); \"notify\" marks the session as needing attention \
-                      with `text` as the reason, which is what list_sessions and the dashboard \
-                      show. A trigger fires on the way into a match — text already on the screen \
-                      when it is armed does not count — at most once per cooldown_ms, and by \
-                      default is removed once it has fired. Triggers outlive the daemon that \
-                      took them and are dropped when their session dies. Use wait_for instead \
-                      when you are going to sit and wait for it yourself."
+        description: "A standing watch for what you will not be here to see: when `pattern` \
+                      newly appears on the session's screen, muxloom types `text` into it \
+                      (action_kind \"send_input\") or marks it as needing attention with `text` \
+                      as the reason (\"notify\", the default). It fires at most once per \
+                      cooldown_ms, by default only once, and dies with its session. `set` \
+                      returns its id; `list` and `delete` manage them. To wait yourself, use \
+                      wait_for."
             .into(),
         input_schema: schema_across(
             flavor,
             json!({
                 "action": { "type": "string", "enum": ["set", "list", "delete"] },
-                "session_id": { "type": "string", "description": "Session to watch (set), or to list watches for." },
-                "pattern": { "type": "string", "description": "Text to watch the screen for, matched case-insensitively." },
-                "action_kind": { "type": "string", "enum": ["send_input", "notify"], "description": "What to do on a match. Default notify." },
-                "text": { "type": "string", "description": "Text to type (send_input) or the attention reason to show (notify)." },
-                "submit": { "type": "boolean", "description": "For send_input: press Enter after the text. Default true." },
-                "once": { "type": "boolean", "description": "Remove the trigger after it fires. Default true." },
-                "cooldown_ms": { "type": "integer", "description": "Shortest gap between two firings. Default 5000." },
-                "id": { "type": "string", "description": "Trigger id: required by delete, and replaces that trigger on set." },
+                "session_id": { "type": "string", "description": "Session to watch, or to list watches of." },
+                "pattern": { "type": "string", "description": "Text to watch for, case-insensitive." },
+                "action_kind": { "type": "string", "enum": ["send_input", "notify"] },
+                "text": { "type": "string", "description": "What to type, or the reason to show." },
+                "submit": { "type": "boolean", "description": "send_input: press Enter after. Default true." },
+                "once": { "type": "boolean", "description": "Remove after firing. Default true." },
+                "cooldown_ms": { "type": "integer", "description": "Default 5000." },
+                "id": { "type": "string", "description": "For delete, or to replace one on set." },
             }),
             &["action"],
         ),
@@ -568,111 +472,65 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "talk_read",
         description: format!(
-            "Read the talk board: the fleet's shared memory, written by every muxloom agent and \
-             every person at a dashboard, on every machine, and kept long after the sessions \
-             that wrote it are gone. Read it when you pick up a piece of work, to find out what \
-             is already known about it — a decision somebody made, a gotcha somebody paid for, \
-             where a surprising thing lives. It is knowledge rather than news, so it is worth \
-             one read at the start and a search when you hit something odd; it is not worth \
-             polling, and what the others are doing right now is in list_sessions, not here.\n\n\
-             The board holds notes and nothing else, in four rooms: your thread (you, whoever \
-             started you, and the subagents any of you started), your folder, this machine, and \
-             global. By default you read the ones in front of you — your thread, this folder, \
-             this machine, and global. `query` searches the text and is usually the better way \
-             in than reading the lot; `include_machines` and `include_paths` widen it to named \
-             machines and folders, or to \"all\" to look everywhere; `scope` reads one room.\n\n\
-             scope \"direct\" is the exception to all of that, and the one thing here worth \
-             waiting on. It is not one of the four rooms and not the board: it is the mailbox of \
-             what agents said straight to each other, filed beside the board rather than on it \
-             and kept hours rather than weeks. It is read through this tool because that is \
-             where a reply to your message_agent arrives. `since_cursor` takes the `cursor` from \
-             a previous read and returns only what has happened since, so polling never repeats \
-             itself; `wait_seconds` (up to {TALK_MAX_WAIT_SECONDS}) holds the call open until \
-             something new is said, which is how you wait to be answered. A wait that ends with \
-             nothing is not an answer of no: it comes back with `waiting_on`, listing which of \
-             your own messages are still unanswered and what the sessions holding them are \
-             doing, and calling it again is usually right.\n\n\
-             A reply too large to hand back is cut, and says so in `truncated` and `note`. \
-             Following a cursor keeps the oldest of what is new and holds the cursor back to \
-             match, so read again with the cursor and the rest follows in order; a read without \
-             one keeps the newest, and `before` pages back from there."
+            "Read the talk board, the fleet's shared memory: notes agents and people wrote down, \
+             on every machine, kept long after their sessions ended. Read it when you pick up a \
+             piece of work, and search it with `query` when something surprises you. It is \
+             knowledge, not news: not worth polling, and what others are doing now is in \
+             list_sessions, not here. You read your thread, this folder, this machine and \
+             global; `scope` reads one of them, `include_machines` / `include_paths` add others \
+             (or [\"all\"]).\n\n\
+             scope \"direct\" is the exception: the mailbox where replies to your message_agent \
+             arrive, and the one thing here worth waiting on. Pass the last read's `cursor` as \
+             `since_cursor` and `wait_seconds` (up to {TALK_MAX_WAIT_SECONDS}); a wait that ends \
+             empty lists what is still unanswered in `waiting_on` — call again. A reply too \
+             large is cut and says so in `truncated`: read on with the cursor, or page back with \
+             `before`."
         ),
         input_schema: schema(
             multi,
             json!({
-                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global", "direct"], "description": "One room of the board, or \"direct\" for the mailbox beside it. Default: the board's rooms in front of you, and never the mailbox." },
-                "since_cursor": { "type": "string", "description": "Cursor from an earlier read: return only what has been said since." },
-                "wait_seconds": { "type": "integer", "description": "Wait this long for something new before answering. Default 0." },
-                "limit": { "type": "integer", "description": "Most messages to return. Default 50. A page too large to hand back is cut whatever this says." },
-                "before": { "type": "integer", "description": "Epoch ms: read backwards from here, for paging into the past." },
-                "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "\"note\" is what the board holds. \"message\" is the older kind, from before notes, and is read only when named here; \"direct\" is the mailbox, read with scope \"direct\"." },
+                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global", "direct"], "description": "One room, or \"direct\" for the mailbox. Default: every room in front of you, never the mailbox." },
+                "since_cursor": { "type": "string", "description": "`cursor` of an earlier read: only what is newer." },
+                "wait_seconds": { "type": "integer", "description": "Wait this long for something new. Default 0." },
+                "limit": { "type": "integer", "description": "Most messages. Default 50." },
+                "before": { "type": "integer", "description": "Epoch ms: page backwards from here." },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["note", "message", "direct"] }, "description": "Default notes; \"message\" is the older kind." },
                 "authors": { "type": "array", "items": { "type": "string" }, "description": "Session ids or labels." },
                 "query": { "type": "string", "description": "Only messages containing this text." },
-                "include_machines": { "type": "array", "items": { "type": "string" }, "description": "Also read these machines' boards, or [\"all\"] for every machine." },
-                "include_paths": { "type": "array", "items": { "type": "string" }, "description": "Also read these directories' boards, or [\"all\"] for every directory." },
-                "path": { "type": "string", "description": "Which directory's board counts as yours. Defaults to the session's own." },
+                "include_machines": { "type": "array", "items": { "type": "string" }, "description": "Also these machines' boards, or [\"all\"]." },
+                "include_paths": { "type": "array", "items": { "type": "string" }, "description": "Also these folders' boards, or [\"all\"]." },
+                "path": { "type": "string", "description": "Which folder counts as yours. Defaults to your own." },
             }),
             &[],
         ),
     });
     tools.push(ToolSpec {
         name: "talk_post",
-        description: "Write something down on the talk board: the fleet's shared memory, kept for \
-                      weeks, replicated to every machine, and read by agents who will never meet \
-                      you. It is a memory, not a transport. Post only what will still be worth \
-                      knowing after the conversation that learned it has ended — a decision and \
-                      why it went that way, a gotcha and what it costs, where something \
-                      surprising lives, a cause you spent an hour finding, an approach that was \
-                      tried and does not work. Write it for someone who is not here yet and has \
-                      no idea what you were doing: one self-contained paragraph, no pronouns \
-                      pointing at things only you can see. If a thing you are about to post \
-                      would be stale in an hour, it does not belong here.\n\n\
-                      These do not go on the board, ever: anything meant for one agent, or \
-                      anything you want an answer to — that is message_agent, and it actually \
-                      reaches them; status, progress, and what you are working on right now — \
-                      that is your head name, set_head_name; a question, an answer, or a \
-                      back-and-forth of any kind — message_agent again, because a board carrying \
-                      two agents' conversation is a board everyone else stops reading; anything \
-                      the person should see — send_channel_message, on their phone; and anything \
-                      already written down in the code, the diff, the commit message, or the CI \
-                      run, which needs at most a note saying where it is. Posting interrupts \
-                      nobody and reaches nobody in particular. If what you have is news rather \
-                      than knowledge, that is the sign not to post it.\n\n\
-                      What the board takes is a note, and these are refused rather than advised \
-                      against, so it stays a memory whoever is writing to it. A post that opens \
-                      by naming somebody (`@name …`) is a message to them: the board reaches \
-                      nobody, message_agent does. A post that ends in a question is a question: \
-                      nobody owes the board an answer, so ask with message_agent. A post too \
-                      short to stand on its own is a remark — under about twenty-five characters \
-                      is a status word, and status is set_head_name. A post you have already \
-                      written word for word is refused naming the one it repeats: a memory does \
-                      not need saying twice, and if what you know has changed, say what changed \
-                      and reply_to the original. So are kind \"message\" (a person speaking at a \
-                      dashboard) and the reserved /muxloom/ paths (muxloom's own coordination \
-                      between machines). A person writing at a dashboard or from a chat app is \
-                      held to none of this; an agent writing to a shared memory is.\n\n\
-                      `scope` is which of the board's four rooms it goes in, and so who inherits \
-                      it: \"folder\" (default) is one directory on one machine, which is where \
-                      anything about a particular codebase belongs; \"machine\" is everyone on \
-                      this machine, for how the machine itself behaves; \"thread\" is you, \
-                      whoever started you, and every subagent any of you started, for what a team \
-                      learns while it works; \"global\" is every agent on every machine, so keep \
-                      it for things that genuinely travel. Prefer the \
-                      narrowest scope the knowledge is true in — a global board full of one \
-                      repository's details is a global board nobody reads.\n\n\
-                      This writes only to the talk board: it never reaches a person's chat app, \
-                      and nobody on their phone is told. To reach a person where they are, use \
-                      send_channel_message instead — the board and the chat app are independent \
-                      surfaces and nothing routes between them."
+        description: "Write a note on the talk board, the fleet's shared memory: kept for weeks \
+                      and read by agents who will never meet you. It is a memory, not a \
+                      transport. Post what will still matter when this conversation is over — a \
+                      decision and why, a gotcha and its cost, where something surprising lives, \
+                      an approach that failed — as one self-contained paragraph. Status belongs \
+                      in set_head_name; questions, answers and anything for one agent in \
+                      message_agent; anything for the person in send_channel_message; what the \
+                      code or a commit already says nowhere.\n\n\
+                      These are refused rather than advised against: a post that opens with \
+                      `@name`, one that ends in a question, one under about twenty-five \
+                      characters, an exact repeat (reply_to the original to say what changed), \
+                      kind \"message\", and the reserved /muxloom/ paths.\n\n\
+                      `scope`: \"folder\" (default) for one codebase, \"machine\" for how this \
+                      machine behaves, \"thread\" for you, whoever started you and what any of \
+                      you started, \"global\" only for what genuinely travels. This never \
+                      reaches a person's chat app."
             .into(),
         input_schema: schema(
             multi,
             json!({
-                "text": { "type": "string", "description": "What to say." },
-                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global"], "description": "Which room it goes in. Default folder. (\"task\" and \"path\" are older names for thread and folder.)" },
-                "path": { "type": "string", "description": "For scope=folder: which directory. Defaults to the session's own." },
-                "kind": { "type": "string", "enum": ["note"], "description": "\"note\", the default and the only kind a tool call may write: knowledge, kept and searched later — what the board is for. \"message\" is a person speaking at the dashboard and is refused here." },
-                "reply_to": { "type": "string", "description": "Id of the note this corrects or adds to. One hop, and only when the correction matters to whoever reads the original later. A reply that is really an answer to somebody belongs in message_agent." },
+                "text": { "type": "string", "description": "The note." },
+                "scope": { "type": "string", "enum": ["thread", "folder", "machine", "global"], "description": "Default folder. (\"task\" and \"path\" are older names for thread and folder.)" },
+                "path": { "type": "string", "description": "For scope=folder: which directory. Defaults to your own." },
+                "kind": { "type": "string", "enum": ["note"], "description": "Always \"note\", the default." },
+                "reply_to": { "type": "string", "description": "Id of the note this corrects or adds to." },
             }),
             &["text"],
         ),
@@ -683,44 +541,29 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         // machine, it reaches a person. Which machine dials the chat app is
         // muxloom's business, and the message says where it came from anyway.
         description: format!(
-            "Reach the human who is not at a dashboard, through the chat app they bound to \
-             muxloom (WeChat, or Lark). Use it when something they are waiting on is finished, \
-             when you are blocked on a decision only they can make, or when a long run ends \
-             while nobody is watching — and not otherwise: this arrives on somebody's phone. \
-             One message per milestone, never a progress log. Write it as a summary they can \
-             act on: `title` says what happened, and `text` opens with the conclusion, then the \
-             numbers, then what you need from them and exactly how to answer. Keep it short: \
-             `text` is capped at {text} characters and `title` at {title}, and a message over \
-             either is refused rather than trimmed, because what a trim removes is whatever you \
-             put last — usually the ask. If it will not fit, that is the message being too long \
-             and not the cap being too small: say the conclusion and where the detail already \
-             is (the board, your session, the diff). Write `text` as markdown, but keep to short \
-             lines and plain lists: Lark renders headings, tables and code fences, WeChat \
-             renders none of them and gets a flattened version where the words and line breaks \
-             survive and the marks do not. muxloom signs it with the machine and session you \
-             are in, so do not write that yourself, and never put a token, a key, or an absolute \
-             home path in it. The receipt reports what you sent as `message_id`; when a reply \
-             reaches you quoting one of your messages it names the quoted id, and answering with \
-             that id as `reply_to` draws WeChat's quote on the same message. Their reply comes \
-             back to you as a direct message: watch for it with talk_read {{ scope: \"direct\", \
-             wait_seconds }}. `files` sends what you cannot describe — a plot, a screenshot, a \
-             short log — from paths on the machine you are running on; a picture arrives shown in \
-             the conversation and anything else as a download, after the words. Both Lark and \
-             WeChat carry them, and a file that cannot be read stops the whole send rather than \
-             quietly dropping it. This is a second surface, independent of the talk board: it \
-             posts nothing there and reads nothing from it, so do not use talk_post to reply to a \
-             person — answer them here, on the surface they wrote to.",
+            "Reach the person on their phone, through the chat app they bound to muxloom \
+             (WeChat or Lark): when something they are waiting on is done, when you need a \
+             decision only they can make, or when a long run ends unwatched. One message per \
+             milestone, never a progress log. `title` says what happened; `text` opens with the \
+             conclusion, then the numbers, then exactly what you need from them. Over {text} \
+             characters of text or {title} of title is refused, not trimmed: say where the \
+             detail is instead. Markdown, in short lines and plain lists — Lark renders it, \
+             WeChat renders none of them. muxloom signs it; never include a token, a key or a \
+             home path. The receipt's `message_id` is what a reply quotes, and passing a quoted \
+             id as `reply_to` answers that message. Their reply arrives as a direct message \
+             (talk_read {{ scope: \"direct\" }}). This is independent of the talk board: answer \
+             a person here, not with talk_post.",
             text = crate::channel::READABLE_LIMIT,
             title = crate::channel::TITLE_LIMIT,
         ),
         input_schema: schema(
             false,
             json!({
-                "text": { "type": "string", "description": format!("The message, as markdown. At most {} characters — a longer one is refused, not trimmed.", crate::channel::READABLE_LIMIT) },
-                "title": { "type": "string", "description": format!("A few words saying what this is about, at most {} characters. Shown as the card's title; taken from a leading \"# \" line if you leave it out.", crate::channel::TITLE_LIMIT) },
-                "channel": { "type": "string", "description": "Which bound channel, by id. Defaults to the one marked default, or to the only one there is." },
-                "reply_to": { "type": "string", "description": "Optional platform id of a message this one answers — the message_id from an earlier send_channel_message receipt, or the id a quote-relayed message named. WeChat draws the answer as a quote of that message; other kinds ignore it." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": format!("Absolute paths on the machine you are running on, sent after the words as their own messages. An image ({image}) arrives shown in the conversation; anything else arrives as a download named after the file. Lark and WeChat both carry them, at most {picture} MB for a picture and {other} MB for anything else — a file over the cap or one that cannot be read stops the whole send before the words go out.", image = "png/jpg/gif/bmp/webp/tiff/ico", picture = crate::channel::cap_in_mb(crate::channel::LARK_IMAGE_BYTES), other = crate::channel::cap_in_mb(crate::channel::LARK_FILE_BYTES)) },
+                "text": { "type": "string", "description": format!("Markdown, at most {} characters.", crate::channel::READABLE_LIMIT) },
+                "title": { "type": "string", "description": format!("At most {} characters; taken from a leading \"# \" line if left out.", crate::channel::TITLE_LIMIT) },
+                "channel": { "type": "string", "description": "Bound channel id. Defaults to the default one." },
+                "reply_to": { "type": "string", "description": "The message id this answers: a receipt's message_id, or the id a quoted message named." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": format!("Absolute local paths, sent after the words: pictures shown inline, anything else as a download; at most {picture} MB a picture, {other} MB otherwise. One that cannot be sent stops the whole send.", picture = crate::channel::cap_in_mb(crate::channel::LARK_IMAGE_BYTES), other = crate::channel::cap_in_mb(crate::channel::LARK_FILE_BYTES)) },
             }),
             &["text"],
         ),
@@ -728,20 +571,13 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "launch_session",
         description: format!(
-            "Start a persistent codex, claude, pi, opencode, or terminal session in a working \
-             directory. Use \
-             this for anything long-running or interactive instead of run_shell. `resume_id` \
-             resumes an agent-native conversation, or — when it names one of muxloom's own \
-             session ids — revives that archived session as itself on the same number with its \
-             recorded label and parent, and relaunches the children recorded under it with it; \
-             `initial_prompt` seeds a fresh agent instead. The session survives this process: \
-             pair every launch with a later archive \
-             or delete. A session you start is recorded as yours — it shows in the dashboard \
-             indented under you, and it is part of your task on the talk board — so this is how \
-             you hand work to a subagent rather than losing it in a list of unrelated \
-             sessions. What it may do in its own turn is yours to set: `may_message`, \
-             `may_launch` and `may_reach_person` are each cut down to what you hold yourself, \
-             and stay with the session through an archive and a resume.{}",
+            "Start a persistent codex, claude, pi, opencode or terminal session — for anything \
+             long-running or interactive, instead of run_shell. It is recorded as yours (under \
+             you in the dashboard, on your thread of the board), which is how you hand work to a \
+             subagent; archive or delete it when it is done. `initial_prompt` seeds a fresh \
+             agent; `resume_id` resumes a runtime's own conversation, or revives an archived \
+             muxloom session as itself, children and all. `may_message`, `may_launch` and \
+             `may_reach_person` set what it may do, never more than you hold.{}",
             match flavor {
                 Flavor::Controller => "",
                 // The daemon surface starts subagents of the agent calling it,
@@ -750,11 +586,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 // environment to read the caller out of either, so the path is
                 // asked for and the person is asked to approve.
                 Flavor::Daemon =>
-                    " On this machine your own working directory is the only place you can start \
-                     one: leave `path` out for it, or name somewhere inside it. On another \
-                     machine, name it with `machine` and give an absolute `path` over there — the \
-                     controller runs the launch once the person approves it, and the session comes \
-                     back recorded as yours.",
+                    " Here it starts in your own folder or below it; leave `path` out for your \
+                     own. On another machine, name `machine` and an absolute `path` there: it \
+                     runs once the person approves.",
             }
         ),
         input_schema: schema_across(
@@ -765,42 +599,31 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                     "type": "string",
                     "description": match flavor {
                         Flavor::Controller => "Absolute working directory on the machine.",
-                        Flavor::Daemon => "Absolute working directory: your own folder, or one \
-                                           inside it. Defaults to your own. Required when \
-                                           `machine` names another one, where you have no folder.",
+                        Flavor::Daemon => "Absolute working directory inside your own. Defaults \
+                                           to your own; required on another machine.",
                     },
                 },
-                "label": { "type": "string", "description": "Display name shown in the dashboard." },
-                "resume_id": { "type": "string", "description": "Agent-native session id to \
-                    resume, or a muxloom session id of an archived session: by muxloom id it \
-                    comes back as the same session (same id, label, parent, history) and its \
-                    recorded children come back with it." },
+                "label": { "type": "string", "description": "Name shown in the dashboard." },
+                "resume_id": { "type": "string", "description": "A runtime's conversation id, \
+                    or an archived muxloom session id to revive as itself." },
                 "initial_prompt": { "type": "string", "description": "First prompt for a fresh agent." },
                 "may_message": {
                     "type": "string",
                     "enum": ["parent", "task", "fleet"],
-                    "description": "How far it may speak. \"parent\": back to you and nobody \
-                                    else. \"task\" (the default): everyone on this piece of work \
-                                    — you, its siblings, and whatever any of you start. \
-                                    \"fleet\": any agent on any machine. Give it \"fleet\" when \
-                                    its work is genuinely somebody else's too; leave it at \
-                                    \"task\" for a helper, so half-finished work does not land \
-                                    in front of agents who did not ask for it.",
+                    "description": "Who it may message: \"parent\" only you; \"task\" (default) \
+                                    you, its siblings and what any of you start; \"fleet\" \
+                                    anyone. Keep helpers at task.",
                 },
                 "may_launch": {
                     "type": "array",
                     "items": { "type": "string", "enum": ["codex", "claude", "pi", "opencode", "terminal"] },
-                    "description": "Which runtimes it may start sessions of. Defaults to your \
-                                    own kind, so a team stays one kind of agent. An empty list \
-                                    means it starts none and does the work itself — say that \
-                                    when the work is one job rather than several.",
+                    "description": "Runtimes it may start. Defaults to your own kind; [] means \
+                                    it does the work itself.",
                 },
                 "may_reach_person": {
                     "type": "boolean",
-                    "description": "Whether it may write to the person's chat app with \
-                                    send_channel_message. Defaults to false: the person hears \
-                                    about this work from you, once, rather than from every \
-                                    session working on it.",
+                    "description": "Whether it may use send_channel_message. Default false: the \
+                                    person hears from you.",
                 },
             }),
             match flavor {
@@ -858,12 +681,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "search_history",
-        description: "Full-text search over session terminal histories, live and archived. \
-                      Searches one session when session_id is given — that one is read in \
-                      full, however old it is. Otherwise it searches the machine: every \
-                      running session, plus the sessions written most recently, which is \
-                      where a word said on this machine almost always is. When it stops \
-                      short of the older ones it says so, and how many it passed over."
+        description: "Full-text search over terminal histories, live and archived: one \
+                      session in full when session_id is given, otherwise every running session \
+                      and the most recent others. It says when it stopped short of older ones."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -872,14 +692,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                 "session_id": { "type": "string", "description": "Limit the search to one session." },
                 "deep": {
                     "type": "boolean",
-                    "description": "Read every capture on the machine instead of the recent \
-                                    ones. Do NOT set this by default. A machine that has been \
-                                    running a while holds several gigabytes of terminal \
-                                    capture, and reading all of it takes seconds while every \
-                                    other call to this machine waits. Search normally first; \
-                                    reach for this only when that answer came back short AND \
-                                    you have reason to think the thing you want was said in a \
-                                    session that has been closed for a long time.",
+                    "description": "Read every capture on the machine. Slow, and it holds up \
+                                    the machine's other calls: only when a normal search came \
+                                    back short.",
                 },
             }),
             &["query"],
@@ -887,16 +702,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "search_conversations",
-        description: "Search what the agents actually said, on every machine: the backed-up \
-                      Codex and Claude Code transcripts, live and archived. This is the \
-                      memory of work already done — look here before working something out \
-                      again, and to find who dealt with a thing last time. Each hit names the \
-                      machine, directory, session and message it came from; feed session_id \
-                      and message_index to read_conversation to read around it. Narrow with \
-                      machines, paths, kinds, and since/until (epoch ms, on when the \
-                      conversation started). The corpus is a backup taken every few minutes, \
-                      so the newest turns of a conversation happening right now may not be in \
-                      it yet — read_screen sees those."
+        description: "Search what agents said, on every machine: the backed-up Codex and \
+                      Claude Code transcripts, live and archived — look here before working \
+                      something out again. Each hit names its machine, folder, session and \
+                      message index; read around it with read_conversation. The backup runs \
+                      every few minutes, so the newest turns may only be on screen."
             .into(),
         input_schema: schema(
             false,
@@ -914,17 +724,12 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "read_conversation",
-        description: "Read a stretch of one backed-up conversation, addressed by message \
-                      index. `around_index` centres the window on a search_conversations hit; \
-                      `from_index` reads forward from one; neither starts at the beginning. \
-                      A conversation is far too long to read whole, so this returns at most \
-                      `limit` messages and `max_chars` characters of text and tells you what \
-                      is left: `next_cursor` is where to carry on, has_more_before and \
-                      has_more_after say which way there is more. A conversation held on \
-                      this machine by claude, codex or pi is read off the runtime's own \
-                      transcript as it stands now (`source: transcript`); one held elsewhere, \
-                      or by opencode, comes from the same backup as search_conversations and \
-                      may lag a live session by a few minutes (`source: backup`)."
+        description: "Read a window of one conversation by message index: `around_index` \
+                      centres it on a search_conversations hit, `from_index` reads forward \
+                      (default 0). Returns at most `limit` messages and `max_chars` characters; \
+                      `next_cursor`, has_more_before and has_more_after say what is left. \
+                      `source` is \"transcript\" when read live off this machine's runtime, \
+                      \"backup\" when it may lag by a few minutes."
             .into(),
         input_schema: schema(
             false,
@@ -992,13 +797,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     });
     tools.push(ToolSpec {
         name: "run_shell",
-        description: "Last resort: run a shell script on the machine with `sh -lc` and return its \
-                      output and exit code. Runs with the user's full permissions and with no \
-                      terminal, so it fits only short, non-interactive, ideally read-only \
-                      queries no other tool covers. Long-running or interactive work belongs in \
-                      launch_session; reading files or history belongs in list_files, \
-                      preview_file, and search_history; work another agent could do belongs in a \
-                      message to its session."
+        description: "Last resort: run a script with `sh -lc` on the machine and return its \
+                      output and exit code. Full user permissions, no terminal: only for a short, \
+                      non-interactive, ideally read-only query no other tool covers. \
+                      Long-running work belongs in launch_session, files in preview_file, work \
+                      another agent could do in a message to it."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -1023,16 +826,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             tool.input_schema["properties"][crate::approvals::ASK_VIA] = json!({
                 "type": "string",
                 "enum": ["dashboard", "chat"],
-                "description": "Where to ask the person, when this call names another machine \
-                                and so waits on their approval. \"dashboard\": the request was \
-                                typed to you directly — into your own terminal, or posted by a \
-                                person on the dashboard's board — so they are at the screen, \
-                                the ask comes up there, and their phone stays quiet. \"chat\": \
-                                it reached you in a muxloom envelope saying a person sent it \
-                                from their chat app, so the ask goes to that chat. Leave it out \
-                                when you cannot tell — a subagent hears from the agent that \
-                                started it, not from the person — and both are asked. Nothing \
-                                on this machine waits on approval, so here it is ignored.",
+                "description": "Only when this names another machine: where to ask the person to \
+                                approve. \"dashboard\" if they typed the request to you in \
+                                muxloom, \"chat\" if it reached you from their chat app; leave it \
+                                out if you cannot tell (a subagent cannot) and both are asked.",
             });
         }
     }
@@ -1092,11 +889,9 @@ fn schema_across(flavor: Flavor, properties: Value, required: &[&str]) -> Value 
     if flavor == Flavor::Daemon {
         schema["properties"]["machine"] = json!({
             "type": "string",
-            "description": "Machine id from list_machines. Defaults to this machine; another one \
-                            is reached through the muxloom controller watching this machine, \
-                            which has to be running. Naming another machine on a tool that \
-                            changes something there puts the call to the person first, and it \
-                            runs once they say so.",
+            "description": "Machine id from list_machines. Defaults to this machine; another \
+                            goes through the attached controller, and a change there waits on \
+                            the person.",
         });
     }
     schema

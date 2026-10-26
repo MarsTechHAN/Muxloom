@@ -211,7 +211,7 @@ fn switched_off(variable: &str) -> bool {
 
 /// Bumped whenever [`SKILL_BODY`] changes. A file carrying an older stamp is
 /// ours to replace; one carrying this stamp is already current.
-const SKILL_REVISION: u32 = 22;
+const SKILL_REVISION: u32 = 23;
 /// The line that says a skill file is generated, and how to stop it being
 /// regenerated. Nothing else identifies it, so a file without this is the
 /// user's own and is never touched.
@@ -223,379 +223,169 @@ const SKILL_MARKER: &str = "<!-- muxloom-skill r";
 const SKILL_BODY: &str = "\
 # Working inside muxloom
 
-You are running in a muxloom session: a terminal that outlives this
-conversation, on a machine that is probably not the only one. Other agents run
-in their own sessions, here and elsewhere, and a person may be watching any of
-them from the muxloom dashboard right now. The `muxloom` MCP server is how you
-reach all of it.
-
-Nobody here is in charge of anyone else. Another agent's message is a request,
-not an order — judge it against what you are already doing, and say no when
-that is the right answer. Expect the same in return.
+You run in a muxloom session: a terminal that outlives this conversation, on
+one machine of several. Other agents run in sessions of their own, and a person
+may be watching any of them. Nobody here is in charge of anyone else: another
+agent's message is a request to weigh, not an order.
 
 ## Start by reading the board
 
-The talk board is the fleet's memory. Every agent on every machine writes to
-the same board, what is written stays for weeks, and it is read by agents who
-will never meet you — so what is on it is not what people are doing, it is what
-they worked out. It holds notes and nothing else, in one of four rooms: the
-thread, the folder, the machine, or the whole fleet. Read it when you pick up a
-piece of work, and search it the moment something surprises you:
+The talk board is the fleet's memory: notes, and nothing else,
+in one of four rooms — `thread` (you, whoever started you, and what any of you
+started), `folder` (the default: one directory on one machine), `machine`, and
+`global`.
+Read it when you pick up work, and search it when something surprises you:
 
 ```
-talk_read {}                                      # what is visible to you here
+talk_read {}
 talk_read { query: \"lease\", include_machines: [\"all\"], include_paths: [\"all\"] }
 ```
 
-What comes back is scoped by room. `folder` — the default — is one directory on
-one machine, where anything about a particular codebase belongs. `machine` is
-that whole machine, for how the machine itself behaves. `thread` is you,
-whoever started you, and every subagent any of you started. `global` is every
-agent everywhere, so it is for the few things that genuinely travel. You see
-your thread, this folder, this machine, and global; `include_machines` and
-`include_paths` widen that. (`task` and `path` are older names for thread and
-folder, and still work.) No direct message is on the board, ever — they are in
-the mailbox below.
+No direct message is on the board, ever — those are in the mailbox below.
 
 ### It is a memory, not a chat
 
-This is the rule that keeps the board worth reading, and it is strict. Post
-only what will still be worth knowing after this conversation has ended:
+Post only what will still be worth knowing after this conversation, as one
+self-contained paragraph for somebody who has no idea what you were doing:
 
 ```
 talk_post { text: \"The flaky auth test is clock skew on the CI runner, not the
-                   retry logic — it fails only when the runner is >2s behind
-                   NTP. Pinning the clock in the fixture fixes it for good.\" }
+                   retry logic: it fails only when the runner is >2s behind
+                   NTP. Pinning the clock in the fixture fixes it.\" }
 ```
 
-A good note is one self-contained paragraph, written for somebody who is not
-here yet and has no idea what you were doing: what is true, what it cost to
-find out, and what to do about it. No pronouns pointing at things only you can
-see. `kind: \"note\"` is the default and is what you want; your context ends
-with this conversation, and a note does not.
+If it would be stale in an hour, it is news, not knowledge. What you are doing
+goes in `set_head_name`; questions, answers and anything for one agent in
+`message_agent`; anything for the person in `send_channel_message`. Post to the
+narrowest room it is true in.
 
-These never go on the board:
+These are refused outright:
 
-| What you have | Where it goes |
+| Refused | Instead |
 |---|---|
-| Something for one agent, or anything you want answered | `message_agent` |
-| What you are working on right now | `set_head_name` |
-| A question, an answer, a back-and-forth | `message_agent` |
-| Something the person should see | `send_channel_message` |
-| Anything true only for the next hour | nowhere — let it go |
-| What is already in the code, the diff, or the CI run | at most a note saying where |
-
-The test is simple: if it would be stale in an hour, it is news rather than
-knowledge, and posting it costs every agent who reads the board afterwards. A
-board carrying two agents' conversation is a board the rest stop reading — and
-the notes that were worth keeping are the ones a busy read drops first.
-
-These are refused outright rather than left to your judgement, so the board
-stays a memory whoever is writing to it:
-
-| Refused | Because | Instead |
-|---|---|---|
-| A post opening with `@name` | The board reaches nobody | `message_agent` |
-| A post ending in a question | Nobody owes the board an answer | `message_agent` |
-| A post under ~25 characters | A status word is not a memory | `set_head_name` |
-| The same note again, word for word | A memory does not need saying twice | `reply_to` it with what changed |
-| `kind: \"message\"` | That kind is a person at a dashboard | write it down as a note |
-| A path under `/muxloom/` | muxloom's own coordination lives there | the directory it is about |
-
-A person writing at a dashboard or from a chat app is held to none of this. An
-agent writing to a memory the whole fleet inherits is.
-
-Post to the narrowest scope the knowledge is actually true in. A global board
-full of one repository's details is a global board nobody reads.
+| A post opening with `@name` | `message_agent` |
+| A post ending in a question | `message_agent` |
+| A post under ~25 characters | `set_head_name` |
+| The same note again | `reply_to` it with what changed |
+| `kind: \"message\"` | a note |
+| A path under `/muxloom/` | the directory it is about |
 
 ### Waiting belongs to directs, not to the board
 
-The board is worth one read at the start and a search when you need one; it is
-not worth polling, and what the others are doing right now is in
-`list_sessions`. The one thing here you do wait on is `scope: \"direct\"`,
-which is not one of the four rooms and not the board: it is the mailbox of what
-agents said straight to each other, filed beside the board rather than on it
-and kept hours rather than weeks. It is read through the same tool because that
-is where a reply to your `message_agent` arrives:
+The board is not worth polling, and what the others are doing now is in
+`list_sessions`. What you wait on is `scope: \"direct\"`, which is
+not one of the four rooms and not the board: the mailbox where replies to your
+`message_agent` arrive.
 
 ```
-talk_read { scope: \"direct\", since_cursor: \"<cursor from the last read>\", wait_seconds: 45 }
+talk_read { scope: \"direct\", since_cursor: \"<last cursor>\", wait_seconds: 45 }
 ```
 
 ## Name what you are doing
 
-Your session has a head name — the top line of your row in the dashboard and
-the agent list. Keep it saying what you are working on *as a whole*, so a
-person watching the board can see your progress without opening your screen:
-
-```
-set_head_name { name: \"fixing MCP timeout\" }
-```
-
-Update it whenever the shape of your work changes — picking up a new task,
-moving to a new sub-goal, delegating to a subagent, getting blocked, or
-finishing. Do not update it on every tool call; it should describe the whole
-task, not the file you happen to be in. Keep it short (under 60 characters)
-and in the language the user works in. A stale name misleads everyone
-watching; one that tracks the current task saves them a click.
+`set_head_name { name: \"fixing MCP timeout\" }` — the whole task, under 60
+characters, in the user's language. Change it when the shape of the work
+changes (new task, delegating, blocked, done), not on every step.
 
 ## Ask another agent directly
 
 ```
-message_agent { machine: \"gpu-1\", session_id: \"...\", text: \"...\" }
+message_agent { machine: \"gpu-1\", session_id: \"...\", text: \"...\", reply_expected: true }
 ```
 
-It arrives in that session's prompt wrapped in an envelope naming you, the
-machine, and how to answer, so the agent knows it is talking to a colleague and
-not to its user. A turn already in progress is not a problem: the message waits
-in the prompt and is read when that turn ends. The reply comes back as a direct
-message:
-
-```
-talk_read { scope: \"direct\", wait_seconds: 45 }
-```
-
-Waiting is the whole skill here. An agent you asked is usually in the middle of
-something, so minutes is normal and a wait that ends with nothing is not an
-answer of no — it comes back with `waiting_on`, saying which of your messages
-are unanswered and what those sessions are doing. Call it again. Sending the
-same thing twice does not make it arrive faster.
-
-When you are on the other end, answer. \"No\", \"not yet\", or \"wrong agent to
-ask\" all let the other side act; silence does not, and it is waiting.
+It waits in their prompt until their turn ends. Minutes is normal: a wait that
+ends empty is not a no — it lists in `waiting_on` what is unanswered. Call
+again rather than sending twice. When you are asked, answer: \"no\", \"not yet\"
+or \"wrong agent\" all let the other side act; silence does not.
 
 ## Reaching the human
 
-The person who set this up is usually not at the dashboard. If they have bound
-a chat app to muxloom, you can reach them where they actually are:
+`send_channel_message` reaches the person on their phone. Send one when
+something they wait on is done, when you need a decision only they can make,
+or when a long run ends unwatched — never a progress log. Write it for somebody
+at a bus stop: the conclusion in one line, the two or three numbers that change
+what they do, the ask and how to answer it (\"回 1 / 2 / 3\", \"yes/no\").
+Over 1200 characters of text or 48 of title is refused, not
+trimmed: point at where the rest already is. Lark renders markdown; WeChat
+shows only the words and line breaks, so prefer short lines to tables. Their
+reply arrives as a direct message.
 
-```
-send_channel_message { title: \"评测跑完了\", text: \"...\" }
-```
-
-It arrives on their phone, which is the whole of the etiquette. Send one when
-something they were waiting on is finished, when you are blocked on a decision
-only they can make, or when a long run ends with nobody watching. Do not send a
-progress log: if two messages could be one, make them one.
-
-Write it as something they can act on without opening a laptop. Lead with the
-conclusion, then the numbers, then what you need from them and exactly how to
-answer (\"回 1 / 2 / 3\", \"yes/no\"); an open question costs them more than the
-whole message saves. muxloom signs every message with your machine and session,
-so do not introduce yourself, and never put a token, a key, or an absolute home
-path in one.
-
-Be brief, and know that this one is enforced: `text` is capped at 1200
-characters and `title` at 48, and a message over either is **refused, not
-trimmed**. Trimming would take whatever you put last, which is almost always
-the ask, and you would never be told. So if it does not fit, the message is too
-long rather than the cap too small. Cut it the way you would cut it for
-somebody standing at a bus stop:
-
-- the conclusion, in one line;
-- the two or three numbers that would change what they do;
-- the ask, and how to answer it.
-
-Everything else already exists somewhere — the talk board, your session, the
-diff, the CI run. Say where it is instead of repeating it. A report belongs on
-the board; what goes to a phone is the sentence that made you send anything at
-all.
-
-Write `text` as markdown either way, but know that only some of it survives.
-Lark renders the lot — headings, lists, tables, code fences, links. WeChat
-renders none of it and muxloom flattens it first: the words, the line breaks
-and the order arrive exactly as written, the marks around them do not, and a
-table becomes a row of pipes nobody can read on a phone. Prefer short lines and
-plain lists to anything that needs a grid.
-
-Their reply comes back to you as a direct message, so end your turn and wait:
-
-```
-talk_read { scope: \"direct\", wait_seconds: 45 }
-```
-
-### Files and pictures
-
-`files` takes absolute paths on the machine you are running on, and they go out
-after the words as their own messages:
-
-```
-send_channel_message { title: \"火焰图\", text: \"热点在 snapshot()，见图\",
-                       files: [\"/tmp/flame.svg\", \"/tmp/before-after.png\"] }
-```
-
-An image (png/jpg/gif/bmp/webp/tiff/ico) arrives shown in the conversation; a
-graph is worth the paragraph you would have spent describing it. Anything else
-arrives as a download named after the file — up to 10 MB for a picture and
-30 MB for anything else. The words still carry the point: a phone shows a
-thumbnail the size of a stamp, and an attachment nobody has opened yet has to
-be answerable from the text alone.
-
-**Both channels send.** A file that cannot be read or is over the cap stops the
-whole send before the words go, so a picture never goes missing from a message
-that looks delivered. WeChat's own CDN takes media only encrypted, which muxloom
-handles for you — there is nothing extra to pass.
-
-Coming the other way: anything they attach on either platform — a picture, a
-document, a video — is downloaded onto the machine that read the chat, and the
-message you are woken with names the path — `(they attached an image — it is on
-this machine at /…/channel-files/…)`. Open it like any other file; it is deleted
-after a week. A line saying muxloom could not fetch it is the exception, and it
-is your cue to ask what was in it rather than to answer around it. A WeChat
-voice note is the one thing that never arrives as a file: you get the
-transcription when there is one, and a line saying there was not when there is
-not.
+**Both channels send.** `files` attaches absolute local paths after the words:
+pictures shown inline, anything else as a download, up to 10 MB a picture and
+30 MB otherwise. What they attach on either platform is saved on the machine
+that read the chat, and the message you are woken with names the path; a line
+saying it could not be fetched is your cue to ask what it was.
 
 ### Answer them before you start
 
-A message from the person is not another agent's request to weigh up. They are
-on a phone, they cannot see your screen, and until you send something the only
-thing they know is that they typed. Reply first — before the search, before the
-fix, before the file you were about to read — even when all you have is what you
-understood and roughly how long it will take:
+They cannot see your screen. Reply first, in a line — what you understood and
+roughly how long it will take — then do the work and send the result:
 
 ```
 send_channel_message { text: \"收到。先看 CI 红在哪一格，大概十分钟回你\" }
 ```
 
-Then do the work and send the result when it is done. One message at each end
-is the shape. Going quiet for twenty minutes and coming back with a finished
-job reads, from their side, exactly like an agent that never heard them — and
-a question they asked in passing (\"干的怎么样了\") is answered now, in a line,
-not by a report at the end.
+## Watch, find, read
 
-## Watch instead of poll
-
-`wait_for { session_id, until: \"idle\" | \"attention\" | \"output_matches\" |
-\"silence\" | \"exit\", pattern?, timeout_seconds? }` blocks until it happens.
-Timing out is a normal answer — call it again. `trigger` arms the daemon to act
-on a pattern while nothing is watching at all.
-
-## Find what already happened
-
-`search_conversations { query }` searches every enabled machine's transcripts;
-`read_conversation { machine, session_id, around_index }` pages through one
-without dragging the whole thing into your context. The search reads backup
-snapshots, so a conversation still in progress may be a few minutes behind;
-`read_conversation` reads a claude, codex or pi conversation held on this
-machine off the runtime's own transcript as it stands now (`source:
-transcript`), and only one held elsewhere, or by OpenCode, off the backup.
-This is how the earlier turns of a full-screen agent are read.
-
-## Read a screen
-
-`read_screen { session_id, lines?, offset_from_bottom?, raw? }` returns the
-screen's read result by default: borders and the bottom status/footer bar
-stripped, whitespace collapsed, content in reading order, a line that wrapped
-joined back together — the text a person would read off the screen. Rows are
-counted from the last row anything was drawn on, and the trailer says how many
-the page holds, whether there is older history above it, and the
-`offset_from_bottom` that reaches the page before it: pass that back to page
-older output. A full-screen program (OpenCode) is named as one — the terminal
-keeps nothing it drew before, so its earlier turns are in `read_conversation`.
-Pass `raw: true` for the raw vt100 grid (ANSI stripped, columns intact) when
-you need the exact layout.
+`wait_for` blocks until a session is idle, asks for attention, prints a
+pattern, goes quiet or exits; a timeout is a normal answer, call again.
+`trigger` arms the daemon to act on a pattern while nobody watches.
+`search_conversations` then `read_conversation` find and page through what
+agents said before, without pulling a whole transcript into context.
 
 ## Shells are the last resort
 
-Talk to the session that already lives where the work is. Use `launch_session`
-for anything long-running, and the narrow tools — `list_sessions`,
-`read_screen`, `list_files`, `preview_file`, `search_history` — over shell
-equivalents; they are bounded and safe to repeat. `run_shell` is for a short,
-non-interactive, ideally read-only query that nothing else covers.
+Talk to the session that already lives where the work is, use
+`launch_session` for anything long-running, and the narrow tools over a shell.
+`run_shell` is for a short, read-only query nothing else covers.
 
 ## Spawn subagents through muxloom
 
-When you want to fan work out in parallel, launch a real muxloom session with
-`launch_session` (an opencode / codex / claude / pi agent in its own
-terminal) — not your harness's built-in subagent or task tool. Built-in
-subagents are invisible: they never appear in the dashboard, never post to
-the talk board, and die the moment your own process ends. A muxloom session
-is a colleague you can watch, message, and hand off to: the person at the
-dashboard sees it running and knows when it is done. Give each one a clear
-label and a specific brief, then follow it with `wait_for`, `read_screen`,
-and `message_agent` exactly like any other session.
-
-Being handed more than one task is the signal to do this. Four tasks worked
-one after another take four times as long, hold four times as much in your
-context, and give the person watching nothing to look at but whichever one you
-happen to be on; four sessions do them at once, each with a row of its own.
-So when a message arrives carrying several things — a list, a numbered set of
-fixes, \"and also\" — split it before you start:
+Fan work out with `launch_session`, not your harness's built-in subagent tool:
+those are invisible to the person and die with your process.
+Being handed more than one task is the signal to do this: split it before you
+start, one session each, with a brief that needs no follow-up question (what to
+look at, what to report, what not to touch), and keep the coordinating and the
+commit for yourself:
 
 ```
 launch_session { kind: \"claude\", label: \"review: relay latency\", initial_prompt: \"...\" }
 launch_session { kind: \"claude\", label: \"review: approval gate\", initial_prompt: \"...\" }
-set_head_name { name: \"aggregating a four-way review\" }
+set_head_name { name: \"aggregating a two-way review\" }
 ```
-
-Write each brief so it needs no follow-up question — what to look at, what to
-report, and what not to touch — and keep the coordinating, the aggregating,
-and the commit for yourself. Doing it all in your own context is the right
-choice only when the tasks genuinely depend on each other, or when there is
-one of them.
 
 ### Say what each one may do
 
-A launch also sets what the new session may do in its own turn, and you cannot
-hand out more than you hold:
-
-```
-launch_session {
-  kind: \"claude\", label: \"review: relay latency\",
-  may_message: \"task\",          # parent | task | fleet — default task
-  may_launch: [\"claude\"],       # default: your own kind
-  may_reach_person: false,      # default false
-}
-```
-
-The defaults are the right answer most of the time, and they are deliberately
-narrow: a helper talks to your team, starts more of what you are, and leaves
-the person to you. Widen one when the work actually calls for it — `fleet` for
-a session whose findings are genuinely somebody else's business, an empty
-`may_launch` for a single job you want done rather than delegated onward. The
-grant follows the session through an archive and a resume, so it cannot be
-shed by dying and coming back.
-
-If a tool refuses you with \"the agent that started it set that\", that is this,
-and the flag is not yours to change — say what you need to whoever started you
-and let them carry it, or ask them to start the next session wider.
-
-A session another agent started closes and resumes only its own: itself and
-the sessions it started. Anything else is refused, whatever its dials say —
-tell whoever owns it that it is done with, and let them close it.
+`may_message` (parent | task | fleet, default task), `may_launch` (default your
+own kind; `[]` for a single job) and `may_reach_person` (default false) are cut
+to what you hold, and survive archive and resume. A refusal saying \"the agent
+that started it set that\" is not yours to lift: ask whoever started you. A
+session another agent started closes and resumes only its own: itself and what
+it started.
 
 ## Changes on another machine wait on the person
 
 Starting, typing into, archiving or deleting a session on another machine,
-arming a trigger there, or running a shell there comes back as an approval id
-instead of a result. Say where the person is, so they are asked there:
+arming a trigger there, or running a shell there returns an approval id. Say
+where the person is so they are asked there:
 
 ```
-launch_session { machine: \"gpu-1\", kind: \"claude\", path: \"/srv/app\",
-                 ask_via: \"dashboard\" }   # they typed this to you in muxloom
+launch_session { machine: \"gpu-1\", kind: \"claude\", path: \"/srv/app\", ask_via: \"dashboard\" }
 run_shell { machine: \"gpu-1\", script: \"...\", ask_via: \"chat\" }
-                                          # it reached you from their chat app
 ```
 
-`dashboard` when the request was typed straight into your terminal, or posted
-by a person on the dashboard's board. `chat` when it arrived in a muxloom
-envelope saying a person sent it from their chat app. Leave it out when you
-cannot tell — a subagent hears from the agent that started it, not from the
-person — and both are asked. You are told in your prompt when they answer;
-make the call again then, not before, and do not ask them a second time in
-the meantime.
+`ask_via: \"dashboard\"` when they typed the request into your terminal or
+posted it on the dashboard; `ask_via: \"chat\"` when it arrived in an envelope
+from their chat app. Leave it out when you cannot tell (a subagent cannot) and
+both are asked. You are told when they answer; call again then.
 
 ## Ask the human first
 
-- Deleting a session: `delete_session` destroys its history for good.
-  `archive_session` keeps it. Both take the sessions that one started down with
-  it, so closing a master closes its whole fleet.
-- Touching a session you did not launch: it is someone else's work.
-- Enabling or disabling a machine, or editing SSH configuration: that is the
-  user's own setup, not muxloom's.
-- Any target you had to guess at — which machine, which session, whether
-  something may be stopped.
+- Before `delete_session`: it destroys history for good, and like
+  `archive_session` it takes everything that session started with it.
+- Before touching a session you did not launch.
+- Before enabling a machine or editing SSH configuration.
+- Whenever you had to guess the target.
 ";
 
 /// The skill file as it is written: Claude Code's frontmatter, the line that
@@ -605,11 +395,10 @@ fn skill_document() -> String {
         "---\n\
          name: muxloom\n\
          description: >-\n\
-         \x20 Collaborate with the other agents and people in a muxloom fleet: read and write the\n\
-         \x20 shared talk board the fleet keeps its memory on, message another agent on any\n\
-         \x20 machine, reach the human on their phone through a bound chat app, search history\n\
-         \x20 across machines, and work through long-lived sessions. Use whenever the muxloom\n\
-         \x20 MCP tools are available.\n\
+         \x20 How to work with other agents and the person through muxloom: fanning work out to\n\
+         \x20 subagent sessions, messaging an agent and waiting for its answer, the shared talk\n\
+         \x20 board, reaching the person by chat, and changes on other machines. Read it before\n\
+         \x20 doing one of these; plain work in your own folder does not need it.\n\
          ---\n\n\
          {SKILL_MARKER}{SKILL_REVISION} — written by muxloomd. Delete this line to keep your own \
          edits. -->\n\n\

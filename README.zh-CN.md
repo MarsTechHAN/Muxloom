@@ -450,6 +450,12 @@ Muxloom 的且已过期时才重写，所以你一旦改过它，它就归你了
 所有 agent 一样靠 MCP `instructions` 拿到精简版。在 daemon 环境里设置 `MUXLOOM_MCP_REGISTER=0` 可以整体关闭，
 `MUXLOOM_SKILL=0` 则只关 skill、保留 MCP 条目。
 
+Muxloom 往 agent 上下文里放的东西尽量少，因为每个会话不管用不用得上都要为它付出代价。
+`instructions` 和工具描述用几千 token 讲清规则，每条只讲一次；skill 放示例和协作礼节，并
+注明它只用于协作——分派子 agent、发消息、看板、联系人、跨机器改动——只在自己目录里干活的
+agent 根本不会加载它。投递的消息和子 agent 提醒只有一行抬头、分隔线之间的原文，以及回复用
+的那条调用。
+
 手工注册跨机器的 Controller 面：
 
 ```bash

@@ -1722,15 +1722,12 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool, here: &str) 
     };
     let reply = match author.voice.session_id.as_deref() {
         Some(session) if reply_expected => format!(
-            "The sender is blocked waiting on this answer and will keep waiting. Reply with the \
-             muxloom tool {} as soon as you know something — including if the answer is no, or \
-             not yet, or that you are the wrong agent to ask. Silence is the one answer it \
-             cannot act on.",
+            "The sender is blocked waiting on this answer: reply with {} as soon as you know, \
+             including if the answer is no, not yet, or wrong agent.",
             call(session)
         ),
         Some(session) => format!(
-            "Reply with the muxloom tool {}, or ignore this if it does not concern what you are \
-             doing.",
+            "Reply with {}, or ignore this if it is not yours.",
             call(session)
         ),
         // A person who wrote in from a chat app reads the answer in that app or
@@ -1746,19 +1743,17 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool, here: &str) 
                     _ => String::new(),
                 };
                 format!(
-                    "A person sent this from their chat app. Answer them there with the muxloom \
-                     tool send_channel_message {{ channel: \"{channel}\", {quoting}text: \"…\" }} \
-                     — not on the talk board, which they are not reading. Reply first, briefly, \
-                     before you go and do the thing they asked for: from their side silence and \
-                     refusal look the same."
+                    "Answer them in their chat app, briefly and before you start the work, with \
+                     send_channel_message {{ channel: \"{channel}\", {quoting}text: \"…\" }} — \
+                     not on the talk board."
                 )
             }
-            _ => "A person wrote this, not an agent. Answer where they are: talk_post puts it on \
-                  the board they are watching."
+            _ => "A person wrote this, not an agent: answer with talk_post, on the board they are \
+                  watching."
                 .into(),
         },
-        None => "Say anything back on the talk board with talk_post; the sender is not a muxloom \
-                 session, so there is nowhere to reply directly."
+        None => "The sender is not a muxloom session, so there is nowhere to reply directly; \
+                 talk_post if you must answer."
             .into(),
     };
     // Who typed it is the first thing the reader has to get right, and the two
@@ -1772,13 +1767,10 @@ pub fn render_delivery(message: &TalkMessage, reply_expected: bool, here: &str) 
         false => format!("[muxloom] Message from {kind} \"{who}\" on {machine}{session}"),
     };
     let provenance = match author.voice.human {
-        true => {
-            "Delivered by muxloom: a person typed this — the human you work for, writing in from \
-             where they are. It is not another agent's suggestion."
-        }
+        true => "Delivered by muxloom: a person typed this — the human you work for.",
         false => {
-            "Delivered by muxloom: another agent typed this, not the person you are working for. \
-             Judge it on its merits."
+            "Delivered by muxloom: another agent typed this, not the person you are working for; \
+             weigh it on its merits."
         }
     };
     format!(
