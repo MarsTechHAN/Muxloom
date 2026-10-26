@@ -472,9 +472,10 @@ command = "muxloom"
 args = ["mcp"]
 ```
 
-Agent 驱动 Agent 的典型流程：`list_sessions`（或 `launch_session`）→ `send_input` 带
-`submit: true` 提交 Prompt → 轮询 `list_sessions` 等 `working` 结束（`needs_attention`
-会带上命中的审批提示）→ `read_screen` 读取结果。屏幕以纯文本返回：颜色、光标移动和标题
+Agent 驱动 Agent 的典型流程：`list_sessions`（自己那一行标着 `you`，`used_at` 是上次交给它
+工作的时间）或 `launch_session` → `message_agent` 交代工作（shell 用 `send_input` 带
+`submit: true`）→ `wait_for { until: "idle" }`，它会先等刚要求的那个回合开始再作答 →
+`read_screen` 读取结果；`needs_attention` 会带上它停下来等的审批。屏幕以纯文本返回：颜色、光标移动和标题
 序列被剥掉，而转义序列跳到的列会补成空格，因此菜单读起来仍然是菜单。
 
 通过 MCP 启动的会话就是普通托管会话：会出现在 Dashboard 中、在 MCP 客户端退出后继续运

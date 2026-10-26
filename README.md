@@ -794,10 +794,12 @@ command = "muxloom"
 args = ["mcp"]
 ```
 
-Typical loop for an agent driving another agent: `list_sessions` (or
-`launch_session`), `send_input` with `submit: true` to hand it a prompt, then
-poll `list_sessions` until `working` clears — `needs_attention` carries the
-matched approval prompt — and `read_screen` to read the outcome. Screens come
+Typical loop for an agent driving another agent: `list_sessions` (your own row
+says `you`, and `used_at` says when each was last given work) or
+`launch_session`, `message_agent` to hand it the work (`send_input` with
+`submit: true` for a shell), `wait_for { until: "idle" }` — which waits for the
+turn it just asked for to start before it answers — and `read_screen` to read
+the outcome; `needs_attention` carries the approval it stopped on. Screens come
 back as plain text: colors, cursor moves, and title sequences are stripped,
 while the column an escape sequence skipped to is preserved as spaces, so a
 menu still reads as a menu.

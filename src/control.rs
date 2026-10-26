@@ -342,8 +342,9 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "list_sessions",
         description: "List sessions with fresh status: kind, folder, label, working, \
-                      needs_attention with its reason, a recap line, and the parent that \
-                      started it. A terminal has no recap; read it with read_screen."
+                      needs_attention with its reason, a recap line, the parent that started it, \
+                      and when it was last used. Your own row says `you`. A terminal has no \
+                      recap; read it with read_screen."
             .into(),
         input_schema: schema_across(
             flavor,
@@ -2603,7 +2604,21 @@ fn session_json(machine: &str, session: &crate::daemon_protocol::DaemonSession) 
         "recap": session.recap,
         // The agent that started this one; null when a person did.
         "parent": session.parent,
+        // When something was last submitted to it, in epoch seconds: what
+        // tells a session in use from one left standing.
+        "used_at": session.used_at,
     })
+}
+
+/// A session as list_sessions lists it: its record, and on the caller's own
+/// row `you`, so an agent tells itself from the others without having to know
+/// its own id — and does not message itself, or wait on itself.
+fn listed_session_json(machine: &str, session: &DaemonSession, caller: Option<&str>) -> Value {
+    let mut listed = session_json(machine, session);
+    if machine == crate::model::LOCAL_TARGET_ID && caller == Some(session.id.as_str()) {
+        listed["you"] = json!(true);
+    }
+    listed
 }
 
 /// What `read_screen` answers with: the page as text, and a trailer saying
@@ -3247,6 +3262,7 @@ impl ControllerControl {
 
     fn list_sessions(&self, arguments: &Value) -> Result<String> {
         let include_archived = optional_bool(arguments, "include_archived");
+        let caller = crate::permissions::launching_session();
         let mut rendered = Vec::new();
         for target in self.targets(arguments)? {
             // Nobody asked for the archive: don't make the machine send it.
@@ -3266,7 +3282,7 @@ impl ControllerControl {
                     sessions
                         .iter()
                         .filter(|session| include_archived || !session.archived)
-                        .map(|session| session_json(&target.id, session)),
+                        .map(|session| listed_session_json(&target.id, session, caller.as_deref())),
                 ),
                 Err(error) => rendered.push(json!({
                     "machine": crate::model::machine_read_as(&target.id),
@@ -4083,9 +4099,9 @@ mod daemon_surface {
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
         WAIT_SCREEN_LINES, allowed_specs, build_input, delivery_json, direct_draft, enforce_policy,
         explain_unknown_session, fleet_already_back, fleet_outcome_json, fleet_resume_caption,
-        fleet_resume_plan, fleet_resume_target, instructions, message_author, native_resume_id,
-        optional_bool, optional_str, optional_usize, plain_screen, preview_text, required_str,
-        screen_page, send_channel, session_json, session_kind, session_name_now, shell_report,
+        fleet_resume_plan, fleet_resume_target, instructions, listed_session_json, message_author,
+        native_resume_id, optional_bool, optional_str, optional_usize, plain_screen, preview_text,
+        required_str, screen_page, send_channel, session_kind, session_name_now, shell_report,
         synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait, tool_json,
         trigger_json, trigger_spec, wait_loop, waited_session,
     };
@@ -5108,10 +5124,13 @@ mod daemon_surface {
                         true => self.sessions()?,
                         false => self.live_sessions()?,
                     };
+                    let caller = crate::permissions::launching_session();
                     let rendered: Vec<Value> = sessions
                         .iter()
                         .filter(|session| include_archived || !session.archived)
-                        .map(|session| session_json(LOCAL_TARGET_ID, session))
+                        .map(|session| {
+                            listed_session_json(LOCAL_TARGET_ID, session, caller.as_deref())
+                        })
                         .collect();
                     Ok(tool_json(&Value::Array(rendered)))
                 }
@@ -5376,6 +5395,24 @@ mod tests {
             || panic!("explained an explained error"),
         );
         assert_eq!(again.to_string(), explained);
+    }
+
+    #[test]
+    fn a_listing_marks_the_callers_own_row_and_says_when_each_was_used() {
+        let mut me = probe_session("muxloomd-claude-me", true, false);
+        me.used_at = Some(1_793_000_000);
+        let other = probe_session("muxloomd-claude-other", false, false);
+        let local = crate::model::LOCAL_TARGET_ID;
+        let mine = listed_session_json(local, &me, Some("muxloomd-claude-me"));
+        assert_eq!(mine["you"], json!(true), "{mine}");
+        assert_eq!(mine["used_at"], json!(1_793_000_000), "{mine}");
+        let theirs = listed_session_json(local, &other, Some("muxloomd-claude-me"));
+        assert!(theirs.get("you").is_none(), "{theirs}");
+        // The same id on another machine is somebody else.
+        let far = listed_session_json("gpu-1", &me, Some("muxloomd-claude-me"));
+        assert!(far.get("you").is_none(), "{far}");
+        // Outside a session nobody is `you`.
+        assert!(listed_session_json(local, &me, None).get("you").is_none());
     }
 
     /// Every row and note an answer carries stays in the reader's context, so
