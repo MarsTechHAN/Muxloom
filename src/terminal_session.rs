@@ -1364,6 +1364,17 @@ impl Drop for TerminalSession {
 }
 
 fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+    // Alt travels the way a terminal sends Meta, as an ESC in front, on every
+    // key that has no modified form of its own. However the dashboard's own
+    // terminal sends Alt+Backspace - as ESC DEL, or as a key report with Alt
+    // in it - it arrives here as Backspace with Alt held, and sending only the
+    // DEL deleted a character where a shell, Claude Code and Codex all delete
+    // a word.
+    let meta: &[u8] = if key.modifiers.contains(KeyModifiers::ALT) {
+        b"\x1b"
+    } else {
+        b""
+    };
     if let KeyCode::Char(character) = key.code {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let lower = character.to_ascii_lowercase();
@@ -1382,19 +1393,24 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
                 '?' | '8' => 127,
                 _ => return None,
             };
-            return Some(vec![byte]);
-        }
-        let mut bytes = Vec::new();
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            bytes.push(0x1b);
+            return Some([meta, &[byte]].concat());
         }
         let mut encoded = [0; 4];
-        bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-        return Some(bytes);
+        return Some([meta, character.encode_utf8(&mut encoded).as_bytes()].concat());
     }
 
     let modifiers = xterm_modifier(key.modifiers);
     let sequence = match key.code {
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Tab
+            if key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let base = match key.code {
+                KeyCode::Esc => "\x1b",
+                KeyCode::Backspace => "\x7f",
+                _ => "\t",
+            };
+            format!("\x1b{base}")
+        }
         KeyCode::Enter
             if key
                 .modifiers
@@ -2446,6 +2462,34 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), false),
             Some(b"\x1b[1;5A".to_vec())
         );
+    }
+
+    #[test]
+    fn alt_reaches_keys_that_have_no_modified_form_of_their_own() {
+        let alt = |code| encode_key(KeyEvent::new(code, KeyModifiers::ALT), false);
+        assert_eq!(
+            alt(KeyCode::Backspace),
+            Some(b"\x1b\x7f".to_vec()),
+            "Alt+Backspace deletes the word before the cursor, not one character"
+        );
+        assert_eq!(alt(KeyCode::Esc), Some(b"\x1b\x1b".to_vec()));
+        assert_eq!(alt(KeyCode::Tab), Some(b"\x1b\t".to_vec()));
+        assert_eq!(
+            encode_key(
+                KeyEvent::new(
+                    KeyCode::Char('b'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
+                false
+            ),
+            Some(b"\x1b\x02".to_vec()),
+            "Ctrl+Alt keeps both halves"
+        );
+        // Unmodified, every one of them is what it always was.
+        let plain = |code| encode_key(KeyEvent::new(code, KeyModifiers::NONE), false);
+        assert_eq!(plain(KeyCode::Backspace), Some(b"\x7f".to_vec()));
+        assert_eq!(plain(KeyCode::Esc), Some(b"\x1b".to_vec()));
+        assert_eq!(plain(KeyCode::Tab), Some(b"\t".to_vec()));
     }
 
     #[test]
