@@ -34,6 +34,12 @@
 //!
 //! The approval is the one question nothing here can answer, because only the
 //! person can; the controller that runs the errand asks it (see `relay`).
+//!
+//! A moderator is not an exception to any of this. It is a session a person
+//! started in a folder muxloom owns, and it holds everything because a person
+//! started it, not because of where it lives: a session another agent puts in
+//! that folder keeps the limits it was launched with, and is not handed the
+//! fleet-wide surface at all (see `mcp_register::handover_to_controller`).
 
 use std::env;
 

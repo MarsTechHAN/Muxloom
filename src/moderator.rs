@@ -9,11 +9,15 @@
 //! Living here is also what decides which surface it is handed. Every agent on
 //! a machine shares one `muxloom` MCP entry and that entry points at the local
 //! daemon, whose tools are about this machine and about talking to the agents
-//! on the others. A session started in one of these folders is handed on to the
-//! `muxloom` beside the daemon instead (see
+//! on the others. A session a person started in one of these folders is handed
+//! on to the `muxloom` beside the daemon instead (see
 //! [`crate::mcp_register::handover_to_controller`]), and that one addresses
 //! every enabled machine directly: it can start a session in any folder on any
-//! of them, and it reads the backup store the search tools answer from.
+//! of them, and it reads the backup store the search tools answer from. A
+//! session another agent started there is not: it keeps the daemon's surface
+//! and the limits it was launched with, because a moderator is something a
+//! person makes in the dashboard's form, not something an agent can mint by
+//! choosing where to put a child.
 //!
 //! Which machines and which agents a particular moderator was asked to look
 //! after is still a briefing, not a sandbox: the surface it holds will answer

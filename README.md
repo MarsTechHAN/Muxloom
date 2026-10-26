@@ -1027,6 +1027,14 @@ Moderators are listed under their own row rather than under this machine, and a
 moderator's folder never becomes this machine's default launch directory. Stop
 one the way you stop any agent, with `x`.
 
+A moderator is something you make, in that form. Its fleet-wide surface is
+handed to sessions you started in a moderator's folder and to no others: a
+session another agent puts there keeps the daemon's surface and the limits it
+was launched with, so a subagent cannot get past its own limits, or past the
+approval a cross-machine write needs, by choosing where its child lives. A
+moderator acts on other machines directly and asks nobody's approval, because it
+is yours.
+
 **Turning it down.** `[mcp] denied_tools` hides a tool from the list and refuses
 it by name; `read_only = true` denies every tool that changes anything. Each
 machine answers for itself, so a remote's own `config.toml` governs what an

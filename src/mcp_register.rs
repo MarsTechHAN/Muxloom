@@ -98,15 +98,26 @@ impl ServerEntry {
 /// none and is served by the daemon. Nothing here is a security boundary — an
 /// agent on this machine can run the controller itself — it decides which tool
 /// list and which instructions the session is handed.
+///
+/// `persons_own` is whether the session holds everything, which is what a
+/// session a person started holds. The folder alone is not enough: an agent
+/// whose own folder contains muxloom's state — one working in the home
+/// directory, say — can start a child in a moderator's folder like anywhere
+/// else, and the child would come up holding the fleet-wide surface, with no
+/// approval between it and a shell on every machine, while carrying the narrow
+/// limits it was launched with. A moderator is a person's choice, made in the
+/// dashboard's form; a subagent that lands in that folder is served the
+/// daemon's surface like any other, and its limits mean what they say.
 pub fn handover_to_controller(
     state_dir: &Path,
     session_path: Option<&str>,
+    persons_own: bool,
     daemon: &Path,
 ) -> Option<String> {
     let path = session_path
         .map(str::trim)
         .filter(|path| !path.is_empty())?;
-    if !crate::moderator::is_moderator_path(state_dir, path) {
+    if !persons_own || !crate::moderator::is_moderator_path(state_dir, path) {
         return None;
     }
     controller_beside(daemon)
@@ -1236,23 +1247,29 @@ mod tests {
         let moderator = moderator.to_string_lossy().into_owned();
 
         assert_eq!(
-            handover_to_controller(&state, Some(&moderator), &daemon).as_deref(),
+            handover_to_controller(&state, Some(&moderator), true, &daemon).as_deref(),
             Some(controller.to_string_lossy().as_ref()),
         );
         // Everyone else keeps the daemon's own surface, and so does a session
         // muxloom did not start, which has no folder to judge.
         for path in [Some("/home/me/Works/Terminal"), Some("  "), Some(""), None] {
             assert_eq!(
-                handover_to_controller(&state, path, &daemon),
+                handover_to_controller(&state, path, true, &daemon),
                 None,
                 "{path:?}"
             );
         }
+        // A subagent another agent put in a moderator's folder is not made a
+        // moderator by being there: it keeps the surface its limits belong to.
+        assert_eq!(
+            handover_to_controller(&state, Some(&moderator), false, &daemon),
+            None
+        );
         // A machine that only ever received the companion has nothing to hand
         // the session to, and serves it itself rather than failing.
         fs::remove_file(&controller).unwrap();
         assert_eq!(
-            handover_to_controller(&state, Some(&moderator), &daemon),
+            handover_to_controller(&state, Some(&moderator), true, &daemon),
             None
         );
         let _ = fs::remove_dir_all(&state);

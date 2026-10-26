@@ -128,9 +128,10 @@ preserve.
   at a fleet that isn't theirs.
 - Which surface a session gets is decided when it calls, not by a second entry.
   The daemon serves its own flavor to every agent, and hands the session over to
-  the controller beside it when the caller's working directory is a moderator's.
-  An ordinary agent drives its own machine and talks to the rest; the fleet-wide
-  flavor is the moderator's.
+  the controller beside it when the caller's working directory is a moderator's
+  and the caller is a session a person started. An ordinary agent drives its own
+  machine and talks to the rest; the fleet-wide flavor is the moderator's, and a
+  subagent another agent put in a moderator's folder is not one.
 - Who may do what is decided in one place, `src/permissions.rs`, and both
   surfaces ask it first thing in `call`, before a call is routed — so naming
   another machine is never a way past a rule. Each tool has one entry saying

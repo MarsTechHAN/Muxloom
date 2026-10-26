@@ -44,14 +44,19 @@ fn hand_over(controller: &str) -> Result<()> {
 /// Every agent on this machine has the same entry, and it points here. A
 /// moderator is the exception: its work is the fleet, so it is handed to the
 /// controller beside this daemon before anything is served, taking over these
-/// very pipes.
+/// very pipes. A moderator is a session a person started in a moderator's
+/// folder; one another agent put there keeps this surface and its limits.
 #[cfg(unix)]
 fn mcp_entry(paths: &DaemonPaths) -> Result<()> {
     let session_path = std::env::var("MUXLOOM_SESSION_PATH").ok();
     let daemon = std::env::current_exe().unwrap_or_default();
-    if let Some(controller) =
-        muxloom::mcp_register::handover_to_controller(&paths.root, session_path.as_deref(), &daemon)
-    {
+    let persons_own = muxloom::permissions::own_powers().is_whole();
+    if let Some(controller) = muxloom::mcp_register::handover_to_controller(
+        &paths.root,
+        session_path.as_deref(),
+        persons_own,
+        &daemon,
+    ) {
         return hand_over(&controller);
     }
     let surface = muxloom::control::DaemonControl::new()?;
