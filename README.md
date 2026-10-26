@@ -1005,6 +1005,15 @@ a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.
 conversation will be around to see; triggers survive daemon upgrades and die
 with their session.
 
+**Session ids.** An id no session has is answered with the sessions it was
+probably meant to be — an id that begins with it, or a label or title that
+holds it — or, failing that, with what is running there, so an agent that
+shortened an id or named a session by its label gets the right one back
+without another `list_sessions`. Nothing is resolved for it: the id still has
+to be passed whole. `wait_for` on such an id says so rather than reporting the
+session as ended, and a subagent naming one is told it does not exist rather
+than that it belongs to someone else.
+
 **Recall.** `search_conversations` searches every enabled machine's transcripts
 and `read_conversation` pages through one by message index without pulling it
 all into context. Both read backup snapshots, so an in-progress conversation

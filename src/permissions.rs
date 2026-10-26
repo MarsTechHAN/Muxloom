@@ -460,6 +460,11 @@ fn check_owns(
     if target == mine || descends_from(lineage, target, std::slice::from_ref(&mine)) {
         return Ok(());
     }
+    // A session nobody holds is not somebody else's: telling a subagent to go
+    // and ask its owner sends it after an owner that does not exist.
+    if !lineage.iter().any(|(id, _)| id == target) {
+        bail!("{} {target}", crate::control::UNKNOWN_SESSION);
+    }
     match owning {
         Owning::Close => bail!(
             "{target} was not started by this session, and a session another agent started \
@@ -583,6 +588,19 @@ fn check_may_message(
     target: &str,
     lineage: &[(String, Option<String>)],
 ) -> Result<()> {
+    let verdict = reach_verdict(own, target, lineage);
+    // Refused over a session the records do not hold at all: that is a
+    // mistyped id, and saying it is out of reach would send the agent to ask
+    // somebody else to carry a message to nobody. Weighed without records,
+    // nothing is known about who exists, so the refusal stands as it is.
+    if verdict.is_err() && !lineage.is_empty() && !lineage.iter().any(|(id, _)| id == target.trim())
+    {
+        bail!("{} {}", crate::control::UNKNOWN_SESSION, target.trim());
+    }
+    verdict
+}
+
+fn reach_verdict(own: &Powers, target: &str, lineage: &[(String, Option<String>)]) -> Result<()> {
     match own.reach {
         Reach::Fleet => Ok(()),
         Reach::Task if same_task(lineage, target) => Ok(()),
@@ -1132,8 +1150,21 @@ mod tests {
         assert!(error.contains("not on this piece of work"), "{error}");
         assert!(error.contains("let it carry the message"), "{error}");
         // A session nobody on this machine has a record of is not this
-        // session's team by default.
-        assert!(check_may_message(&own, "muxloomd-claude-nowhere", &here).is_err());
+        // session's team by default — and is said to be unknown, rather than
+        // out of reach, so nobody is asked to carry a message to it.
+        let error = check_may_message(&own, "muxloomd-claude-nowhere", &here)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "{} muxloomd-claude-nowhere",
+                crate::control::UNKNOWN_SESSION
+            )
+        );
+        // Weighed without the records, nothing is known about who exists.
+        assert!(!reaches_without_records(&own, "muxloomd-claude-nowhere"));
 
         // A subagent started on another machine is one hop from this session
         // on that machine's own list, and that is enough to recognise it.
@@ -1418,7 +1449,6 @@ mod tests {
             "muxloomd-claude-lead",
             "muxloomd-claude-sibling",
             "muxloomd-claude-stranger",
-            "muxloomd-claude-nowhere",
         ] {
             let error = authorize(&own, "delete_session", &on(theirs), tree)
                 .err()
@@ -1427,6 +1457,18 @@ mod tests {
             assert!(error.contains("closes only itself"), "{error}");
             assert!(error.contains(theirs), "{error}");
         }
+        // A session nobody holds is not somebody else's to go and ask about.
+        let error = authorize(&own, "delete_session", &on("muxloomd-claude-nowhere"), tree)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "{} muxloomd-claude-nowhere",
+                crate::control::UNKNOWN_SESSION
+            )
+        );
 
         // A resume by muxloom number is the same question; by a runtime's own
         // conversation id it is an ordinary launch, and only the kind counts.

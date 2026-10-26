@@ -473,8 +473,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
                       is hearing from an agent and how to answer. Use this to ask for work, hand \
                       something over, answer a question you were asked, or warn someone off a file \
                       you are changing — and use send_input instead only when you need raw \
-                      keystrokes rather than a message. The target must be a codex, claude, \
-                      session; a terminal has nobody in it to read. Replies come back the same \
+                      keystrokes rather than a message. The target must be a codex, claude, pi \
+                      or opencode session; a terminal has nobody in it to read. Replies come back the same \
                       way, as direct messages: read yours with talk_read { scope: \"direct\" }, \
                       and answer with message_agent again. Never answer one of these with \
                       talk_post — that puts a private exchange on a board every agent on every \
@@ -1379,6 +1379,119 @@ fn screen_tail(screen: &str) -> String {
 /// running holds that id, so the wait is over either way, and the archive is
 /// the only place that can still say what the session was. An answer that
 /// could not name what it had been waiting on would be a worse answer.
+/// What every refusal over a session id nobody holds says, wherever it was
+/// raised: the daemon's lookup, a wait that never saw the session, a check of
+/// whose it is. [`explain_unknown_session`] looks for it.
+pub(crate) const UNKNOWN_SESSION: &str = "unknown daemon session";
+
+/// How many sessions an unknown-id answer names.
+const UNKNOWN_SESSION_SUGGESTIONS: usize = 6;
+
+/// Turn a refusal over a session id nobody here holds into one that says which
+/// session the caller most likely meant.
+///
+/// Ids are long — `muxloomd-claude-1792996960-57139-5` — and an agent shortens
+/// them, drops the tail, or names the session by its label. Told only that the
+/// id is unknown, it calls list_sessions and tries again, a round trip spent
+/// learning what this answer already knows. Nothing is resolved on the
+/// caller's behalf: a guess that types into, archives or deletes the wrong
+/// session costs far more than the second call.
+fn explain_unknown_session(
+    error: anyhow::Error,
+    arguments: &Value,
+    machine: &str,
+    sessions: impl FnOnce() -> Result<Vec<DaemonSession>>,
+) -> anyhow::Error {
+    let Some(asked) = optional_str(arguments, "session_id") else {
+        return error;
+    };
+    let told = format!("{error:#}");
+    // Said once: a relayed call comes back already explained by the side that
+    // holds the sessions.
+    if !told.contains(UNKNOWN_SESSION) || told.contains("list_sessions") {
+        return error;
+    }
+    match sessions() {
+        Ok(sessions) => anyhow::anyhow!(unknown_session_hint(asked, machine, &sessions)),
+        Err(_) => error,
+    }
+}
+
+/// The answer [`explain_unknown_session`] gives: the sessions whose id, label
+/// or title holds what was asked for, or when none does, the ones running.
+fn unknown_session_hint(asked: &str, machine: &str, sessions: &[DaemonSession]) -> String {
+    let place = match machine {
+        crate::model::LOCAL_TARGET_ID => "this machine".to_string(),
+        machine => crate::model::machine_read_as(machine).to_string(),
+    };
+    let needle = asked.trim().to_lowercase();
+    let holds = |text: &str| !needle.is_empty() && text.to_lowercase().contains(&needle);
+    let mut likely: Vec<&DaemonSession> = sessions
+        .iter()
+        .filter(|session| {
+            holds(&session.id)
+                || holds(&session.label)
+                || session.title.as_deref().is_some_and(holds)
+        })
+        .collect();
+    // Live before archived, and a session whose id begins with what was asked
+    // before one that merely contains it.
+    likely.sort_by_key(|session| {
+        (
+            session.archived || session.dead,
+            !session.id.to_lowercase().starts_with(&needle),
+        )
+    });
+    let line = |session: &DaemonSession| {
+        let mut about = vec![session.kind.clone(), session.path.clone()];
+        let name = match session.label.trim() {
+            "" => session.title.as_deref().unwrap_or_default().trim(),
+            label => label,
+        };
+        if !name.is_empty() {
+            about.push(format!("\"{name}\""));
+        }
+        if session.archived {
+            about.push("archived".into());
+        } else if session.dead {
+            about.push("ended".into());
+        }
+        format!("\n- {} ({})", session.id, about.join(", "))
+    };
+    let mut text = format!("{UNKNOWN_SESSION} `{asked}`: no session has that id on {place}.");
+    if !likely.is_empty() {
+        text.push_str(" Did you mean:");
+        for session in likely.iter().take(UNKNOWN_SESSION_SUGGESTIONS) {
+            text.push_str(&line(session));
+        }
+        text.push_str("\nPass the id whole, exactly as list_sessions gives it.");
+        return text;
+    }
+    let running: Vec<&DaemonSession> = sessions
+        .iter()
+        .filter(|session| !session.archived && !session.dead)
+        .collect();
+    if running.is_empty() {
+        text.push_str(
+            " Nothing is running there; list_sessions { include_archived: true } shows what was.",
+        );
+        return text;
+    }
+    text.push_str(" Running there:");
+    for session in running.iter().take(UNKNOWN_SESSION_SUGGESTIONS) {
+        text.push_str(&line(session));
+    }
+    if running.len() > UNKNOWN_SESSION_SUGGESTIONS {
+        text.push_str(&format!(
+            "\n…and {} more; list_sessions shows them all.",
+            running.len() - UNKNOWN_SESSION_SUGGESTIONS
+        ));
+    } else {
+        text.push_str("\nPass one of these ids whole, exactly as list_sessions gives it.");
+    }
+    text
+}
+
 fn waited_session(
     session_id: &str,
     running: impl FnOnce() -> Result<Option<DaemonSession>>,
@@ -1474,6 +1587,15 @@ fn wait_loop(
                     }
                     _ => {}
                 }
+            }
+            // A session never seen at all was never there: a mistyped id, not
+            // a session that ended, which is what an agent reading "exit"
+            // concludes about its subagent.
+            Ok(None) if session.is_none() => {
+                bail!(
+                    "{UNKNOWN_SESSION} {}",
+                    optional_str(arguments, "session_id").unwrap_or_default()
+                );
             }
             // A session that is no longer listed is over, whichever way the
             // caller was waiting for it to end.
@@ -3918,6 +4040,19 @@ impl ControlSurface for ControllerControl {
     }
 
     fn call(&self, name: &str, arguments: &Value) -> Result<String> {
+        self.dispatch(name, arguments).map_err(|error| {
+            let Ok(target) = self.target(arguments) else {
+                return error;
+            };
+            explain_unknown_session(error, arguments, &target.id, || {
+                self.runtime.bridge_pool().list_sessions(&target)
+            })
+        })
+    }
+}
+
+impl ControllerControl {
+    fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
         enforce_policy(&self.config.mcp, name)?;
         // Whoever runs this surface is weighed the same way a daemon's caller
         // is, before anything is touched: a moderator holds everything because
@@ -4055,12 +4190,12 @@ mod daemon_surface {
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
         WAIT_SCREEN_LINES, allowed_specs, build_input, delivery_json, direct_draft, enforce_policy,
-        fleet_already_back, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
-        fleet_resume_target, instructions, message_author, native_resume_id, optional_bool,
-        optional_str, optional_usize, plain_screen, pretty, preview_text, required_str,
-        screen_page, send_channel, session_json, session_kind, session_name_now, shell_report,
-        synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait, trigger_json,
-        trigger_spec, wait_loop, waited_session,
+        explain_unknown_session, fleet_already_back, fleet_outcome_json, fleet_resume_caption,
+        fleet_resume_plan, fleet_resume_target, instructions, message_author, native_resume_id,
+        optional_bool, optional_str, optional_usize, plain_screen, pretty, preview_text,
+        required_str, screen_page, send_channel, session_json, session_kind, session_name_now,
+        shell_report, synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait,
+        trigger_json, trigger_spec, wait_loop, waited_session,
     };
     use crate::permissions::{
         Act, Lineage, act, authorize, check_may_launch, granted_powers, launch_path_within,
@@ -4988,6 +5123,21 @@ mod daemon_surface {
         }
 
         fn call(&self, name: &str, arguments: &Value) -> Result<String> {
+            self.dispatch(name, arguments).map_err(|error| {
+                // A call that went to another machine is explained over there,
+                // by the side that holds its sessions.
+                match self.elsewhere(arguments) {
+                    Some(_) => error,
+                    None => explain_unknown_session(error, arguments, LOCAL_TARGET_ID, || {
+                        self.sessions()
+                    }),
+                }
+            })
+        }
+    }
+
+    impl DaemonControl {
+        fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
             enforce_policy(&self.config.mcp, name)?;
             // What another machine holds is the controller's to answer. The
             // two that are only ever about other machines go straight out;
@@ -5259,6 +5409,109 @@ mod tests {
             resumed_to: None,
             used_at: None,
         }
+    }
+
+    #[test]
+    fn an_unknown_session_id_is_answered_with_the_session_it_was_likely_meant_to_be() {
+        let mut lead = probe_session("muxloomd-claude-1792996960-57139-5", false, false);
+        lead.label = "profiling the t2va run".into();
+        lead.path = "/work/triton".into();
+        let mut shell = probe_session("muxloomd-terminal-1792996271-57139-4", false, false);
+        shell.kind = "terminal".into();
+        shell.label = String::new();
+        let mut old = probe_session("muxloomd-claude-1792990000-1-1", false, false);
+        old.archived = true;
+        old.dead = true;
+        old.label = "an earlier profiling pass".into();
+        let sessions = vec![old, shell, lead];
+
+        // The tail cut off: the one it begins.
+        let told = unknown_session_hint(
+            "muxloomd-claude-1792996960",
+            crate::model::LOCAL_TARGET_ID,
+            &sessions,
+        );
+        assert!(
+            told.starts_with(&format!(
+                "{UNKNOWN_SESSION} `muxloomd-claude-1792996960`: no session has that id on this \
+                 machine. Did you mean:\n- muxloomd-claude-1792996960-57139-5 (claude, \
+                 /work/triton, \"profiling the t2va run\")"
+            )),
+            "{told}"
+        );
+        assert!(told.contains("exactly as list_sessions gives it"), "{told}");
+
+        // Named by its label: live first, the archived one after, said so.
+        let told = unknown_session_hint("Profiling", crate::model::LOCAL_TARGET_ID, &sessions);
+        let live = told.find("57139-5").unwrap();
+        let archived = told.find("1792990000-1-1").unwrap();
+        assert!(live < archived, "{told}");
+        assert!(
+            told.contains("\"an earlier profiling pass\", archived)"),
+            "{told}"
+        );
+
+        // Nothing like it: what is running there instead, and never the archive.
+        let told =
+            unknown_session_hint("no-such-session", crate::model::LOCAL_TARGET_ID, &sessions);
+        assert!(told.contains("Running there:"), "{told}");
+        assert!(
+            told.contains("muxloomd-terminal-1792996271-57139-4 (terminal, /tmp)"),
+            "{told}"
+        );
+        assert!(!told.contains("1792990000"), "{told}");
+
+        // An error that is about something else is left alone, and one already
+        // explained is not explained twice.
+        let other = explain_unknown_session(
+            anyhow::anyhow!("the keeper hung up"),
+            &json!({ "session_id": "x" }),
+            crate::model::LOCAL_TARGET_ID,
+            || panic!("listed sessions for an unrelated error"),
+        );
+        assert_eq!(other.to_string(), "the keeper hung up");
+        let explained = explain_unknown_session(
+            anyhow::anyhow!("{UNKNOWN_SESSION} x"),
+            &json!({ "session_id": "x" }),
+            crate::model::LOCAL_TARGET_ID,
+            || Ok(sessions.clone()),
+        )
+        .to_string();
+        let again = explain_unknown_session(
+            anyhow::anyhow!(explained.clone()),
+            &json!({ "session_id": "x" }),
+            crate::model::LOCAL_TARGET_ID,
+            || panic!("explained an explained error"),
+        );
+        assert_eq!(again.to_string(), explained);
+    }
+
+    #[test]
+    fn waiting_on_a_session_that_was_never_there_is_an_error_not_an_exit() {
+        let error = wait_loop(
+            &json!({ "session_id": "muxloomd-claude-typo", "until": "idle", "timeout_seconds": 1 }),
+            crate::model::LOCAL_TARGET_ID,
+            || Ok(None),
+            || Ok(String::new()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, format!("{UNKNOWN_SESSION} muxloomd-claude-typo"));
+
+        // One seen and then gone did end.
+        let mut looks = 0;
+        let answer = wait_loop(
+            &json!({ "session_id": "s", "until": "idle", "timeout_seconds": 5, "poll_ms": 200 }),
+            crate::model::LOCAL_TARGET_ID,
+            || {
+                looks += 1;
+                Ok((looks == 1).then(|| probe_session("s", true, false)))
+            },
+            || Ok(String::new()),
+        )
+        .unwrap();
+        assert!(answer.contains("\"outcome\": \"exit\""), "{answer}");
     }
 
     #[test]
