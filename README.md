@@ -1011,6 +1011,9 @@ silence it used to be.
 
 **Waiting.** `wait_for` blocks until a session is idle, needs attention, prints
 a pattern, goes quiet, or exits — a timeout is a normal answer, not a failure.
+Waiting for idle right after a launch or a message waits for the turn it asked
+for to start — up to twenty seconds — so the answer is not the screen from
+before the turn began.
 `trigger` leaves a standing watch with the daemon instead, for what no
 conversation will be around to see; triggers survive daemon upgrades and die
 with their session.

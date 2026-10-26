@@ -1308,6 +1308,26 @@ fn waited_session(
 /// agent cares to wait. `look` reports the session as the daemon sees it —
 /// `None` once it is gone — and `read` renders its screen, which is only
 /// asked for when the wait is about the screen.
+/// How long after a turn is asked for a session that has not started it is
+/// still taken to be about to. A launched agent boots for seconds before its
+/// first prompt runs, and a submitted message takes a moment to become a turn;
+/// past this, an idle session is idle.
+const TURN_START_GRACE_SECONDS: u64 = 20;
+
+/// Whether `session` was asked for a turn within [`TURN_START_GRACE_SECONDS`]
+/// of `now` (epoch seconds): something was submitted to it, or it was launched
+/// with a prompt. Only the asking is known here; whether the turn has started
+/// is the caller's to see.
+fn turn_starting(session: &DaemonSession, now: u64) -> bool {
+    let launched_with_prompt = session
+        .first_prompt
+        .as_ref()
+        .map(|_| session.created_at)
+        .unwrap_or(0);
+    let asked = session.used_at.unwrap_or(0).max(launched_with_prompt);
+    asked != 0 && now.saturating_sub(asked) < TURN_START_GRACE_SECONDS
+}
+
 fn wait_loop(
     arguments: &Value,
     machine: &str,
@@ -1337,12 +1357,24 @@ fn wait_loop(
     let mut matched = None;
     let mut failures = 0;
     let mut outcome = "timeout";
+    // Whether the session has been seen doing anything during this wait, and
+    // whether an idle reading was passed over because the turn it was asked
+    // for had not started yet.
+    let mut seen_busy = false;
+    let mut held_for_turn = false;
     loop {
         match look() {
             Ok(Some(observed)) => {
                 failures = 0;
                 let alive = !observed.dead;
-                let idle = !observed.working && !observed.needs_attention;
+                seen_busy |= observed.working || observed.needs_attention;
+                // Idle, unless a turn was just asked of it and has not been
+                // seen to start: right after a launch or a message the session
+                // is still booting or reading, and an answer of idle then
+                // sends the caller to read a screen the turn has not touched.
+                let starting = !seen_busy && turn_starting(&observed, now_ms() / 1000);
+                held_for_turn |= starting;
+                let idle = !observed.working && !observed.needs_attention && !starting;
                 let attention = observed.needs_attention;
                 session = Some(observed);
                 if !alive {
@@ -1423,9 +1455,17 @@ fn wait_loop(
         _ => true,
     };
     let note = match outcome {
+        "timeout" if held_for_turn && !seen_busy => Some(
+            "the turn it was just asked for has not started yet: call wait_for again to keep \
+             waiting",
+        ),
         "timeout" => Some(
             "the wait ran out, which is not a failure: nothing has happened yet, so call \
              wait_for again to keep waiting",
+        ),
+        "idle" if held_for_turn && !seen_busy => Some(
+            "no turn was seen to start after the last prompt: it finished before this wait \
+             began, or the prompt was not taken; read_screen shows which",
         ),
         "exit" if until != "exit" => {
             Some("the session ended before what you were waiting for happened")
@@ -5299,6 +5339,64 @@ mod tests {
             || panic!("explained an explained error"),
         );
         assert_eq!(again.to_string(), explained);
+    }
+
+    #[test]
+    fn waiting_for_idle_right_after_a_prompt_waits_for_the_turn_it_asked_for() {
+        let now = crate::relay::now_ms() / 1000;
+        let asked = || {
+            let mut session = probe_session("s", false, false);
+            session.used_at = Some(now);
+            session
+        };
+        let idle_for = |arguments: Value, mut look: Box<dyn FnMut() -> DaemonSession>| {
+            let answer = wait_loop(
+                &arguments,
+                crate::model::LOCAL_TARGET_ID,
+                || Ok(Some(look())),
+                || Ok(String::new()),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&answer).unwrap()
+        };
+        let wait =
+            json!({ "session_id": "s", "until": "idle", "timeout_seconds": 1, "poll_ms": 200 });
+
+        // Asked a moment ago and not started: not idle yet, and said why.
+        let answer = idle_for(wait.clone(), Box::new(asked));
+        assert_eq!(answer["outcome"], json!("timeout"), "{answer}");
+        assert!(
+            answer["note"]
+                .as_str()
+                .unwrap()
+                .contains("has not started yet"),
+            "{answer}"
+        );
+
+        // Seen working, then idle: that is the turn done.
+        let mut looks = 0;
+        let answer = idle_for(
+            json!({ "session_id": "s", "until": "idle", "timeout_seconds": 5, "poll_ms": 200 }),
+            Box::new(move || {
+                looks += 1;
+                let mut session = asked();
+                session.working = looks == 2;
+                session
+            }),
+        );
+        assert_eq!(answer["outcome"], json!("idle"), "{answer}");
+        assert!(answer.get("note").is_none(), "{answer}");
+
+        // A prompt long past is no reason to hold an idle session.
+        let answer = idle_for(
+            wait,
+            Box::new(move || {
+                let mut session = probe_session("s", false, false);
+                session.used_at = Some(now - TURN_START_GRACE_SECONDS - 1);
+                session
+            }),
+        );
+        assert_eq!(answer["outcome"], json!("idle"), "{answer}");
     }
 
     #[test]
