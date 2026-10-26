@@ -1952,6 +1952,7 @@ mod platform {
                 powers: None,
                 resumed_from: None,
                 resumed_to: None,
+                used_at: None,
             };
             if let Err(error) = persist_session_metadata(&metadata_path, &metadata) {
                 eprintln!("muxloomd could not record recovered session {id}: {error:#}");
@@ -4674,6 +4675,10 @@ mod platform {
             resumed_to: resuming
                 .as_ref()
                 .and_then(|record| record.resumed_to.clone()),
+            // Starting a session is using it — reviving an old one most of all,
+            // which would otherwise sort by when it was last used before it was
+            // put down.
+            used_at: Some(now_secs()),
         };
         // The record precedes the keeper so a crash between the two leaves a
         // session that can be retired, never a keeper nothing knows about.
@@ -6794,6 +6799,29 @@ mod platform {
             self.keeper_frame(keeper::frame::RESIZE, &payload)
         }
 
+        /// Note that something was just submitted to this session, which is
+        /// what the agent list orders by. Written through to the record now
+        /// and then rather than on every line: often enough that a daemon
+        /// generation reading the record in keeps the order, and seldom enough
+        /// that a session being typed into is not rewriting its file per line.
+        fn mark_used(&self, now: u64) {
+            const WRITE_THROUGH_SECS: u64 = 60;
+            let stale = {
+                let mut metadata = self
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let stale = metadata
+                    .used_at
+                    .is_none_or(|used| now.saturating_sub(used) >= WRITE_THROUGH_SECS);
+                metadata.used_at = Some(now);
+                stale
+            };
+            if stale {
+                let _ = self.persist_metadata();
+            }
+        }
+
         fn write_input(&self, bytes: &[u8]) -> Result<()> {
             // Someone is typing here, so whatever a trigger wanted looked at
             // has been looked at.
@@ -6809,8 +6837,10 @@ mod platform {
             // too small to record - is not to be invented from a later one.
             let now = now_ms();
             let ever_asked = self.last_input.swap(now, Ordering::Relaxed) != 0;
-            if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            let submitted = bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
+            if submitted {
                 self.last_submission.store(now, Ordering::Relaxed);
+                self.mark_used(now / 1000);
             }
             if !ever_asked && self.first_prompt_armed.load(Ordering::Relaxed) {
                 self.record_first_prompt(bytes);
@@ -13560,6 +13590,54 @@ mod platform {
             fs::remove_dir_all(root).ok();
         }
 
+        /// What the agent list orders by is when something was last submitted
+        /// to a session — not a keystroke that sends nothing — and it is on
+        /// the record, so the next daemon generation keeps the order.
+        #[test]
+        fn a_submission_marks_a_session_used_and_the_record_keeps_it() {
+            let state = test_state("used-at");
+            let root = state.paths.root.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-claude-used-at".into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let launched = session.snapshot().used_at.expect("a launch is a use");
+            let stored = |session: &ManagedSession| -> DaemonSession {
+                serde_json::from_slice(&fs::read(&session.metadata_path).unwrap()).unwrap()
+            };
+            assert_eq!(stored(&session).used_at, Some(launched));
+
+            // Forget the launch, as a record from before this was kept would.
+            session
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .used_at = None;
+            session.write_input(b"half a word").unwrap();
+            assert_eq!(session.snapshot().used_at, None, "nothing was sent");
+            session.write_input(b"go\r").unwrap();
+            let used = session.snapshot().used_at.expect("a submission is a use");
+            assert!(used >= launched);
+            assert_eq!(stored(&session).used_at, Some(used), "written through");
+
+            session.archive().unwrap();
+            fs::remove_dir_all(root).ok();
+        }
+
         /// A claim taken on timing - which is how a crossed pair is made -
         /// asks for the folder to be looked through until the first words
         /// settle it, and stops asking once settled or out of budget.
@@ -14499,6 +14577,7 @@ mod platform {
                     powers: None,
                     resumed_from: None,
                     resumed_to: None,
+                    used_at: None,
                 },
             )
             .unwrap();
@@ -14558,6 +14637,7 @@ mod platform {
                 composer: None,
                 parent: None,
                 powers: None,
+                used_at: None,
             }
         }
 
@@ -16966,6 +17046,7 @@ mod platform {
                     composer: None,
                     parent: None,
                     powers: None,
+                    used_at: None,
                 },
             )
             .unwrap();

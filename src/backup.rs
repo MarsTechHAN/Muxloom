@@ -3440,6 +3440,7 @@ mod tests {
             powers: None,
             resumed_from: None,
             resumed_to: None,
+            used_at: None,
         }
     }
 

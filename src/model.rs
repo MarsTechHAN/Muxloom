@@ -659,6 +659,21 @@ pub struct AgentSession {
     /// from the dashboard has none, and neither has anything a daemon too old
     /// to record one reports.
     pub parent: Option<String>,
+    /// When something was last submitted to it, in seconds — what the agent
+    /// list orders by. `None` when nothing has been, or the daemon is too old
+    /// to say.
+    pub used_at: Option<u64>,
+}
+
+impl AgentSession {
+    /// When this session was last used, by the best account there is: the last
+    /// thing submitted to it, and failing that when it was put down or began.
+    /// A session put down later than it was last typed into was used then too:
+    /// closing a conversation is the last thing anybody did with it.
+    pub fn last_used(&self) -> u64 {
+        let put_down = self.archived_at.filter(|_| self.dead).unwrap_or(0);
+        self.used_at.unwrap_or(0).max(put_down).max(self.created_at)
+    }
 }
 
 impl AgentSession {

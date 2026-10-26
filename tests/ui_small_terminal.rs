@@ -52,6 +52,7 @@ fn make_app() -> App {
         title: None,
         thread: None,
         parent: None,
+        used_at: None,
     });
     app.selected_session_id = Some("ad-codex-1-1-1".into());
     app

@@ -6210,6 +6210,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             });
             app.selected_session_id = Some("ad-codex-1-1-1".into());
 
@@ -6401,6 +6402,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             });
         }
         app.targets[0].probe.set(AgentKind::Codex, true);
@@ -6505,6 +6507,7 @@ mod tests {
             title: None,
             thread: None,
             parent: parent.map(Into::into),
+            used_at: None,
         };
         app.sessions = vec![
             session("lead", "/work/project", None, 30),
@@ -6603,6 +6606,7 @@ mod tests {
             title: None,
             thread: None,
             parent: parent.map(Into::into),
+            used_at: None,
         };
         app.sessions = vec![
             session("lead", None),
@@ -6712,6 +6716,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-waiting".into());
 
@@ -6775,6 +6780,7 @@ mod tests {
                     title: None,
                     thread: None,
                     parent: None,
+                    used_at: None,
                 });
             }
         }
@@ -7125,6 +7131,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         let backend = TestBackend::new(150, 30);
         let mut terminal = Terminal::new(backend).unwrap();

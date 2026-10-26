@@ -4021,6 +4021,29 @@ impl App {
                     && (!session.dead || self.state.show_archived)
             })
             .collect();
+        // A folder is as recent as the most recent use of anything in it, and
+        // the folders go most recently used first: the work somebody is in the
+        // middle of is at the top, not wherever its path falls in the alphabet.
+        // Live and archived sessions are two lists, so each is weighed apart —
+        // closing a session this morning must not lift its folder above the
+        // ones still running.
+        let mut folder_used: HashMap<(bool, &str, &str), u64> = HashMap::new();
+        for session in &sessions {
+            let used = folder_used
+                .entry((session.dead, &session.target_id, &session.path))
+                .or_default();
+            *used = (*used).max(session.last_used());
+        }
+        let folder = |session: &AgentSession| {
+            folder_used
+                .get(&(
+                    session.dead,
+                    session.target_id.as_str(),
+                    session.path.as_str(),
+                ))
+                .copied()
+                .unwrap_or(0)
+        };
         sessions.sort_by(|left, right| {
             left.dead
                 .cmp(&right.dead)
@@ -4030,23 +4053,15 @@ impl App {
                     is_temporary_session_id(&right.id).cmp(&is_temporary_session_id(&left.id))
                 })
                 .then_with(|| left.target_id.cmp(&right.target_id))
+                .then_with(|| folder(right).cmp(&folder(left)))
+                // Two folders used in the same second still have to stay two
+                // blocks rather than interleave.
                 .then_with(|| left.path.cmp(&right.path))
-                // Inside a folder: live sessions by when they started, and
-                // archived ones by when they were put down. What sends anybody
-                // into the archive is the conversation they just closed, and
-                // when it began says nothing about where it sits in that list —
-                // a week-old session archived this morning was buried under
-                // everything started since. A record from a daemon too old to
-                // say when it ended falls back to when it began.
-                .then_with(|| {
-                    let when = |session: &AgentSession| {
-                        session
-                            .archived_at
-                            .filter(|_| session.dead)
-                            .unwrap_or(session.created_at)
-                    };
-                    when(right).cmp(&when(left))
-                })
+                // Inside a folder, the session last used first: what was last
+                // submitted to it, or when it was put down, or when it began —
+                // see `AgentSession::last_used`.
+                .then_with(|| right.last_used().cmp(&left.last_used()))
+                .then_with(|| left.id.cmp(&right.id))
         });
 
         let by_id: HashMap<&str, &AgentSession> = sessions
@@ -4072,12 +4087,12 @@ impl App {
         }
         for siblings in children.values_mut() {
             // Inside a task the folder has stopped deciding anything: these are
-            // the agents one agent started, so they go newest first the way
-            // everything else in this list does.
+            // the agents one agent started, so they go most recently used first
+            // the way everything else in this list does.
             siblings.sort_by(|left, right| {
                 right
-                    .created_at
-                    .cmp(&left.created_at)
+                    .last_used()
+                    .cmp(&left.last_used())
                     .then_with(|| left.id.cmp(&right.id))
             });
         }
@@ -6404,6 +6419,7 @@ impl App {
                 // The backup mirrors a transcript, not the machine's session
                 // list, so it cannot say who started this one.
                 parent: None,
+                used_at: None,
             });
         }
     }
@@ -13323,6 +13339,7 @@ fn forwarded_sessions(machine: &str, body: &str) -> Result<Vec<AgentSession>, St
             // resumed from is not carried.
             thread: None,
             parent: text("parent"),
+            used_at: None,
         });
     }
     match refused {
@@ -13913,6 +13930,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
 
         let read = |spinner: bool, cursor_hidden: bool| Activity {
@@ -14025,6 +14043,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             },
             AgentSession {
                 id: "muxloomd-terminal-old-2".into(),
@@ -14043,6 +14062,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             },
         ];
 
@@ -14291,6 +14311,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             },
             AgentSession {
                 id: "muxloomd-claude-background".into(),
@@ -14309,6 +14330,7 @@ mod tests {
                 title: None,
                 thread: None,
                 parent: None,
+                used_at: None,
             },
         ];
         app.pending_activity_refreshes.insert("local".into());
@@ -14363,6 +14385,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         }
     }
 
@@ -14414,6 +14437,7 @@ mod tests {
             title: None,
             thread: None,
             parent: parent.map(Into::into),
+            used_at: None,
         }
     }
 
@@ -14722,6 +14746,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
 
         app.refresh_daemon_activity();
@@ -14731,6 +14756,69 @@ mod tests {
             receive_request(&request_rx),
             Request::RefreshActivity { target } if target.id == "local"
         ));
+    }
+
+    /// Folders go most recently used first, and so does each folder's own
+    /// list: the work somebody is in the middle of is at the top, whatever
+    /// its path or however long ago it began. A Temporal Chat stays above them
+    /// all, and the archive keeps its own order below.
+    #[test]
+    fn folders_and_their_sessions_go_most_recently_used_first() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.state.show_archived = true;
+        let row = |id: &str, path: &str, created_at: u64, used_at: Option<u64>| AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: path.into(),
+            label: id.into(),
+            created_at,
+            archived_at: None,
+            dead: false,
+            pid: Some(1),
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+            used_at,
+        };
+        // /alpha sorts first by name and holds the newest session, but nobody
+        // has typed into it since; /zeta was used a minute ago.
+        app.sessions = vec![
+            row("alpha-new", "/alpha", 900, None),
+            row("zeta-old", "/zeta", 100, Some(950)),
+            row("zeta-recent", "/zeta", 500, Some(990)),
+            row("zeta-idle", "/zeta", 800, None),
+            row("muxloomd-temporal-claude-1", "/scratch", 10, None),
+            AgentSession {
+                dead: true,
+                archived_at: Some(999),
+                ..row("alpha-closed", "/alpha", 1, Some(5))
+            },
+        ];
+        let order: Vec<String> = app
+            .visible_sessions()
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "muxloomd-temporal-claude-1",
+                // /zeta was used last, so its whole block comes first, newest
+                // use first and a session never typed into by when it began.
+                "zeta-recent",
+                "zeta-old",
+                "zeta-idle",
+                "alpha-new",
+                "alpha-closed",
+            ]
+            .map(String::from),
+            "{order:?}"
+        );
     }
 
     #[test]
@@ -14764,6 +14852,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("ad-codex-old".into());
         app.selected_target = 1;
@@ -15216,6 +15305,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.select_session("muxloomd-claude-next".into());
         assert!(
@@ -16148,6 +16238,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-claude-long-history".into());
         app.terminal_session_id = Some("muxloomd-claude-long-history".into());
@@ -16292,6 +16383,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.sessions.push(AgentSession {
             id: "muxloom-terminal-dead".into(),
@@ -16310,6 +16402,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         assert!(app.visible_sessions().is_empty());
         assert_eq!(app.archived_count(), 1);
@@ -16373,6 +16466,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloom-codex-dead".into());
         app.focus = Focus::Agents;
@@ -16498,6 +16592,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-claude-dead".into());
         app.focus = Focus::Agents;
@@ -16653,6 +16748,7 @@ mod tests {
             // for a match the daemon never made.
             thread: Some("4797f4e5".into()),
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some(record.into());
         app.focus = Focus::Agents;
@@ -16803,6 +16899,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
 
         app.handle_worker_event(Event::Launched {
@@ -16852,6 +16949,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.handle_worker_event(Event::Launched {
             target_id: "local".into(),
@@ -16903,6 +17001,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloom-codex-live".into());
         app.focus = Focus::Agents;
@@ -16998,6 +17097,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloom-codex-files".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -17943,6 +18043,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloom-codex-modal".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -18015,6 +18116,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloom-codex-nav".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -18750,6 +18852,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         for failure in 1..=2 {
             app.handle_worker_event(Event::Scanned {
@@ -19012,6 +19115,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         }
     }
 
@@ -19201,6 +19305,7 @@ mod tests {
                     title: None,
                     thread: None,
                     parent: None,
+                    used_at: None,
                 }],
             )),
         });
@@ -19268,6 +19373,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-codex-current".into());
         app.focus = Focus::Agents;
@@ -19348,6 +19454,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-temporal-codex-test".into());
         app.request_history();
@@ -19417,6 +19524,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         });
         app.selected_session_id = Some("muxloomd-claude-forward".into());
         app.focus = Focus::Agents;
@@ -19552,6 +19660,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         };
         app.sessions = vec![
             session("worker", "/work/Terminal"),
@@ -19625,6 +19734,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         };
         app.sessions = vec![session("far", "gpu"), session("near", "local")];
         app.select_machine_row(MachineRow::Moderators);
@@ -19998,6 +20108,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         };
         app.sessions.push(session(""));
 
@@ -20150,6 +20261,7 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
+            used_at: None,
         };
         app.sessions = vec![
             session("local-a", "local", 1),
@@ -20954,6 +21066,7 @@ mod tests {
                     title: None,
                     thread: None,
                     parent: None,
+                    used_at: None,
                 }],
             )),
         });

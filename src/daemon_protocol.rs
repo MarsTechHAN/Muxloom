@@ -865,6 +865,15 @@ pub struct DaemonSession {
     ///   written, so a split master never strands its fleet.
     #[serde(default)]
     pub resumed_to: Option<String>,
+    /// When this session was last used, in seconds: the last time something
+    /// was submitted to it — a line typed and sent, a message delivered.
+    /// Keystrokes that send nothing, and output, do not count: a list ordered
+    /// by output reshuffles itself every time two agents are working, and one
+    /// ordered by keystrokes moves when somebody merely scrolls. `None` on a
+    /// session nothing has been sent to since this was recorded, and from
+    /// daemons too old to record it.
+    #[serde(default)]
+    pub used_at: Option<u64>,
 }
 
 /// One attention edge the daemon saw but has not told anyone about yet: a

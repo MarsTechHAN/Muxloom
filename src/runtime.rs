@@ -5056,6 +5056,7 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
         // conversation the match will land on.
         thread: session.thread.or(session.seed),
         parent: session.parent,
+        used_at: session.used_at,
     })
 }
 
@@ -5145,6 +5146,7 @@ fn parse_discovery(target_id: &str, output: &str) -> Result<(Probe, Vec<AgentSes
                     title: None,
                     thread: None,
                     parent: None,
+                    used_at: None,
                 });
             }
             _ => {}

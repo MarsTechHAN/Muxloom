@@ -256,9 +256,17 @@ are matched without reading anything and are listed at once; the scrollback is
 then read underneath them, a batch of machines at a time, with a bar counting
 histories read and hits added as they land. The cursor stays on the session it
 is on while the list fills in. Each session carries a recap line, and archived
-agents stay searchable and resumable. Inside a folder
-the archive is ordered by when each session was put down, not by when it
-started, so the conversation you just closed is at the top of its folder.
+agents stay searchable and resumable.
+
+The agent list goes most recently used first, at both levels: folders by the
+last use of anything in them, and each folder's sessions by their own last use.
+A session is used when something is submitted to it — a line typed and sent, a
+message delivered, a launch or a resume — not by keystrokes that send nothing
+and not by its output, so two working agents do not keep swapping places. The
+time is kept on the session's record and survives daemon upgrades. Temporal
+Chats stay above every folder, and the archive is listed below in the same
+order, which for an archived session is when it was put down — so the
+conversation you just closed is at the top of its folder.
 Resuming an Archived agent brings that entry back as itself: the same session
 id, label, parent and subagents, its history file carried on rather than
 started over, and no second entry left behind in the archive. The

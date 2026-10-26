@@ -223,7 +223,10 @@ preserve.
   patterns are sunk into the daemon so both classifiers agree.
 - The grouped session view must separate one folder from the next visually, not
   only by indentation, and temporal sessions sort above every folder so the
-  scratch chat just opened is the first thing on screen.
+  scratch chat just opened is the first thing on screen. Below them, folders and
+  the sessions in each go most recently used first, where used means something
+  was submitted to the session — never its output, which would reshuffle the
+  list while agents work — and the time lives on the session's record.
 - File-browser input is modal: while it is focused, application shortcuts must
   not leak into the machine or agent views.
 - Tag asynchronous directory and preview results with their request identity.
