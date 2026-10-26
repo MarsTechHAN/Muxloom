@@ -215,7 +215,9 @@ and `#{window_activity}`. When a session waits, its entire agent item turns
 bold yellow, it raises a clickable banner, rings the bell, and emits a desktop
 notification. The reason it reports is the runtime's own notification when it
 sent one since the last keystroke, else the question the dialog draws above its options, in the words
-it is asked in, else plainly `waiting for input`. Opening the session clears
+it is asked in, else plainly `waiting for input`. A dialog is a block of numbered
+options with the selected one marked (`❯ 1. Yes`); a numbered list at the end of
+an answer marks none, and is not read as one. Opening the session clears
 the banner — the session list keeps showing Waiting until the agent stops
 asking — and a later prompt raises it again.
 

@@ -3722,6 +3722,12 @@ fn question_line(rows: &[&str]) -> Option<String> {
         }
         break;
     }
+    // A dialog marks the option the keyboard is on (`❯ 1. Yes`, `› 1. Yes`); a
+    // numbered list in an answer marks none. Without this, an idle agent whose
+    // last answer ended in a list read as waiting on the sentence above it.
+    if !rows[first..=last].iter().any(|line| selector_line(line)) {
+        return None;
+    }
     rows[..first]
         .iter()
         .rev()
@@ -6138,6 +6144,17 @@ mod tests {
                 .collect::<String>(),
         );
         assert_eq!(dialog_question(&stale), None);
+        // An idle agent whose answer ended in a numbered list, over its empty
+        // prompt box: no option is marked, so nothing is being asked.
+        let answered = format!(
+            "  3. 没有其他地方用到它：新代码里出现的 ref_selected_topk: 64 在 seedance_pf_recipe.py（PF\n  \
+             用的配置），另外 seedance_bd_attn.py 只用于 BD，都和这次 480p T2VA 无关。\n\n  \
+             4. 每层的 selected_topk 也一致：两边都是按全局层号取。\n\n✻ Sautéed for 2m 6s\n\n{}\n❯\n{}\n  \
+             ⏵⏵ auto mode on (shift+tab to cycle)\n",
+            rule(),
+            rule()
+        );
+        assert_eq!(dialog_question(&answered), None);
         // OpenCode draws its answers as buttons on one row, not as options,
         // so its question is not read: the state still says it waits.
         let opencode = concat!(

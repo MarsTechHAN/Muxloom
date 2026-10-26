@@ -276,7 +276,8 @@ shell 还有子进程在等就算 Working（静默链接中的编译也是编译
 （`$`、`#`、`%`、`>`、`❯`、`»`，最常见的是 ssh）上，都是有人在看的屏幕而不是提问，读作
 Idle。tmux 托管的会话用同样的办法读
 `#{pane_title}`、`#{cursor_flag}` 和 `#{window_activity}`。Waiting 的理由依次取 runtime
-在最后一次按键之后自己发出的通知、对话框选项上方的那句问话、否则就是 `waiting for input`；Waiting Agent
+在最后一次按键之后自己发出的通知、对话框选项上方的那句问话、否则就是 `waiting for input`。对话框是一组编号选项，其中被选中的那项带标记（`❯ 1. Yes`）；
+回答末尾的编号列表没有任何一项被标记，不会被当成对话框；Waiting Agent
 的整个条目会变成黄色加粗。
 
 <a id="zh-controls"></a>
