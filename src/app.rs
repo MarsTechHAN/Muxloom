@@ -1951,6 +1951,11 @@ pub struct App {
     pending_activity_refreshes: HashSet<String>,
     pending_capture: Option<(String, String, usize)>,
     history_cache: HashMap<String, Vec<HistoryPage>>,
+    /// The width the daemon last drew each session's history pages at, keyed
+    /// like [`Self::history_cache`]. That is the session's own width, or wider
+    /// where its log positions text past it, and never the pane's: a capture
+    /// does not say how wide a pane is asking.
+    history_widths: HashMap<String, usize>,
     history_cache_dir: PathBuf,
     dragging: Option<DragDivider>,
     /// The press being followed from button-down to button-up, and the pane it
@@ -2156,6 +2161,7 @@ impl App {
             pending_activity_refreshes: HashSet::new(),
             pending_capture: None,
             history_cache: HashMap::new(),
+            history_widths: HashMap::new(),
             history_cache_dir,
             dragging: None,
             pointer: None,
@@ -4185,6 +4191,12 @@ impl App {
     pub fn resize_agent_viewport(&mut self, width: u16, height: u16) {
         let width = width.max(20);
         let height = height.max(5);
+        if width != self.agent_viewport_width {
+            // An attached session is about to be drawn at the new width, so
+            // what the daemon drew it at before says nothing about the pages
+            // it will draw next.
+            self.history_widths.clear();
+        }
         self.agent_viewport_width = width;
         self.agent_viewport_height = height;
         if self.dragging.is_none() {
@@ -8455,15 +8467,20 @@ impl App {
         desired_offset: usize,
         viewport_lines: usize,
     ) -> Option<HistoryPage> {
+        let key = history_cache_key(target_id, session_id);
+        let drawn_width = self.history_drawn_width(&key);
         self.history_cache
-            .get(&history_cache_key(target_id, session_id))?
+            .get(&key)?
             .iter()
             // A rendered page is not text, it is the rows a terminal of one
-            // particular width drew. Put those rows in a pane of another width
-            // and every wrapped line lands in the wrong place — which is what
-            // reading an archived session's history looked like, because the
-            // pane it is read in is not the width the page was captured at.
-            .filter(|page| !page.rendered || page.pane_width == self.agent_viewport_width as usize)
+            // particular width drew, and only pages drawn at one width tile:
+            // the rows a page counts back depend on where its lines wrapped.
+            // Which width is the daemon's to say - it draws at the session's
+            // own - so a page is reused at the width the daemon drew the last
+            // one at. Matching it to the pane instead turned away every page
+            // of a session not exactly as wide as the pane, the one that had
+            // just arrived included, and each arrival asked for itself again.
+            .filter(|page| !page.rendered || page.pane_width == drawn_width)
             .filter(|page| {
                 if self.history.total_lines() == 0 {
                     return true;
@@ -8480,6 +8497,16 @@ impl App {
             .max_by_key(|page| page.offset_from_bottom)
     }
 
+    /// The width rendered pages of the session cached under `key` are drawn
+    /// at: what the daemon last answered with, or until it has, the pane's -
+    /// the width an attached session's terminal has.
+    fn history_drawn_width(&self, key: &str) -> usize {
+        self.history_widths
+            .get(key)
+            .copied()
+            .unwrap_or(self.agent_viewport_width as usize)
+    }
+
     fn show_history_page(&mut self, page: HistoryPage) {
         self.history = page;
         self.history_message = if self.history.text.is_empty() {
@@ -8491,6 +8518,10 @@ impl App {
     }
 
     fn store_history_page(&mut self, target_id: &str, session_id: &str, page: HistoryPage) {
+        if page.rendered {
+            self.history_widths
+                .insert(history_cache_key(target_id, session_id), page.pane_width);
+        }
         let pages = self
             .history_cache
             .entry(history_cache_key(target_id, session_id))
@@ -8546,7 +8577,7 @@ impl App {
             target_id,
             session_id,
             offset,
-            Some(self.agent_viewport_width as usize),
+            Some(self.history_drawn_width(&history_cache_key(target_id, session_id))),
         );
         let path = if rendered.exists() {
             rendered
@@ -16323,6 +16354,86 @@ mod tests {
         app.scroll_history(false, 3);
         assert_eq!(app.history_offset, buffered_boundary);
         assert!(app.attached_history_is_buffered());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An archived session keeps the width it last ran at, and the pane it is
+    /// read in is whatever width the dashboard has today.
+    #[test]
+    fn an_archived_session_read_in_a_pane_of_another_width_shows_its_history_once() {
+        let (mut app, request_rx, root, _boundary) = attached_claude_app("archived-width");
+        app.terminal = None;
+        app.terminal_session_id = None;
+        app.history_offset = 0;
+        app.sessions[0].dead = true;
+        app.history_cache_dir = root.join("history");
+
+        app.scroll_history(true, 1);
+        let requested = match receive_request(&request_rx) {
+            Request::Capture {
+                offset_from_bottom, ..
+            } => offset_from_bottom,
+            request => panic!("expected a history capture, got {request:?}"),
+        };
+        let mut page = daemon_page(requested, true);
+        page.pane_width = 132;
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(page),
+        });
+
+        assert!(app.history.text.contains("daemon-line"));
+        assert!(!app.history_loading, "not left saying it is loading");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "one capture for one page, not one after another for as long as it is selected"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The daemon draws a page at the session's own width, and wider still
+    /// where a log positions text past it - Claude Code's, once the pane has
+    /// been wider than it is now. Whatever width it reports, the page that
+    /// came back is the page to show, and it answers the scroll it was asked
+    /// for: no second capture for the same rows.
+    #[test]
+    fn a_history_page_drawn_wider_than_the_pane_is_shown_and_not_asked_for_again() {
+        let (mut app, request_rx, root, buffered_boundary) = attached_claude_app("wide-page");
+
+        app.scroll_history(true, 3);
+        let requested = match receive_request(&request_rx) {
+            Request::Capture {
+                offset_from_bottom, ..
+            } => offset_from_bottom,
+            request => panic!("expected a history capture, got {request:?}"),
+        };
+        let mut page = daemon_page(requested, true);
+        page.pane_width = 120;
+        app.handle_worker_event(Event::Captured {
+            target_id: "local".into(),
+            session_id: "muxloomd-claude-long-history".into(),
+            result: Ok(page),
+        });
+
+        assert!(
+            app.history.text.contains("daemon-line"),
+            "the page that came back is on screen"
+        );
+        assert!(!app.history_loading);
+        assert!(
+            request_rx.try_recv().is_err(),
+            "and nothing asks the daemon to draw the same rows again"
+        );
+
+        // Scrolling on within the page is served from it.
+        app.scroll_history(true, 3);
+        assert_eq!(app.history_offset, buffered_boundary + 6);
+        assert!(app.history.text.contains("daemon-line"));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "a line further up is in hand"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
