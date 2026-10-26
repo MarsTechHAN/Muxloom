@@ -370,9 +370,10 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
     tools.push(ToolSpec {
         name: "send_input",
         description: "Type into a session's terminal without disturbing whoever is attached: \
-                      `text` verbatim, then each key in `keys` (enter, esc, tab, backspace, \
-                      space, delete, up, down, left, right, home, end, page-up, page-down, \
-                      ctrl-a…ctrl-z), then Enter if `submit`. For an agent, message_agent is \
+                      `text` verbatim, then each key in `keys` (enter, esc, tab, shift-tab, \
+                      backspace, space, delete, up, down, left, right, home, end, page-up, \
+                      page-down, ctrl-a…ctrl-z; tmux names like C-c work too), then Enter if \
+                      `submit`. For an agent, message_agent is \
                       usually better. Typing interrupts: check working and needs_attention \
                       first, and watch the result with wait_for."
             .into(),
@@ -1012,31 +1013,60 @@ fn agent_kind(arguments: &Value) -> Result<AgentKind> {
         .map_err(|error: String| anyhow::anyhow!(error))
 }
 
+/// The keys [`encode_key`] knows, as an agent is told them when it names
+/// one that is not among them.
+const KEY_NAMES: &str = "enter, esc, tab, shift-tab, backspace, space, delete, up, down, left, \
+                         right, home, end, page-up, page-down, ctrl-a…ctrl-z";
+
 /// The bytes one named key sends to a PTY.
+///
+/// A name is read the way agents write it, not only the way this list does:
+/// any case, `+`, `_` or a space for the dash, tmux's `C-c` and `BTab`, a
+/// caret for control, and the common other names — `return`, `escape`,
+/// `arrowup`, `pgup`, `del`. Each of those used to be refused, and the agent
+/// learned the right spelling from the error one call later.
 fn encode_key(name: &str) -> Result<Vec<u8>> {
-    let bytes: &[u8] = match name {
-        "enter" => b"\r",
-        "newline" => b"\n",
+    let key = name
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['+', '_', ' '], "-");
+    // tmux writes control as `C-c` and a caret writes it as `^C`.
+    let key = match key.strip_prefix("c-").or_else(|| key.strip_prefix('^')) {
+        Some(letter) if letter.len() == 1 => format!("ctrl-{letter}"),
+        _ => key,
+    };
+    let key = key
+        .strip_prefix("control-")
+        .map_or(key.clone(), |rest| format!("ctrl-{rest}"));
+    let key = key
+        .strip_prefix("arrow-")
+        .or_else(|| key.strip_prefix("arrow"))
+        .unwrap_or(&key)
+        .to_string();
+    let bytes: &[u8] = match key.as_str() {
+        "enter" | "return" | "ret" | "cr" => b"\r",
+        "newline" | "lf" => b"\n",
         "esc" | "escape" => b"\x1b",
         "tab" => b"\t",
-        "backspace" => b"\x7f",
-        "space" => b" ",
-        "delete" => b"\x1b[3~",
+        "shift-tab" | "s-tab" | "backtab" | "btab" => b"\x1b[Z",
+        "backspace" | "bs" | "bspace" => b"\x7f",
+        "space" | "spc" => b" ",
+        "delete" | "del" | "dc" => b"\x1b[3~",
         "up" => b"\x1b[A",
         "down" => b"\x1b[B",
         "right" => b"\x1b[C",
         "left" => b"\x1b[D",
         "home" => b"\x1b[H",
         "end" => b"\x1b[F",
-        "page-up" => b"\x1b[5~",
-        "page-down" => b"\x1b[6~",
+        "page-up" | "pageup" | "pgup" | "ppage" => b"\x1b[5~",
+        "page-down" | "pagedown" | "pgdn" | "pgdown" | "npage" => b"\x1b[6~",
         other => {
             if let Some(letter) = other.strip_prefix("ctrl-")
                 && let [letter @ b'a'..=b'z'] = letter.as_bytes()
             {
                 return Ok(vec![letter - b'a' + 1]);
             }
-            bail!("unsupported key {other:?}");
+            bail!("unsupported key {name:?}: use {KEY_NAMES}");
         }
     };
     Ok(bytes.to_vec())
@@ -5801,6 +5831,30 @@ mod tests {
         assert_eq!(encode_key("ctrl-z").unwrap(), vec![26]);
         assert!(encode_key("ctrl-1").is_err());
         assert!(encode_key("meta-x").is_err());
+        // The names agents actually write, all of which used to be refused.
+        for (written, bytes) in [
+            ("Enter", &b"\r"[..]),
+            ("Return", b"\r"),
+            ("ESCAPE", b"\x1b"),
+            ("ctrl+c", &[3]),
+            ("Ctrl-C", &[3]),
+            ("C-c", &[3]),
+            ("^C", &[3]),
+            ("control_d", &[4]),
+            ("shift+tab", b"\x1b[Z"),
+            ("BTab", b"\x1b[Z"),
+            ("ArrowUp", b"\x1b[A"),
+            ("arrow down", b"\x1b[B"),
+            ("PageUp", b"\x1b[5~"),
+            ("pgdn", b"\x1b[6~"),
+            ("Del", b"\x1b[3~"),
+        ] {
+            assert_eq!(encode_key(written).unwrap(), bytes, "{written}");
+        }
+        // And one it still cannot read says which it can.
+        let error = encode_key("hyper-q").unwrap_err().to_string();
+        assert!(error.contains("\"hyper-q\""), "{error}");
+        assert!(error.contains("shift-tab"), "{error}");
     }
 
     #[test]
