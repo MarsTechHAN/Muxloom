@@ -4681,116 +4681,168 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     let label_width = 27u16.min(inner.width / 2);
     let value_width = inner.width.saturating_sub(label_width + 1) as usize;
     let visible_rows = inner.height.saturating_sub(3) as usize;
+    let label = |text: &str, style: Style| {
+        Span::styled(
+            truncate(
+                &format!("  {text:<width$}", width = label_width as usize - 2),
+                label_width as usize,
+            ),
+            style,
+        )
+    };
+    let editing = Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58));
     // Lay every row out first — section headings interleaved with fields —
-    // then scroll so the selected field stays visible.
-    let mut lines: Vec<(Option<usize>, Line)> = Vec::new();
+    // then scroll so the selected one stays visible. The selected text row
+    // also says which column its cursor is in.
+    let mut lines: Vec<Line> = Vec::new();
     let mut field_index = 0usize;
     let mut focus_index = 0usize;
     let mut note_index = 0usize;
     let mut selected_row = 0usize;
+    let mut cursor_column = None;
+    let own_names: Vec<&str> = form
+        .environment
+        .iter()
+        .filter_map(|row| row.split_once('=').map(|(name, _)| name.trim()))
+        .collect();
     for row in form.rows() {
+        let active = matches!(
+            row,
+            SettingsRow::Field(_) | SettingsRow::Variable(_) | SettingsRow::Action(..)
+        ) && focus_index == form.selected;
+        if active {
+            selected_row = lines.len();
+        }
         match row {
-            SettingsRow::Note(label) => {
+            SettingsRow::Note(text) => {
                 let value = form.notes.get(note_index).cloned().unwrap_or_default();
-                lines.push((
-                    None,
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  {label:<width$}", width = label_width as usize - 2),
-                            Style::default().fg(Color::Gray),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            truncate(&value, value_width),
-                            Style::default().fg(Color::Gray),
-                        ),
-                    ]),
-                ));
+                lines.push(Line::from(vec![
+                    label(text, Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(&value, value_width),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]));
                 note_index += 1;
             }
-            SettingsRow::Action(label, hint) => {
-                let active = focus_index == form.selected;
-                if active {
-                    selected_row = lines.len();
-                }
-                lines.push((
-                    None,
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  {label:<width$}", width = label_width as usize - 2),
-                            if active {
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::Gray)
-                            },
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            truncate(hint, value_width),
-                            Style::default().fg(if active { Color::White } else { MUTED }),
-                        ),
-                    ]),
-                ));
+            SettingsRow::Action(text, hint) => {
+                lines.push(Line::from(vec![
+                    label(
+                        text,
+                        match active {
+                            true => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            false => Style::default().fg(Color::Gray),
+                        },
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(hint, value_width),
+                        Style::default().fg(if active { Color::White } else { MUTED }),
+                    ),
+                ]));
                 focus_index += 1;
             }
             SettingsRow::Section(title) => {
                 if !lines.is_empty() {
-                    lines.push((None, Line::raw("")));
+                    lines.push(Line::raw(""));
                 }
-                lines.push((
-                    None,
-                    Line::styled(
-                        format!("— {title} —"),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
+                lines.push(Line::styled(
+                    format!("— {title} —"),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ));
             }
-            SettingsRow::Field(label) => {
+            SettingsRow::Field(text) => {
                 let value = form.values.get(field_index).cloned().unwrap_or_default();
-                let active = focus_index == form.selected;
-                if active {
-                    selected_row = lines.len();
-                }
-                let shown = tail_display(&value, value_width);
-                lines.push((
-                    Some(field_index),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  {label:<width$}", width = label_width as usize - 2),
-                            Style::default().fg(if active { ACCENT } else { Color::Gray }),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            shown,
-                            if active {
-                                Style::default().fg(Color::White).bg(Color::Rgb(42, 48, 58))
-                            } else {
-                                Style::default().fg(Color::White)
-                            },
-                        ),
-                    ]),
-                ));
+                let shown = match active {
+                    true => {
+                        let (shown, column) = field_window(&value, form.cursor, value_width);
+                        cursor_column = Some(column);
+                        shown
+                    }
+                    false => tail_display(&value, value_width),
+                };
+                lines.push(Line::from(vec![
+                    label(
+                        text,
+                        Style::default().fg(if active { ACCENT } else { Color::Gray }),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        shown,
+                        match active {
+                            true => editing,
+                            false => Style::default().fg(Color::White),
+                        },
+                    ),
+                ]));
                 field_index += 1;
                 focus_index += 1;
+            }
+            SettingsRow::Variable(index) => {
+                let text = form.environment.get(index).cloned().unwrap_or_default();
+                let (name, value) = text
+                    .split_once('=')
+                    .map_or((text.as_str(), ""), |(name, value)| (name, value));
+                let name = match name.trim() {
+                    "" => "(new variable)",
+                    name => name,
+                };
+                // Read as a list of names and values; edited as the one
+                // `NAME=value` it is.
+                let shown = match active {
+                    true => {
+                        let (shown, column) = field_window(&text, form.cursor, value_width);
+                        cursor_column = Some(column);
+                        shown
+                    }
+                    false => tail_display(value, value_width),
+                };
+                lines.push(Line::from(vec![
+                    label(
+                        name,
+                        Style::default().fg(if active { ACCENT } else { Color::White }),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        shown,
+                        match active {
+                            true => editing,
+                            false => Style::default().fg(Color::White),
+                        },
+                    ),
+                ]));
+                focus_index += 1;
+            }
+            SettingsRow::Inherited(index) => {
+                let (name, value) = form.inherited.get(index).cloned().unwrap_or_default();
+                let note = match own_names.contains(&name.as_str()) {
+                    true => "  · overridden here",
+                    false => "  · global",
+                };
+                lines.push(Line::from(vec![
+                    label(&name, Style::default().fg(MUTED)),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(&format!("{value}{note}"), value_width),
+                        Style::default().fg(MUTED),
+                    ),
+                ]));
             }
         }
     }
     let start = selected_row.saturating_add(1).saturating_sub(visible_rows);
     let mut cursor_position = None;
-    for (visible_index, (field, line)) in
-        lines.into_iter().skip(start).take(visible_rows).enumerate()
-    {
+    for (visible_index, line) in lines.into_iter().skip(start).take(visible_rows).enumerate() {
         let row = Rect::new(inner.x, inner.y + visible_index as u16, inner.width, 1);
-        if let Some(selected_value) = form.selected_value()
-            && field == Some(selected_value)
-            && let Some(value) = form.values.get(selected_value)
+        if start + visible_index == selected_row
+            && let Some(column) = cursor_column
         {
-            let shown = tail_display(value, value_width);
             cursor_position = Some((
                 inner
                     .x
                     .saturating_add(label_width + 1)
-                    .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
+                    .saturating_add(column as u16)
                     .min(inner.x + inner.width.saturating_sub(1)),
                 row.y,
             ));
@@ -4806,9 +4858,11 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
         );
     }
     frame.render_widget(
-        Paragraph::new(
-            "Shell syntax: --flag 'value' / A=value   Tab field   Enter save   Esc cancel",
-        )
+        Paragraph::new(truncate(
+            "Tab/↑↓ row  ←→ Home End edit  Enter save  Esc cancel  ⌘C copy  ⌘V paste  \
+             ^D remove variable  ^U clear",
+            inner.width as usize,
+        ))
         .style(Style::default().fg(MUTED)),
         Rect::new(
             inner.x,
@@ -4820,6 +4874,36 @@ fn draw_settings_modal(frame: &mut Frame<'_>, form: &SettingsForm, outer: Rect) 
     if let Some(position) = cursor_position {
         frame.set_cursor_position(position);
     }
+}
+
+/// The stretch of `text` a field `width` columns wide shows with the cursor at
+/// character `cursor`, and the column the cursor sits in. The end of the text
+/// is shown when the cursor is there, which is where typing usually is; moved
+/// back, the window follows it so the character being edited is always on
+/// screen.
+fn field_window(text: &str, cursor: usize, width: usize) -> (String, usize) {
+    let characters: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(characters.len());
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let column_width = |range: &[char]| -> usize {
+        range
+            .iter()
+            .map(|character| UnicodeWidthChar::width(*character).unwrap_or(0))
+            .sum()
+    };
+    // Start as far left as still keeps the cursor (and one cell after it) in.
+    let mut start = 0usize;
+    while start < cursor && column_width(&characters[start..cursor]) + 1 > width {
+        start += 1;
+    }
+    let mut end = start;
+    while end < characters.len() && column_width(&characters[start..=end]) <= width {
+        end += 1;
+    }
+    let shown: String = characters[start..end].iter().collect();
+    (shown, column_width(&characters[start..cursor]))
 }
 
 /// The runtime row, with the hint that Left/Right change it. Only the
@@ -6674,6 +6758,29 @@ mod tests {
             drawn.iter().any(|text| text.contains("[Thread]")),
             "{drawn:?}"
         );
+    }
+
+    /// A field narrower than its text keeps the cursor on screen wherever it
+    /// is: at the end it shows the end, moved back it follows, and the column
+    /// it reports is where the cursor is drawn.
+    #[test]
+    fn a_long_field_scrolls_to_keep_its_cursor_in_view() {
+        let text = "TOKEN=abcdefghijklmnopqrstuvwxyz";
+        let (shown, column) = field_window(text, text.chars().count(), 10);
+        assert!(
+            text.ends_with(&shown) && shown.chars().count() <= 10,
+            "{shown}"
+        );
+        assert_eq!(column, shown.chars().count());
+        let (shown, column) = field_window(text, 0, 10);
+        assert_eq!((shown.as_str(), column), ("TOKEN=abcd", 0));
+        let (shown, column) = field_window(text, 12, 10);
+        assert_eq!(&shown[column..column + 1], "g", "{shown} at {column}");
+        // Wide characters count by the columns they take.
+        let (shown, column) = field_window("名前=値です", 5, 6);
+        assert!(UnicodeWidthStr::width(shown.as_str()) <= 6, "{shown}");
+        assert!(column <= 6);
+        assert_eq!(field_window("", 0, 0), (String::new(), 0));
     }
 
     #[test]

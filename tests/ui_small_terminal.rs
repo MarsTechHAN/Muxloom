@@ -307,13 +307,20 @@ fn settings_modal_never_panics() {
                 AgentKind::agents().collect(),
             ),
         ] {
+            // Variables of both kinds, one long enough that it has to scroll
+            // around the cursor at every width.
+            let environment = vec![
+                "HTTP_PROXY=http://proxy.example:8080".to_string(),
+                format!("LONG={}", "x".repeat(200)),
+                String::new(),
+            ];
+            let inherited = vec![("HTTP_PROXY".to_string(), "http://global:3128".to_string())];
             let template = SettingsForm {
                 scope: scope.clone(),
-                selected: 0,
-                values: Vec::new(),
-                notes: Vec::new(),
+                environment: environment.clone(),
+                inherited: inherited.clone(),
                 missing: missing.clone(),
-                error: None,
+                ..SettingsForm::default()
             };
             let rows = template.rows();
             let values: Vec<String> = rows
@@ -335,7 +342,9 @@ fn settings_modal_never_panics() {
                 .filter(|row| {
                     matches!(
                         row,
-                        muxloom::app::SettingsRow::Field(_) | muxloom::app::SettingsRow::Action(..)
+                        muxloom::app::SettingsRow::Field(_)
+                            | muxloom::app::SettingsRow::Variable(_)
+                            | muxloom::app::SettingsRow::Action(..)
                     )
                 })
                 .count();
@@ -344,8 +353,12 @@ fn settings_modal_never_panics() {
                     scope: scope.clone(),
                     selected: selected.min(focusable - 1),
                     values: values.clone(),
+                    environment: environment.clone(),
+                    inherited: inherited.clone(),
                     notes: notes.clone(),
                     missing: missing.clone(),
+                    // Anywhere in the text, including past the end.
+                    cursor: selected * 7,
                     error: Some("bad value".into()),
                 };
                 draw_with(Some(Modal::Settings(form)), *w, *h);

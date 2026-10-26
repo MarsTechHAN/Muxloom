@@ -175,7 +175,10 @@ nightly 才会被提示。`-V` 会打印 CI 构建对应的 commit 与所属线�
 GitHub 不可达时 companion 部署会降级使用已校验的本地缓存并明确提示可能过期。设置面板
 （`,` 机器级 / `Ctrl-,` 全局）按分组只展示常用项——刷新间隔、环境变量、各 agent 命令、
 更新提示与更新通道；隧道、companion 覆盖、安装命令、sync files、attention patterns 等
-低频项仅在 config.toml 中配置。机器级面板还会显示该机 `muxloomd` 的运行版本，并带一个
+低频项仅在 config.toml 中配置。环境变量是一张列表，每个变量单独一行：用光标就地编辑（`←` `→`
+`Home` `End`、`Delete`），`⌘C`/`Ctrl-Shift-C` 复制，`Ctrl-D` 删除；**Add variable** 新增一行，
+在那里粘贴多行 `NAME=value` 或 `export NAME=value` 会变成同样多行。机器级面板会在自己的变量下面列出
+从全局继承的变量，并标出被本机覆盖的那些；保存时只把本机自己的行写进本机配置。机器级面板还会显示该机 `muxloomd` 的运行版本，并带一个
 **Force update** 动作，用来强制完成被旧会话拖住的 daemon 升级。
 
 <a id="zh-first-run"></a>

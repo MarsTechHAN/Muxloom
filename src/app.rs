@@ -934,23 +934,95 @@ const RECOVERED_HISTORY_BYTES: usize = 512 * 1024;
 /// instead of re-dialing and replaying the scrollback from scratch.
 const MAX_CACHED_TERMINALS: usize = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SettingsForm {
     pub scope: SettingsScope,
     pub values: Vec<String>,
+    /// The environment this panel sets, one `NAME=value` per row, each its own
+    /// line to read, edit, copy, or remove. Kept in `config.toml` as one
+    /// shell-quoted string, which is what every older build reads.
+    pub environment: Vec<String>,
+    /// On a machine's panel, what the global settings already set, shown so a
+    /// person can see what the machine inherits and what its own rows override.
+    pub inherited: Vec<(String, String)>,
     /// Text for the read-only [`SettingsRow::Note`] rows, in row order.
     pub notes: Vec<String>,
     /// The runtimes this machine does not have, filled when the panel opens.
     /// Each one gets an install action in its own section.
     pub missing: Vec<AgentKind>,
     pub selected: usize,
+    /// Where typing lands in the selected text, in characters. Moving the
+    /// selection puts it at the end, which is where a person starts editing.
+    pub cursor: usize,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SettingsScope {
+    #[default]
     Global,
     Host(String),
+}
+
+/// The action that adds an environment row.
+pub const ADD_VARIABLE_ACTION: &str = "Add variable";
+
+/// A config environment string as the rows a panel edits, one assignment per
+/// row. A string whose quoting will not parse — edited by hand into something
+/// no shell reads — comes back as one row holding all of it, so the panel shows
+/// exactly what is there and saving says what is wrong with it.
+pub fn environment_rows(value: &str) -> Vec<String> {
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    shell_words::split(value).unwrap_or_else(|_| vec![value.trim().to_string()])
+}
+
+/// The rows back as the one string `config.toml` keeps: each assignment quoted
+/// for the shell, so a value with a space or a quote in it survives, and blank
+/// rows left out.
+pub fn environment_value(rows: &[String]) -> String {
+    rows.iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty())
+        // `NAME='a value'`, the way a person writes it, rather than the whole
+        // assignment in quotes; a row that is not an assignment is quoted
+        // whole, so saving keeps it intact and says what is wrong with it.
+        .map(|row| match row.split_once('=') {
+            Some((name, value)) if is_assignment(row) => {
+                format!("{name}={}", shell_words::quote(value))
+            }
+            _ => shell_words::quote(row).into_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The variables a paste names, when it names any: each line, and each
+/// `NAME=value` word on a line, is one. A paste that is not a list of
+/// assignments — half a URL, a value on its own — is `None`, and is typed into
+/// the row under the cursor instead.
+fn pasted_assignments(text: &str) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let words = shell_words::split(line).ok()?;
+        if words.is_empty() || !words.iter().all(|word| is_assignment(word)) {
+            return None;
+        }
+        found.extend(words);
+    }
+    (found.len() > 1 || text.trim().contains('\n')).then_some(found)
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        let mut characters = name.chars();
+        characters
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && characters.all(|rest| rest == '_' || rest.is_ascii_alphanumeric())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1160,6 +1232,12 @@ fn human_voice() -> TalkVoice {
 pub enum SettingsRow {
     Section(&'static str),
     Field(&'static str),
+    /// One environment variable, `environment[n]`: its own line, edited,
+    /// copied and removed on its own.
+    Variable(usize),
+    /// A variable a machine inherits from the global settings, `inherited[n]`:
+    /// shown, not edited here.
+    Inherited(usize),
     /// Read-only text the app fills in when the form opens.
     Note(&'static str),
     /// Runs when the selection is on it and Enter is pressed, with the hint
@@ -1208,20 +1286,23 @@ impl SettingsForm {
     pub fn rows(&self) -> Vec<SettingsRow> {
         let mut rows = Vec::new();
         let host = matches!(self.scope, SettingsScope::Host(_));
-        if host {
-            rows.extend([
-                SettingsRow::Section("Environment"),
-                SettingsRow::Field("Environment (A=x B=y)"),
-            ]);
-        } else {
+        if !host {
             rows.extend([
                 SettingsRow::Section("General"),
                 SettingsRow::Field("Refresh interval (ms)"),
                 SettingsRow::Field("SSH config path"),
-                SettingsRow::Section("Environment"),
-                SettingsRow::Field("Environment (A=x B=y)"),
             ]);
         }
+        // Every variable on a line of its own, and the ones a machine inherits
+        // listed beneath its own, so what a session there will see is on
+        // screen rather than worked out from two strings.
+        rows.push(SettingsRow::Section("Environment"));
+        rows.extend((0..self.environment.len()).map(SettingsRow::Variable));
+        rows.push(SettingsRow::Action(
+            ADD_VARIABLE_ACTION,
+            "Enter: add one · paste NAME=value lines to add several",
+        ));
+        rows.extend((0..self.inherited.len()).map(SettingsRow::Inherited));
         for kind in AgentKind::agents() {
             rows.push(SettingsRow::Section(agent_section(kind)));
             rows.push(SettingsRow::Field("Command"));
@@ -1270,8 +1351,149 @@ impl SettingsForm {
     fn focusable(&self) -> Vec<SettingsRow> {
         self.rows()
             .into_iter()
-            .filter(|row| matches!(row, SettingsRow::Field(_) | SettingsRow::Action(..)))
+            .filter(|row| {
+                matches!(
+                    row,
+                    SettingsRow::Field(_) | SettingsRow::Variable(_) | SettingsRow::Action(..)
+                )
+            })
             .collect()
+    }
+
+    /// The row under the selection.
+    pub fn selected_row(&self) -> Option<SettingsRow> {
+        self.focusable().get(self.selected).copied()
+    }
+
+    /// The text under the selection, when it is one a person can type into.
+    pub fn selected_text(&self) -> Option<&String> {
+        match self.selected_row()? {
+            SettingsRow::Variable(index) => self.environment.get(index),
+            SettingsRow::Field(_) => self.values.get(self.selected_value()?),
+            _ => None,
+        }
+    }
+
+    fn selected_text_mut(&mut self) -> Option<&mut String> {
+        match self.selected_row()? {
+            SettingsRow::Variable(index) => self.environment.get_mut(index),
+            SettingsRow::Field(_) => {
+                let index = self.selected_value()?;
+                self.values.get_mut(index)
+            }
+            _ => None,
+        }
+    }
+
+    /// Move the selection by `delta` rows, landing the cursor at the end of
+    /// whatever is there.
+    pub fn step(&mut self, delta: isize) {
+        self.selected = clamped_index(self.selected, self.focus_len(), delta);
+        self.cursor_to_end();
+        self.error = None;
+    }
+
+    fn cursor_to_end(&mut self) {
+        self.cursor = self.selected_text().map_or(0, |text| text.chars().count());
+    }
+
+    /// Put `text` in at the cursor.
+    pub fn insert(&mut self, text: &str) {
+        let cursor = self.cursor;
+        let Some(field) = self.selected_text_mut() else {
+            return;
+        };
+        let at = byte_at(field, cursor);
+        field.insert_str(at, text);
+        self.cursor = cursor + text.chars().count();
+        self.error = None;
+    }
+
+    /// Take out the character before the cursor (`back`) or under it.
+    pub fn erase(&mut self, back: bool) {
+        let cursor = self.cursor;
+        let Some(field) = self.selected_text_mut() else {
+            return;
+        };
+        let length = field.chars().count();
+        let gone = match back {
+            true if cursor > 0 => cursor - 1,
+            false if cursor < length => cursor,
+            _ => return,
+        };
+        let at = byte_at(field, gone);
+        field.remove(at);
+        self.cursor = gone;
+        self.error = None;
+    }
+
+    /// Move the cursor within the selected text, by characters or to an end.
+    pub fn move_cursor(&mut self, to: CursorMove) {
+        let length = self.selected_text().map_or(0, |text| text.chars().count());
+        self.cursor = match to {
+            CursorMove::Left => self.cursor.saturating_sub(1),
+            CursorMove::Right => (self.cursor + 1).min(length),
+            CursorMove::Start => 0,
+            CursorMove::End => length,
+        };
+    }
+
+    /// Empty the selected text.
+    pub fn clear_selected(&mut self) {
+        if let Some(field) = self.selected_text_mut() {
+            field.clear();
+        }
+        self.cursor = 0;
+        self.error = None;
+    }
+
+    /// Add an empty variable at the end of the list and select it.
+    pub fn add_variable(&mut self) {
+        self.environment.push(String::new());
+        let at = self
+            .focusable()
+            .iter()
+            .position(|row| *row == SettingsRow::Variable(self.environment.len() - 1));
+        self.selected = at.unwrap_or(self.selected);
+        self.cursor = 0;
+        self.error = None;
+    }
+
+    /// Add several variables at once, after the selected one or at the end.
+    pub fn add_variables(&mut self, assignments: Vec<String>) {
+        let after = match self.selected_row() {
+            Some(SettingsRow::Variable(index)) if !self.environment[index].trim().is_empty() => {
+                index + 1
+            }
+            // An empty row being filled in is replaced, not left behind.
+            Some(SettingsRow::Variable(index)) => {
+                self.environment.remove(index);
+                index
+            }
+            _ => self.environment.len(),
+        };
+        let added = assignments.len();
+        for (offset, assignment) in assignments.into_iter().enumerate() {
+            self.environment.insert(after + offset, assignment);
+        }
+        let last = SettingsRow::Variable(after + added.saturating_sub(1));
+        if let Some(at) = self.focusable().iter().position(|row| *row == last) {
+            self.selected = at;
+        }
+        self.cursor_to_end();
+        self.error = None;
+    }
+
+    /// Remove the selected variable, if a variable is selected.
+    pub fn remove_variable(&mut self) -> bool {
+        let Some(SettingsRow::Variable(index)) = self.selected_row() else {
+            return false;
+        };
+        self.environment.remove(index);
+        self.selected = self.selected.min(self.focus_len().saturating_sub(1));
+        self.cursor_to_end();
+        self.error = None;
+        true
     }
 
     pub fn focus_len(&self) -> usize {
@@ -1300,6 +1522,22 @@ impl SettingsForm {
             _ => None,
         }
     }
+}
+
+/// Where a cursor in a text field goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMove {
+    Left,
+    Right,
+    Start,
+    End,
+}
+
+/// The byte offset of the `chars`th character of `text`, or its end.
+fn byte_at(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(at, _)| at)
 }
 
 #[derive(Debug)]
@@ -2566,7 +2804,11 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        // The settings panel copies its own field: a selection left in the
+        // terminal behind it is not what a person pressing copy over a field
+        // they are looking at means.
         if is_copy_shortcut(key)
+            && !matches!(self.modal, Some(Modal::Settings(_)))
             && (self.copy_preview_selection() || self.copy_terminal_selection())
         {
             return Action::Continue;
@@ -3840,6 +4082,31 @@ impl App {
             self.file_manager = Some(form);
             return;
         }
+        // A paste into the settings panel goes to the field under the
+        // selection — it used to go to the field whose number matched the
+        // row's, which past the first action row was a different one — and a
+        // list of `NAME=value` lines pasted into the environment becomes that
+        // many rows rather than one long line.
+        if let Some(Modal::Settings(form)) = self.modal.as_mut() {
+            let environment = matches!(
+                form.selected_row(),
+                Some(SettingsRow::Variable(_) | SettingsRow::Action(ADD_VARIABLE_ACTION, _))
+            );
+            match pasted_assignments(&text).filter(|_| environment) {
+                Some(assignments) => {
+                    let count = assignments.len();
+                    form.add_variables(assignments);
+                    self.status_message = format!("Added {count} variables");
+                }
+                None if form.selected_text().is_some() => form.insert(&single_line_paste(&text)),
+                None if form.selected_action() == Some(ADD_VARIABLE_ACTION) => {
+                    form.add_variable();
+                    form.insert(&single_line_paste(&text));
+                }
+                None => self.status_message = "Select a text field before pasting".into(),
+            }
+            return;
+        }
         if let Some(modal) = self.modal.as_mut() {
             let text = single_line_paste(&text);
             if text.is_empty() {
@@ -3858,12 +4125,6 @@ impl App {
                 Modal::Search(form) => {
                     form.query.push_str(&text);
                     mark_search_edited(form);
-                }
-                Modal::Settings(form) => {
-                    if let Some(value) = form.values.get_mut(form.selected) {
-                        value.push_str(&text);
-                        form.error = None;
-                    }
                 }
                 Modal::PortForward(form) if form.selected < PortForwardForm::FIELD_COUNT => {
                     port_forward_value(form).push_str(&text);
@@ -9872,7 +10133,6 @@ impl App {
         let mut values = vec![
             self.config.refresh_interval_ms.to_string(),
             self.config.ssh_config.clone(),
-            self.config.environment.clone(),
         ];
         for kind in AgentKind::agents() {
             let command = self.config.agents.get(kind);
@@ -9883,14 +10143,14 @@ impl App {
         values.push(self.config.update_prompt.clone());
         values.push(self.config.update_channel.clone());
         values.push(self.config.touch.clone());
-        self.modal = Some(Modal::Settings(SettingsForm {
+        let mut form = SettingsForm {
             scope: SettingsScope::Global,
             values,
-            notes: Vec::new(),
-            missing: Vec::new(),
-            selected: 0,
-            error: None,
-        }));
+            environment: environment_rows(&self.config.environment),
+            ..SettingsForm::default()
+        };
+        form.step(0);
+        self.modal = Some(Modal::Settings(form));
     }
 
     /// What the Daemon section reports for a machine: the version actually
@@ -9927,13 +10187,27 @@ impl App {
             self.status_message = "Select a machine before editing its configuration".into();
             return;
         };
-        let mut values = vec![
+        // The machine's own variables are its rows, and what it inherits from
+        // the global settings is listed under them. The panel used to show the
+        // global string in the machine's own field whenever the machine had
+        // none, and saving anything else on the panel then wrote a copy of it
+        // into the machine — which stopped following the global value from
+        // that moment on.
+        let environment = environment_rows(
             self.config
                 .hosts
                 .get(&target_id)
-                .and_then(|host| host.environment.clone())
-                .unwrap_or_else(|| self.config.environment.clone()),
-        ];
+                .and_then(|host| host.environment.as_deref())
+                .unwrap_or_default(),
+        );
+        let inherited = environment_rows(&self.config.environment)
+            .into_iter()
+            .filter_map(|row| {
+                row.split_once('=')
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+            })
+            .collect();
+        let mut values = Vec::new();
         for kind in AgentKind::agents() {
             let command = self.config.command_for(&target_id, kind).clone();
             values.push(command.command);
@@ -9959,14 +10233,17 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        self.modal = Some(Modal::Settings(SettingsForm {
+        let mut form = SettingsForm {
             scope: SettingsScope::Host(target_id.clone()),
             values,
+            environment,
+            inherited,
             notes: vec![self.daemon_version_note(&target_id)],
             missing,
-            selected: 0,
-            error: None,
-        }));
+            ..SettingsForm::default()
+        };
+        form.step(0);
+        self.modal = Some(Modal::Settings(form));
     }
 
     fn open_search(&mut self) {
@@ -11117,64 +11394,71 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Help(form)),
             },
-            Modal::Settings(mut form) => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Tab | KeyCode::Down => {
-                    form.selected = clamped_index(form.selected, form.focus_len(), 1);
-                    form.error = None;
-                    self.modal = Some(Modal::Settings(form));
-                }
-                KeyCode::BackTab | KeyCode::Up => {
-                    form.selected = clamped_index(form.selected, form.focus_len(), -1);
-                    form.error = None;
-                    self.modal = Some(Modal::Settings(form));
-                }
-                // Enter on an action runs it and leaves the panel; on a field
-                // it saves, as it always has.
-                KeyCode::Enter | KeyCode::Char('s')
-                    if key.code == KeyCode::Enter
-                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    match (form.selected_action(), form.scope.clone()) {
-                        (Some(FORCE_UPDATE_ACTION), SettingsScope::Host(target_id)) => {
-                            self.force_update_machine(&target_id);
+            Modal::Settings(mut form) => {
+                let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc => return Action::Continue,
+                    KeyCode::Tab | KeyCode::Down => form.step(1),
+                    KeyCode::BackTab | KeyCode::Up => form.step(-1),
+                    // What is in a field can be taken out of it: a token, a
+                    // proxy URL, a path — things that live in other windows.
+                    _ if is_copy_shortcut(key) => match form.selected_text() {
+                        Some(text) if !text.is_empty() => {
+                            self.clipboard_request = Some(text.clone());
+                            self.status_message = "Copied the field".into();
                         }
-                        (Some(action), SettingsScope::Host(target_id)) => {
-                            match install_action_kind(action) {
-                                Some(kind) => self.install_runtime(&target_id, kind),
-                                None => self.apply_settings(form),
+                        _ => self.status_message = "Nothing in this field to copy".into(),
+                    },
+                    KeyCode::Enter if form.selected_action() == Some(ADD_VARIABLE_ACTION) => {
+                        form.add_variable();
+                    }
+                    // Enter on an action runs it and leaves the panel; on a
+                    // field it saves, as it always has.
+                    KeyCode::Enter | KeyCode::Char('s')
+                        if key.code == KeyCode::Enter || control =>
+                    {
+                        match (form.selected_action(), form.scope.clone()) {
+                            (Some(FORCE_UPDATE_ACTION), SettingsScope::Host(target_id)) => {
+                                self.force_update_machine(&target_id);
                             }
+                            (Some(action), SettingsScope::Host(target_id)) => {
+                                match install_action_kind(action) {
+                                    Some(kind) => self.install_runtime(&target_id, kind),
+                                    None => self.apply_settings(form),
+                                }
+                            }
+                            _ => self.apply_settings(form),
                         }
-                        _ => self.apply_settings(form),
+                        return Action::Continue;
                     }
-                }
-                KeyCode::Backspace => {
-                    if let Some(index) = form.selected_value() {
-                        form.values[index].pop();
+                    KeyCode::Left => form.move_cursor(CursorMove::Left),
+                    KeyCode::Right => form.move_cursor(CursorMove::Right),
+                    KeyCode::Home => form.move_cursor(CursorMove::Start),
+                    KeyCode::End => form.move_cursor(CursorMove::End),
+                    KeyCode::Char('a') if control => form.move_cursor(CursorMove::Start),
+                    KeyCode::Char('e') if control => form.move_cursor(CursorMove::End),
+                    KeyCode::Backspace => form.erase(true),
+                    KeyCode::Delete => form.erase(false),
+                    KeyCode::Char('u') if control => form.clear_selected(),
+                    KeyCode::Char('d') if control => {
+                        if !form.remove_variable() {
+                            self.status_message = "Ctrl-D removes an environment variable".into();
+                        }
                     }
-                    form.error = None;
-                    self.modal = Some(Modal::Settings(form));
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(index) = form.selected_value() {
-                        form.values[index].clear();
+                    // Only plain typing types: a chord with Cmd, Ctrl or Alt
+                    // held is a shortcut, and one this panel does not know
+                    // must not land in the field as its letter.
+                    KeyCode::Char(character)
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        form.insert(character.encode_utf8(&mut [0; 4]));
                     }
-                    form.error = None;
-                    self.modal = Some(Modal::Settings(form));
+                    _ => {}
                 }
-                KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    if let Some(index) = form.selected_value() {
-                        form.values[index].push(character);
-                    }
-                    form.error = None;
-                    self.modal = Some(Modal::Settings(form));
-                }
-                _ => self.modal = Some(Modal::Settings(form)),
-            },
+                self.modal = Some(Modal::Settings(form));
+            }
             Modal::Board(mut form) => {
                 if self.handle_board_key(key, &mut form) {
                     self.modal = Some(Modal::Board(form));
@@ -11777,8 +12061,8 @@ impl App {
                         return Err("Refresh interval must be at least 500 ms".into());
                     }
                     config.ssh_config = form.values[1].clone();
-                    config.environment = form.values[2].clone();
-                    let mut index = 3;
+                    config.environment = environment_value(&form.environment);
+                    let mut index = 2;
                     for kind in AgentKind::agents() {
                         let command = form.values[index].clone();
                         let args = parse_shell_list(
@@ -11803,8 +12087,11 @@ impl App {
                     // seeded from the effective config so those hidden parts
                     // ride along unchanged.
                     let mut host = config.hosts.get(target_id).cloned().unwrap_or_default();
-                    host.environment = Some(form.values[0].clone());
-                    let mut index = 1;
+                    // No rows of its own is no override: the machine goes on
+                    // following the global variables.
+                    host.environment = Some(environment_value(&form.environment))
+                        .filter(|value| !value.is_empty());
+                    let mut index = 0;
                     for kind in AgentKind::agents() {
                         let mut entry = config.command_for(target_id, kind).clone();
                         entry.command = form.values[index].clone();
@@ -16300,9 +16587,10 @@ mod tests {
             panic!("settings modal did not open");
         };
         form.values[0] = "1500".into();
-        // The terminal's command sits behind the three general fields and the
-        // command/args pair each agent runtime contributes.
-        let terminal_command = 3 + AgentKind::agents().count() * 2;
+        // The terminal's command sits behind the two general fields and the
+        // command/args pair each agent runtime contributes; the environment
+        // is its own list of rows, not a field.
+        let terminal_command = 2 + AgentKind::agents().count() * 2;
         form.values[terminal_command] = "/bin/zsh".into();
         app.apply_settings(form);
 
@@ -18899,9 +19187,9 @@ mod tests {
             panic!("machine settings modal did not open");
         };
         assert_eq!(form.scope, SettingsScope::Host("gpu".into()));
-        form.values[0] = "HTTP_PROXY=http://proxy:8080".into();
-        form.values[1] = "/opt/codex".into();
-        form.values[2] = "--full-auto".into();
+        form.environment = vec!["HTTP_PROXY=http://proxy:8080".into()];
+        form.values[0] = "/opt/codex".into();
+        form.values[1] = "--full-auto".into();
         app.apply_settings(form);
 
         let reloaded = Config::load(&config_path).unwrap();
@@ -20050,17 +20338,128 @@ mod tests {
         assert!(!sync_config, "the declined sign-in must not be sent anyway");
     }
 
+    /// A machine's environment is a list: one row per variable, each edited
+    /// with a cursor, copied, and removed on its own; a pasted block of
+    /// `NAME=value` lines is that many rows; and what the machine inherits
+    /// from the global settings is listed under its own rows rather than
+    /// copied into them.
+    #[test]
+    fn a_machine_s_environment_is_a_list_of_variables_to_edit_one_by_one() {
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-environment-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let mut config = Config {
+            environment: "PROXY=http://global:3128 LANG=C".into(),
+            ..Config::default()
+        };
+        config.hosts.insert(
+            "local".into(),
+            crate::config::HostConfig {
+                environment: Some("TOKEN='abc def'".into()),
+                ..Default::default()
+            },
+        );
+        let worker = Worker::start(Runtime::new(&config));
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        let mut app = App::new(
+            config,
+            config_path.clone(),
+            state,
+            root.join("state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.selected_target = 0;
+        app.open_machine_settings();
+        let form = |app: &App| match app.modal.as_ref() {
+            Some(Modal::Settings(form)) => form.clone(),
+            other => panic!("the settings panel closed: {other:?}"),
+        };
+        let key = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| {
+            app.handle_key(KeyEvent::new(code, modifiers));
+        };
+        // Its own variable is its row, quoting undone; the global ones are
+        // listed, not copied in.
+        assert_eq!(form(&app).environment, ["TOKEN=abc def"]);
+        assert_eq!(form(&app).inherited.len(), 2);
+        assert_eq!(
+            form(&app).selected_text().map(String::as_str),
+            Some("TOKEN=abc def")
+        );
+
+        // A cursor, not an append: into the middle of the value.
+        key(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        for _ in 0.."TOKEN=".len() {
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        }
+        key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        key(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(form(&app).environment, ["TOKEN=xbc def"]);
+
+        // Cmd+C copies the field and types nothing into it.
+        key(&mut app, KeyCode::Char('c'), KeyModifiers::SUPER);
+        assert_eq!(
+            app.take_clipboard_request().as_deref(),
+            Some("TOKEN=xbc def")
+        );
+        assert_eq!(form(&app).environment, ["TOKEN=xbc def"]);
+
+        // A block of exports pasted is that many rows, after the selected one.
+        app.handle_paste("export A=1\nB='two words'\n".into());
+        assert_eq!(
+            form(&app).environment,
+            ["TOKEN=xbc def", "A=1", "B=two words"]
+        );
+        // Ctrl-D takes the selected one out.
+        key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(form(&app).environment, ["TOKEN=xbc def", "A=1"]);
+
+        // Enter on "Add variable" gives an empty row to type into.
+        while form(&app).selected_action() != Some(ADD_VARIABLE_ACTION) {
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_paste("C=3".into());
+        assert_eq!(form(&app).environment, ["TOKEN=xbc def", "A=1", "C=3"]);
+
+        key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.modal.is_none(), "{:?}", app.modal);
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(
+            reloaded.environment_for("local").unwrap(),
+            [
+                ("A".into(), "1".into()),
+                ("C".into(), "3".into()),
+                ("LANG".into(), "C".into()),
+                ("PROXY".into(), "http://global:3128".into()),
+                ("TOKEN".into(), "xbc def".into()),
+            ]
+        );
+        // The machine keeps following the global variables: only its own
+        // rows were written to it.
+        assert_eq!(
+            reloaded.hosts["local"].environment.as_deref(),
+            Some("TOKEN='xbc def' A=1 C=3")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// The global panel is not about one machine, so it never offers installs
     /// however the form was built.
     #[test]
     fn global_settings_never_offer_an_install() {
         let form = SettingsForm {
             scope: SettingsScope::Global,
-            values: Vec::new(),
-            notes: Vec::new(),
             missing: AgentKind::agents().collect(),
-            selected: 0,
-            error: None,
+            ..SettingsForm::default()
         };
         assert!(
             !form

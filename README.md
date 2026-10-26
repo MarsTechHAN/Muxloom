@@ -693,7 +693,13 @@ args = ["--sandbox", "read-only"]
   covers the common fields — refresh, environment, each runtime's command and
   arguments, the update prompt and channel — grouped under one heading per
   runtime; a machine's panel adds an install action under any runtime it lacks.
-  Everything else (tunnels, companion overrides, install commands, sync files,
+  The environment is a list, one variable per row: each is edited in place with
+  a cursor (`←` `→` `Home` `End`, `Delete`), copied with `⌘C`/`Ctrl-Shift-C`,
+  and removed with `Ctrl-D`; **Add variable** adds one, and a block of
+  `NAME=value` or `export NAME=value` lines pasted there becomes that many
+  rows. A machine's panel lists the global variables it inherits under its own
+  rows, marked where one of its own overrides them, and saving writes only the
+  machine's own rows to it. Everything else (tunnels, companion overrides, install commands, sync files,
   attention patterns, history bounds) lives in this file only.
 
 ## MCP
