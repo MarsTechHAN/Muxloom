@@ -15,7 +15,7 @@ use ratatui::{layout::Rect, widgets::ListState};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    activity::{Activity, Status, agent_status},
+    activity::{Activity, Status, agent_status_on_screen},
     channel::ChannelKind,
     config::{Config, State},
     debug,
@@ -5234,20 +5234,12 @@ impl App {
             return;
         };
         let dialog = dialog_question(screen);
-        let mut status = agent_status(&activity);
-        if status == Status::Waiting
-            && activity.cursor_hidden
-            && !activity.blinking
-            && activity.notice.is_none()
-            && dialog.is_none()
-            && activity.quiet_ms >= crate::activity::TERMINAL_ASK_QUIET_MS
-        {
-            status = Status::Idle;
-        }
+        let status = agent_status_on_screen(&activity, dialog.is_some(), kind == AgentKind::Claude);
         let attention = (status == Status::Waiting).then(|| {
             activity
                 .notice
                 .as_ref()
+                .filter(|_| activity.asked)
                 .map(|notice| notice.text.clone())
                 .or(dialog)
                 .unwrap_or_else(|| WAITING_FOR_INPUT.to_string())
@@ -14214,6 +14206,7 @@ mod tests {
             title: None,
             quiet_ms: 0,
             notice: None,
+            asked: false,
             bell_at: None,
         };
         // A spinner in the title is a turn, whatever the screen says.

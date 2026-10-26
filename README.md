@@ -189,7 +189,15 @@ forty frames a second and go silent the moment a turn ends. A dialog holding the
 keyboard hides the terminal cursor on every runtime whose prompt box shows one,
 which is how a permission prompt, a numbered menu or a trust dialog reads as
 Waiting without a word of it being matched (pi draws its own cursor and has no
-dialogs, so it never reads as waiting). A spinner held in the title while
+dialogs, so it never reads as waiting). Claude Code's dialogs blink a glyph
+twice a second, so on Claude a hidden cursor over a quiet PTY is a redraw that
+left it hidden and counts only with a dialog on screen or a notification sent
+since the last keystroke. A title only blinks when it flips back to what it
+said two changes ago: Claude Code renaming its conversation, or clearing its
+title on the way out, is not a blink. Output in the moment after a keystroke or
+a resize is the session echoing what was typed or redrawing at its new size,
+and counts for nothing: typing into an idle agent's box, or attaching to it, no
+longer lights it up as working. A spinner held in the title while
 nothing comes off the PTY is still a turn — one that shelled out to a build —
 for up to ten minutes. A session a new daemon adopted has its screen replayed
 out of the capture, which may be drawing a turn that ended an hour ago, so its
@@ -199,12 +207,14 @@ the machine at once. A plain terminal is read off the kernel and the cursor
 instead: it works while its shell has a child to wait on — a build linking in
 silence is still a build — and it waits when that child has gone quiet with the
 cursor parked after what it printed (`[y/N]`, a password prompt, a pager's
-`--More--`), or has taken the whole screen and stopped painting it. A
-tmux-hosted session is read the same way, off `#{pane_title}`, `#{cursor_flag}`
+`--More--`). An editor or pager sitting quiet on the alternate screen, and a
+shell or REPL the child started sitting at its prompt (`$`, `#`, `%`, `>`, `❯`,
+`»` — an ssh session above all), are a screen somebody is reading rather than a
+question, and read as idle. A tmux-hosted session is read the same way, off `#{pane_title}`, `#{cursor_flag}`
 and `#{window_activity}`. When a session waits, its entire agent item turns
 bold yellow, it raises a clickable banner, rings the bell, and emits a desktop
 notification. The reason it reports is the runtime's own notification when it
-sent one, else the question the dialog draws above its options, in the words
+sent one since the last keystroke, else the question the dialog draws above its options, in the words
 it is asked in, else plainly `waiting for input`. Opening the session clears
 the banner — the session list keeps showing Waiting until the agent stops
 asking — and a later prompt raises it again.

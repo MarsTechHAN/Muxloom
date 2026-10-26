@@ -121,7 +121,7 @@ mod platform {
     use anyhow::{Context, Result, anyhow, bail};
 
     use crate::{
-        activity::{ActivityTracker, CursorRow, Status, agent_status, terminal_status},
+        activity::{ActivityTracker, CursorRow, Status, agent_status_on_screen, terminal_status},
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonHistorySearchHit, DaemonRequest,
@@ -6499,21 +6499,12 @@ mod platform {
                         let busy = snapshot.pid.is_some_and(has_child_process);
                         terminal_status(&activity, busy, &self.cursor_row())
                     } else {
-                        let mut status = agent_status(&activity);
                         let dialog = dialog_question(&visible_screen);
-                        // A hidden cursor is also used during Claude's full
-                        // screen redraws. Once that redraw has gone quiet,
-                        // require an actual dialog (or a runtime notice)
-                        // before exposing the generic waiting state.
-                        if status == Status::Waiting
-                            && activity.cursor_hidden
-                            && !activity.blinking
-                            && activity.notice.is_none()
-                            && dialog.is_none()
-                            && activity.quiet_ms >= crate::activity::TERMINAL_ASK_QUIET_MS
-                        {
-                            status = Status::Idle;
-                        }
+                        let status = agent_status_on_screen(
+                            &activity,
+                            dialog.is_some(),
+                            kind == AgentKind::Claude,
+                        );
                         let reason = (status == Status::Waiting).then(|| {
                             // The runtime's own notification names the
                             // question best; the dialog's prose is next; the
@@ -6805,6 +6796,11 @@ mod platform {
             }
             self.columns.store(columns, Ordering::Relaxed);
             self.rows.store(rows, Ordering::Relaxed);
+            // The repaint the child answers this with is not a turn.
+            self.activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .note_redraw(now_ms());
             {
                 let mut screen = self
                     .screen
@@ -6872,6 +6868,12 @@ mod platform {
             // too small to record - is not to be invented from a later one.
             let now = now_ms();
             let ever_asked = self.last_input.swap(now, Ordering::Relaxed) != 0;
+            // What the session writes back in the next moment is the echo of
+            // this, not a turn.
+            self.activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .note_input(now);
             let submitted = bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
             if submitted {
                 self.last_submission.store(now, Ordering::Relaxed);

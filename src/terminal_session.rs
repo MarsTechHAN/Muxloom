@@ -413,6 +413,7 @@ impl TerminalSession {
                 .context("failed to resize embedded PTY")?;
         }
         debug::log("pty", format!("resized to {width}x{height}"));
+        self.activity.note_redraw(now_ms());
         resize_parser(&mut self.parser, height, width);
         self.inline.reset();
         self.width = width;
@@ -460,6 +461,7 @@ impl TerminalSession {
                 .context("failed to restore embedded PTY size")?;
         }
         debug::log("pty", format!("refreshed at {width}x{height}"));
+        self.activity.note_redraw(now_ms());
         Ok(())
     }
 
@@ -499,6 +501,7 @@ impl TerminalSession {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.activity.note_input(now_ms());
         if let Some(daemon) = &self.daemon {
             daemon.stream.write(bytes)
         } else {

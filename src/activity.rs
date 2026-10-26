@@ -54,10 +54,24 @@ pub const PAINT_WINDOW_MS: u64 = 2_000;
 pub const PAINT_MIN_WRITES: usize = 6;
 /// Or this many bytes: a streaming answer can arrive in a few large writes.
 pub const PAINT_MIN_BYTES: usize = 1_200;
-/// A title rewritten this often with no spinner at its head is being blinked
-/// at whoever is looking, which is what Codex does while it waits.
+/// A title flipped back and forth between two values inside this window, with
+/// no spinner at its head, is being blinked at whoever is looking — which is
+/// what Codex does while it waits. A title that merely changed twice is not:
+/// Claude Code renames its conversation as a turn ends, and on the way out
+/// clears its title and writes its own name back, and read as a blink each of
+/// those raised an attention notice nobody was owed.
 pub const BLINK_WINDOW_MS: u64 = 3_000;
-pub const BLINK_MIN_CHANGES: usize = 2;
+/// Output this soon after input is the session showing what was typed, not a
+/// turn: a prompt box redraws itself on every keystroke, and a person typing a
+/// sentence into one used to light the session up as working.
+pub const ECHO_WINDOW_MS: u64 = 250;
+/// But only this many writes of it per keystroke, so that typing into a box
+/// while a turn runs under it does not hide the turn's own frames.
+pub const ECHO_WRITES: u32 = 3;
+/// Output this soon after a resize is the session redrawing itself at the new
+/// size: attaching to an idle agent reflows its screen, and that burst used to
+/// read as a turn starting.
+pub const REDRAW_WINDOW_MS: u64 = 1_000;
 /// A spinner held in the title while nothing at all comes off the PTY says
 /// a turn is running — a turn that shells out to a build says nothing for
 /// minutes — until it has said nothing for this long, at which point it is a
@@ -106,6 +120,10 @@ pub struct Activity {
     /// The last desktop notification the session sent (OSC 9, OSC 99 or
     /// OSC 777), with when it was sent.
     pub notice: Option<Notice>,
+    /// That notification was sent live and since anything was last typed
+    /// in, so it is still asking. One answered, or replayed out of a record,
+    /// says nothing about now.
+    pub asked: bool,
     /// When the bell last rang, if it ever did.
     pub bell_at: Option<u64>,
 }
@@ -126,14 +144,24 @@ pub struct ActivityTracker {
     title: Option<String>,
     /// When the title last changed, live: `0` until a title has been heard.
     title_changed_at: u64,
-    /// When the title changed and whether it changed to a spinner, newest
-    /// last, bounded to what blink detection needs. A spinner's own frames
-    /// are not blinks, and neither is the one change that puts the title to
-    /// rest after them.
-    title_changes: VecDeque<(u64, bool)>,
-    /// Writes heard, newest last, as (when, bytes), bounded to the paint window.
+    /// When the title changed, whether it changed to a spinner, and what it
+    /// changed to, newest last, bounded to what blink detection needs. A
+    /// spinner's own frames are not blinks, and neither is the one change
+    /// that puts the title to rest after them.
+    title_changes: VecDeque<(u64, bool, String)>,
+    /// Writes the session made of its own accord, newest last, as (when,
+    /// bytes), bounded to the paint window. Echo and redraws are left out.
     writes: VecDeque<(u64, usize)>,
+    /// The last write the session made of its own accord: not the echo of a
+    /// keystroke, not a redraw after a resize.
     last_output: u64,
+    /// Until when output is the echo of input, how many more writes of it
+    /// are, and until when output is a redraw.
+    echo_until: u64,
+    echo_writes: u32,
+    redraw_until: u64,
+    /// When something was last typed into the session.
+    last_input: u64,
     cursor_hidden: bool,
     /// When the cursor was last hidden after being shown; `0` when it never
     /// was (a runtime that never shows it hides it once, at startup).
@@ -171,7 +199,15 @@ impl ActivityTracker {
         if bytes.is_empty() {
             return;
         }
-        if now != 0 {
+        // The session answering a keystroke or a resize is not the session
+        // doing anything: its title and cursor still count, below, but none
+        // of it is evidence of a turn.
+        let echo = now != 0 && now <= self.echo_until && self.echo_writes > 0;
+        if echo {
+            self.echo_writes -= 1;
+        }
+        let answering = echo || (now != 0 && now <= self.redraw_until);
+        if now != 0 && !answering {
             self.last_output = now;
             self.writes.push_back((now, bytes.len()));
             while self
@@ -186,6 +222,19 @@ impl ActivityTracker {
         for &byte in bytes {
             self.step(byte, now);
         }
+    }
+
+    /// Typed input reached the session at `now`: what it writes next is the
+    /// echo of it.
+    pub fn note_input(&mut self, now: u64) {
+        self.last_input = self.last_input.max(now);
+        self.echo_until = self.echo_until.max(now + ECHO_WINDOW_MS);
+        self.echo_writes = (self.echo_writes + ECHO_WRITES).min(4 * ECHO_WRITES);
+    }
+
+    /// The session was resized at `now`: what it writes next is the redraw.
+    pub fn note_redraw(&mut self, now: u64) {
+        self.redraw_until = self.redraw_until.max(now + REDRAW_WINDOW_MS);
     }
 
     fn step(&mut self, byte: u8, now: u64) {
@@ -283,7 +332,14 @@ impl ActivityTracker {
                 if self.title.as_deref() != Some(rest) {
                     self.title = Some(rest.to_string());
                     self.title_changed_at = now;
-                    self.title_changes.push_back((now, title_has_spinner(rest)));
+                    // A title the session rewrote is the session speaking
+                    // for itself, echo or not: no prompt box retitles the
+                    // window on a keystroke.
+                    if now != 0 {
+                        self.last_output = now;
+                    }
+                    self.title_changes
+                        .push_back((now, title_has_spinner(rest), rest.to_string()));
                     while self.title_changes.len() > 32 {
                         self.title_changes.pop_front();
                     }
@@ -362,14 +418,7 @@ impl ActivityTracker {
         let spinner_head = self.title.as_deref().is_some_and(title_has_spinner);
         let spinner =
             spinner_head && self.title_changed_at != 0 && quiet_ms < SPINNER_HELD_QUIET_MS;
-        let recent_changes = self
-            .title_changes
-            .iter()
-            .filter(|(at, to_spinner)| {
-                !to_spinner && *at != 0 && now.saturating_sub(*at) <= BLINK_WINDOW_MS
-            })
-            .count();
-        let blinking = !spinner_head && recent_changes >= BLINK_MIN_CHANGES;
+        let blinking = !spinner_head && self.title_blinking(now);
         Activity {
             painting,
             spinner,
@@ -380,8 +429,32 @@ impl ActivityTracker {
             title: self.title.clone(),
             quiet_ms,
             notice: self.notice.clone(),
+            asked: self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.at != 0 && notice.at > self.last_input),
             bell_at: self.bell_at,
         }
+    }
+
+    /// Whether the last three titles went `A`, `B`, `A`, live, none of them
+    /// a spinner or empty, with the flip back to `B` inside the blink window.
+    fn title_blinking(&self, now: u64) -> bool {
+        let mut recent = self.title_changes.iter().rev();
+        let (Some(third), Some(second), Some(first)) =
+            (recent.next(), recent.next(), recent.next())
+        else {
+            return false;
+        };
+        let frame = |(at, to_spinner, title): &(u64, bool, String)| {
+            *at != 0 && !to_spinner && !title.trim().is_empty()
+        };
+        frame(first)
+            && frame(second)
+            && frame(third)
+            && first.2 == third.2
+            && first.2 != second.2
+            && now.saturating_sub(second.0) <= BLINK_WINDOW_MS
     }
 
     /// The title as last written.
@@ -393,16 +466,19 @@ impl ActivityTracker {
 /// Whether a title starts with one of the glyphs a CLI animates at its head to
 /// say a turn is running: the braille dots Codex cycles, the half-circles
 /// Claude Code alternates, and the ASCII bar a terminal without either falls
-/// back to. Claude Code's resting `✳` is not among them, deliberately.
+/// back to. Claude Code's resting `✳` is not among them, deliberately. An
+/// ASCII glyph only counts standing on its own: `-zsh` and `/Users/me` are
+/// names, not frames.
 pub fn title_has_spinner(title: &str) -> bool {
-    title.trim_start().chars().next().is_some_and(|glyph| {
-        matches!(glyph,
-            '\u{2800}'..='\u{28ff}'
-            | '\u{25d0}'..='\u{25d3}'
-            | '\u{25f4}'..='\u{25f7}'
-            | '\u{25dc}'..='\u{25df}'
-            | '|' | '/' | '-' | '\\')
-    })
+    let mut chars = title.trim_start().chars();
+    match chars.next() {
+        Some('\u{2800}'..='\u{28ff}')
+        | Some('\u{25d0}'..='\u{25d3}')
+        | Some('\u{25f4}'..='\u{25f7}')
+        | Some('\u{25dc}'..='\u{25df}') => true,
+        Some('|' | '/' | '-' | '\\') => chars.next().is_none_or(char::is_whitespace),
+        _ => false,
+    }
 }
 
 /// What an agent session is doing.
@@ -422,6 +498,36 @@ pub fn agent_status(activity: &Activity) -> Status {
     }
 }
 
+/// [`agent_status`], checked against what is on the screen, which is the one
+/// reading the daemon and the dashboard both make.
+///
+/// `dialog` says a dialog's question was found on screen, and
+/// `dialogs_keep_painting` says the runtime is one whose dialogs never go
+/// quiet — Claude Code blinks a glyph in every one twice a second. For such a
+/// runtime a cursor that is hidden over a quiet PTY is a full-screen redraw
+/// that left it so, not a dialog, unless the screen shows one or the runtime
+/// has sent a notification nobody has answered. A runtime whose dialog sits
+/// still — OpenCode's permission dialog paints nothing and names no numbered
+/// options — keeps its hidden cursor as the question it is.
+pub fn agent_status_on_screen(
+    activity: &Activity,
+    dialog: bool,
+    dialogs_keep_painting: bool,
+) -> Status {
+    let status = agent_status(activity);
+    if status == Status::Waiting
+        && dialogs_keep_painting
+        && activity.cursor_hidden
+        && !activity.blinking
+        && !activity.asked
+        && !dialog
+        && activity.quiet_ms >= TERMINAL_ASK_QUIET_MS
+    {
+        return Status::Idle;
+    }
+    status
+}
+
 /// Where a plain terminal's cursor is, as far as a shell's child can be read
 /// off it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -435,9 +541,15 @@ pub struct CursorRow {
 /// What a plain terminal is doing: nothing without a child to wait on, and
 /// with one, working unless the child has gone quiet with its cursor parked
 /// right after the last thing it printed — `Overwrite? [y/N] `,
-/// `Password:`, `--More--` — or has taken the whole screen and stopped
-/// painting it, which is a full-screen program waiting on a key. The row the
-/// cursor sits on is the question, in the program's own words.
+/// `Password:`, `--More--`. The row the cursor sits on is the question, in
+/// the program's own words.
+///
+/// Two quiet children are nobody's question. A full-screen program that has
+/// stopped painting — an editor, a pager, a picker — is a screen the person
+/// opened and is reading, and a prompt (`$`, `#`, `%`, `>`, `❯`, `»`) is a
+/// shell or a REPL the child started, an ssh session above all, sitting at
+/// its line. Read as waiting, each raised an attention notice for a terminal
+/// nobody had asked anything of.
 pub fn terminal_status(
     activity: &Activity,
     has_child: bool,
@@ -450,13 +562,13 @@ pub fn terminal_status(
         return (Status::Working, None);
     }
     if cursor.alternate_screen {
-        return (
-            Status::Waiting,
-            Some("a full-screen program is waiting for a key".into()),
-        );
+        return (Status::Idle, None);
     }
     let asked = cursor.before_cursor.trim_end();
     let trailing = cursor.before_cursor.len() - asked.len();
+    if asked.ends_with(['$', '#', '%', '>', '❯', '»']) {
+        return (Status::Idle, None);
+    }
     if !asked.is_empty() && trailing <= 1 {
         return (Status::Waiting, Some(asked.to_string()));
     }
@@ -716,8 +828,141 @@ mod tests {
             alternate_screen: true,
             before_cursor: String::new(),
         };
+        // A quiet editor or pager is a screen somebody is reading.
         assert_eq!(
-            terminal_status(&tracker.report(5_000), true, &pager).0,
+            terminal_status(&tracker.report(5_000), true, &pager),
+            (Status::Idle, None)
+        );
+        // And ssh sitting at the far shell's prompt is nobody's question.
+        for prompt in ["me@far:~$ ", "root@far:/# ", ">>> ", "❯ "] {
+            let at_prompt = CursorRow {
+                alternate_screen: false,
+                before_cursor: prompt.into(),
+            };
+            assert_eq!(
+                terminal_status(&tracker.report(5_000), true, &at_prompt),
+                (Status::Idle, None),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_renaming_its_conversation_is_not_a_blink() {
+        let mut tracker = ActivityTracker::default();
+        tracker.process(b"\x1b[?25h", 1_000);
+        // A turn ends, the conversation is named, and on the way out the
+        // title is cleared and Claude Code writes its own name back.
+        let mut at = 2_000;
+        for title in [
+            "◐ Claude Code",
+            "✳ Claude Code",
+            "✳ curl headers",
+            "",
+            "✳ Claude Code",
+        ] {
+            tracker.process(format!("\x1b]0;{title}\x07").as_bytes(), at);
+            at += 300;
+        }
+        let activity = tracker.report(at);
+        assert!(!activity.blinking, "{activity:?}");
+        assert_eq!(agent_status(&activity), Status::Idle);
+    }
+
+    #[test]
+    fn a_title_flipped_back_and_forth_blinks_until_it_comes_to_rest() {
+        let mut tracker = ActivityTracker::default();
+        tracker.process(b"\x1b[?25h\x1b]0;codex\x07", 1_000);
+        tracker.process(b"\x1b]0;[ . ] Action Required\x07", 2_000);
+        tracker.process(b"\x1b]0;[ ! ] Action Required\x07", 3_000);
+        // Two changes are not a blink yet.
+        assert!(!tracker.report(3_100).blinking);
+        tracker.process(b"\x1b]0;[ . ] Action Required\x07", 4_000);
+        assert!(tracker.report(4_100).blinking);
+        // Answered: the title rests, and that ends the blink.
+        tracker.process(b"\x1b]0;codex\x07", 4_500);
+        assert!(!tracker.report(4_600).blinking);
+    }
+
+    #[test]
+    fn an_ascii_glyph_is_a_spinner_only_standing_on_its_own() {
+        assert!(title_has_spinner("| building"));
+        assert!(title_has_spinner("\\"));
+        assert!(title_has_spinner("⠹ project"));
+        assert!(!title_has_spinner("-zsh"));
+        assert!(!title_has_spinner("/Users/me/project"));
+        assert!(!title_has_spinner("✳ Claude Code"));
+    }
+
+    #[test]
+    fn echo_and_redraws_are_not_a_turn() {
+        let mut tracker = ActivityTracker::default();
+        tracker.process(b"\x1b[?25h\x1b]0;\xe2\x9c\xb3 Claude Code\x07", 1_000);
+        // Somebody types a sentence into the prompt box: every keystroke is
+        // answered with a redraw of the box.
+        let mut at = 10_000;
+        for _ in 0..40 {
+            tracker.note_input(at);
+            tracker.process(&[b'.'; 300], at + 20);
+            at += 80;
+        }
+        let activity = tracker.report(at);
+        assert!(!activity.painting, "{activity:?}");
+        assert_eq!(agent_status(&activity), Status::Idle);
+
+        // Attaching resizes the session, and it repaints the whole screen.
+        tracker.note_redraw(20_000);
+        paint(&mut tracker, &[b'.'; 2_000], 20_000, 50, 15);
+        let activity = tracker.report(20_800);
+        assert!(!activity.painting, "{activity:?}");
+        assert_eq!(agent_status(&activity), Status::Idle);
+
+        // A turn that starts after the echo is heard as one.
+        tracker.note_input(30_000);
+        let at = paint(&mut tracker, &[b'.'; 300], 30_400, 70, 20);
+        assert_eq!(agent_status(&tracker.report(at)), Status::Working);
+
+        // Typing into the box while a turn paints thirty frames a second
+        // under it hides the echo, not the turn.
+        let mut tracker = ActivityTracker::default();
+        let mut at = 40_000;
+        for frame in 0..90 {
+            if frame % 6 == 0 {
+                tracker.note_input(at);
+            }
+            tracker.process(&[b'.'; 100], at);
+            at += 33;
+        }
+        assert_eq!(agent_status(&tracker.report(at)), Status::Working);
+    }
+
+    #[test]
+    fn a_quiet_hidden_cursor_is_a_question_only_where_dialogs_sit_still() {
+        // Claude Code: a redraw that leaves the cursor hidden and goes quiet.
+        let mut claude = ActivityTracker::default();
+        claude.process(b"\x1b[?25h\x1b]0;\xe2\x9c\xb3 Claude Code\x07", 1_000);
+        // The notification it sent after an earlier turn, since answered.
+        claude.process(b"\x1b]9;Claude is waiting for your input\x07", 2_000);
+        claude.note_input(3_000);
+        claude.process(b"\x1b[?25l", 10_000);
+        let quiet = claude.report(10_000 + TERMINAL_ASK_QUIET_MS);
+        assert!(quiet.cursor_hidden && !quiet.asked, "{quiet:?}");
+        assert_eq!(agent_status_on_screen(&quiet, false, true), Status::Idle);
+        // A dialog on screen is the question.
+        assert_eq!(agent_status_on_screen(&quiet, true, true), Status::Waiting);
+        // So is a notification nobody has answered yet.
+        claude.process(b"\x1b]9;Claude needs your permission\x07", 11_000);
+        let asked = claude.report(11_000 + TERMINAL_ASK_QUIET_MS);
+        assert!(asked.asked, "{asked:?}");
+        assert_eq!(agent_status_on_screen(&asked, false, true), Status::Waiting);
+
+        // OpenCode's permission dialog hides the cursor, paints nothing and
+        // numbers no options, and is still a question a minute on.
+        let mut opencode = ActivityTracker::default();
+        opencode.process(b"\x1b[?25h", 1_000);
+        opencode.process(b"\x1b[?25l", 2_000);
+        assert_eq!(
+            agent_status_on_screen(&opencode.report(62_000), false, false),
             Status::Waiting
         );
     }
