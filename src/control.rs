@@ -713,8 +713,8 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         name: "search_conversations",
         description: "Search what agents said, on every machine: the backed-up Codex and \
                       Claude Code transcripts, live and archived — look here before working \
-                      something out again. Each hit names its machine, folder, session and \
-                      message index; read around it with read_conversation. The backup runs \
+                      something out again. Hits come grouped by conversation, each with its \
+                      message index; read around one with read_conversation. The backup runs \
                       every few minutes, so the newest turns may only be on screen."
             .into(),
         input_schema: schema(
@@ -2234,6 +2234,47 @@ fn talk_selector(arguments: &Value, key: &str) -> Result<TalkSelector> {
     } else {
         TalkSelector::Only { names }
     })
+}
+
+/// Search hits grouped by the conversation they came from, conversations in
+/// the order of their best hit. A conversation that matched twenty times used
+/// to name its machine, session, folder and title twenty times over, all of it
+/// kept in the searcher's context.
+#[cfg(feature = "controller")]
+fn conversation_hits(hits: &[crate::backup::SearchHit]) -> Vec<Value> {
+    let mut order: Vec<(&str, &str)> = Vec::new();
+    let mut grouped: BTreeMap<(&str, &str), Vec<&crate::backup::SearchHit>> = BTreeMap::new();
+    for hit in hits {
+        let key = (hit.target_id.as_str(), hit.session_id.as_str());
+        if !grouped.contains_key(&key) {
+            order.push(key);
+        }
+        grouped.entry(key).or_default().push(hit);
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let hits = &grouped[&key];
+            let first = hits[0];
+            json!({
+                "machine": crate::model::machine_read_as(&first.target_id),
+                "session_id": first.session_id,
+                "kind": first.kind,
+                "path": first.cwd,
+                "title": first.title,
+                "started_at": first.created_at,
+                "hits": hits.iter().map(|hit| json!({
+                    // A title match belongs to no message, so there is no
+                    // index to read around: open the conversation from the
+                    // start.
+                    "message_index": (hit.message_index != usize::MAX).then_some(hit.message_index),
+                    "role": hit.role,
+                    "ts": hit.ts,
+                    "snippet": hit.snippet,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 fn talk_json(message: &TalkMessage) -> Value {
@@ -3825,35 +3866,12 @@ impl ControllerControl {
         // The index was loaded to work out which machines may be searched;
         // the search reads the same one rather than parsing the file again.
         let hits = search_index(&store, &index, query, limit, &filter)?;
-        let rendered: Vec<Value> = hits
-            .iter()
-            .map(|hit| {
-                json!({
-                    "machine": crate::model::machine_read_as(&hit.target_id),
-                    "session_id": hit.session_id,
-                    "kind": hit.kind,
-                    "path": hit.cwd,
-                    "title": hit.title,
-                    "started_at": hit.created_at,
-                    "role": hit.role,
-                    "ts": hit.ts,
-                    // A title match belongs to no message, so there is no index
-                    // to read around — open the conversation from the start.
-                    "message_index": (hit.message_index != usize::MAX).then_some(hit.message_index),
-                    "snippet": hit.snippet,
-                    "matches": hit.score,
-                })
-            })
-            .collect();
         Ok(tool_json(&json!({
             "query": query,
             "machines_searched": machines,
-            "hits": rendered,
+            "conversations": conversation_hits(&hits),
             "note": "read around a hit with read_conversation { session_id, machine, \
-                     around_index }. This is a backup taken every few minutes, so a conversation \
-                     happening right now may be missing its last turns; read_conversation reads \
-                     a claude, codex or pi conversation on this machine off its own transcript, \
-                     which has them.",
+                     around_index }; the backup lags a live conversation by a few minutes",
         })))
     }
 
@@ -5397,6 +5415,40 @@ mod tests {
             || panic!("explained an explained error"),
         );
         assert_eq!(again.to_string(), explained);
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn search_hits_name_their_conversation_once() {
+        let hit = |session: &str, index: usize, snippet: &str| crate::backup::SearchHit {
+            target_id: "local".into(),
+            session_id: session.into(),
+            kind: "claude".into(),
+            cwd: "/work".into(),
+            created_at: 1,
+            title: format!("about {session}"),
+            role: "user".into(),
+            snippet: snippet.into(),
+            score: 1,
+            message_index: index,
+            ts: String::new(),
+        };
+        let grouped = conversation_hits(&[
+            hit("b", 4, "best"),
+            hit("a", 9, "second"),
+            hit("b", 7, "third"),
+            hit("a", usize::MAX, "in the title"),
+        ]);
+        // In the order of each conversation's best hit, each named once.
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0]["session_id"], json!("b"));
+        assert_eq!(grouped[0]["title"], json!("about b"));
+        assert_eq!(grouped[0]["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(grouped[0]["hits"][1]["message_index"], json!(7));
+        assert_eq!(grouped[1]["session_id"], json!("a"));
+        // A title match has no message to read around.
+        assert!(grouped[1]["hits"][1]["message_index"].is_null());
+        assert!(grouped[0]["hits"][0].get("session_id").is_none());
     }
 
     #[test]
