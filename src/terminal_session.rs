@@ -1367,15 +1367,19 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     if let KeyCode::Char(character) = key.code {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let lower = character.to_ascii_lowercase();
+            // The digits are where a terminal's control bytes 0x1c to 0x1f come
+            // back as: crossterm reads the byte Ctrl+\ sends as Ctrl+4, and
+            // Ctrl+_ (Ctrl+/ on most keyboards) as Ctrl+7. A terminal that
+            // reports keys unambiguously sends Ctrl+/ as itself.
             let byte = match lower {
-                '@' | ' ' => 0,
+                '@' | ' ' | '2' => 0,
                 'a'..='z' => lower as u8 - b'a' + 1,
-                '[' => 27,
-                '\\' => 28,
-                ']' => 29,
-                '^' => 30,
-                '_' => 31,
-                '?' => 127,
+                '[' | '3' => 27,
+                '\\' | '4' => 28,
+                ']' | '5' => 29,
+                '^' | '6' => 30,
+                '_' | '/' | '7' => 31,
+                '?' | '8' => 127,
                 _ => return None,
             };
             return Some(vec![byte]);
@@ -2442,6 +2446,25 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), false),
             Some(b"\x1b[1;5A".to_vec())
         );
+    }
+
+    #[test]
+    fn ctrl_backslash_bracket_caret_and_underscore_reach_the_session() {
+        let control = |character| {
+            encode_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                false,
+            )
+        };
+        // What crossterm makes of the bytes a terminal sends for Ctrl+\, Ctrl+],
+        // Ctrl+^ and Ctrl+_: each was dropped on the floor.
+        assert_eq!(control('4'), Some(vec![0x1c]), "Ctrl+\\ is SIGQUIT");
+        assert_eq!(control('5'), Some(vec![0x1d]));
+        assert_eq!(control('6'), Some(vec![0x1e]));
+        assert_eq!(control('7'), Some(vec![0x1f]), "Ctrl+_ is undo");
+        assert_eq!(control('/'), Some(vec![0x1f]), "and so is Ctrl+/");
+        assert_eq!(control('2'), Some(vec![0]));
+        assert_eq!(control('8'), Some(vec![0x7f]));
     }
 
     #[test]
