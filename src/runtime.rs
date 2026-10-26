@@ -2634,6 +2634,30 @@ END {
         if kind == AgentKind::OpenCode {
             return self.scan_opencode_resumes(target, path);
         }
+        // The daemon reads the folder's own conversations with the same code
+        // it matches sessions to them with: one request, no transcript sent
+        // over the wire, nothing run on the machine but muxloomd. The shell
+        // scan below is for a daemon too old to be asked, and for a machine
+        // muxloom reaches without one — it greps every transcript the runtime
+        // ever wrote for the folder's name, which on a machine that has used
+        // the runtime for a while is the slowness this replaces.
+        if let Ok(Some(threads)) =
+            self.bridges
+                .list_threads(target, kind, path.to_string(), RESUME_LISTED)
+        {
+            return Ok(threads
+                .into_iter()
+                .map(|thread| ResumeCandidate {
+                    id: thread.id,
+                    kind,
+                    source_path: thread.source_path,
+                    recap: thread.title,
+                    first_message: thread.first_message,
+                    last_message: thread.last_message,
+                    updated_at: crate::native_history::iso_timestamp(thread.updated_at),
+                })
+                .collect());
+        }
         let root = match kind {
             AgentKind::Codex => "$HOME/.codex/sessions",
             AgentKind::Claude => "$HOME/.claude/projects",
@@ -4446,6 +4470,11 @@ fn unique_destination(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {
     }
     directory.join(format!("{stem}-{}", std::process::id()))
 }
+
+/// How many conversations a resume listing asks each runtime for: more than a
+/// picker shows at once, and few enough that a folder used for years answers
+/// quickly.
+const RESUME_LISTED: usize = 64;
 
 fn parse_resume_candidates(kind: AgentKind, path: &str, output: &str) -> Vec<ResumeCandidate> {
     let mut titles = HashMap::new();

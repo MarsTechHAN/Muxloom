@@ -127,6 +127,77 @@ pub fn threads_for(kind: AgentKind, cwd: &str, since: u64) -> Vec<NativeThread> 
     }
 }
 
+/// The conversations a runtime has held in `cwd`, newest first, at most
+/// `limit`: what a resume picker lists.
+///
+/// [`threads_for`] reads the transcripts written most recently anywhere, which
+/// is where a live session's own is. A picker wants the folder's own instead,
+/// however long ago they were written, and for Codex those are not the same
+/// thing: it files rollouts by date rather than by folder, so the newest few
+/// dozen on the machine can all belong to somewhere else, and a quiet folder's
+/// conversations never made the cut. So Codex is walked newest day first and
+/// filtered as it goes, until the folder has enough or the walk has opened as
+/// many rollouts as one listing is allowed. Claude Code and pi keep a folder
+/// per working directory, and that folder is all there is to read.
+///
+/// OpenCode keeps its conversations in a store only OpenCode reads, and is
+/// asked for them elsewhere.
+pub fn resumable(kind: AgentKind, cwd: &str, limit: usize) -> Vec<NativeThread> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let limit = limit.clamp(1, MAX_SCANNED);
+    let mut threads = match kind {
+        AgentKind::Claude => claude_threads(&home.join(".claude").join("projects"), cwd, 0),
+        AgentKind::Pi => pi_threads(&home.join(".pi").join("agent").join("sessions"), cwd, 0),
+        AgentKind::Codex => codex_resumable(&home.join(".codex"), cwd, limit),
+        AgentKind::OpenCode | AgentKind::Terminal => Vec::new(),
+    };
+    threads.sort_by_key(|thread| Reverse(thread.updated_at));
+    threads.truncate(limit);
+    threads
+}
+
+/// How many rollouts one Codex listing opens at most. Each costs a few lines of
+/// reading; a machine that has used Codex daily for a year holds thousands, and
+/// a picker that waits on all of them is the slowness it exists to end.
+const CODEX_LISTING_OPENS: usize = 2_000;
+
+fn codex_resumable(codex_home: &Path, cwd: &str, limit: usize) -> Vec<NativeThread> {
+    let cwd = normalize_path(cwd);
+    let names = codex_names(codex_home);
+    // Ordered by when each rollout was last written, not by the day folder it
+    // sits in: a conversation resumed today is still filed under the day it
+    // began, and walking the days newest first would reach it last. Telling
+    // the order costs a stat per file, which is nothing beside opening one.
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    for day in codex_day_folders(&codex_home.join("sessions"), 0) {
+        let Ok(entries) = fs::read_dir(&day) else {
+            continue;
+        };
+        files.extend(entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|kind| kind != "jsonl") {
+                return None;
+            }
+            let stamped = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(as_epoch_ms)?;
+            Some((path, stamped))
+        }));
+    }
+    files.sort_by_key(|(_, updated_at)| Reverse(*updated_at));
+    files
+        .into_iter()
+        .take(CODEX_LISTING_OPENS)
+        .filter_map(|(path, updated_at)| codex_thread(&path, updated_at, &names))
+        .filter(|thread| thread.cwd == cwd)
+        .take(limit)
+        .collect()
+}
+
 /// Read one conversation that is already spoken for. A session that knows which
 /// one is its own never rescans the folder for it.
 pub fn reread(kind: AgentKind, path: &Path, id: &str) -> Option<NativeThread> {
@@ -1488,6 +1559,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn json(line: &str) -> Value {
         serde_json::from_str(line).expect("valid json")
@@ -2053,6 +2125,57 @@ mod tests {
             found.last_message.as_deref(),
             Some("The tail is all that is read.")
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A resume picker lists the folder's own conversations, however many
+    /// other folders have been busier since. Codex files rollouts by the day
+    /// they began, so a conversation resumed yesterday sits in a folder from
+    /// months ago; it is found by when it was written, not where it is filed.
+    #[test]
+    fn a_folder_s_codex_conversations_are_listed_whatever_else_was_busy() {
+        let root = scratch("codex-resumable");
+        let old_day = root.join("sessions/2026/01/05");
+        let new_day = root.join("sessions/2026/10/25");
+        fs::create_dir_all(&old_day).unwrap();
+        fs::create_dir_all(&new_day).unwrap();
+        let rollout = |day: &Path, id: &str, cwd: &str, written: u64| {
+            let path = day.join(format!("rollout-{id}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\",\
+                     \"timestamp\":\"2026-01-05T00:00:00.000Z\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            let when = UNIX_EPOCH + Duration::from_secs(written);
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        // Begun in January, written to again most recently of all.
+        rollout(&old_day, "revived", "/work", 2_000_000_000);
+        rollout(&old_day, "january", "/work", 1_700_000_000);
+        // Busier, newer, and somebody else's.
+        for n in 0..10 {
+            rollout(
+                &new_day,
+                &format!("elsewhere-{n}"),
+                "/other",
+                1_900_000_000 + n,
+            );
+        }
+        let ids: Vec<String> = codex_resumable(&root, "/work/", 5)
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect();
+        assert_eq!(ids, ["revived", "january"]);
+        // And the bound is the bound.
+        assert_eq!(codex_resumable(&root, "/other", 3).len(), 3);
         fs::remove_dir_all(&root).ok();
     }
 

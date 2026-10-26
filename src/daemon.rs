@@ -125,9 +125,10 @@ mod platform {
         channel::{CHANNELS_CAPABILITY, ChannelSet},
         daemon_protocol::{
             DATA_CHUNK_SIZE, DaemonHistoryMatch, DaemonHistorySearchHit, DaemonRequest,
-            DaemonResponse, DaemonSession, Frame, FrameKind, HISTORY_SEARCH_CAPABILITY,
-            INITIAL_STREAM_WINDOW, LINEAGE_CAPABILITY, OpenStream, PARENT_ALERT_CAPABILITY,
-            PROTOCOL_VERSION, ParentAlert, StreamOpened, Trigger, TriggerAction, stream,
+            DaemonResponse, DaemonSession, DaemonThread, Frame, FrameKind,
+            HISTORY_SEARCH_CAPABILITY, INITIAL_STREAM_WINDOW, LINEAGE_CAPABILITY, OpenStream,
+            PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, StreamOpened,
+            THREADS_CAPABILITY, Trigger, TriggerAction, stream,
         },
         keeper,
         model::{
@@ -3078,6 +3079,7 @@ mod platform {
                             PARENT_ALERT_CAPABILITY.into(),
                             LINEAGE_CAPABILITY.into(),
                             HISTORY_SEARCH_CAPABILITY.into(),
+                            THREADS_CAPABILITY.into(),
                         ],
                     },
                 )
@@ -3694,6 +3696,25 @@ mod platform {
                         skipped,
                     },
                 )
+            }
+            // Read by the runtime readers this daemon already uses to tell
+            // which conversation a session is having — in Rust, on this side,
+            // with no find, grep or sed on the machine and no transcript sent
+            // over the wire to be picked through at the other end.
+            DaemonRequest::ListThreads { kind, path, limit } => {
+                let kind: AgentKind = kind.parse().map_err(|error: String| anyhow!(error))?;
+                let threads = crate::native_history::resumable(kind, &path, limit)
+                    .into_iter()
+                    .map(|thread| DaemonThread {
+                        id: thread.id,
+                        source_path: thread.path.to_string_lossy().into_owned(),
+                        updated_at: thread.updated_at,
+                        title: thread.title,
+                        first_message: thread.first_message,
+                        last_message: thread.last_message,
+                    })
+                    .collect();
+                write_response(writer, request_id, &DaemonResponse::Threads { threads })
             }
             DaemonRequest::ListDirectory { path } => write_response(
                 writer,
@@ -13088,6 +13109,12 @@ mod platform {
                     .iter()
                     .any(|it| it == HISTORY_SEARCH_CAPABILITY),
                 "the daemon must say it can search every capture at once: {capabilities:?}"
+            );
+            // Likewise the resume picker: an unadvertised thread listing leaves
+            // every dashboard grepping every transcript on the machine.
+            assert!(
+                capabilities.iter().any(|it| it == THREADS_CAPABILITY),
+                "the daemon must say it lists a folder's conversations: {capabilities:?}"
             );
 
             handle_request(

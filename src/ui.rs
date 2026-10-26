@@ -4194,7 +4194,7 @@ fn draw_search_modal(frame: &mut Frame<'_>, form: &mut SearchForm, outer: Rect) 
         // Names and recaps are already listed by now; what is left is reading
         // scrollback, which is the part worth a bar.
         format!(
-            "{} {read}/{total} histories read{}",
+            "{} {read}/{total} machines searched{}",
             progress_bar(read, total, 24),
             if form.results.is_empty() {
                 String::new()
@@ -7199,7 +7199,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("3/12 histories read"));
+        assert!(rendered.contains("3/12 machines searched"));
         assert!(rendered.contains("1 matches so far"));
         assert!(rendered.contains('·'), "the unread part of the bar shows");
         assert!(

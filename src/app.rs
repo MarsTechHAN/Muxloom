@@ -10807,10 +10807,14 @@ impl App {
         self.modal = Some(Modal::Search(form));
     }
 
+    /// Run what has been typed once typing pauses — including while the last
+    /// query is still being read. Waiting for that one to finish was waiting for
+    /// every capture of a question nobody was asking any more; the worker drops
+    /// a search a newer one has passed, and its stragglers are told apart by
+    /// their query and ignored.
     fn maybe_auto_submit_search(&mut self) {
         let should_submit = matches!(self.modal.as_ref(), Some(Modal::Search(form))
-            if !form.loading
-                && form.query.trim().chars().count() >= 2
+            if form.query.trim().chars().count() >= 2
                 && form.submitted_query != form.query.trim()
                 && form.edited_at.elapsed() >= Duration::from_millis(350));
         if !should_submit {

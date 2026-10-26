@@ -1825,38 +1825,93 @@ pub fn search_index(
     if needle.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+    let plain = plain_needle(&needle);
+    let shape = Needle::of(&needle);
+    let records: Vec<&BackupRecord> = index
+        .records
+        .iter()
+        .filter(|record| filter.keeps(record))
+        .collect();
+    // Read by a few threads at once. Every conversation's messages are their own
+    // compressed file, and one reader opening them end to end is what kept a
+    // search box waiting between two keystrokes; the work is independent per
+    // conversation, so each reader keeps its own best few and the best of all
+    // of those is the answer. Where a hit was found in the walk — conversation
+    // first, then line — still breaks ties, so the answer is the one a single
+    // reader gives.
+    let readers = SEARCH_READERS.min(records.len()).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let kept: Vec<Vec<Ranked>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..readers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut best = TopHits::new(limit);
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(record) = records.get(at) else {
+                            break;
+                        };
+                        search_record(store, record, at, &needle, plain, &shape, &mut best);
+                    }
+                    best.heap.into_vec()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok())
+            .collect()
+    });
+    let mut all: Vec<Ranked> = kept.into_iter().flatten().collect();
+    all.sort();
+    all.truncate(limit);
+    Ok(all.into_iter().map(|ranked| ranked.hit).collect())
+}
+
+/// How many conversations a backup search reads at once.
+const SEARCH_READERS: usize = 8;
+
+/// One conversation searched, its hits offered to `best` stamped with where in
+/// the walk they were found: the conversation's place, then the hit's.
+fn search_record(
+    store: &BackupStore,
+    record: &BackupRecord,
+    place: usize,
+    needle: &str,
+    plain: bool,
+    shape: &Needle,
+    best: &mut TopHits,
+) {
     // A word common enough to appear in every conversation matches tens of
     // thousands of lines, and a hit is eight strings and a snippet. Rank on the
     // way in so the corpus is read once and only `limit` of it is ever held.
-    let mut best = TopHits::new(limit);
-    let plain = plain_needle(&needle);
-    let shape = Needle::of(&needle);
-    for record in index.records.iter().filter(|record| filter.keeps(record)) {
-        let mut matched_message = false;
-        let raw = store
-            .read_blob(&record.target_id, &record.session_id, MESSAGES_BLOB)
-            .unwrap_or_default();
-        // Enumerated over every line, parseable or not, so an index here is the
-        // same index `read_messages` pages around.
-        for (position, line) in String::from_utf8_lossy(&raw).lines().enumerate() {
-            // Parsing a line costs far more than looking at it, and almost no
-            // line holds the needle. See `plain_needle` for why this is allowed
-            // to decide, and when it steps aside.
-            if plain && !shape.holds(line, &needle) {
-                continue;
-            }
-            let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) else {
-                continue;
-            };
-            let count = message.text.to_lowercase().matches(&needle).count();
-            if count == 0 {
-                continue;
-            }
-            matched_message = true;
-            if !best.admits(count, record.created_at) {
-                continue;
-            }
-            best.offer(SearchHit {
+    let mut found = (place as u64) << 32;
+    let mut matched_message = false;
+    let raw = store
+        .read_blob(&record.target_id, &record.session_id, MESSAGES_BLOB)
+        .unwrap_or_default();
+    // Enumerated over every line, parseable or not, so an index here is the
+    // same index `read_messages` pages around.
+    for (position, line) in String::from_utf8_lossy(&raw).lines().enumerate() {
+        // Parsing a line costs far more than looking at it, and almost no line
+        // holds the needle. See `plain_needle` for why this is allowed to
+        // decide, and when it steps aside.
+        if plain && !shape.holds(line, needle) {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<ExtractedMessage>(line) else {
+            continue;
+        };
+        let count = message.text.to_lowercase().matches(needle).count();
+        if count == 0 {
+            continue;
+        }
+        matched_message = true;
+        if !best.admits(count, record.created_at) {
+            continue;
+        }
+        best.offer_at(
+            SearchHit {
                 target_id: record.target_id.clone(),
                 session_id: record.session_id.clone(),
                 kind: record.kind.clone(),
@@ -1864,17 +1919,21 @@ pub fn search_index(
                 created_at: record.created_at,
                 title: record.title.clone(),
                 role: message.role,
-                snippet: make_snippet(&message.text, &needle),
+                snippet: make_snippet(&message.text, needle),
                 score: count,
                 message_index: position,
                 ts: message.ts,
-            });
-        }
-        // Surface a title/recap match even when no message body matched.
-        if !matched_message && best.admits(1, record.created_at) {
-            let haystack = format!("{} {}", record.title, record.recap).to_lowercase();
-            if haystack.contains(&needle) {
-                best.offer(SearchHit {
+            },
+            found,
+        );
+        found += 1;
+    }
+    // Surface a title/recap match even when no message body matched.
+    if !matched_message && best.admits(1, record.created_at) {
+        let haystack = format!("{} {}", record.title, record.recap).to_lowercase();
+        if haystack.contains(needle) {
+            best.offer_at(
+                SearchHit {
                     target_id: record.target_id.clone(),
                     session_id: record.session_id.clone(),
                     kind: record.kind.clone(),
@@ -1882,15 +1941,15 @@ pub fn search_index(
                     created_at: record.created_at,
                     title: record.title.clone(),
                     role: "title".into(),
-                    snippet: make_snippet(matched_side(record, &needle), &needle),
+                    snippet: make_snippet(matched_side(record, needle), needle),
                     score: 1,
                     message_index: usize::MAX,
                     ts: String::new(),
-                });
-            }
+                },
+                found,
+            );
         }
     }
-    Ok(best.into_ranked())
 }
 
 /// How a line has to be looked at to find a needle in it, worked out once from
@@ -1974,7 +2033,6 @@ struct TopHits {
     limit: usize,
     /// Worst first, so the one to drop is the one on top.
     heap: BinaryHeap<Ranked>,
-    found: u64,
 }
 
 struct Ranked {
@@ -2015,7 +2073,6 @@ impl TopHits {
         Self {
             limit,
             heap: BinaryHeap::new(),
-            found: 0,
         }
     }
 
@@ -2031,12 +2088,10 @@ impl TopHits {
             .is_none_or(|worst| (score, created_at) > (worst.hit.score, worst.hit.created_at))
     }
 
-    fn offer(&mut self, hit: SearchHit) {
-        let ranked = Ranked {
-            hit,
-            found: self.found,
-        };
-        self.found += 1;
+    /// Keep `hit` if it ranks among the best, `found` saying where in the
+    /// walk it turned up.
+    fn offer_at(&mut self, hit: SearchHit, found: u64) {
+        let ranked = Ranked { hit, found };
         if self.heap.len() < self.limit {
             self.heap.push(ranked);
             return;
@@ -2045,16 +2100,6 @@ impl TopHits {
             self.heap.pop();
             self.heap.push(ranked);
         }
-    }
-
-    /// Best first. `into_sorted_vec` sorts ascending, and here the better hit
-    /// is the lesser one, so that is already the order a reader wants.
-    fn into_ranked(self) -> Vec<SearchHit> {
-        self.heap
-            .into_sorted_vec()
-            .into_iter()
-            .map(|ranked| ranked.hit)
-            .collect()
     }
 }
 

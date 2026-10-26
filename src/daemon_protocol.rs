@@ -25,6 +25,10 @@ pub const LINEAGE_CAPABILITY: &str = "lineage-v1";
 /// to answer walks the sessions itself, which is what this exists to stop
 /// doing.
 pub const HISTORY_SEARCH_CAPABILITY: &str = "history-search-v1";
+/// A daemon that lists the conversations a runtime has held in a folder, read
+/// off the runtime's own transcripts by its own code. Additive: a client
+/// talking to a daemon too old to answer runs the shell scan it always did.
+pub const THREADS_CAPABILITY: &str = "threads-v1";
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const DATA_CHUNK_SIZE: usize = 64 * 1024;
@@ -391,6 +395,13 @@ pub enum DaemonRequest {
         #[serde(default)]
         deep: bool,
     },
+    /// The conversations `kind` has held in `path`, newest first, at most
+    /// `limit` — what a resume picker offers.
+    ListThreads {
+        kind: String,
+        path: String,
+        limit: usize,
+    },
     ListDirectory {
         path: String,
     },
@@ -677,6 +688,10 @@ pub enum DaemonResponse {
         #[serde(default)]
         skipped: usize,
     },
+    /// Answers `ListThreads`.
+    Threads {
+        threads: Vec<DaemonThread>,
+    },
     Directory {
         listing: DirectoryListing,
     },
@@ -945,6 +960,23 @@ pub struct DaemonHistoryMatch {
 /// One session whose capture holds what was searched for, with the label it
 /// goes by so the answer reads the same as it did when the caller had the
 /// session list in hand.
+/// One conversation a runtime recorded, as a resume picker shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonThread {
+    /// What the runtime resumes it by.
+    pub id: String,
+    /// The transcript it is written in.
+    pub source_path: String,
+    /// When it was last written, epoch milliseconds.
+    pub updated_at: u64,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub first_message: Option<String>,
+    #[serde(default)]
+    pub last_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonHistorySearchHit {
     pub session_id: String,

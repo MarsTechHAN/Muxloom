@@ -111,7 +111,11 @@ machine remembers its last selected agent while you move between targets.
 
 `n` opens the New/Resume flow. Pick a runtime and a working directory with the
 fuzzy path picker, then start fresh or resume a history discovered in that exact
-folder. The runtime row lists what the selected machine actually has — a
+folder. The histories are read by the machine's own daemon, off each runtime's
+transcripts, in one request per runtime and all runtimes at once — nothing is
+run on the machine but `muxloomd`, and a Codex conversation resumed yesterday is
+found even though Codex filed it under the day it began. A daemon too old to be
+asked is scanned the old way. The runtime row lists what the selected machine actually has — a
 machine without OpenCode never offers it — and falls back to the full list for
 a machine Muxloom has not reached yet, so the install prompt stays reachable.
 The form opens on the runtime you last launched on that machine, alongside the
@@ -253,9 +257,11 @@ to copy · drag local files in to upload.
 `/` searches every enabled target's history — live and archived — ranked by
 label and folder, then recap, then remaining history. Labels, folders and recaps
 are matched without reading anything and are listed at once; the scrollback is
-then read underneath them, a batch of machines at a time, with a bar counting
-histories read and hits added as they land. The cursor stays on the session it
-is on while the list fills in. Each session carries a recap line, and archived
+then read underneath them, every machine at once and one request per machine —
+its recently written captures first, then the rest of its archive — with a bar
+counting machines searched and hits added as they land. Typing on starts the
+new query straight away and drops the one it replaced. The cursor stays on the
+session it is on while the list fills in. Each session carries a recap line, and archived
 agents stay searchable and resumable.
 
 The agent list goes most recently used first, at both levels: folders by the

@@ -24,7 +24,9 @@ use crate::{
         PARENT_ALERT_CAPABILITY, PROTOCOL_VERSION, ParentAlert, Trigger, stream,
     },
     debug,
-    model::{DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport},
+    model::{
+        AgentKind, DirectoryListing, FileListing, FilePreview, Target, TaskProgress, Transport,
+    },
     relay::{RELAY_CAPABILITY, RelayAnswer, RelayJob, RelayPeer},
     talk::{
         DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
@@ -869,6 +871,30 @@ impl BridgeConnection {
                 skipped,
             } => Ok((hits, searched, skipped)),
             response => bail!("unexpected history-search response: {response:?}"),
+        }
+    }
+
+    /// The conversations `kind` has held in `path`, read by the daemon off the
+    /// runtime's own transcripts. `None` from a daemon too old to read them.
+    pub fn list_threads(
+        &self,
+        kind: AgentKind,
+        path: String,
+        limit: usize,
+    ) -> Result<Option<Vec<crate::daemon_protocol::DaemonThread>>> {
+        if !self.has_capability(crate::daemon_protocol::THREADS_CAPABILITY) {
+            return Ok(None);
+        }
+        match self
+            .request(DaemonRequest::ListThreads {
+                kind: kind.as_str().into(),
+                path,
+                limit,
+            })?
+            .response
+        {
+            DaemonResponse::Threads { threads } => Ok(Some(threads)),
+            response => bail!("unexpected thread-list response: {response:?}"),
         }
     }
 
@@ -2686,6 +2712,17 @@ impl BridgePool {
 
     pub fn list_directory(&self, target: &Target, path: String) -> Result<DirectoryListing> {
         self.connection_for_target(target)?.list_directory(path)
+    }
+
+    pub fn list_threads(
+        &self,
+        target: &Target,
+        kind: AgentKind,
+        path: String,
+        limit: usize,
+    ) -> Result<Option<Vec<crate::daemon_protocol::DaemonThread>>> {
+        self.connection_for_target(target)?
+            .list_threads(kind, path, limit)
     }
 
     pub fn list_files(&self, target: &Target, path: String) -> Result<FileListing> {

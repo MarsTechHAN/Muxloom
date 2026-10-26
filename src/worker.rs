@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -936,10 +936,26 @@ impl Worker {
                                 history_jobs.push((target, session));
                             }
                         }
-                        // Multiplex a bounded number of SSH/tmux searches at once. This keeps
-                        // large fleets responsive without opening an unbounded connection burst.
+                        // The slow half: what nothing about a session's name
+                        // says, read out of its scrollback. One question per
+                        // machine rather than one per session — a daemon reads
+                        // every capture it holds in one round, a few readers
+                        // at a time, and a fleet with thousands of archived
+                        // sessions was being asked thousands of times, eight
+                        // at once, each waiting its turn. Every machine is
+                        // asked at once; only a tmux-fallback session, which
+                        // the daemon does not hold, is still read by itself.
+                        let generation = SEARCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                        let current = || SEARCH_GENERATION.load(Ordering::SeqCst) == generation;
                         let mut unreachable: Vec<String> = Vec::new();
-                        let captures = history_jobs.len();
+                        let mut machines: Vec<(Target, Vec<AgentSession>)> = Vec::new();
+                        for (target, session) in history_jobs {
+                            match machines.iter_mut().find(|(held, _)| held.id == target.id) {
+                                Some((_, sessions)) => sessions.push(session),
+                                None => machines.push((target, vec![session])),
+                            }
+                        }
+                        let total = machines.len();
                         // What was matched without reading anything - names,
                         // paths, recaps - goes out before the first capture is
                         // opened, so the list is on screen while the slow half
@@ -963,49 +979,52 @@ impl Worker {
                                     query: query.clone(),
                                     results: ranked.into_iter().map(|(result, _)| result).collect(),
                                     unreachable: unreachable.to_vec(),
-                                    reading: read.map(|read| (read, captures)),
+                                    reading: read.map(|read| (read, total)),
                                 });
                             };
-                        instalment(&results, &unreachable, (captures > 0).then_some(0));
-                        let mut read = 0;
-                        for jobs in history_jobs.chunks(8) {
-                            let batch = thread::scope(|scope| {
-                                let mut handles = Vec::new();
-                                for (target, session) in jobs {
-                                    let runtime = runtime.clone();
-                                    let target = target.clone();
-                                    let session = session.clone();
-                                    let query = query.clone();
-                                    handles.push(scope.spawn(move || {
-                                        search_session_history(&runtime, target, session, &query)
-                                    }));
+                        instalment(&results, &unreachable, (total > 0).then_some(0));
+                        let (found_tx, found_rx) = mpsc::channel();
+                        thread::scope(|scope| {
+                            for (target, sessions) in machines {
+                                let runtime = runtime.clone();
+                                let query = query.clone();
+                                let found = found_tx.clone();
+                                let current = &current;
+                                scope.spawn(move || {
+                                    search_machine(
+                                        &runtime, target, sessions, &query, current, &found,
+                                    )
+                                });
+                            }
+                            drop(found_tx);
+                            let mut read = 0;
+                            // Each machine reports what its recent captures
+                            // held first, then the rest of its archive, then
+                            // that it is done; the list grows as they land.
+                            for found in found_rx {
+                                if !current() {
+                                    continue;
                                 }
-                                handles
-                                    .into_iter()
-                                    .filter_map(|handle| handle.join().ok())
-                                    .collect::<Vec<_>>()
-                            });
-                            for outcome in batch {
-                                match outcome {
-                                    Ok(Some(hit)) => results.push(hit),
-                                    Ok(None) => {}
-                                    Err(target_id) => {
+                                match found {
+                                    MachineSearch::Hits(hits) => results.extend(hits),
+                                    MachineSearch::Unreachable(target_id) => {
                                         if !unreachable.contains(&target_id) {
                                             unreachable.push(target_id);
                                         }
                                     }
+                                    MachineSearch::Done => read += 1,
                                 }
+                                // The last machine is reported as the final
+                                // answer rather than as progress, so the search
+                                // is never left looking like it is still running.
+                                instalment(&results, &unreachable, (read < total).then_some(read));
                             }
-                            read += jobs.len();
-                            // The last batch is reported as the final answer
-                            // rather than as progress, so the search is never
-                            // left looking like it is still running.
-                            instalment(&results, &unreachable, (read < captures).then_some(read));
-                        }
+                        });
                         debug::log(
                             "search",
                             format!(
-                                "query completed results={} captures={captures}",
+                                "query {} results={} machines={total}",
+                                if current() { "completed" } else { "superseded" },
                                 results.len()
                             ),
                         );
@@ -1034,10 +1053,30 @@ impl Worker {
                         // candidates are pooled and the failures reported apart.
                         let mut candidates = Vec::new();
                         let mut failures: Vec<(AgentKind, String)> = Vec::new();
-                        let mut scanned = 0usize;
-                        for source in AgentKind::agents().filter(|kind| kind.has_native_history()) {
-                            scanned += 1;
-                            match runtime.scan_resumes(&target, source, &path) {
+                        let sources: Vec<AgentKind> = AgentKind::agents()
+                            .filter(|kind| kind.has_native_history())
+                            .collect();
+                        let scanned = sources.len();
+                        // Asked of every runtime at once: each is its own
+                        // round to the machine, and the picker waited on the
+                        // sum of them.
+                        let answers: Vec<(AgentKind, anyhow::Result<Vec<ResumeCandidate>>)> =
+                            thread::scope(|scope| {
+                                let asks: Vec<_> = sources
+                                    .iter()
+                                    .map(|&source| {
+                                        let runtime = &runtime;
+                                        let target = &target;
+                                        let path = &path;
+                                        scope.spawn(move || {
+                                            (source, runtime.scan_resumes(target, source, path))
+                                        })
+                                    })
+                                    .collect();
+                                asks.into_iter().filter_map(|ask| ask.join().ok()).collect()
+                            });
+                        for (source, answer) in answers {
+                            match answer {
                                 Ok(found) => candidates.extend(found),
                                 Err(error) => {
                                     debug::log(
@@ -1945,6 +1984,105 @@ fn search_session_history(
         ),
         score,
     )))
+}
+
+/// Which search the dashboard is waiting on. Every search takes the next
+/// number, and one that finds it has been passed stops reading: a person
+/// typing a longer query does not want the shorter one's answer, and used to
+/// wait for every capture of it to be read before theirs could start.
+static SEARCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// What one machine's part of a search sends back, as it goes.
+enum MachineSearch {
+    Hits(Vec<(SearchResult, usize)>),
+    Unreachable(String),
+    Done,
+}
+
+/// One machine's scrollback searched for `query`, for the `sessions` the
+/// dashboard lists there and could not match by name.
+///
+/// The daemon is asked once for the captures written most recently — which is
+/// where a word said lately is — and that answer goes out at once; then, when
+/// that left older captures unread, once more for all of them. A tmux-fallback
+/// session is not the daemon's to read and is asked about by itself. A search
+/// that has been passed by a newer one stops between questions.
+fn search_machine(
+    runtime: &Runtime,
+    target: Target,
+    sessions: Vec<AgentSession>,
+    query: &str,
+    current: &(dyn Fn() -> bool + Sync),
+    found: &mpsc::Sender<MachineSearch>,
+) {
+    let (daemon, tmux): (Vec<AgentSession>, Vec<AgentSession>) = sessions
+        .into_iter()
+        .partition(|session| crate::runtime::is_daemon_session_id(&session.id));
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !daemon.is_empty() {
+        for deep in [false, true] {
+            if !current() {
+                break;
+            }
+            let sweep = match runtime.search_history_all(&target, query, 12, deep) {
+                Ok(sweep) => sweep,
+                Err(error) => {
+                    debug::log(
+                        "search",
+                        format!("history search failed target={}: {error:#}", target.id),
+                    );
+                    let _ = found.send(MachineSearch::Unreachable(target.id.clone()));
+                    break;
+                }
+            };
+            let hits: Vec<(SearchResult, usize)> = sweep
+                .hits
+                .iter()
+                .filter(|hit| !answered.contains(&hit.session_id))
+                .filter_map(|hit| {
+                    let session = daemon.iter().find(|session| session.id == hit.session_id)?;
+                    let (item, score) = best_history_match(&hit.matches, query)?;
+                    let match_kind = match item.recap {
+                        true => SearchMatchKind::Recap,
+                        false => SearchMatchKind::History,
+                    };
+                    Some((
+                        search_result(
+                            session,
+                            match_kind,
+                            item.text.clone(),
+                            Some(item.line_number),
+                        ),
+                        score,
+                    ))
+                })
+                .collect();
+            answered.extend(hits.iter().map(|(result, _)| result.session_id.clone()));
+            if !hits.is_empty() {
+                let _ = found.send(MachineSearch::Hits(hits));
+            }
+            // Nothing was passed over, so there is nothing more to read.
+            if sweep.skipped == 0 {
+                break;
+            }
+        }
+    }
+    for session in tmux {
+        if !current() {
+            break;
+        }
+        match search_session_history(runtime, target.clone(), session, query) {
+            Ok(Some(hit)) => {
+                let _ = found.send(MachineSearch::Hits(vec![hit]));
+            }
+            Ok(None) => {}
+            Err(target_id) => {
+                let _ = found.send(MachineSearch::Unreachable(target_id));
+                break;
+            }
+        }
+    }
+    let _ = found.send(MachineSearch::Done);
 }
 
 fn search_result(
