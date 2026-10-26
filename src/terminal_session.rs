@@ -1376,6 +1376,20 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
         b""
     };
     if let KeyCode::Char(character) = key.code {
+        // AltGr is Ctrl and Alt held together, and on Windows that is exactly
+        // how the console reports it: `@` on a German keyboard arrives as
+        // Ctrl+Alt+@, which read as Ctrl+@ is a NUL, and `[` read as Ctrl+[ an
+        // Escape. A real Ctrl+Alt chord names a letter or a digit; anything
+        // else that comes with both held is the character AltGr typed.
+        if key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !character.is_ascii_alphanumeric()
+            && character != ' '
+        {
+            let mut encoded = [0; 4];
+            return Some(character.encode_utf8(&mut encoded).as_bytes().to_vec());
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let lower = character.to_ascii_lowercase();
             // The digits are where a terminal's control bytes 0x1c to 0x1f come
@@ -2490,6 +2504,25 @@ mod tests {
         assert_eq!(plain(KeyCode::Backspace), Some(b"\x7f".to_vec()));
         assert_eq!(plain(KeyCode::Esc), Some(b"\x1b".to_vec()));
         assert_eq!(plain(KeyCode::Tab), Some(b"\t".to_vec()));
+    }
+
+    #[test]
+    fn a_character_typed_with_altgr_is_that_character() {
+        // Windows reports AltGr as Ctrl and Alt held together.
+        let altgr = |character| {
+            encode_key(
+                KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+                false,
+            )
+        };
+        assert_eq!(altgr('@'), Some(b"@".to_vec()), "not a NUL");
+        assert_eq!(altgr('['), Some(b"[".to_vec()), "not an Escape");
+        assert_eq!(altgr('{'), Some(b"{".to_vec()), "not dropped");
+        assert_eq!(altgr('€'), Some("€".as_bytes().to_vec()));
+        assert_eq!(altgr('ł'), Some("ł".as_bytes().to_vec()));
     }
 
     #[test]
