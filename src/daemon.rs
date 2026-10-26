@@ -3800,6 +3800,9 @@ mod platform {
                 environment,
             } => {
                 let mut command = Command::new("sh");
+                // Not the identity of whoever started the daemon; what the
+                // caller asked for is applied on top.
+                scrub_inherited_session(&mut command);
                 command.args(["-lc", &script]).envs(environment);
                 let output = command
                     .output()
@@ -5558,6 +5561,45 @@ mod platform {
             .collect()
     }
 
+    /// Variables that say which session the process holding them belongs to,
+    /// set by muxloom or by an agent runtime for its own children. A daemon
+    /// inherits the environment of whoever started it, and a daemon started
+    /// from inside an agent — an agent restarting it from its shell — passed
+    /// that agent's identity to every session it launched: Claude Code read
+    /// `CLAUDE_CODE_SESSION_ID` and `CLAUDE_CODE_CHILD_SESSION` as being a
+    /// child of the agent that ran the command, kept no transcript of its own,
+    /// and so could never be matched, backed up, or resumed; and a session a
+    /// person launched took a parent and limits from muxloom's own variables
+    /// wherever the launch did not set them. What a person configured for
+    /// themselves (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_DISABLE_…`) is not here.
+    pub(crate) const INHERITED_SESSION_VARIABLES: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_PID",
+        "CLAUDE_EFFORT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+    ];
+
+    /// Take another session's identity out of what `command` will inherit:
+    /// the runtimes' own ([`INHERITED_SESSION_VARIABLES`]) and muxloom's
+    /// ([`crate::permissions::SESSION_ENVIRONMENT`]). A launch sets muxloom's
+    /// afresh for the session it starts.
+    pub(crate) fn scrub_inherited_session(command: &mut Command) {
+        for name in INHERITED_SESSION_VARIABLES
+            .iter()
+            .chain(crate::permissions::SESSION_ENVIRONMENT)
+        {
+            command.env_remove(name);
+        }
+    }
+
     /// Spawn the detached `muxloomd keeper` that owns one session. The spec
     /// travels over stdin so environment values never appear in `ps`.
     fn spawn_keeper_process(state: &DaemonState, spec: &keeper::KeeperSpec) -> Result<()> {
@@ -5565,6 +5607,10 @@ mod platform {
         let log = open_log(&state.paths.keepers.join(format!("{}.log", spec.session_id)))?;
         let error_log = log.try_clone()?;
         let mut command = Command::new(executable);
+        // The keeper hands its own environment on to the session, so this is
+        // the one place every launch passes through, whoever started the
+        // daemon.
+        scrub_inherited_session(&mut command);
         command
             .arg("keeper")
             .current_dir("/")
@@ -8660,6 +8706,8 @@ mod platform {
         let log = open_log(&paths.log)?;
         let error_log = log.try_clone()?;
         let mut command = Command::new(executable);
+        // The daemon outlives whoever started it, and that is often an agent.
+        scrub_inherited_session(&mut command);
         command
             .arg("serve")
             .current_dir("/")
@@ -12475,6 +12523,51 @@ mod platform {
         /// painting itself.
         fn draw(session: &ManagedSession, bytes: &[u8]) {
             session.record_output_at(bytes, now_ms() - crate::activity::PAINT_WINDOW_MS - 1);
+        }
+
+        /// A daemon an agent started inherits that agent's identity, and a
+        /// keeper hands its environment on to the session: Claude Code then
+        /// ran as a child of the agent that restarted the daemon and kept no
+        /// transcript, and a person's session took a parent and limits it was
+        /// never given. Whatever started the daemon, none of it gets through.
+        #[test]
+        fn a_keeper_does_not_inherit_the_session_that_started_the_daemon() {
+            let mut command = Command::new("true");
+            command.env("ANTHROPIC_BASE_URL", "https://proxy.example");
+            scrub_inherited_session(&mut command);
+            let removed: Vec<String> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect();
+            for name in [
+                "CLAUDECODE",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CODEX_SANDBOX",
+                "MUXLOOM_SESSION_ID",
+                "MUXLOOM_SESSION_PARENT",
+                "MUXLOOM_MAY_MESSAGE",
+                "MUXLOOM_MAY_LAUNCH",
+                "MUXLOOM_MAY_REACH_PERSON",
+            ] {
+                assert!(
+                    removed.iter().any(|removed| removed == name),
+                    "{name} is inherited"
+                );
+            }
+            // What the person configured for themselves stays.
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == "ANTHROPIC_BASE_URL" && value.is_some())
+            );
+            // And a value the launch sets afresh wins over the removal.
+            command.env("MUXLOOM_SESSION_ID", "muxloomd-claude-new");
+            assert!(command.get_envs().any(|(name, value)| {
+                name == "MUXLOOM_SESSION_ID"
+                    && value.is_some_and(|value| value == "muxloomd-claude-new")
+            }));
         }
 
         #[test]
