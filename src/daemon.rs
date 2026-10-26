@@ -6813,7 +6813,7 @@ mod platform {
                 // And the region the app had set is measured in the grid that
                 // just stopped existing. The parser's own copy is clamped by
                 // the resize, but this one is handed to every client that
-                // attaches from here on - see `screen_preamble` - and a client
+                // attaches from here on - see `screen_snapshot` - and a client
                 // that installs a region shorter than its grid has an agent
                 // walking down with `ESC[1B` clamp at the region's last row,
                 // piling every remaining row of its interface onto that one
@@ -6975,38 +6975,16 @@ mod platform {
         }
 
         /// The mode preamble every attaching client needs before row content:
-        /// the screen buffer the daemon is on, the app's scroll region, and a
-        /// full clear. Sent on its own when an attach just resized an
-        /// alt-screen TUI, whose row dump at that moment is a reflowed copy of
-        /// the old-size screen — the app's post-SIGWINCH repaint (streamed as
-        /// live frames) is what paints the real one.
-        fn screen_preamble(&self) -> Vec<u8> {
-            let screen = self
-                .screen
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let inline = self
-                .inline
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut out = Vec::new();
-
+        /// the screen buffer the daemon is on and a full clear.
+        fn screen_preamble(screen: &vt100::Screen) -> Vec<u8> {
             // Match the client's active screen buffer.  A fresh client parser
             // starts in the primary buffer, so explicitly enter/leave alt to
             // match the daemon's state.
-            if screen.screen().alternate_screen() {
-                out.extend_from_slice(b"\x1b[?1049h");
+            let mut out = if screen.alternate_screen() {
+                b"\x1b[?1049h".to_vec()
             } else {
-                out.extend_from_slice(b"\x1b[?1049l");
-            }
-
-            // Reinstall the scroll region the app has set, so the client's
-            // InlineScrollback tracks the same region and subsequent scrolls
-            // behave identically.
-            if let Some(region) = inline.region_sequence() {
-                out.extend_from_slice(region.as_bytes());
-            }
-
+                b"\x1b[?1049l".to_vec()
+            };
             out.extend_from_slice(b"\x1b[2J");
             out
         }
@@ -7017,11 +6995,15 @@ mod platform {
         /// alt-screen flag).  Replaces the old "replay last 2 MiB of raw bytes"
         /// approach which was lossy for alt-screen TUIs.
         fn screen_snapshot(&self) -> Vec<u8> {
-            let mut out = self.screen_preamble();
             let screen = self
                 .screen
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let inline = self
+                .inline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut out = Self::screen_preamble(screen.screen());
             // Full absolute redraw: all rows (with SGR) + cursor position +
             // input modes + title. The clear already went out in the preamble
             // — `state_formatted` only emits the rows that carry content, so
@@ -7029,6 +7011,19 @@ mod platform {
             // is locked per frame) could leave bytes on a row the daemon's
             // screen has blank.
             out.extend_from_slice(&screen.screen().state_formatted());
+            // Reinstall the scroll region the app has set, so the client's
+            // InlineScrollback tracks the same region and subsequent scrolls
+            // behave identically. Only now, behind the rows: those step from
+            // one row to the next with a newline, and a newline on a region's
+            // last row scrolls the region instead of moving down - a footer
+            // pinned under it came out piled up the region's top and the rows
+            // below left blank. Installing a region homes the cursor, so the
+            // one the rows left is saved across it, pending wrap and all.
+            if let Some(region) = inline.region_sequence() {
+                out.extend_from_slice(b"\x1b7");
+                out.extend_from_slice(region.as_bytes());
+                out.extend_from_slice(b"\x1b8");
+            }
             out
         }
 
@@ -12283,37 +12278,130 @@ mod platform {
             // The agent pins a footer: rows 1..36 scroll, the last four are its
             // composer. Tracked, and handed to a client attaching at this size.
             session.record_output(b"\x1b[1;36r");
-            assert!(
-                session
-                    .screen_preamble()
-                    .windows(7)
-                    .any(|w| w == b"\x1b[1;36r"),
+            assert_eq!(
+                scroll_regions(&session.screen_snapshot()),
+                ["1;36"],
                 "the region is handed over while it still describes the grid"
             );
 
             // The pane grows. The region now describes forty rows of a grid
             // that has eighty, and nothing has re-stated it.
             session.resize(120, 80).unwrap();
-            let preamble = session.screen_preamble();
-            let text = String::from_utf8_lossy(&preamble).to_string();
+            let snapshot = session.screen_snapshot();
             assert!(
-                !text.contains(";36r"),
-                "a region from the old grid must not reach a client: {text:?}"
-            );
-            assert!(
-                !text.contains('r') || !text.contains("\x1b["),
-                "nothing at all is claimed about the region until the app says: {text:?}"
+                scroll_regions(&snapshot).is_empty(),
+                "nothing at all is claimed about the region until the app says: {:?}",
+                String::from_utf8_lossy(&snapshot)
             );
 
             // And once the agent states it again, at the size it now has, it
             // travels once more.
             session.record_output(b"\x1b[1;76r");
-            assert!(
-                session
-                    .screen_preamble()
-                    .windows(7)
-                    .any(|w| w == b"\x1b[1;76r"),
+            assert_eq!(
+                scroll_regions(&session.screen_snapshot()),
+                ["1;76"],
                 "the region the app set at this size is handed over"
+            );
+
+            session.stop().unwrap();
+            discard_root(paths.root);
+        }
+
+        /// The parameters of every scroll region `bytes` installs.
+        fn scroll_regions(bytes: &[u8]) -> Vec<String> {
+            let mut regions = Vec::new();
+            let mut rest = bytes;
+            while let Some(start) = rest.windows(2).position(|pair| pair == b"\x1b[") {
+                let body = &rest[start + 2..];
+                let Some(end) = body.iter().position(|byte| (0x40..=0x7e).contains(byte)) else {
+                    break;
+                };
+                let parameters = &body[..end];
+                if body[end] == b'r'
+                    && parameters
+                        .iter()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b';'))
+                {
+                    regions.push(String::from_utf8_lossy(parameters).into_owned());
+                }
+                rest = &body[end + 1..];
+            }
+            regions
+        }
+
+        /// An agent that pins a footer under a scroll region — its composer
+        /// and status lines held still while the transcript scrolls above
+        /// them — is handed back to an attaching client exactly as it stands.
+        ///
+        /// The rows of a snapshot step from one to the next with a newline.
+        /// Installed ahead of them, the region caught every one of those on its
+        /// last row and scrolled instead of moving down: the transcript came
+        /// out shifted up by the height of the footer, the footer itself was
+        /// gone, and the rows that scrolled off landed in the client's history
+        /// a second time.
+        #[test]
+        fn an_attach_keeps_a_pinned_footer_where_the_app_drew_it() {
+            let state = test_state("pinned-footer");
+            let paths = state.paths.clone();
+            let session = launch_session(
+                &state,
+                "muxloomd-codex-pinned-footer".into(),
+                "codex".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                1,
+                40,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let mut drawn = Vec::new();
+            for row in 1..=20 {
+                drawn.extend_from_slice(format!("\x1b[{row};1Hturn {row}").as_bytes());
+            }
+            for row in 21..=24 {
+                drawn.extend_from_slice(format!("\x1b[{row};1Hfooter {row}").as_bytes());
+            }
+            drawn.extend_from_slice(b"\x1b[1;20r\x1b[22;10H");
+            session.record_output(&drawn);
+            let (daemon_contents, daemon_cursor) = {
+                let screen = session.screen.lock().unwrap();
+                (
+                    screen.screen().contents(),
+                    screen.screen().cursor_position(),
+                )
+            };
+
+            let mut client = vt100::Parser::new(24, 40, 1_000);
+            let mut inline = InlineScrollback::default();
+            inline.process(&mut client, &session.screen_snapshot());
+
+            assert_eq!(
+                client.screen().contents(),
+                daemon_contents,
+                "the client draws what the daemon holds, footer and all"
+            );
+            assert_eq!(client.screen().cursor_position(), daemon_cursor);
+            client.set_scrollback(usize::MAX);
+            assert_eq!(
+                client.screen().scrollback(),
+                0,
+                "drawing a snapshot scrolls nothing into the client's history"
+            );
+            client.set_scrollback(0);
+            // And the region is the app's again, so its next line of transcript
+            // scrolls the turns and leaves the footer where it is.
+            inline.process(&mut client, b"\x1b[20;1H\nturn 21");
+            let contents = client.screen().contents();
+            assert!(
+                contents.starts_with("turn 2\n") && contents.contains("turn 21\nfooter 21"),
+                "the region scrolls the transcript above the footer: {contents:?}"
             );
 
             session.stop().unwrap();
