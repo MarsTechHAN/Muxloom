@@ -1221,17 +1221,30 @@ pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16)
     let (previous_height, previous_width) = parser.screen().size();
     if height < previous_height && !parser.screen().alternate_screen() {
         // `set_size` truncates the tail when the height shrinks, which would
-        // drop the newest lines. A real terminal keeps the bottom of the
-        // viewport, so delete the top rows that are about to be discarded,
-        // sliding the surviving rows up; `set_size` then drops the blanks left
-        // at the bottom. The scroll region is reset so the deletion spans the
-        // whole grid, which is also the region a resized screen should have.
+        // drop the newest lines. A real terminal keeps the bottom of what was
+        // drawn and the cursor on the line it was on, so scroll just enough of
+        // the top into scrollback for the lower of those two to fit; `set_size`
+        // then drops the blanks left below. The program goes on writing
+        // relative to where it left the cursor, so the cursor moves up with
+        // its line rather than to the top of the screen, and the rows that
+        // leave the top are history rather than lost. The scroll region is
+        // reset so the scroll spans the whole grid, which is the only scroll
+        // vt100 records, and is also the region a resized screen should have.
         // In alt-screen mode the TUI draws from the top, so the default
         // top-anchored truncation is already correct.
-        use std::fmt::Write as _;
-        let mut sequence = String::new();
-        let _ = write!(sequence, "\x1b[r\x1b[H\x1b[{}M", previous_height - height);
-        parser.process(sequence.as_bytes());
+        let excess = shrink_excess(parser, height);
+        if excess > 0 {
+            use std::fmt::Write as _;
+            let (cursor_row, cursor_column) = parser.screen().cursor_position();
+            let mut sequence = String::new();
+            let _ = write!(
+                sequence,
+                "\x1b[r\x1b[{excess}S\x1b[{};{}H",
+                cursor_row - excess + 1,
+                cursor_column + 1
+            );
+            parser.process(sequence.as_bytes());
+        }
     }
     if width < previous_width {
         // vt100 0.15 can leave the first half of a wide glyph in the new last
@@ -1254,6 +1267,34 @@ pub(crate) fn resize_parser(parser: &mut vt100::Parser, height: u16, width: u16)
         });
     }
     parser.set_size(height, width);
+}
+
+/// How many rows have to leave the top of a primary screen shrinking to
+/// `height` rows: enough that both the cursor and the last row anything was
+/// drawn on still fit, and never so many that the cursor's own line goes.
+fn shrink_excess(parser: &mut vt100::Parser, height: u16) -> u16 {
+    // Read the grid the program is drawing on, not the history a person may
+    // have scrolled the view back to.
+    let offset = parser.screen().scrollback();
+    parser.set_scrollback(0);
+    let screen = parser.screen();
+    let (rows, columns) = screen.size();
+    let (cursor_row, _) = screen.cursor_position();
+    let drawn = (0..rows)
+        .rev()
+        .find(|&row| {
+            (0..columns).any(|column| {
+                screen.cell(row, column).is_some_and(|cell| {
+                    cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                })
+            })
+        })
+        .unwrap_or(0);
+    let excess = (cursor_row.max(drawn) + 1)
+        .saturating_sub(height)
+        .min(cursor_row);
+    parser.set_scrollback(offset);
+    excess
 }
 
 fn scrub_shrink_boundary(parser: &mut vt100::Parser, rows: u16, new_width: u16) {
@@ -2173,6 +2214,85 @@ mod tests {
         assert_ne!(
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
+        );
+    }
+
+    /// A shell has printed ten lines and sits at its prompt on the eleventh
+    /// row of a 24-row pane. The pane gets shorter: the layout changed, a
+    /// window was resized, a phone attached.
+    fn shell_at_its_prompt() -> vt100::Parser {
+        let mut parser = vt100::Parser::new(24, 40, 1_000);
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        parser.process(b"$ ls");
+        parser
+    }
+
+    #[test]
+    fn a_shorter_pane_leaves_a_screen_that_still_fits_where_it_was() {
+        let mut parser = shell_at_its_prompt();
+        let before = parser.screen().contents();
+
+        resize_parser(&mut parser, 12, 40);
+
+        assert_eq!(
+            parser.screen().contents(),
+            before,
+            "everything drawn still fits in twelve rows, so nothing may move, let alone vanish"
+        );
+        assert_eq!(
+            parser.screen().cursor_position(),
+            (10, 4),
+            "the cursor stays where the shell left it; at the top of the screen, the next \
+             thing the shell writes would land over somebody else's line"
+        );
+    }
+
+    #[test]
+    fn a_shorter_pane_scrolls_what_no_longer_fits_into_history() {
+        let mut parser = shell_at_its_prompt();
+
+        resize_parser(&mut parser, 6, 40);
+        parser.process(b" -l");
+
+        assert_eq!(
+            parser.screen().contents(),
+            "line5\nline6\nline7\nline8\nline9\n$ ls -l",
+            "the prompt keeps the bottom row, and what the shell writes next follows it"
+        );
+        assert_eq!(parser.screen().cursor_position(), (5, 7));
+        parser.set_scrollback(usize::MAX);
+        assert_eq!(
+            parser.screen().scrollback(),
+            5,
+            "the rows that left the top are history a person can scroll back to, not gone"
+        );
+        assert!(parser.screen().contents().starts_with("line0\n"));
+    }
+
+    #[test]
+    fn a_shorter_pane_keeps_what_was_drawn_below_the_cursor() {
+        // Claude Code never takes the alternate screen: its composer and the
+        // hints under it are drawn inline at the bottom of the grid, with the
+        // cursor parked inside the composer above them.
+        let mut parser = vt100::Parser::new(24, 40, 1_000);
+        for row in 1..=24 {
+            parser.process(format!("\x1b[{row};1Hrow{row}").as_bytes());
+        }
+        parser.process(b"\x1b[21;3H");
+
+        resize_parser(&mut parser, 20, 40);
+
+        let contents = parser.screen().contents();
+        assert!(
+            contents.starts_with("row5\n") && contents.ends_with("\nrow24"),
+            "the bottom of the drawing survives a shrink, and the top goes: {contents:?}"
+        );
+        assert_eq!(
+            parser.screen().cursor_position(),
+            (16, 2),
+            "and the cursor moves up with the line it was on"
         );
     }
 
