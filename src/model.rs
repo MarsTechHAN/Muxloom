@@ -301,6 +301,13 @@ impl Powers {
         }
     }
 
+    /// Whether this is everything there is: a person's own agent, which answers
+    /// to the person rather than to another agent, and is held to none of the
+    /// rules that keep one agent's hands off another's work.
+    pub fn is_whole(&self) -> bool {
+        *self == Self::whole()
+    }
+
     /// Nothing but the work: report back to whoever asked, and do it yourself.
     pub fn none() -> Self {
         Self {

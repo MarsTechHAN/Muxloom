@@ -803,10 +803,24 @@ with a gate beside it.
 posting to the wider ones is another way of being heard: `task` scope is always
 open, `path` opens once the session may talk to the others working in that
 folder, and `machine` and `global` need the full reach. `send_channel_message`
-is refused outright to a session that was not handed the person, on the way out
-and again before a relayed one borrows the controller's credentials. Every
-refusal names the agent that set the limit and the route around it, because the
-session reading it cannot lift the limit itself.
+is refused outright to a session that was not handed the person. Every refusal
+names the agent that set the limit and the route around it, because the session
+reading it cannot lift the limit itself.
+
+Closing and resuming are a session's own business. A session another agent
+started may archive or delete only itself and the sessions it started, and
+bring back by muxloom id only an archived session it started — whatever its
+dials say, because closing takes a whole fleet down with it and resuming puts
+one back to work. Bringing a session back is starting it, so `may_launch` is
+weighed against the kind the record actually is, child by child, and whatever
+comes back holds no more than the session bringing it back. The person's own
+agents are held to none of this; they answer to the person.
+
+Every rule above is decided in one place (`src/permissions.rs`), against the
+caller's own environment, before a call is routed anywhere — so naming another
+machine is never a way past one. A call bound for another machine is weighed on
+the caller's machine, against that machine's records fetched over the relay,
+and only then handed to the controller.
 
 The tool surface itself is transport-agnostic (`src/control.rs`); MCP stdio
 is its first adapter, and the same seam is intended to carry a TCP or serial
@@ -1101,6 +1115,7 @@ old frame visible until the new stream produces its first frame.
 | `src/mcp.rs` | Minimal MCP server over line-based JSON-RPC |
 | `src/talk.rs` | Talk board: messages, scopes, version-vector store, delivery envelopes |
 | `src/moderator.rs` | Moderator folders and the briefing an agent finds in one |
+| `src/permissions.rs` | Who may do what: subagent limits, closing and resuming, what crosses machines |
 | `src/runtime.rs` | Launch, discovery, installation, compatibility backend |
 | `src/bridge.rs` | Persistent connections, bootstrap, multiplexed streams |
 | `src/daemon_protocol.rs` | Frames, compression, request/stream types |

@@ -131,6 +131,15 @@ preserve.
   the controller beside it when the caller's working directory is a moderator's.
   An ordinary agent drives its own machine and talks to the rest; the fleet-wide
   flavor is the moderator's.
+- Who may do what is decided in one place, `src/permissions.rs`, and both
+  surfaces ask it first thing in `call`, before a call is routed — so naming
+  another machine is never a way past a rule. Each tool has one entry saying
+  what it does and how it crosses machines; a limit is written against what a
+  tool does, never inside one tool or on one route. A caller's limits come from
+  the environment its launch wrote and never from an argument. A session
+  another agent started closes and resumes only itself and what it started, a
+  resume is weighed as a launch of the record's own kind, and nothing comes back
+  holding more than the session bringing it back.
 - A launch on the daemon flavor lands in the caller's own folder or inside it,
   and defaults to it, so starting a subagent needs no argument at all. Not a
   sandbox — the same agent has a shell on that machine — but a statement of what

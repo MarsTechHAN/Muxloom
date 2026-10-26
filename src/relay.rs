@@ -7,13 +7,13 @@
 //!
 //! The daemon holds a small queue. An agent submits a job, whatever controller
 //! is attached takes it on its next round, runs it against its own tool
-//! surface, and writes the answer back; the agent polls until it appears. The
-//! controller decides what it is willing to run — the allowlist here covers
-//! looking and speaking, and the things left off it are exactly the ones that
-//! would let an agent on one machine reach into another's shell, SSH
-//! configuration, or session list with a delete. A machine's own daemon is
-//! still the only thing that can do those, to its own machine, for whoever is
-//! standing on it.
+//! surface, and writes the answer back; the agent polls until it appears. What
+//! travels at all, and what waits on the person first, is
+//! `permissions::crossing`'s to say: looking and speaking go through as they
+//! are, a change to the far machine is held until the person approves it, and
+//! the fleet's own wiring never travels. The asking agent was weighed against
+//! its own limits on its own machine before the job was ever queued; the
+//! person's approval is the one question that is asked here.
 //!
 //! The same round is how a daemon finds out the other machines are there at
 //! all. It never opens a connection and never goes looking: a controller names
@@ -40,72 +40,12 @@ use crate::{
     control::{ControlSurface, ControllerControl},
     debug,
     model::Target,
+    permissions::{needs_approval, travels},
     runtime::Runtime,
 };
 
 /// Capability that says a daemon will pass work to an attached controller.
 pub const RELAY_CAPABILITY: &str = "relay-v1";
-/// The tools a controller runs on another machine's behalf: everything that
-/// looks, and everything that says something to somebody. Nothing that changes
-/// a machine, and nothing whose blast radius is larger than a message.
-///
-/// Looking is the half that makes the rest usable. An agent asked to work with
-/// another machine has to be able to find out what is on it — which sessions,
-/// what is on their screens, which files, what was said — before it can decide
-/// who to ask; a list of machine names and a way to send a message into the
-/// dark is not a route, it is a rumour. So reading is relayed freely, and the
-/// line stays exactly where it was: the tools left off this list are the ones
-/// that would let an agent on one machine run a command, start or end a
-/// session, type into one, or edit how the fleet is wired. Those belong to the
-/// machine's own daemon, for whoever is standing on it.
-///
-/// Waiting is the one thing that does not travel: a relayed job runs on the
-/// controller's own round, so a tool that sits there holds up every other
-/// machine's errands and the talk board with them. `wait_for` is therefore not
-/// here, and the tools that can be told to wait are run without the waiting.
-pub const RELAYED_TOOLS: &[&str] = &[
-    "list_directory",
-    "list_files",
-    "list_machines",
-    "list_sessions",
-    "message_agent",
-    "preview_file",
-    "read_conversation",
-    "read_screen",
-    "search_conversations",
-    "search_history",
-    // Speaking to the human, for a machine that has not been handed the
-    // credentials yet. It changes nothing over there — the controller says
-    // something on this machine's behalf, exactly as `message_agent` does.
-    "send_channel_message",
-    "talk_post",
-    "talk_read",
-];
-
-/// Cross-machine WRITE tools a daemon-flavoured agent may run on another
-/// machine once a person has approved it. These are the ones that act on a
-/// session a human would expect to sign off on: starting one, and typing into
-/// one. `relay.rs` lets the controller execute them, but only after the
-/// approval gate (see `control.rs`) lets them through; the controller itself
-/// never prompts, it only runs what an approved daemon submitted.
-pub const APPROVE_TOOLS: &[&str] = &["launch_session", "send_input"];
-
-/// Cross-machine WRITE tools that are sensitive enough that a one-shot yes is
-/// all a person should give: they destroy state or run arbitrary code. They
-/// may be approved once, but never remembered for the rest of the
-/// conversation.
-pub const SENSITIVE_TOOLS: &[&str] = &["delete_session", "archive_session", "run_shell", "trigger"];
-
-/// Whether `tool` is held behind the cross-machine approval gate.
-pub fn approve_gated(tool: &str) -> bool {
-    APPROVE_TOOLS.contains(&tool) || SENSITIVE_TOOLS.contains(&tool)
-}
-
-/// Whether an approved cross-machine WRITE may be remembered for the rest of
-/// the conversation (false = one-shot only).
-pub fn reminder_allowed(tool: &str) -> bool {
-    APPROVE_TOOLS.contains(&tool)
-}
 /// How long a controller's last request for work counts for. A controller
 /// carries the board every couple of seconds and asks for work on the same
 /// round, so a gap this size means it is gone, not busy.
@@ -183,11 +123,6 @@ pub struct RelayAnswer {
     /// The tool's output, or its error.
     #[serde(default)]
     pub output: String,
-}
-
-/// Whether the controller will run this tool for another machine.
-pub fn relayed(tool: &str) -> bool {
-    RELAYED_TOOLS.contains(&tool)
 }
 
 /// The refusal an off-list tool gets, worded the same wherever it is caught:
@@ -446,7 +381,7 @@ impl RelayQueue {
         // person's approval when the controller runs it. It is not refused at
         // the door: the agent should be told it is waiting on a person, not
         // that the machine cannot be reached at all.
-        if !relayed(tool) && !approve_gated(tool) {
+        if !travels(tool) {
             bail!("{}", refusal(tool));
         }
         if !self.attached(now) {
@@ -739,7 +674,7 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
             // A WRITE tool held behind the approval gate runs only after the
             // person has said so — remembered for the session, or asked now.
             let machine = job_machine(&job);
-            if approve_gated(&job.tool) && !approvals.remembered(&job.session, &machine, &job.tool)
+            if needs_approval(&job.tool) && !approvals.remembered(&job.session, &machine, &job.tool)
             {
                 let tool = job.tool.clone();
                 // An agent asks again while the person is still deciding, and
@@ -802,13 +737,13 @@ pub fn run_pump(runtime: &Runtime, config: &Config, targets: &[Target]) -> Resul
                 let _ = pool.relay_complete(target, job.id.clone(), false, output);
                 continue;
             }
-            let (ok, output) = if relayed(&job.tool) || approve_gated(&job.tool) {
+            let (ok, output) = if travels(&job.tool) {
                 let surface = surface_for(&mut surface, config, runtime)?;
                 match run(surface, &job.tool, &job.arguments, &job.session) {
                     Ok(output) => {
                         round.ran += 1;
                         // A one-shot grant is spent by the run it let through.
-                        if approve_gated(&job.tool)
+                        if needs_approval(&job.tool)
                             && approvals.once.iter().any(|(s, m, t)| {
                                 s == &job.session && m == &machine && t == &job.tool
                             })

@@ -16,22 +16,22 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
     config::{Config, McpConfig, State, default_state_path},
     daemon_protocol::{DaemonSession, Trigger, TriggerAction},
-    model::{
-        AgentKind, FilePreview, FilePreviewKind, HistorySearchHit, LaunchRequest, Powers, Reach,
-        Target,
+    model::{AgentKind, FilePreview, FilePreviewKind, HistorySearchHit, LaunchRequest, Target},
+    permissions::{
+        authorize, granted_powers, own_powers, relayed_caller, relayed_powers, resumed_powers,
+        session_env, task_root,
     },
     relay::now_ms,
     runtime::{Runtime, ScreenRead},
@@ -130,24 +130,6 @@ const TALK_MAX_RESPONSE_CHARS: usize = 30_000;
 /// exchange rather than from this call's window.
 const TALK_OUTSTANDING_MS: u64 = 6 * 60 * 60 * 1000;
 
-/// Every tool that changes something rather than reporting it. `read_only`
-/// denies exactly this set, so a tool added here is denied by that switch from
-/// the day it exists.
-const WRITE_TOOLS: &[&str] = &[
-    "send_input",
-    "message_agent",
-    "launch_session",
-    "archive_session",
-    "delete_session",
-    "run_shell",
-    "set_machine_enabled",
-    "ssh_host",
-    "trigger",
-    "talk_post",
-    "send_channel_message",
-    "set_head_name",
-];
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flavor {
     /// Every enabled machine, addressed by a `machine` argument.
@@ -165,7 +147,10 @@ fn denial(policy: &McpConfig, tool: &str) -> Option<String> {
             "tool {tool} is disabled by muxloom policy on this machine (mcp.denied_tools)"
         ));
     }
-    if policy.read_only && WRITE_TOOLS.contains(&tool) {
+    // Every tool that changes something rather than reporting it, read off
+    // the one table that says what each tool does — so a tool added there is
+    // denied by this switch from the day it exists.
+    if policy.read_only && crate::permissions::changes_something(tool) {
         return Some(format!(
             "tool {tool} changes state and muxloom is configured read-only on this machine \
              (mcp.read_only)"
@@ -309,7 +294,8 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
          write bytes — it resizes the session under whoever is attached.\n\
          - Sessions are persistent state. A session you launched is yours to archive or delete \
          when it is done; a session you did not launch is someone else's — do not archive, \
-         delete, or reconfigure it unless you were asked to.\n\
+         delete, or reconfigure it unless you were asked to. A session another agent started \
+         closes and resumes only itself and what it started, and muxloom refuses it the rest.\n\
          - delete_session destroys a session's history irreversibly. Ask the human first; \
          archive_session keeps the history. Either one takes the whole fleet under that session \
          with it, so closing a master closes every subagent it started.\n\
@@ -1088,7 +1074,7 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing required argument {key}"))
 }
 
-fn optional_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn optional_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
     arguments
         .get(key)
         .and_then(Value::as_str)
@@ -1505,382 +1491,6 @@ fn wait_loop(
     })))
 }
 
-/// What muxloom told this process about the session it is running in.
-///
-/// `launch_session` puts these in a session's environment, so an agent that
-/// lives in one never has to be told — or to guess — who and where it is.
-/// Outside a muxloom session they are simply absent, and the board says so
-/// rather than inventing an identity.
-fn session_env(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// The session this tool call is being made from, which is the session a
-/// launch it asks for belongs under.
-///
-/// An agent starting a subagent is handing off part of what it is doing, and
-/// the two are one piece of work however many sessions it takes. Nothing about
-/// the child says so — its transcript begins with the task, not with who set
-/// it — so the only chance to record it is here, where muxloom already knows
-/// who is calling. Read from the environment rather than asked for as an
-/// argument: an agent naming its own parent could only get it wrong.
-fn launching_session() -> Option<String> {
-    session_env("MUXLOOM_SESSION_ID")
-}
-
-/// Which runtime this session is, when muxloom said. Used to work out what a
-/// child of it may be started as when the caller does not say.
-fn own_kind() -> Option<AgentKind> {
-    session_env("MUXLOOM_SESSION_KIND").and_then(|kind| kind.parse().ok())
-}
-
-/// What this session was handed when it was started.
-///
-/// Read from the environment, which only a launch writes, for the same reason
-/// the parent is: an agent asked what it is allowed to do would be answering
-/// about itself. A session nobody started carries none of these variables, and
-/// that is what full powers look like — a person's own agent answers to the
-/// person, not to another agent.
-///
-/// The three go in together, so a set with one missing is a set something went
-/// wrong with; each missing dial reads as the narrow answer rather than the
-/// wide one, because the cost of guessing narrow is a refusal a person can
-/// undo and the cost of guessing wide is a limit that was never applied.
-fn own_powers() -> Powers {
-    let Some(reach) = session_env("MUXLOOM_MAY_MESSAGE") else {
-        return Powers::whole();
-    };
-    Powers {
-        reach: reach.parse().unwrap_or(Reach::Task),
-        launches: Powers::launches_from(&session_env("MUXLOOM_MAY_LAUNCH").unwrap_or_default()),
-        may_reach_person: session_env("MUXLOOM_MAY_REACH_PERSON").as_deref() == Some("yes"),
-    }
-}
-
-/// What a launch hands the session it is starting: what it asked for, cut down
-/// to what the asking session actually holds.
-///
-/// Dials a subagent's launch says nothing about take the ordinary defaults —
-/// talk within your own task, start more of the runtime you are, and leave the
-/// person to the agent they asked. A launch nobody made from inside a session
-/// is a person's, and what a person starts is theirs: it begins whole, and
-/// only what the launch names narrows it.
-fn granted_powers(arguments: &Value, own: &Powers) -> Result<Powers> {
-    let mut asked = match launching_session() {
-        Some(_) => Powers::default_child_of(own_kind(), own),
-        None => Powers::whole(),
-    };
-    if let Some(reach) = optional_str(arguments, "may_message") {
-        asked.reach = reach.parse().map_err(|message: String| anyhow!(message))?;
-    }
-    if let Some(kinds) = arguments.get("may_launch").and_then(Value::as_array) {
-        asked.launches = AgentKind::ALL
-            .into_iter()
-            .filter(|kind| {
-                kinds
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|asked| asked.trim() == kind.as_str())
-            })
-            .collect();
-    }
-    if let Some(person) = arguments.get("may_reach_person").and_then(Value::as_bool) {
-        asked.may_reach_person = person;
-    }
-    Ok(own.narrowed(&asked))
-}
-
-/// Refuse a launch this session was not given the power to make, in words that
-/// say who set the limit and what to do about it. The agent reading this
-/// cannot lift it — its parent can, on the next launch — so the answer is
-/// where to take the question, not what flag to pass.
-fn check_may_launch(own: &Powers, kind: AgentKind) -> Result<()> {
-    if own.launches.contains(&kind) {
-        return Ok(());
-    }
-    if own.launches.is_empty() {
-        bail!(
-            "this session may not start others: the agent that started it kept that to itself. \
-             Do the work here, or ask that agent to start one for you."
-        );
-    }
-    bail!(
-        "this session may start {} sessions, and {kind} is not one of them. The agent that \
-         started it set that; ask it if you need another runtime.",
-        own.launches_list()
-    )
-}
-
-/// How far up a chain of parents one reach check will walk. A session ten
-/// handoffs down is still on the same piece of work, and past that a cycle is
-/// the likelier explanation than a team.
-///
-/// This and the walk below are both surfaces': a moderator's session is served
-/// by the controller and can have been started by another agent like anyone
-/// else, so the same dial has to answer there. Only the list they walk differs
-/// — one machine's records, or a target machine's out of the fleet.
-const TASK_WALK_MAX: usize = 16;
-
-/// Whether `target` is on the same piece of work as this session.
-///
-/// The chain of parents above the target is walked until it reaches something
-/// this session recognises: the task it belongs to, or itself — anything under
-/// this session is its own work by definition, and that hop is what lets a
-/// subagent started on another machine be recognised from one record over
-/// there. A chain that runs out unrecognised belongs to somebody else.
-///
-/// A process running in no session has no task to be outside of, so nothing is.
-fn same_task(lineage: &[(String, Option<String>)], target: &str) -> bool {
-    let mine: Vec<String> = [task_root(), launching_session()]
-        .into_iter()
-        .flatten()
-        .collect();
-    if mine.is_empty() {
-        return true;
-    }
-    descends_from(lineage, target, &mine)
-}
-
-/// Whether `target` is one of the sessions this one started, however far down.
-///
-/// A session's own subtree is its own hands rather than somebody else's
-/// attention, and the narrowest reach is about the second: an agent handed
-/// `parent` is one that reports to whoever asked and does not go bothering the
-/// rest of the fleet. If it may start a helper at all, being unable to say a
-/// word to the helper leaves it holding something it cannot use — and the
-/// helper, which reaches its parent by definition, asking questions upward that
-/// can never be answered.
-fn started_here(lineage: &[(String, Option<String>)], target: &str) -> bool {
-    match launching_session() {
-        Some(mine) => descends_from(lineage, target, &[mine]),
-        None => false,
-    }
-}
-
-/// Walk the chain of parents above `target` until it reaches one of `mine`.
-///
-/// A chain that runs out unrecognised, or runs longer than a team plausibly is,
-/// belongs to somebody else. `mine` is never empty here: a caller with nothing
-/// to compare against has already decided what that means, and the two callers
-/// decide it differently.
-fn descends_from(lineage: &[(String, Option<String>)], target: &str, mine: &[String]) -> bool {
-    let mut at = target.trim().to_string();
-    for _ in 0..TASK_WALK_MAX {
-        if mine.contains(&at) {
-            return true;
-        }
-        let Some(parent) = lineage
-            .iter()
-            .find(|(id, _)| *id == at)
-            .and_then(|(_, parent)| parent.clone())
-        else {
-            return false;
-        };
-        at = parent;
-    }
-    false
-}
-
-/// Who begat whom, taken from session records.
-///
-/// Only the fallback for a daemon too old to answer a lineage round still reads
-/// it out of whole session records, and that surface is this platform's — the
-/// same reason [`lineage_of_answer`] below is spelled the same way.
-#[cfg(unix)]
-fn lineage(sessions: &[DaemonSession]) -> Vec<(String, Option<String>)> {
-    sessions
-        .iter()
-        .map(|record| (record.id.clone(), record.parent.clone()))
-        .collect()
-}
-
-/// The same, read back out of a rendered `list_sessions` answer — which is all
-/// another machine ever hands over.
-#[cfg(unix)]
-fn lineage_of_answer(rendered: &str) -> Vec<(String, Option<String>)> {
-    serde_json::from_str::<Vec<Value>>(rendered)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|row| {
-            let id = row.get("session_id")?.as_str()?.to_string();
-            Some((
-                id,
-                row.get("parent")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            ))
-        })
-        .collect()
-}
-
-/// Refuse a message this session may not send, saying who it may speak to and
-/// who set that, so the answer is a route rather than a flag.
-fn check_may_message(
-    own: &Powers,
-    target: &str,
-    lineage: &[(String, Option<String>)],
-) -> Result<()> {
-    match own.reach {
-        Reach::Fleet => Ok(()),
-        Reach::Task if same_task(lineage, target) => Ok(()),
-        Reach::Task => bail!(
-            "{target} is not on this piece of work, and this session speaks within its own: the \
-             agent that started it set that. Tell that agent what needs saying, and let it carry \
-             the message."
-        ),
-        // Upward to the one agent that asked, and downward into whatever this
-        // session started to answer it with. Everything else on the machine is
-        // somebody else's, which is the whole of what this dial says.
-        Reach::Parent
-            if session_env("MUXLOOM_SESSION_PARENT").as_deref() == Some(target.trim())
-                || started_here(lineage, target) =>
-        {
-            Ok(())
-        }
-        Reach::Parent => bail!(
-            "this session answers to the agent that started it, and to the sessions it started \
-             itself, and to nobody else — which is what that agent asked for. Report to it, and \
-             it can pass anything on."
-        ),
-    }
-}
-
-/// Whether the same weighing comes out yes with no records at all.
-///
-/// Most of what it is asked needs none: a session speaking to the agent that
-/// started it, or to the task it belongs to, or a process running in no session
-/// and so outside nobody's. Fetching the records to answer those is a round
-/// trip to a daemon that hands back every conversation the machine has ever
-/// held — and across a relay, a round trip to another machine, before a
-/// keystroke goes anywhere.
-///
-/// Asking with nothing in hand can only be stricter than asking with them. The
-/// walk in [`descends_from`] recognises the target on its first hop, before it
-/// consults anything, and otherwise follows only parents it was given: records
-/// can add a path to the answer and never take one away. So a yes here is a yes
-/// there, and a no here settles nothing and goes on to ask properly.
-fn reaches_without_records(own: &Powers, target: &str) -> bool {
-    check_may_message(own, target, &[]).is_ok()
-}
-
-/// The session a call would put words into, when it is one of the calls that
-/// does.
-///
-/// `message_agent` is not the only door into another agent's prompt box.
-/// `send_input` types straight into it, without even the envelope that says who
-/// is speaking, and a trigger types into it later on a pattern. All three are
-/// this session speaking to that one, so one dial has to answer for all three —
-/// a reach enforced on the politest of them and nowhere else is a fence with a
-/// gate beside it.
-///
-/// A call that names no session is left alone: the tool itself refuses it a
-/// moment later, and with a better sentence than this could manage.
-fn written_to<'a>(name: &str, arguments: &'a Value) -> Option<&'a str> {
-    let writes = match name {
-        "message_agent" | "send_input" => true,
-        // Only the kind that types. A `notify` trigger raises a flag on the
-        // session for a person to see, and says nothing to the agent in it.
-        "trigger" => {
-            optional_str(arguments, "action") == Some("set")
-                && optional_str(arguments, "action_kind") == Some("send_input")
-        }
-        _ => false,
-    };
-    writes
-        .then(|| optional_str(arguments, "session_id"))
-        .flatten()
-}
-
-/// Refuse a message to the person from a session that was not handed the
-/// person to talk to. One agent answers them, and it is not this one.
-fn check_may_reach_person(own: &Powers) -> Result<()> {
-    if own.may_reach_person {
-        return Ok(());
-    }
-    bail!(
-        "this session does not write to the person's chat: the agent that started it is the one \
-         answering them, and asked to keep it that way. Tell that agent what the person needs to \
-         hear, and it will carry it."
-    )
-}
-
-/// Refuse a board post aimed wider than this session may speak.
-///
-/// The board is a set of rooms rather than one, and the same dial says which
-/// of them a session may be heard in: its own task's room always, the folder
-/// it works in once it may talk to the others working there, and the machine
-/// and the world only when it may speak to any agent at all.
-fn check_may_post(own: &Powers, scope: &TalkScope) -> Result<()> {
-    let allowed = matches!(
-        (own.reach, scope),
-        (Reach::Fleet, _) | (_, TalkScope::Task { .. }) | (Reach::Task, TalkScope::Path { .. })
-    );
-    if allowed {
-        return Ok(());
-    }
-    match own.reach {
-        Reach::Parent => bail!(
-            "this session posts to its own task's board and nowhere else: the agent that started \
-             it set that. Use scope \"task\", or report to that agent."
-        ),
-        _ => bail!(
-            "this session speaks within its own task and the folder it works in: the agent that \
-             started it set that. Use scope \"task\" or \"path\", or ask that agent to say it \
-             more widely."
-        ),
-    }
-}
-
-/// The caller a relayed launch names for itself. The controller's own process
-/// never runs inside a session, so a launch arriving through a relay has no
-/// environment to read and would otherwise lose its parent entirely: the
-/// relay runner copies the submitting session's id into the arguments, and it
-/// is consulted only when the environment says nothing. The daemon flavor
-/// never reads it - an agent on its own machine already has the environment,
-/// and trusting an argument there would let any caller name a parent it likes.
-fn relayed_caller(arguments: &Value) -> Option<String> {
-    launching_session().or_else(|| {
-        optional_str(arguments, "_muxloom_caller")
-            .map(str::trim)
-            .filter(|id| crate::runtime::is_managed_session_id(id))
-            .map(str::to_string)
-    })
-}
-
-/// Where a relayed launch carries the grant it was already cut down to.
-const POWERS_ARGUMENT: &str = "_muxloom_powers";
-
-/// Write the grant into a call about to leave for the controller.
-///
-/// A launch aimed at another machine is still this session's launch, and what
-/// it may hand on is written in this session's environment — which the
-/// controller cannot read, because the controller runs in no session at all.
-/// So the side that can read it works the grant out and sends it along.
-#[cfg(unix)]
-fn stamp_powers(arguments: &mut Value, powers: &Powers) {
-    if let (Some(object), Ok(value)) = (arguments.as_object_mut(), serde_json::to_value(powers)) {
-        object.insert(POWERS_ARGUMENT.into(), value);
-    }
-}
-
-/// The grant a relayed launch arrived carrying, if it did.
-///
-/// Trusted on the same terms as `relayed_caller`: only where there is no
-/// environment to read instead. On a machine where an agent could write this
-/// itself, its own environment is what answers, and this is never consulted.
-fn relayed_powers(arguments: &Value) -> Option<Powers> {
-    if session_env("MUXLOOM_SESSION_ID").is_some() {
-        return None;
-    }
-    arguments
-        .get(POWERS_ARGUMENT)
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-}
-
 /// The deepest child chain one fleet resume walks. A coordinator five
 /// handoffs from its master is already a team; below that the sessions have
 /// their own coordinators, and it is their resumes that walk their fleets.
@@ -2149,39 +1759,6 @@ fn synthetic_child_prompt(record: &DaemonSession) -> String {
     format!("You are resumed as \"{name}\" without your old context; ask the coordinator.")
 }
 
-/// Where a launch asked for on the daemon surface may actually run: the
-/// caller's own folder, or somewhere inside it.
-///
-/// This is not a sandbox, and could not be one — the same agent has `run_shell`
-/// on this machine and could start whatever it liked by hand. It is a statement
-/// of what the surface is for. The daemon flavor is an agent's own machine and
-/// its own work: the sessions it starts are its subagents, and they belong
-/// beside the work rather than somewhere the user has to go looking for them.
-/// An agent asked to do something in another folder has a better move available
-/// — ask the agent that lives there — and saying so here is what makes it
-/// think of it. Reaching the whole fleet is the moderator's flavor.
-///
-/// Leaving `path` out is the ordinary case and means the caller's own folder,
-/// so starting a subagent takes no argument the agent has to look up.
-///
-/// The surface that consults it is the daemon's, which exists only where the
-/// daemon does; the rule it states is worth testing everywhere all the same.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn launch_path_within(arguments: &Value, own: &str) -> Result<String> {
-    let Some(path) = optional_str(arguments, "path") else {
-        return Ok(own.to_string());
-    };
-    if crate::moderator::within(own, path) {
-        return Ok(path.to_string());
-    }
-    bail!(
-        "launch_session starts sessions in your own folder, {own}, and {path} is outside it. \
-         Leave path out to start one where you are. For work in another folder or on another \
-         machine, ask the agent that lives there with message_agent — or ask a muxloom \
-         moderator, whose surface reaches the whole fleet."
-    )
-}
-
 /// What the calling session is called *now*, asked of whoever can see the
 /// session table.
 ///
@@ -2281,7 +1858,6 @@ fn send_channel(
     now: Option<String>,
     leave: impl FnOnce(crate::channel::ChannelReceipt),
 ) -> Result<String> {
-    check_may_reach_person(&own_powers())?;
     let message = crate::channel::Outgoing {
         title: optional_str(arguments, "title").unwrap_or_default().into(),
         text: required_str(arguments, "text")?.into(),
@@ -2455,7 +2031,6 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
         },
         other => bail!("unknown scope {other}: use path, machine, task, or global"),
     };
-    check_may_post(&own_powers(), &scope)?;
     Ok(TalkDraft {
         scope,
         author,
@@ -2464,16 +2039,6 @@ fn talk_draft(arguments: &Value, author: TalkAuthor) -> Result<TalkDraft> {
         reply_to: optional_str(arguments, "reply_to").map(Into::into),
         text: text.into(),
     })
-}
-
-/// The task the calling session belongs to: what the daemon worked out when it
-/// launched the session, and failing that the session itself.
-///
-/// The fallback is what a daemon too old to have said would have meant anyway —
-/// a session nobody started is its own task — so an agent talking to one is
-/// alone in its task rather than cut off from the scope.
-fn task_root() -> Option<String> {
-    session_env("MUXLOOM_TASK_ROOT").or_else(|| session_env("MUXLOOM_SESSION_ID"))
 }
 
 /// Who a message is from, board post or direct alike.
@@ -3801,15 +3366,11 @@ impl ControllerControl {
         let kind = agent_kind(arguments)?;
         // A relayed launch was already weighed against its caller's powers on
         // the machine that could read them, and arrives holding the grant that
-        // came out of it. A launch made here is a person's, and a person's
-        // agent answers to the person.
+        // came out of it. Anything else was weighed in `call` against this
+        // process's own, which for a moderator is a person's.
         let powers = match relayed_powers(arguments) {
             Some(granted) => granted,
-            None => {
-                let own = own_powers();
-                check_may_launch(&own, kind)?;
-                granted_powers(arguments, &own)?
-            }
+            None => granted_powers(arguments, &own_powers())?,
         };
         let request = LaunchRequest {
             target: target.clone(),
@@ -3862,6 +3423,13 @@ impl ControllerControl {
         if master_command.command.trim().is_empty() && master_kind != AgentKind::Terminal {
             bail!("command for {master_kind} is empty; the master cannot come back either");
         }
+        // Bringing a session back is starting it. `call` weighed the kind the
+        // caller named; this is the kind the record actually is, and every
+        // child below is weighed the same way before it is relaunched. A relay
+        // was weighed on the machine it came from, against the caller's own
+        // records, and arrives with this process holding everything.
+        let own = own_powers();
+        crate::permissions::check_may_launch(&own, master_kind)?;
         let sessions = self.runtime.bridge_pool().list_sessions(target)?;
         let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
         let pool = self.runtime.bridge_pool();
@@ -3894,6 +3462,10 @@ impl ControllerControl {
                 ));
                 continue;
             };
+            if let Err(refused) = crate::permissions::check_may_launch(&own, kind) {
+                outcomes.push(outcome("unresumed", None, Some(format!("{refused:#}"))));
+                continue;
+            }
             let command = self.config.command_for(&target.id, kind).clone();
             if command.command.trim().is_empty() && kind != AgentKind::Terminal {
                 outcomes.push(outcome(
@@ -3927,8 +3499,9 @@ impl ControllerControl {
                 member.record.created_at,
                 Some(master.id.clone()),
                 // A resume restores the powers off the record it revives, so a
-                // session cannot come back holding more than it died with.
-                None,
+                // session cannot come back holding more than it died with — nor
+                // more than the session bringing it back holds.
+                resumed_powers(&own, member.record.powers.as_ref()),
                 synthetic,
                 // Nothing to tell it: a member coming back on its own thread
                 // already carries the words that thread opened with, and one
@@ -3980,7 +3553,7 @@ impl ControllerControl {
                 environment,
                 master.created_at,
                 relayed_caller(arguments),
-                None,
+                resumed_powers(&own, master.powers.as_ref()),
                 Some(caption),
                 // A resume, so the same as its members: the caption is typed
                 // in and the record already holds the opening.
@@ -4292,27 +3865,17 @@ impl ControlSurface for ControllerControl {
 
     fn call(&self, name: &str, arguments: &Value) -> Result<String> {
         enforce_policy(&self.config.mcp, name)?;
-        // A moderator is served by this surface rather than the daemon's, and
-        // a moderator can have been started by another agent like anyone else:
-        // the three other dials are already weighed here, and reach was the one
-        // that was not. The list to walk it against is the target machine's,
-        // because this surface can aim at any of them.
-        if let Some(session_id) = written_to(name, arguments) {
-            let own = own_powers();
-            if own.reach != Reach::Fleet && !reaches_without_records(&own, session_id) {
-                // Parent links alone, and asked for as such. This runs before
-                // every message and every keystroke one agent sends another,
-                // and asking for the sessions instead drew every screen on the
-                // machine and carried its whole archive back to read two fields
-                // off each record — which is what made talking to a sibling the
-                // slowest thing an agent could do.
-                let parents = self
-                    .runtime
-                    .bridge_pool()
-                    .lineage(&self.target(arguments)?)?;
-                check_may_message(&own, session_id, &parents)?;
-            }
-        }
+        // Whoever runs this surface is weighed the same way a daemon's caller
+        // is, before anything is touched: a moderator holds everything because
+        // a person started it, and anyone else running it inside a session is
+        // held to what that session was handed. The records to weigh against
+        // are the target machine's, because this surface can aim at any of
+        // them — parent links alone, and asked for as such: this runs before
+        // every message and keystroke one agent sends another, and asking for
+        // the sessions instead drew every screen on the machine.
+        authorize(&own_powers(), name, arguments, || {
+            self.runtime.bridge_pool().lineage(&self.target(arguments)?)
+        })?;
         match name {
             "list_machines" => self.list_machines(),
             "set_machine_enabled" => self.set_machine_enabled(arguments),
@@ -4407,16 +3970,18 @@ mod daemon_surface {
 
     use super::{
         DEFAULT_SCREEN_LINES, Flavor, FleetMemberAction, FleetOutcome, SEARCH_MAX_MATCHES,
-        WAIT_SCREEN_LINES, agent_kind, allowed_specs, build_input, check_may_launch,
-        check_may_message, check_may_reach_person, delivery_json, direct_draft, enforce_policy,
+        WAIT_SCREEN_LINES, allowed_specs, build_input, delivery_json, direct_draft, enforce_policy,
         fleet_already_back, fleet_outcome_json, fleet_resume_caption, fleet_resume_plan,
-        fleet_resume_target, granted_powers, instructions, launch_path_within, launching_session,
-        lineage, lineage_of_answer, message_author, native_resume_id, optional_bool, optional_str,
-        optional_usize, own_powers, plain_screen, pretty, preview_text, reaches_without_records,
-        required_str, screen_page, send_channel, session_env, session_json, session_kind,
-        session_name_now, shell_report, stamp_powers, synthetic_child_prompt, talk_draft,
-        talk_filter, talk_json, talk_wait, trigger_json, trigger_spec, wait_loop, waited_session,
-        written_to,
+        fleet_resume_target, instructions, message_author, native_resume_id, optional_bool,
+        optional_str, optional_usize, plain_screen, pretty, preview_text, required_str,
+        screen_page, send_channel, session_json, session_kind, session_name_now, shell_report,
+        synthetic_child_prompt, talk_draft, talk_filter, talk_json, talk_wait, trigger_json,
+        trigger_spec, wait_loop, waited_session,
+    };
+    use crate::permissions::{
+        Act, Lineage, act, authorize, check_may_launch, granted_powers, launch_path_within,
+        launching_session, lineage, lineage_of_answer, own_powers, resumed_powers, session_env,
+        stamp_powers, travels,
     };
     use crate::{
         channel::ChannelSet,
@@ -4426,7 +3991,7 @@ mod daemon_surface {
             DaemonHistoryMatch, DaemonRequest, DaemonResponse, DaemonSession, Frame, FrameKind,
             Trigger, stream,
         },
-        model::{AgentKind, LOCAL_TARGET_ID, Reach},
+        model::{AgentKind, LOCAL_TARGET_ID},
         runtime::{ScreenRead, launch_arguments, launch_seed, new_daemon_session_id},
     };
 
@@ -4580,28 +4145,11 @@ mod daemon_surface {
         /// This surface negotiates no capabilities, so the fallback answers the
         /// version question instead of a handshake: a daemon too old for this
         /// says so, and gets asked the old expensive way.
-        fn parentage(&self) -> Result<Vec<(String, Option<String>)>> {
+        fn parentage(&self) -> Result<Lineage> {
             match self.transact(&DaemonRequest::Lineage) {
                 Ok((DaemonResponse::Parents { parents }, _)) => Ok(parents),
                 _ => Ok(lineage(&self.sessions()?)),
             }
-        }
-
-        /// Weigh a write aimed at one of this machine's sessions against how
-        /// far this session may speak.
-        ///
-        /// Reading the list is a round trip to the daemon, so the full reach —
-        /// which asks nothing of a lineage — never pays for it. What the rest
-        /// pay is two fields per session: this runs before every message one
-        /// agent sends another, and asking for the sessions themselves drew
-        /// every screen on the machine and carried its whole archive back to
-        /// throw all but the parent links away.
-        fn check_reach(&self, session_id: &str) -> Result<()> {
-            let own = own_powers();
-            if own.reach == Reach::Fleet || reaches_without_records(&own, session_id) {
-                return Ok(());
-            }
-            check_may_message(&own, session_id, &self.parentage()?)
         }
 
         fn expect_ack(&self, request: &DaemonRequest) -> Result<()> {
@@ -4951,10 +4499,8 @@ mod daemon_surface {
                     return self.resume_fleet(master, arguments);
                 }
             }
-            let kind = agent_kind(arguments)?;
-            let powers = own_powers();
-            check_may_launch(&powers, kind)?;
-            let powers = granted_powers(arguments, &powers)?;
+            let kind = super::agent_kind(arguments)?;
+            let powers = granted_powers(arguments, &own_powers())?;
             let own = self.own_folder.as_deref().context(
                 "launch_session starts a session where you are, and muxloom cannot tell which \
                  folder that is",
@@ -5054,6 +4600,12 @@ mod daemon_surface {
             if master_command.command.trim().is_empty() && master_kind != AgentKind::Terminal {
                 bail!("command for {master_kind} is empty; the master cannot come back either");
             }
+            // Bringing a session back is starting it, and the kind that counts
+            // is the record's rather than the one the call named. Every child
+            // below is weighed the same way, and whatever comes back holds no
+            // more than the session bringing it back.
+            let powers = own_powers();
+            check_may_launch(&powers, master_kind)?;
             let sessions = self.sessions()?;
             let (plan, truncated) = fleet_resume_plan(&sessions, &master.id);
             let mut outcomes: Vec<FleetOutcome> = Vec::new();
@@ -5093,6 +4645,10 @@ mod daemon_surface {
                     ));
                     continue;
                 };
+                if let Err(refused) = check_may_launch(&powers, kind) {
+                    outcomes.push(outcome("unresumed", None, Some(format!("{refused:#}"))));
+                    continue;
+                }
                 let command = self.config.command_for(LOCAL_TARGET_ID, kind).clone();
                 if command.command.trim().is_empty() && kind != AgentKind::Terminal {
                     outcomes.push(outcome(
@@ -5122,8 +4678,8 @@ mod daemon_surface {
                     parent: Some(master.id.clone()),
                     // A resume restores the powers off the record it revives,
                     // so a session cannot come back holding more than it died
-                    // with.
-                    powers: None,
+                    // with — nor more than the session bringing it back holds.
+                    powers: resumed_powers(&powers, member.record.powers.as_ref()),
                     initial_prompt: synthetic,
                     // Nothing to tell it: a member coming back on its own
                     // thread already carries the words that thread opened
@@ -5179,7 +4735,7 @@ mod daemon_surface {
                     columns: 120,
                     rows: 40,
                     parent: launching_session(),
-                    powers: None,
+                    powers: resumed_powers(&powers, master.powers.as_ref()),
                     initial_prompt: Some(caption),
                     // A resume, so the same as its members: the caption is
                     // typed in and the record already holds the opening.
@@ -5364,14 +4920,38 @@ mod daemon_surface {
             enforce_policy(&self.config.mcp, name)?;
             // What another machine holds is the controller's to answer. The
             // two that are only ever about other machines go straight out;
-            // the rest go out only when they name one. A cross-machine WRITE
-            // goes out too — the controller enforces the person's approval on
-            // the far side — so it is offered here rather than refused.
+            // the rest go out only when they name one and the controller will
+            // carry them there. A cross-machine WRITE goes out too — the
+            // controller holds it for the person's approval on the far side —
+            // so it is offered here rather than refused.
             let elsewhere = self.elsewhere(arguments);
-            if matches!(name, "search_conversations" | "read_conversation")
-                || ((crate::relay::relayed(name) || crate::relay::approve_gated(name))
-                    && elsewhere.is_some())
-            {
+            let crossing = matches!(name, "search_conversations" | "read_conversation")
+                || (travels(name) && elsewhere.is_some());
+            // Weighed here, before it goes anywhere, against what this session
+            // was handed — which is written in its environment on this machine
+            // and nowhere else: the controller runs in no session and would
+            // find nothing to hold it to. The records a rule walks are the
+            // ones of the machine the call lands on, so a crossing call fetches
+            // the far machine's list and the walk happens on this side, where
+            // what counts as "our task" is known. A person on the far machine
+            // approving the call is a separate question: they are saying yes
+            // to a stranger touching their box, not lifting a limit the
+            // agent's own parent set.
+            authorize(&own_powers(), name, arguments, || -> Result<Lineage> {
+                match (&elsewhere, crossing) {
+                    (Some(machine), true) => {
+                        // Closing or bringing back reaches into the archive;
+                        // speaking only ever reaches the living.
+                        let archived = matches!(act(name), Act::Close | Act::Start);
+                        Ok(lineage_of_answer(&self.relay(
+                            "list_sessions",
+                            &json!({ "machine": machine, "include_archived": archived }),
+                        )?))
+                    }
+                    _ => self.parentage(),
+                }
+            })?;
+            if crossing {
                 // The one argument that cannot be defaulted across the wire:
                 // a launch here falls back to the caller's own folder, and
                 // over there that folder is somebody else's or nobody's. Said
@@ -5387,44 +4967,15 @@ mod daemon_surface {
                              around."
                         );
                     }
-                    // What this session may start, and hand on, is written in
-                    // its environment here. Over there it is nowhere: the
-                    // controller runs in no session. So it is weighed on this
-                    // side and the answer travels with the call.
-                    let own = own_powers();
-                    check_may_launch(&own, agent_kind(arguments)?)?;
+                    // What this session may hand on is written in its
+                    // environment here, and over there it is nowhere: so the
+                    // grant is worked out on this side and travels with the
+                    // call.
                     let mut relayed = arguments.clone();
-                    stamp_powers(&mut relayed, &granted_powers(arguments, &own)?);
+                    stamp_powers(&mut relayed, &granted_powers(arguments, &own_powers())?);
                     return self.relay(name, &relayed);
                 }
-                // Borrowing the controller's credentials does not widen what
-                // this session may say to the person.
-                if name == "send_channel_message" {
-                    check_may_reach_person(&own_powers())?;
-                }
-                // How far this session may speak is written here too, and a
-                // write crossing a machine is still it speaking. The chain
-                // above the session it is aimed at lives over there, so the
-                // list comes back first and the walk happens on this side,
-                // where what counts as "our task" is known. A person on the far
-                // machine approving the call is a separate question from this
-                // one: they are saying yes to a stranger touching their box,
-                // not lifting a limit the agent's own parent set.
-                if let Some(target) = written_to(name, arguments) {
-                    let own = own_powers();
-                    if own.reach != Reach::Fleet && !reaches_without_records(&own, target) {
-                        let machine = elsewhere.clone().unwrap_or_default();
-                        let over_there =
-                            self.relay("list_sessions", &json!({ "machine": machine }))?;
-                        check_may_message(&own, target, &lineage_of_answer(&over_there))?;
-                    }
-                }
                 return self.relay(name, arguments);
-            }
-            // The same weighing for this machine's own sessions, against the
-            // records the daemon beside us holds.
-            if let Some(target) = written_to(name, arguments) {
-                self.check_reach(target)?;
             }
             match name {
                 "list_machines" => self.list_machines(),
@@ -6351,7 +5902,7 @@ mod tests {
                 .is_some()
             {
                 assert!(
-                    crate::relay::relayed(tool.name) || crate::relay::approve_gated(tool.name),
+                    crate::permissions::travels(tool.name),
                     "{} takes a machine the controller will not relay",
                     tool.name
                 );
@@ -6389,7 +5940,7 @@ mod tests {
                 continue;
             }
             assert!(
-                crate::relay::relayed(tool.name) || crate::relay::approve_gated(tool.name),
+                crate::permissions::travels(tool.name),
                 "{} invites a machine the controller will not carry",
                 tool.name
             );
@@ -6423,46 +5974,6 @@ mod tests {
                 tool.input_schema["properties"]["machine"].is_object(),
                 "{name} cannot be aimed at another machine"
             );
-        }
-    }
-
-    #[test]
-    fn a_daemon_surface_launch_stays_in_the_folder_it_was_called_from() {
-        let own = "/home/agent/project";
-        // The ordinary call: no folder named, so the caller's own.
-        assert_eq!(
-            launch_path_within(&json!({ "kind": "claude" }), own).unwrap(),
-            own
-        );
-        for inside in [
-            own,
-            "/home/agent/project/crates/core",
-            "/home/agent/project/",
-        ] {
-            assert_eq!(
-                launch_path_within(&json!({ "path": inside }), own).unwrap(),
-                inside,
-                "{inside} is inside {own}"
-            );
-        }
-        // A prefix in text is not a folder in the tree, and the parent, a
-        // sibling, and the root are all somebody else's work.
-        for outside in [
-            "/home/agent",
-            "/home/agent/project-notes",
-            "/home/agent/other",
-            "/",
-            "/etc",
-        ] {
-            let error = launch_path_within(&json!({ "path": outside }), own)
-                .expect_err("{outside} is outside {own}")
-                .to_string();
-            // Refusing is half of it: the answer has to say where the agent
-            // actually is, what it asked for, and what to do instead, or the
-            // next thing it tries is a guess.
-            assert!(error.contains(own), "{error}");
-            assert!(error.contains(outside), "{error}");
-            assert!(error.contains("message_agent"), "{error}");
         }
     }
 
@@ -6529,9 +6040,14 @@ mod tests {
         );
         // It says something on a machine's behalf without changing anything
         // there, which is exactly the shape of an errand a controller runs.
-        assert!(crate::relay::relayed("send_channel_message"));
+        assert_eq!(
+            crate::permissions::crossing("send_channel_message"),
+            crate::permissions::Crossing::Free
+        );
         // And speaking is acting, so read-only refuses it.
-        assert!(WRITE_TOOLS.contains(&"send_channel_message"));
+        assert!(crate::permissions::changes_something(
+            "send_channel_message"
+        ));
         assert!(instructions(Flavor::Daemon, &McpConfig::default()).contains("their phone"));
     }
 
@@ -6662,7 +6178,12 @@ mod tests {
             denied_tools: Vec::new(),
             read_only: true,
         };
-        for tool in WRITE_TOOLS {
+        for tool in specs(Flavor::Controller)
+            .into_iter()
+            .chain(specs(Flavor::Daemon))
+            .map(|tool| tool.name)
+            .filter(|name| crate::permissions::changes_something(name))
+        {
             assert!(
                 enforce_policy(&policy, tool).is_err(),
                 "{tool} must be denied read-only"
@@ -7199,392 +6720,6 @@ mod tests {
         assert!(fleet_already_back("muxloomd-claude-master", &nothing).is_none());
     }
 
-    #[test]
-    fn a_relayed_caller_is_taken_only_when_the_environment_says_nothing() {
-        // These rewrite a process-global; they run beside the daemon tests
-        // that do the same, so they wait for the same lock.
-        let _lock = daemon_env_lock();
-        let _none = EnvScope::set("MUXLOOM_SESSION_ID", None);
-        assert_eq!(
-            relayed_caller(&json!({ "_muxloom_caller": "muxloomd-claude-3-1-0" })).as_deref(),
-            Some("muxloomd-claude-3-1-0")
-        );
-        // A caller that is not a session id is not a caller.
-        assert_eq!(
-            relayed_caller(&json!({ "_muxloom_caller": "whoever says so" })),
-            None
-        );
-        assert_eq!(relayed_caller(&json!({})), None);
-        // The environment outranks an argument: an agent cannot rename its
-        // parent by naming one, and neither can a relay.
-        let _env = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-4-1-0"));
-        assert_eq!(
-            relayed_caller(&json!({ "_muxloom_caller": "muxloomd-claude-3-1-0" })).as_deref(),
-            Some("muxloomd-claude-4-1-0")
-        );
-    }
-
-    /// What an agent hands its subagent is what it holds, and no more — and
-    /// what a person hands theirs is everything, because a person's agent
-    /// answers to the person.
-    #[test]
-    fn a_launch_hands_on_no_more_than_the_session_making_it_holds() {
-        let _lock = daemon_env_lock();
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", None);
-        let _kind = EnvScope::set("MUXLOOM_SESSION_KIND", None);
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", None);
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", None);
-        // Nobody's session: a person is launching, and what they start is
-        // theirs. Not a subagent's defaults.
-        assert_eq!(own_powers(), Powers::whole());
-        assert_eq!(
-            granted_powers(&json!({}), &own_powers()).unwrap(),
-            Powers::whole()
-        );
-
-        // A claude session with the run of the fleet, starting a helper it
-        // says nothing about: its own kind, its own task, and the person left
-        // to it.
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-1-1-0"));
-        let _kind = EnvScope::set("MUXLOOM_SESSION_KIND", Some("claude"));
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("fleet"));
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("codex,claude,terminal"));
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("yes"));
-        let granted = granted_powers(&json!({}), &own_powers()).unwrap();
-        assert_eq!(granted.reach, Reach::Task);
-        assert_eq!(granted.launches, vec![AgentKind::Claude]);
-        assert!(!granted.may_reach_person);
-
-        // Asking for more than the parent holds gets the parent's answer:
-        // opencode is not on its list, and neither dial goes past it.
-        let asked = json!({
-            "may_message": "fleet",
-            "may_launch": ["codex", "opencode"],
-            "may_reach_person": true,
-        });
-        let granted = granted_powers(&asked, &own_powers()).unwrap();
-        assert_eq!(granted.reach, Reach::Fleet);
-        assert_eq!(granted.launches, vec![AgentKind::Codex]);
-        assert!(granted.may_reach_person);
-
-        // And a parent that may not reach the person cannot hand that on,
-        // however plainly the launch asks for it.
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let granted = granted_powers(&asked, &own_powers()).unwrap();
-        assert!(!granted.may_reach_person);
-        assert_eq!(granted.reach, Reach::Task);
-
-        // A refusal names who set the limit rather than a flag to pass.
-        let error = check_may_launch(&own_powers(), AgentKind::OpenCode)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("codex, claude, terminal"), "{error}");
-        assert!(
-            error.contains("The agent that started it set that"),
-            "{error}"
-        );
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some(""));
-        let error = check_may_launch(&own_powers(), AgentKind::Claude)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("may not start others"), "{error}");
-    }
-
-    /// A launch aimed at another machine is weighed where the powers are
-    /// legible and arrives holding the answer, because the controller running
-    /// it lives in no session and has nothing to read.
-    #[cfg(unix)]
-    #[test]
-    fn a_relayed_launch_carries_the_grant_its_own_machine_worked_out() {
-        let _lock = daemon_env_lock();
-        let granted = Powers {
-            reach: Reach::Parent,
-            launches: vec![AgentKind::Terminal],
-            may_reach_person: false,
-        };
-        let mut relayed = json!({ "kind": "terminal", "path": "/works" });
-        stamp_powers(&mut relayed, &granted);
-
-        // Read on the controller, which is in no session.
-        let _none = EnvScope::set("MUXLOOM_SESSION_ID", None);
-        assert_eq!(relayed_powers(&relayed), Some(granted));
-        assert_eq!(relayed_powers(&json!({})), None);
-
-        // Never read on a machine where the caller has an environment of its
-        // own: there the environment is the answer, and an argument saying
-        // otherwise is an agent talking about itself.
-        let _env = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-4-1-0"));
-        assert_eq!(relayed_powers(&relayed), None);
-    }
-
-    /// A task-scoped session talks to its own team and is refused the rest —
-    /// and the team is the whole tree under the task, not the siblings it
-    /// happens to know about.
-    #[cfg(unix)]
-    #[test]
-    fn a_task_scoped_session_reaches_its_own_work_and_stops_there() {
-        let _lock = daemon_env_lock();
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-lead"));
-        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", Some("muxloomd-claude-lead"));
-        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", None);
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
-        let here = lineage(&[
-            fleet_row("muxloomd-claude-lead", None),
-            fleet_row("muxloomd-claude-hand", Some("muxloomd-claude-lead")),
-            fleet_row("muxloomd-claude-grandchild", Some("muxloomd-claude-hand")),
-            fleet_row("muxloomd-claude-stranger", None),
-            fleet_row(
-                "muxloomd-claude-someone-elses",
-                Some("muxloomd-claude-stranger"),
-            ),
-        ]);
-        let own = own_powers();
-        for reachable in [
-            "muxloomd-claude-lead",
-            "muxloomd-claude-hand",
-            "muxloomd-claude-grandchild",
-        ] {
-            check_may_message(&own, reachable, &here).unwrap();
-        }
-        let error = check_may_message(&own, "muxloomd-claude-someone-elses", &here)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("not on this piece of work"), "{error}");
-        assert!(error.contains("let it carry the message"), "{error}");
-        // A session nobody on this machine has a record of is not this
-        // session's team by default.
-        assert!(check_may_message(&own, "muxloomd-claude-nowhere", &here).is_err());
-
-        // A subagent started on another machine is one hop from this session
-        // on that machine's own list, and that is enough to recognise it.
-        let over_there = lineage_of_answer(
-            &json!([
-                { "session_id": "muxloomd-codex-far", "parent": "muxloomd-claude-lead" },
-                { "session_id": "muxloomd-codex-native", "parent": null },
-            ])
-            .to_string(),
-        );
-        check_may_message(&own, "muxloomd-codex-far", &over_there).unwrap();
-        assert!(check_may_message(&own, "muxloomd-codex-native", &over_there).is_err());
-
-        // The full reach asks nothing of a lineage at all.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("fleet"));
-        check_may_message(&own_powers(), "muxloomd-claude-someone-elses", &[]).unwrap();
-
-        // The narrowest answers to the one session that asked, and to whatever
-        // it started to answer with, and to nothing else.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
-        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", Some("muxloomd-claude-boss"));
-        check_may_message(&own_powers(), "muxloomd-claude-boss", &here).unwrap();
-        let error = check_may_message(&own_powers(), "muxloomd-claude-stranger", &here)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("and to nobody else"), "{error}");
-        // Its own subtree, however far down: an agent that may start a helper
-        // and may not speak to it is holding something it cannot use, and the
-        // helper's questions upward would never be answerable.
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-hand"));
-        for mine in ["muxloomd-claude-grandchild", "muxloomd-claude-boss"] {
-            check_may_message(&own_powers(), mine, &here).unwrap();
-        }
-        assert!(check_may_message(&own_powers(), "muxloomd-claude-lead", &here).is_err());
-    }
-
-    /// Fetching the records to weigh a reach is a round trip that hands back
-    /// every conversation the machine has ever held — and across a relay, a
-    /// round trip to another machine — before a keystroke goes anywhere. Most
-    /// of what is asked does not turn on them.
-    #[cfg(unix)]
-    #[test]
-    fn a_reach_settled_without_records_is_settled_the_same_way_with_them() {
-        let _lock = daemon_env_lock();
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-hand"));
-        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", Some("muxloomd-claude-lead"));
-        let _parent = EnvScope::set("MUXLOOM_SESSION_PARENT", Some("muxloomd-claude-lead"));
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
-        let here = lineage(&[
-            fleet_row("muxloomd-claude-lead", None),
-            fleet_row("muxloomd-claude-hand", Some("muxloomd-claude-lead")),
-            fleet_row("muxloomd-claude-grandchild", Some("muxloomd-claude-hand")),
-            fleet_row("muxloomd-claude-stranger", None),
-        ]);
-        let everyone = [
-            "muxloomd-claude-lead",
-            "muxloomd-claude-hand",
-            "muxloomd-claude-grandchild",
-            "muxloomd-claude-stranger",
-            "muxloomd-claude-nowhere",
-        ];
-
-        // Reporting to the agent that started this one, and speaking to this
-        // session itself, are recognised on the first hop of the walk, before
-        // it has consulted anything.
-        let own = own_powers();
-        for close in ["muxloomd-claude-lead", "muxloomd-claude-hand"] {
-            assert!(reaches_without_records(&own, close), "{close}");
-        }
-        // Anything further down is only reachable by following a parent, so
-        // that one does send for the records — and is allowed once it has them.
-        assert!(!reaches_without_records(&own, "muxloomd-claude-grandchild"));
-        check_may_message(&own, "muxloomd-claude-grandchild", &here).unwrap();
-
-        // The same split holds for the narrowest reach: the agent that asked is
-        // named in the environment, and only the subtree needs looking up.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
-        let narrow = own_powers();
-        assert!(reaches_without_records(&narrow, "muxloomd-claude-lead"));
-        assert!(!reaches_without_records(
-            &narrow,
-            "muxloomd-claude-grandchild"
-        ));
-        check_may_message(&narrow, "muxloomd-claude-grandchild", &here).unwrap();
-
-        // Whatever is waved through with nothing in hand has to be waved
-        // through with everything in hand as well, or the saving is a hole.
-        for powers in [&own, &narrow] {
-            for target in everyone {
-                if reaches_without_records(powers, target) {
-                    assert!(
-                        check_may_message(powers, target, &here).is_ok(),
-                        "{target} was let through with no records"
-                    );
-                }
-            }
-        }
-        assert!(!reaches_without_records(&own, "muxloomd-claude-stranger"));
-
-        // A process running in no session is outside nobody's work, and settles
-        // that way rather than by recognising anyone: no records there either.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let _root = EnvScope::set("MUXLOOM_TASK_ROOT", None);
-        let _id = EnvScope::set("MUXLOOM_SESSION_ID", None);
-        assert!(reaches_without_records(
-            &own_powers(),
-            "muxloomd-claude-stranger"
-        ));
-    }
-
-    /// Every door into another agent's prompt box is the same door as far as
-    /// the reach dial is concerned, or the narrow settings mean nothing.
-    #[test]
-    fn typing_into_a_session_counts_as_speaking_to_it() {
-        let aimed = json!({ "session_id": "muxloomd-claude-hand", "text": "ping" });
-        assert_eq!(
-            written_to("message_agent", &aimed),
-            Some("muxloomd-claude-hand")
-        );
-        assert_eq!(
-            written_to("send_input", &aimed),
-            Some("muxloomd-claude-hand")
-        );
-
-        // A trigger types on a pattern, which is a send_input with a delay on
-        // it; a notify one raises a flag for a person and says nothing.
-        let types = json!({
-            "action": "set",
-            "action_kind": "send_input",
-            "session_id": "muxloomd-claude-hand",
-            "pattern": "done",
-            "text": "carry on",
-        });
-        assert_eq!(written_to("trigger", &types), Some("muxloomd-claude-hand"));
-        let mut notifies = types.clone();
-        notifies["action_kind"] = json!("notify");
-        assert_eq!(written_to("trigger", &notifies), None);
-        // The default action_kind is notify, and listing or deleting one is
-        // not typing at all.
-        let mut bare = types.clone();
-        bare.as_object_mut().unwrap().remove("action_kind");
-        assert_eq!(written_to("trigger", &bare), None);
-        let mut listing = types.clone();
-        listing["action"] = json!("list");
-        assert_eq!(written_to("trigger", &listing), None);
-
-        // Reading a session is not writing to it, and a call that names no
-        // session is the tool's own to refuse.
-        assert_eq!(written_to("read_screen", &aimed), None);
-        assert_eq!(written_to("send_input", &json!({ "text": "ping" })), None);
-    }
-
-    /// The person hears about a piece of work from the agent they asked, not
-    /// from every session working on it.
-    #[test]
-    fn a_session_not_handed_the_person_cannot_write_to_them() {
-        let _lock = daemon_env_lock();
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
-        let error = check_may_reach_person(&own_powers())
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            error.contains("does not write to the person's chat"),
-            "{error}"
-        );
-        assert!(error.contains("Tell that agent"), "{error}");
-
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("yes"));
-        check_may_reach_person(&own_powers()).unwrap();
-
-        // A session nobody set limits on is a person's own agent.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", None);
-        check_may_reach_person(&own_powers()).unwrap();
-    }
-
-    /// The board is rooms, and the same dial says which of them a session may
-    /// be heard in: its own task always, the folder it works in when it may
-    /// talk to the others there, the machine and the world only at full reach.
-    #[test]
-    fn a_narrowed_session_posts_to_its_own_rooms_and_no_wider() {
-        let _lock = daemon_env_lock();
-        let task = TalkScope::Task {
-            machine: String::new(),
-            root_session: "muxloomd-claude-lead".into(),
-        };
-        let folder = TalkScope::Path {
-            machine: String::new(),
-            path: "/works/Terminal".into(),
-        };
-        let machine = TalkScope::Machine {
-            machine: String::new(),
-        };
-        let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("claude"));
-        let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
-
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
-        let own = own_powers();
-        check_may_post(&own, &task).unwrap();
-        check_may_post(&own, &folder).unwrap();
-        let error = check_may_post(&own, &machine).err().unwrap().to_string();
-        assert!(error.contains("scope \"task\" or \"path\""), "{error}");
-        assert!(check_may_post(&own, &TalkScope::Global).is_err());
-
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("parent"));
-        let own = own_powers();
-        check_may_post(&own, &task).unwrap();
-        let error = check_may_post(&own, &folder).err().unwrap().to_string();
-        assert!(error.contains("its own task's board"), "{error}");
-
-        // Nothing said about this session: a person's agent, and every room
-        // is open to it.
-        let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", None);
-        for scope in [task, folder, machine, TalkScope::Global] {
-            check_may_post(&own_powers(), &scope).unwrap();
-        }
-    }
-
     /// A session is signed with what it is called now, not what it was named
     /// at launch — and never with its id.
     ///
@@ -7642,45 +6777,9 @@ mod tests {
         assert_eq!(speaker(None), "claude · seed");
     }
 
-    /// The same process-global the daemon-surface tests rewrite; the gate
-    /// runs them one thread at a time, and this keeps them honest if that
-    /// ever changes.
-    fn daemon_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENVELOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENVELOPE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Set an environment variable for the duration of a test; the same
-    /// discipline the daemon-surface tests use, at module scope.
-    struct EnvScope {
-        key: String,
-        previous: Option<String>,
-    }
-
-    impl EnvScope {
-        fn set(key: &str, value: Option<&str>) -> Self {
-            let scope = Self {
-                key: key.into(),
-                previous: std::env::var(key).ok(),
-            };
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-            scope
-        }
-    }
-
-    impl Drop for EnvScope {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe { std::env::set_var(&self.key, value) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
-    }
+    /// The same process-global every test that plays a session rewrites, and
+    /// the one lock they all wait on.
+    use crate::permissions::test_env::{EnvScope, lock as daemon_env_lock};
 
     #[cfg(unix)]
     mod daemon_round_trip {
@@ -7878,39 +6977,14 @@ mod tests {
             assert!(!listed.contains(&session_id));
         }
 
-        // The tests below rewrite MUXLOOM_SESSION_ID, a process-global env var
-        // the whole binary reads, so they must not overlap one another.
-        static HEAD_NAME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        /// Hold one env var at a value for a test, restoring it on drop.
-        struct EnvScope {
-            key: &'static str,
-            previous: Option<String>,
-        }
-        impl EnvScope {
-            fn set(key: &'static str, value: Option<&str>) -> Self {
-                let previous = std::env::var(key).ok();
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-                Self { key, previous }
-            }
-        }
-        impl Drop for EnvScope {
-            fn drop(&mut self) {
-                match &self.previous {
-                    Some(value) => unsafe { std::env::set_var(self.key, value) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
+        // The tests below rewrite MUXLOOM_SESSION_ID and its neighbours,
+        // process-global env vars the whole binary reads, so they wait on the
+        // one lock every test that plays a session waits on.
+        use crate::permissions::test_env::{self, EnvScope};
 
         #[test]
         fn set_head_name_renames_the_callers_own_session_row() {
-            let _env_lock = HEAD_NAME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = test_env::lock();
             let mut surface = surface("headname");
             let launched: Value = serde_json::from_str(&call(
                 &mut surface,
@@ -7954,9 +7028,7 @@ mod tests {
 
         #[test]
         fn set_head_name_is_refused_outside_a_session_and_on_a_bad_name() {
-            let _env_lock = HEAD_NAME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = test_env::lock();
             let surface = surface("headname-none");
 
             // No session id in the environment: this surface has no row to name.
@@ -8443,9 +7515,7 @@ mod tests {
 
         #[test]
         fn resuming_a_coordinator_by_its_muxloom_id_comes_back_with_its_fleet() {
-            let _env_lock = HEAD_NAME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = test_env::lock();
             let script = fake_claude_script("fleet-resume");
             let config = claude_config(&script);
             let (mut surface, paths) = surface_and_paths("fleet-resume", config);
@@ -8556,9 +7626,7 @@ mod tests {
 
         #[test]
         fn a_resume_by_muxloom_id_refuses_the_session_that_is_still_live() {
-            let _env_lock = HEAD_NAME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = test_env::lock();
             let script = fake_claude_script("fleet-alive");
             let mut surface = surface_with("fleet-alive", claude_config(&script));
             let workdir = std::env::temp_dir().to_str().unwrap().to_string();
@@ -8591,9 +7659,7 @@ mod tests {
 
         #[test]
         fn closing_a_master_closes_every_session_under_it() {
-            let _env_lock = HEAD_NAME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = test_env::lock();
             let script = fake_claude_script("fleet-close");
             let mut surface = surface_with("fleet-close", claude_config(&script));
             let workdir = std::env::temp_dir().to_str().unwrap().to_string();
@@ -8649,6 +7715,85 @@ mod tests {
                 !closed(&bystander),
                 "a session outside the fleet is left alone: {listed:#}"
             );
+        }
+
+        /// A subagent on a real daemon: it closes and brings back what it
+        /// started, and is refused what it did not — however plainly it names
+        /// it. The person's own sessions, which hold everything, are not.
+        #[test]
+        fn a_subagent_closes_and_resumes_only_its_own_through_the_surface() {
+            let _env_lock = test_env::lock();
+            let _nobody = test_env::nobody();
+            let mut surface = surface("own-subtree");
+            let workdir = std::env::temp_dir().to_str().unwrap().to_string();
+            let launched = |surface: &mut DaemonControl, label: &str| -> String {
+                let started: Value = serde_json::from_str(&call(
+                    surface,
+                    "launch_session",
+                    json!({ "kind": "terminal", "path": workdir, "label": label }),
+                ))
+                .unwrap();
+                started["session_id"].as_str().unwrap().to_string()
+            };
+            let stranger = launched(&mut surface, "stranger");
+            let lead = launched(&mut surface, "lead");
+
+            // Now play the lead as a subagent somebody else started: narrowed,
+            // and allowed to start terminals and nothing else.
+            let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some(&lead));
+            let _root = EnvScope::set("MUXLOOM_TASK_ROOT", Some(&lead));
+            let _reach = EnvScope::set("MUXLOOM_MAY_MESSAGE", Some("task"));
+            let _launch = EnvScope::set("MUXLOOM_MAY_LAUNCH", Some("terminal"));
+            let _person = EnvScope::set("MUXLOOM_MAY_REACH_PERSON", Some("no"));
+            let helper = launched(&mut surface, "helper");
+
+            for (tool, theirs) in [
+                ("delete_session", &stranger),
+                ("archive_session", &stranger),
+            ] {
+                let error = surface
+                    .call(tool, &json!({ "session_id": theirs }))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("closes only itself"), "{tool}: {error}");
+            }
+            call(
+                &mut surface,
+                "archive_session",
+                json!({ "session_id": helper }),
+            );
+            let back: Value = serde_json::from_str(&call(
+                &mut surface,
+                "launch_session",
+                json!({ "kind": "terminal", "resume_id": helper }),
+            ))
+            .unwrap();
+            assert_eq!(back["session_id"], json!(helper), "{back}");
+            assert_eq!(back["parent"], json!(lead), "{back}");
+
+            // The stranger, archived by its own person, is not the lead's to
+            // bring back.
+            {
+                let _whole = test_env::nobody();
+                call(
+                    &mut surface,
+                    "archive_session",
+                    json!({ "session_id": stranger }),
+                );
+            }
+            let error = surface
+                .call(
+                    "launch_session",
+                    &json!({ "kind": "terminal", "resume_id": stranger }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("brings back only its own"), "{error}");
+
+            let _whole = test_env::nobody();
+            for id in [&helper, &lead, &stranger] {
+                call(&mut surface, "delete_session", json!({ "session_id": id }));
+            }
         }
 
         #[test]

@@ -2,7 +2,7 @@
 //!
 //! A daemon-flavoured agent reaches another machine only by relaying through
 //! an attached muxloom controller. muxloom's relay deliberately lets only
-//! look-and-speak tools through (see `relay::RELAYED_TOOLS`); a WRITE tool —
+//! look-and-speak tools through (see `permissions::crossing`); a WRITE tool —
 //! starting a session, typing into one, deleting one — must not run on a
 //! remote machine without a person saying so. That person is usually not at
 //! the dashboard, so the ask goes out over the bound chat, and the answer

@@ -3033,7 +3033,7 @@ fn settle_approval(
             )
         }
         crate::approvals::Verdict::Always => {
-            if crate::relay::reminder_allowed(&pending.tool) {
+            if crate::permissions::approval_may_stand(&pending.tool) {
                 ledger.remember(&pending.session, &pending.machine, &pending.tool);
                 format!(
                     "· allowed {} for the rest of this conversation",
