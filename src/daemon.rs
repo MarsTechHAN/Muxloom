@@ -6332,6 +6332,9 @@ mod platform {
                 return Ok(HistoryRead::empty());
             }
             if rendered {
+                // A record keeps no screen, so whether the session ended on
+                // the alternate screen is unknown here; reading on is what
+                // finds its rows if it did not.
                 return render_history_file(
                     &self.history_path,
                     self.columns,
@@ -6341,6 +6344,7 @@ mod platform {
                     SCROLLBACK_SEED_BYTES_MIN,
                     SCROLLBACK_SEED_BYTES_MAX,
                     anchor,
+                    false,
                 );
             }
             read_history_file(
@@ -7275,6 +7279,15 @@ mod platform {
                 {
                     return Ok(live);
                 }
+                // A window opening inside a full-screen program's repaint
+                // never sees the switch that took it there, so whether the
+                // session is on the alternate screen is asked of the session.
+                let full_screen = self
+                    .screen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .screen()
+                    .alternate_screen();
                 return render_history_file(
                     &self.history_path,
                     self.columns.load(Ordering::Relaxed),
@@ -7284,6 +7297,7 @@ mod platform {
                     SCROLLBACK_SEED_BYTES_MIN,
                     SCROLLBACK_SEED_BYTES_MAX,
                     anchor,
+                    full_screen,
                 );
             }
             read_history_file(
@@ -7576,6 +7590,7 @@ mod platform {
         least: u64,
         most: u64,
         anchor: Anchor,
+        full_screen: bool,
     ) -> Result<HistoryRead> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open history {}", path.display()))?;
@@ -7643,7 +7658,18 @@ mod platform {
             // nothing: it did not find the first screenful either, so there is
             // no screenful here to answer with and stopping only fixes the
             // blanks in place.
-            let widened_in_vain = !barren && reached.is_some_and(|before| total_lines <= before);
+            //
+            // And it is a read of the screen that may stop like this, or one
+            // on the alternate screen, where nothing ever scrolls off. A page
+            // of history on the primary screen is the dashboard paging back,
+            // and a program that sat repainting its status in place for a while
+            // - Claude Code thinking - wrote megabytes that added no rows on top
+            // of rows that are still there to be read. Stopping inside them
+            // answered with a screenful and said there was more, and the next
+            // page, rounding back to the same offset, got the same screenful.
+            let may_stop = anchor == Anchor::Drawn || full_screen || rendered.alternate_screen;
+            let widened_in_vain =
+                may_stop && !barren && reached.is_some_and(|before| total_lines <= before);
             if (actual_offset >= offset_from_bottom && filled)
                 || widened_in_vain
                 || start == 0
@@ -9159,7 +9185,8 @@ mod platform {
             );
 
             let read =
-                render_history_file(&path, 40, 5, 0, 4, window, window, Anchor::Drawn).unwrap();
+                render_history_file(&path, 40, 5, 0, 4, window, window, Anchor::Drawn, false)
+                    .unwrap();
             let text = String::from_utf8_lossy(&read.rows).to_string();
             assert!(
                 text.contains("kept"),
@@ -9259,9 +9286,18 @@ mod platform {
             fs::write(&path, &log).unwrap();
 
             // Read back on a pane that has since narrowed to 80.
-            let read =
-                render_history_file(&path, 80, 5, 0, 5, 4 * 1024, 1024 * 1024, Anchor::Drawn)
-                    .unwrap();
+            let read = render_history_file(
+                &path,
+                80,
+                5,
+                0,
+                5,
+                4 * 1024,
+                1024 * 1024,
+                Anchor::Drawn,
+                false,
+            )
+            .unwrap();
             let text = String::from_utf8_lossy(&read.rows).to_string();
             for word in words {
                 assert!(
@@ -9316,6 +9352,7 @@ mod platform {
                 window,
                 log.len() as u64,
                 Anchor::Grid,
+                false,
             )
             .unwrap();
             let page = String::from_utf8_lossy(&read.rows).into_owned();
@@ -9330,7 +9367,8 @@ mod platform {
 
             // A window that may not widen answers with what it could reach.
             let shallow =
-                render_history_file(&path, 20, 5, 300, 40, window, window, Anchor::Grid).unwrap();
+                render_history_file(&path, 20, 5, 300, 40, window, window, Anchor::Grid, false)
+                    .unwrap();
             assert!(
                 shallow.offset_from_bottom < 300,
                 "as far back as one window reaches: {}",
@@ -9342,33 +9380,51 @@ mod platform {
             );
         }
 
-        #[test]
-        fn a_history_page_stops_widening_once_widening_stops_finding_rows() {
-            // The paired case to the test above, where every frame ends in a
-            // newline so widening keeps turning up rows. An agent on the
-            // alternate screen paints without one: the cursor is put back and
-            // the row overwritten, so nothing ever scrolls off and no window,
-            // however far back it reaches, holds more than a screenful. The
-            // read used to widen through that all the way to its ceiling before
-            // answering with the screenful it already had on its first look.
-            let path = test_state("render-history-still")
-                .paths
-                .history
-                .join("log.ansi");
+        /// Two hundred rows that scrolled, and then a long stretch of a
+        /// program repainting its screen in place - `alternate` says whether
+        /// it took the alternate screen to do it.
+        fn painted_in_place(name: &str, alternate: bool) -> PathBuf {
+            let path = test_state(name).paths.history.join("log.ansi");
             let mut log: String = (1..=200)
                 .map(|line| format!("scrolled{line}\r\n"))
                 .collect();
+            if alternate {
+                log.push_str("\x1b[?1049h");
+            }
             for frame in 1..=8_000 {
                 log.push_str(&format!("\x1b[1;1H\x1b[Kpaint{frame}"));
             }
             fs::write(&path, &log).unwrap();
+            path
+        }
+
+        #[test]
+        fn a_history_page_stops_widening_once_widening_stops_finding_rows() {
+            // The paired case to the test above, where every frame ends in a
+            // newline so widening keeps turning up rows. A program painting in
+            // place writes without one: the cursor is put back and the row
+            // overwritten, so a window inside that finds a screenful however
+            // far back it reaches. A read of the screen - every agent sitting
+            // in a wait makes one a second - used to widen through that all
+            // the way to its ceiling before answering with the screenful it
+            // already had on its first look.
+            let path = painted_in_place("render-history-still", false);
 
             // The seed reaches 12,800 bytes and quadruples from there, so the
             // first two looks both land inside the repaint; the third would
             // span the whole log and reach the rows at the top of it.
-            let read =
-                render_history_file(&path, 20, 5, 0, 40, 4 * 1024, 1024 * 1024, Anchor::Grid)
-                    .unwrap();
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                0,
+                40,
+                4 * 1024,
+                1024 * 1024,
+                Anchor::Drawn,
+                false,
+            )
+            .unwrap();
 
             assert!(
                 !read.reached_start,
@@ -9381,6 +9437,60 @@ mod platform {
             );
             let page = String::from_utf8_lossy(&read.rows).into_owned();
             assert!(page.contains("paint8000"), "the newest paint: {page:?}");
+
+            // On the alternate screen nothing can ever scroll off, so a page of
+            // history stops there as well: no reach back finds more rows.
+            let path = painted_in_place("render-history-still-alternate", true);
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                0,
+                40,
+                4 * 1024,
+                1024 * 1024,
+                Anchor::Grid,
+                true,
+            )
+            .unwrap();
+            assert!(!read.reached_start);
+        }
+
+        #[test]
+        fn a_page_of_history_reaches_back_past_a_screen_painted_in_place() {
+            // The dashboard pages back through a session with these reads. A
+            // primary-screen program that sat repainting its status in place -
+            // Claude Code thinking for ten minutes - writes megabytes that add
+            // no rows, and the rows it scrolled before that are still there to
+            // be read. Stopping inside the repaint answered with a screenful
+            // and said there was more: the next page rounds back to the same
+            // offset, gets the same screenful, and the pane said loading
+            // forever.
+            let path = painted_in_place("render-history-reach-back", false);
+
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                0,
+                40,
+                4 * 1024,
+                1024 * 1024,
+                Anchor::Grid,
+                false,
+            )
+            .unwrap();
+
+            assert!(
+                read.total_lines >= 40,
+                "the page holds the rows it was asked for: {}",
+                read.total_lines
+            );
+            let page = String::from_utf8_lossy(&read.rows).into_owned();
+            assert!(
+                page.contains("scrolled196"),
+                "reached back to what scrolled before the repaint: {page:?}"
+            );
         }
 
         #[test]
@@ -9419,8 +9529,18 @@ mod platform {
             // the page the old read stopped on. Asking for more than the screen
             // holds happened to escape it: the blanks could not fill a page
             // deeper than they were.
-            let read = render_history_file(&path, 20, 5, 0, 5, 4 * 1024, 1024 * 1024, Anchor::Grid)
-                .unwrap();
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                0,
+                5,
+                4 * 1024,
+                1024 * 1024,
+                Anchor::Grid,
+                false,
+            )
+            .unwrap();
 
             let page = String::from_utf8_lossy(&read.rows).into_owned();
             assert!(
@@ -9446,18 +9566,36 @@ mod platform {
             let log: String = (1..=30).map(|line| format!("line{line}\r\n")).collect();
             fs::write(&path, &log).unwrap();
 
-            let read =
-                render_history_file(&path, 20, 5, 0, 500, 16 * 1024, 64 * 1024, Anchor::Grid)
-                    .unwrap();
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                0,
+                500,
+                16 * 1024,
+                64 * 1024,
+                Anchor::Grid,
+                false,
+            )
+            .unwrap();
             assert!(read.reached_start, "a 30-row log is read whole");
             assert_eq!(read.offset_from_bottom, 0);
             // The rows above the screen are the ones a client may scroll to.
             assert!(read.total_lines >= 30, "rows in all: {}", read.total_lines);
 
             // Asking past the oldest row answers with the oldest row there is.
-            let read =
-                render_history_file(&path, 20, 5, 5_000, 500, 16 * 1024, 64 * 1024, Anchor::Grid)
-                    .unwrap();
+            let read = render_history_file(
+                &path,
+                20,
+                5,
+                5_000,
+                500,
+                16 * 1024,
+                64 * 1024,
+                Anchor::Grid,
+                false,
+            )
+            .unwrap();
             assert!(read.reached_start);
             assert_eq!(read.offset_from_bottom, read.total_lines - 5);
         }
