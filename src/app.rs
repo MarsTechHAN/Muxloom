@@ -13652,7 +13652,12 @@ fn sanitize_terminal_text(output: &str) -> String {
                         _ => {}
                     }
                 }
-                Some(']') => {
+                // A window title, a hyperlink, and every other string addressed
+                // to the terminal rather than the screen - among them the mark
+                // a rendered page puts on each row that wrapped, which is an
+                // application program command. Taking only its introducer left
+                // the word between them on the end of every such row.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
                     characters.next();
                     while let Some(next) = characters.next() {
                         if next == '\x07' {
@@ -13664,8 +13669,14 @@ fn sanitize_terminal_text(output: &str) -> String {
                         }
                     }
                 }
-                Some(_) => {
+                Some(next) => {
                     characters.next();
+                    // A character set designation names its set in the byte
+                    // after: `ESC ( B` is how a raw log resets one, and the
+                    // `B` is no more text than the escape is.
+                    if matches!(next, '(' | ')' | '*' | '+' | '-' | '.' | '/' | '%' | '#') {
+                        characters.next();
+                    }
                 }
                 None => {}
             }
@@ -14142,6 +14153,38 @@ mod tests {
         );
         assert_eq!(styled, "\x1b[31;1mred\x1b[0m\nlink");
         assert_eq!(strip_terminal_styles(&styled), "red\nlink");
+    }
+
+    #[test]
+    fn history_rows_that_wrapped_do_not_show_the_mark_that_says_so() {
+        // A rendered page marks each row that ran on into the next one, for a
+        // reader joining them back up. The pane only draws the rows.
+        let log = format!("{}\r\nnext\r\n", "x".repeat(30));
+        let (page, _total, _offset) =
+            crate::terminal_session::render_history_rows(log.as_bytes(), 20, 5, 0, 5)
+                .expect("render");
+        let page = String::from_utf8(page).expect("utf-8 rows");
+        assert!(
+            page.contains("\x1b_"),
+            "the page this is about carries the mark: {page:?}"
+        );
+
+        let plain = strip_terminal_styles(&sanitize_terminal_text(&page));
+        let mut lines = plain.lines();
+
+        assert_eq!(lines.next(), Some("x".repeat(20).as_str()));
+        assert_eq!(lines.next(), Some("x".repeat(10).as_str()));
+        assert_eq!(lines.next(), Some("next"));
+    }
+
+    #[test]
+    fn raw_history_does_not_show_the_character_set_it_selects() {
+        // `tput sgr0` and a good many prompts reset the character set along
+        // with the colours, and an older daemon answers in raw log lines.
+        let plain = strip_terminal_styles(&sanitize_terminal_text(
+            "\x1b(B\x1b[mdone\x1b)0 \x1bPq#1\x1b\\",
+        ));
+        assert_eq!(plain, "done ");
     }
 
     #[test]
