@@ -1679,6 +1679,9 @@ pub struct App {
     /// Asks already brought to the person's attention once, so one they put
     /// off with Esc stays a chip rather than coming back every round.
     approvals_raised: HashSet<String>,
+    /// Names typed on this dashboard before they were written to the daemon,
+    /// already on their way there, so each is sent once.
+    labels_migrating: HashSet<String>,
     pub attention_banner: Option<Rect>,
     pub terminal_back: Option<Rect>,
     pub layout_debug_signature: Option<(u16, u16, u16, u16, bool, bool)>,
@@ -1894,6 +1897,7 @@ impl App {
             approvals: Vec::new(),
             approvals_chip: None,
             approvals_raised: HashSet::new(),
+            labels_migrating: HashSet::new(),
             attention_banner: None,
             terminal_back: None,
             layout_debug_signature: None,
@@ -6127,6 +6131,11 @@ impl App {
                 }
             }
             Event::Approvals { open } => self.absorb_approvals(open),
+            Event::LabelSet {
+                session_id,
+                label,
+                result,
+            } => self.absorb_label_set(session_id, label, result),
             Event::ApprovalSettled { id, result } => match result {
                 Ok(told) => self.status_message = format!("{id}: {told}"),
                 Err(error) => self.set_error(format!("{id}: {error}")),
@@ -7403,7 +7412,18 @@ impl App {
                 || session.pid != latest.pid
                 || session.working != latest.working
                 || session.needs_attention != latest.needs_attention
-                || session.attention_reason != latest.attention_reason;
+                || session.attention_reason != latest.attention_reason
+                || session.label != latest.label;
+            // The name too, every round. An agent naming itself with
+            // `set_head_name` changes nothing else the round looks at, so a row
+            // that took its name only from a full scan kept the old one until
+            // somebody pressed refresh — which read as the name never having
+            // been written. A name this dashboard is still holding on its own
+            // outranks the record until it has been sent there.
+            match self.state.session_labels.get(&session.id) {
+                Some(held) => session.label.clone_from(held),
+                None => session.label.clone_from(&latest.label),
+            }
             session.dead = latest.dead;
             session.pid = latest.pid;
             session.working = latest.working;
@@ -10944,18 +10964,39 @@ impl App {
         });
     }
 
+    /// Name a session on its daemon's record — the same field an agent's
+    /// `set_head_name` writes, read by every dashboard, chat card and board
+    /// signature. A name kept on this dashboard alone was a second name: the
+    /// agent's own `set_head_name` never showed through it, and nothing beyond
+    /// this screen ever saw it.
     fn submit_rename_agent(&mut self, session_id: String, value: String) {
         let name = value.trim().to_string();
-        if name.is_empty() {
-            self.state.session_labels.remove(&session_id);
-        } else {
-            self.state
-                .session_labels
-                .insert(session_id.clone(), name.clone());
+        let Some(target_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.target_id.clone())
+        else {
+            return;
+        };
+        if self.refuse_forwarded(&target_id, "rename a session") {
+            return;
         }
-        self.persist_state();
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.label = name.clone();
+        }
+        let sent = self.target(&target_id).cloned().is_some_and(|target| {
+            self.worker
+                .requests
+                .send(Request::SetLabel {
+                    target,
+                    session_id: session_id.clone(),
+                    label: name.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            self.keep_label_here(&session_id, &name);
         }
         self.status_message = if name.is_empty() {
             "Agent name cleared".into()
@@ -10964,11 +11005,83 @@ impl App {
         };
     }
 
-    /// Overlay custom agent names (keyed by session id) onto the live sessions.
+    /// Hold a name on this dashboard, for a session with no record to write it
+    /// to: a tmux-fallback session, or a daemon that would not take it.
+    fn keep_label_here(&mut self, session_id: &str, name: &str) {
+        match name.is_empty() {
+            true => self.state.session_labels.remove(session_id),
+            false => self
+                .state
+                .session_labels
+                .insert(session_id.to_string(), name.to_string()),
+        };
+        self.persist_state();
+    }
+
+    /// A name reached the session's record, or could not.
+    fn absorb_label_set(&mut self, session_id: String, label: String, result: Result<(), String>) {
+        match result {
+            // On the record now, so any name this dashboard was holding on its
+            // own stands down: from here the record is the only one.
+            Ok(()) => {
+                self.labels_migrating.remove(&session_id);
+                if self.state.session_labels.remove(&session_id).is_some() {
+                    self.persist_state();
+                }
+            }
+            // Kept here, and not offered to the record again until the
+            // dashboard restarts: a daemon that refused it once will refuse it
+            // every round.
+            Err(error) => {
+                self.labels_migrating.insert(session_id.clone());
+                self.keep_label_here(&session_id, &label);
+                self.apply_session_labels();
+                self.set_background_status(format!(
+                    "Named on this dashboard only: {}",
+                    short_error(&error)
+                ));
+            }
+        }
+    }
+
+    /// Overlay the names this dashboard holds on its own onto the sessions it
+    /// lists, and send each one on to its session's record — where it belongs,
+    /// and where it stops hiding whatever the agent names itself afterwards.
+    /// What cannot be written there (a tmux session) stays here.
     fn apply_session_labels(&mut self) {
+        let mut moving = Vec::new();
         for session in &mut self.sessions {
             if let Some(custom) = self.state.session_labels.get(&session.id) {
                 session.label = custom.clone();
+                if crate::runtime::is_daemon_session_id(&session.id)
+                    && !self.labels_migrating.contains(&session.id)
+                {
+                    moving.push((
+                        session.target_id.clone(),
+                        session.id.clone(),
+                        custom.clone(),
+                    ));
+                }
+            }
+        }
+        for (target_id, session_id, label) in moving {
+            if self.forwarded_machine(&target_id).is_some() {
+                continue;
+            }
+            let Some(target) = self.target(&target_id).cloned() else {
+                continue;
+            };
+            if self
+                .worker
+                .requests
+                .send(Request::SetLabel {
+                    target,
+                    session_id: session_id.clone(),
+                    label,
+                })
+                .is_ok()
+            {
+                self.labels_migrating.insert(session_id);
             }
         }
     }
@@ -19865,14 +19978,15 @@ mod tests {
     }
 
     #[test]
-    fn renaming_an_agent_sets_applies_and_clears_its_display_name() {
-        let mut app = ux_test_app(vec![Target::local()]);
-        app.sessions.push(AgentSession {
-            id: "s1".into(),
+    fn renaming_an_agent_writes_the_name_to_its_record() {
+        let (mut app, requests) = board_app();
+        let id = "muxloomd-codex-1-1-0";
+        let session = |label: &str| AgentSession {
+            id: id.into(),
             target_id: "local".into(),
             kind: AgentKind::Codex,
             path: "/work/project".into(),
-            label: String::new(),
+            label: label.into(),
             created_at: 1,
             archived_at: None,
             dead: false,
@@ -19884,26 +19998,70 @@ mod tests {
             title: None,
             thread: None,
             parent: None,
-        });
-        app.submit_rename_agent("s1".into(), "  My Bot  ".into());
-        assert_eq!(
-            app.state.session_labels.get("s1").map(String::as_str),
-            Some("My Bot")
-        );
+        };
+        app.sessions.push(session(""));
+
+        // A name typed here goes to the session's record, where the agent's
+        // own set_head_name writes it and every other reader looks, and is not
+        // held here as a second name that would hide the agent's.
+        app.submit_rename_agent(id.into(), "  My Bot  ".into());
+        assert!(matches!(
+            receive_request(&requests),
+            Request::SetLabel { session_id, label, .. } if session_id == id && label == "My Bot"
+        ));
         assert_eq!(app.sessions[0].label, "My Bot");
+        app.handle_worker_event(Event::LabelSet {
+            session_id: id.into(),
+            label: "My Bot".into(),
+            result: Ok(()),
+        });
+        assert!(app.state.session_labels.is_empty());
 
-        // A blank name removes the override and reverts to the folder name.
-        app.submit_rename_agent("s1".into(), "   ".into());
-        assert!(!app.state.session_labels.contains_key("s1"));
-        assert_eq!(app.sessions[0].display_label(), "project");
+        // The agent names itself afterwards, and the next activity round shows
+        // it — not only the next full scan.
+        app.apply_activity_refresh("local", &[session("reviewing the relay")]);
+        assert_eq!(app.sessions[0].display_label(), "reviewing the relay");
 
-        // Overrides re-apply when a refresh rebuilds the session list.
-        app.state
-            .session_labels
-            .insert("s1".into(), "Persisted".into());
-        app.sessions[0].label = String::new();
+        // A daemon that would not take it leaves the name on this dashboard.
+        app.submit_rename_agent(id.into(), "Pinned".into());
+        let _ = receive_request(&requests);
+        app.handle_worker_event(Event::LabelSet {
+            session_id: id.into(),
+            label: "Pinned".into(),
+            result: Err("refused".into()),
+        });
+        assert_eq!(
+            app.state.session_labels.get(id).map(String::as_str),
+            Some("Pinned")
+        );
+        app.apply_activity_refresh("local", &[session("something else")]);
+        assert_eq!(app.sessions[0].label, "Pinned");
+
+        // A name held here from before is sent to the record once, and stands
+        // down when it lands.
+        app.labels_migrating.clear();
         app.apply_session_labels();
-        assert_eq!(app.sessions[0].label, "Persisted");
+        assert!(matches!(
+            receive_request(&requests),
+            Request::SetLabel { label, .. } if label == "Pinned"
+        ));
+        app.apply_session_labels();
+        assert!(requests.try_recv().is_err(), "a held name was sent twice");
+        app.handle_worker_event(Event::LabelSet {
+            session_id: id.into(),
+            label: "Pinned".into(),
+            result: Ok(()),
+        });
+        assert!(app.state.session_labels.is_empty());
+
+        // A blank name clears it, and the folder names the row again.
+        app.submit_rename_agent(id.into(), "   ".into());
+        assert!(matches!(
+            receive_request(&requests),
+            Request::SetLabel { label, .. } if label.is_empty()
+        ));
+        app.sessions[0].title = None;
+        assert_eq!(app.sessions[0].display_label(), "project");
     }
 
     #[test]

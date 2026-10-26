@@ -2818,6 +2818,18 @@ END {
         ensure_success(&output, "send input to agent session")
     }
 
+    /// Name a session where everything that reads its name will see it: on the
+    /// daemon's record. A tmux-fallback session has no record to write, and is
+    /// named by the dashboard alone, as it always was.
+    pub fn set_label(&self, target: &Target, session_id: &str, label: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        if !session_id.starts_with(DAEMON_SESSION_PREFIX) {
+            bail!("{session_id} is not a muxloomd session, so its name lives on this dashboard");
+        }
+        self.bridges
+            .set_label(target, session_id.into(), label.trim().to_string())
+    }
+
     pub fn archive(&self, target: &Target, session_id: &str) -> Result<()> {
         debug::log(
             "runtime",

@@ -125,6 +125,13 @@ pub enum Request {
         target: Target,
         session_id: String,
     },
+    /// Name a session on its daemon's record, where an agent's own
+    /// `set_head_name` writes it too.
+    SetLabel {
+        target: Target,
+        session_id: String,
+        label: String,
+    },
     RemoveResumedArchive {
         target: Target,
         session_id: String,
@@ -385,6 +392,12 @@ pub enum Event {
     Archived {
         target_id: String,
         session_id: String,
+        result: Result<(), String>,
+    },
+    /// A name was written to a session's record, or could not be.
+    LabelSet {
+        session_id: String,
+        label: String,
         result: Result<(), String>,
     },
     ResumedArchiveRemoved {
@@ -841,6 +854,26 @@ impl Worker {
                         let _ = events.send(Event::Killed {
                             target_id,
                             session_id,
+                            result,
+                        });
+                    }
+                    Request::SetLabel {
+                        target,
+                        session_id,
+                        label,
+                    } => {
+                        let result = runtime
+                            .set_label(&target, &session_id, &label)
+                            .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            debug::log(
+                                "worker",
+                                format!("naming {session_id} failed target={}: {error}", target.id),
+                            );
+                        }
+                        let _ = events.send(Event::LabelSet {
+                            session_id,
+                            label,
                             result,
                         });
                     }

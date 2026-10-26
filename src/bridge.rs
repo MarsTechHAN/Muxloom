@@ -963,6 +963,12 @@ impl BridgeConnection {
         self.expect_ack(DaemonRequest::Archive { session_id })
     }
 
+    /// Name a session on its own record, which is the one every reader of it
+    /// asks: other dashboards, chat cards, and the session's own signature.
+    pub fn set_label(&self, session_id: String, label: String) -> Result<()> {
+        self.expect_ack(DaemonRequest::SetLabel { session_id, label })
+    }
+
     pub fn send_input(&self, session_id: String, bytes: Vec<u8>) -> Result<()> {
         self.require_capability("send-input-v1")?;
         self.expect_ack(DaemonRequest::SendInput { session_id, bytes })
@@ -2801,6 +2807,11 @@ impl BridgePool {
 
     pub fn archive(&self, target: &Target, session_id: String) -> Result<()> {
         self.connection_for_target(target)?.archive(session_id)
+    }
+
+    pub fn set_label(&self, target: &Target, session_id: String, label: String) -> Result<()> {
+        self.connection_for_target(target)?
+            .set_label(session_id, label)
     }
 
     pub fn send_input(&self, target: &Target, session_id: String, bytes: Vec<u8>) -> Result<()> {

@@ -283,6 +283,7 @@ shell 还有子进程在等就算 Working（静默链接中的编译也是编译
 | `p`（Agents） | 为所选机器设置本地端口转发 |
 | `Enter` | 打开 Terminal 或确认表单 |
 | `x` | Live Agent 归档；Temporal Chat 直接销毁；Archived Agent 永久删除。它起的子 Agent 一并关闭，光标上移一格而不是跳回顶部 |
+| Agents 中按 `e` | 重命名选中的 Agent。名字写进会话记录——也就是 Agent 自己调用 `set_head_name` 写的那一处——所以每个 Dashboard、聊天卡片和公告板署名读到的都是它 |
 | `a` | 展开或收起 Archived |
 | `/` / `Ctrl-p` | 搜索全部会话历史 |
 | `b` | 打开所有机器和 Agent 共用的 Talk Board；有未读时 Footer 会显示 `● N` |

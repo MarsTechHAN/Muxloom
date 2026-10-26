@@ -216,14 +216,18 @@ fn instructions(flavor: Flavor, policy: &McpConfig) -> String {
     };
     // Only a session has a head name of its own: the daemon flavor runs inside one,
     // while the controller is the user's fleet-wide view and has no row to name.
-    let headname = match flavor {
-        Flavor::Daemon => {
+    let headname = match flavor == Flavor::Daemon
+        || crate::permissions::launching_session().is_some()
+    {
+        true => {
             "- Keep your head name honest: set_head_name {{ name: \"...\" }} updates the name on \
              your row in the dashboard, so a person watching sees your current task at a glance. \
              Update it when the shape of your work changes, not on every step; keep it a whole- \
              task phrase under 60 characters.\n"
         }
-        Flavor::Controller => "",
+        // The controller run by hand, outside any session, has no row of its
+        // own to name. A moderator is a session like any other, and has one.
+        false => "",
     };
     let channel_limit = crate::channel::READABLE_LIMIT;
     let mut text = format!(
@@ -1003,24 +1007,11 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
             &["script"],
         ),
     });
-    // Daemon-only: only a session has its own head name. The controller is a
-    // fleet-wide view with no row of its own to rename.
+    // The daemon surface always runs inside a session, and its row is the
+    // caller's own. The controller surface adds this in `tools` when it is
+    // running inside one too — a moderator's.
     if flavor == Flavor::Daemon {
-        tools.push(ToolSpec {
-            name: "set_head_name",
-            description: "Set your own session's head name (the name on your row in the dashboard / \
-                          agent list). Use it to reflect, as a whole, what you are currently working \
-                          on. Keep it short (under 60 chars) and update it when the shape of your \
-                          work changes, not on every step."
-                .into(),
-            input_schema: schema(
-                false,
-                json!({
-                    "name": { "type": "string", "description": "Short phrase describing your current task." },
-                }),
-                &["name"],
-            ),
-        });
+        tools.push(head_name_spec());
         // A change aimed at another machine waits on the person, and the one
         // thing muxloom cannot work out for itself is where they are. The
         // agent can: it knows how the request reached it.
@@ -1045,6 +1036,25 @@ fn specs(flavor: Flavor) -> Vec<ToolSpec> {
         }
     }
     tools
+}
+
+/// The `set_head_name` tool, offered wherever the caller has a row of its own.
+fn head_name_spec() -> ToolSpec {
+    ToolSpec {
+        name: "set_head_name",
+        description: "Set your own session's head name (the name on your row in the dashboard / \
+                      agent list). Use it to reflect, as a whole, what you are currently working \
+                      on. Keep it short (under 60 chars) and update it when the shape of your \
+                      work changes, not on every step."
+            .into(),
+        input_schema: schema(
+            false,
+            json!({
+                "name": { "type": "string", "description": "Short phrase describing your current task." },
+            }),
+            &["name"],
+        ),
+    }
 }
 
 fn schema(multi_machine: bool, properties: Value, required: &[&str]) -> Value {
@@ -3881,7 +3891,15 @@ impl ControllerControl {
 
 impl ControlSurface for ControllerControl {
     fn tools(&self) -> Vec<ToolSpec> {
-        allowed_specs(Flavor::Controller, &self.config.mcp)
+        let mut tools = allowed_specs(Flavor::Controller, &self.config.mcp);
+        // A moderator runs this surface from inside a session of its own, and
+        // that session has a row to name like any other.
+        if crate::permissions::launching_session().is_some()
+            && denial(&self.config.mcp, "set_head_name").is_none()
+        {
+            tools.push(head_name_spec());
+        }
+        tools
     }
 
     fn instructions(&self) -> Option<String> {
@@ -3975,9 +3993,39 @@ impl ControlSurface for ControllerControl {
                 Ok(preview_text(&preview))
             }
             "run_shell" => self.run_shell(arguments),
+            // The caller's own session is on this machine, whatever else this
+            // surface can reach.
+            "set_head_name" => {
+                let (session_id, name) = head_name(arguments)?;
+                self.runtime
+                    .set_label(&Target::local(), &session_id, &name)?;
+                Ok(format!("Head name set to: {name}"))
+            }
             other => bail!("unknown tool {other}"),
         }
     }
+}
+
+/// The caller's own session and the name it asked for, checked.
+///
+/// The id comes from the environment the surface was started in, never from
+/// the arguments, so an agent cannot rename somebody else's row.
+fn head_name(arguments: &Value) -> Result<(String, String)> {
+    const MAX_HEAD_NAME: usize = 80;
+    let session_id = crate::permissions::launching_session()
+        .context("set_head_name can only be called from within a muxloom session")?;
+    let name: String = required_str(arguments, "name")?
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if name.is_empty() {
+        bail!("name must not be empty");
+    }
+    if name.chars().count() > MAX_HEAD_NAME {
+        bail!("name is too long: {MAX_HEAD_NAME} characters at most");
+    }
+    Ok((session_id, name))
 }
 
 #[cfg(unix)]
@@ -4791,20 +4839,7 @@ mod daemon_surface {
         /// surface was launched with, never from the arguments, so an agent
         /// cannot rename somebody else's row.
         fn set_head_name(&self, arguments: &Value) -> Result<String> {
-            let session_id = session_env("MUXLOOM_SESSION_ID")
-                .context("set_head_name can only be called from within a muxloom session")?;
-            const MAX_HEAD_NAME: usize = 80;
-            let name: String = required_str(arguments, "name")?
-                .trim()
-                .chars()
-                .filter(|c| !c.is_control())
-                .collect();
-            if name.is_empty() {
-                bail!("name must not be empty");
-            }
-            if name.chars().count() > MAX_HEAD_NAME {
-                bail!("name is too long: {MAX_HEAD_NAME} characters at most");
-            }
+            let (session_id, name) = super::head_name(arguments)?;
             self.expect_ack(&DaemonRequest::SetLabel {
                 session_id,
                 label: name.clone(),
@@ -6335,6 +6370,34 @@ mod tests {
             state_path: root.join("state.json"),
         };
         (control, root)
+    }
+
+    /// A moderator is a session with a row of its own, served by this surface;
+    /// it names its row the way every other agent does. Run by hand outside
+    /// any session, the surface has no row and offers nothing to name.
+    #[test]
+    fn a_moderator_can_name_its_own_row() {
+        let _lock = daemon_env_lock();
+        let _nobody = crate::permissions::test_env::nobody();
+        let (control, root) = controller_over_temp("head-name");
+        let named = |control: &ControllerControl| {
+            control
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "set_head_name")
+        };
+        assert!(!named(&control));
+        assert!(!control.instructions().unwrap().contains("set_head_name"));
+        let error = control
+            .call("set_head_name", &json!({ "name": "triage" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("within a muxloom session"), "{error}");
+
+        let _id = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-7-1-0"));
+        assert!(named(&control));
+        assert!(control.instructions().unwrap().contains("set_head_name"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -563,6 +563,10 @@ mod platform {
         /// Whether this session's record has been deleted on purpose. See
         /// [`ManagedSession::persist_metadata`].
         discarded: Mutex<bool>,
+        /// Held from the snapshot a record write is taken from until the write
+        /// lands, so two writes land in the order their snapshots were taken.
+        /// See [`ManagedSession::persist_metadata`].
+        persisting: Mutex<()>,
         archived: AtomicBool,
         /// Lines this daemon has counted itself, one per newline it recorded.
         line_count: AtomicUsize,
@@ -4763,6 +4767,7 @@ mod platform {
             history_path,
             metadata_path,
             discarded: Mutex::new(false),
+            persisting: Mutex::new(()),
             archived: AtomicBool::new(false),
             line_count: AtomicUsize::new(0),
             columns: AtomicU16::new(columns.max(20)),
@@ -5800,6 +5805,7 @@ mod platform {
             history_path,
             metadata_path,
             discarded: Mutex::new(false),
+            persisting: Mutex::new(()),
             archived: AtomicBool::new(archived),
             line_count: AtomicUsize::new(0),
             columns: AtomicU16::new(columns),
@@ -6703,6 +6709,16 @@ mod platform {
         /// The gate is held across the write and [`Self::discard`] takes it to
         /// remove the file, so the two cannot cross.
         fn persist_metadata(&self) -> Result<()> {
+            // Snapshot and write as one step. Each was taken on its own, so a
+            // round that snapshotted a moment before a rename could write after
+            // it, and the name on disk went back to the old one — invisible
+            // until the next daemon generation read the record in, and then the
+            // rename had simply never happened. Every caller arrives holding
+            // none of this session's other locks, so this one is outermost.
+            let _ordered = self
+                .persisting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Outside the gate: a snapshot draws this session's screen and
             // takes its own locks, and the gate is only ever the innermost one.
             let record = self.snapshot();

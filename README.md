@@ -478,6 +478,7 @@ the full categorized help inside the TUI.
 | `p` in Agents | Configure local port forwarding for the selected machine |
 | `Enter` | Open the selected terminal or confirm the current form |
 | `x` | Archive a live agent; directly destroy a Temporal Chat; delete an archived agent. The subagents it started go with it, and the cursor steps up one row rather than back to the top |
+| `e` in Agents | Rename the selected agent. The name is written to its session's record — the same one an agent's own `set_head_name` writes — so every dashboard, chat card and board signature reads it |
 | `a` | Show or hide archived agents |
 | `/`, `Ctrl-p` | Search all discovered session histories |
 | `b` | Open the talk board every machine and agent shares; the footer shows `● N` when it has unread messages |
