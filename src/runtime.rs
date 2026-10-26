@@ -2563,6 +2563,18 @@ END {
     /// sibling. Unlike [`Runtime::upload_files`] the destination name is chosen
     /// by the caller, which is what restoring an agent transcript needs: the
     /// agent only finds its own history under the name it wrote it as.
+    /// Whether a regular file is at `path` on the machine.
+    pub fn file_exists(&self, target: &Target, path: &str) -> Result<bool> {
+        match &target.transport {
+            Transport::Local => Ok(Path::new(path).is_file()),
+            Transport::Ssh { .. } => {
+                let output =
+                    self.run_shell(target, &format!("test -f {}", shell_quote(path)), false)?;
+                Ok(output.status.success())
+            }
+        }
+    }
+
     pub fn place_file(&self, target: &Target, local_path: &Path, remote_path: &str) -> Result<()> {
         let parent = Path::new(remote_path)
             .parent()

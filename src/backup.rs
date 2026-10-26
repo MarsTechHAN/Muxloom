@@ -1684,6 +1684,22 @@ pub fn restore_transcript(
         RestoreRoute::File(relative) => Some(runtime.home_relative_path(target, relative)?),
         RestoreRoute::Import => None,
     };
+    // A conversation still on the machine is the newer copy of it, so it is
+    // resumed as it stands rather than written over with the backup.
+    let still_there = match &placement {
+        Some(destination) => runtime.file_exists(target, destination)?,
+        None => runtime
+            .export_opencode_session(target, &record.native_id)?
+            .is_some(),
+    };
+    if still_there {
+        return Ok(RestoredTranscript {
+            resume_id: record.native_id.clone(),
+            path: placement.unwrap_or_default(),
+            bytes: 0,
+            placed: false,
+        });
+    }
     let temp = std::env::temp_dir().join(format!(
         "muxloom-restore-{}-{}.{}",
         sanitize(&record.target_id),
@@ -1727,6 +1743,7 @@ pub fn restore_transcript(
         resume_id: record.native_id.clone(),
         path: destination,
         bytes: data.len() as u64,
+        placed: true,
     })
 }
 

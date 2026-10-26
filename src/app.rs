@@ -553,6 +553,9 @@ struct PendingResume {
     kind: AgentKind,
     path: String,
     label: String,
+    /// The conversation the session recorded, which is the one it comes back
+    /// on — not whichever its folder wrote to last.
+    thread: Option<String>,
 }
 
 /// A slot the startup update thread writes once; the UI drains it on the next tick.
@@ -2519,6 +2522,7 @@ impl App {
                         kind: session.kind,
                         path: session.path.clone(),
                         label: session.label.clone(),
+                        thread: session.thread.clone(),
                     });
                 }
                 Request::Archive {
@@ -2631,6 +2635,25 @@ impl App {
                 remaining.push(pending);
                 continue;
             }
+            // Each session comes back on the conversation it recorded, listed
+            // or not: a runtime resumes by id, and the listing is only the
+            // folder's newest few. Handing out the folder's newest instead put
+            // two agents working in one repository onto each other's
+            // conversations, in whatever order the list happened to be in.
+            if let Some(thread) = pending.thread.clone() {
+                candidates.retain(|candidate| candidate.id != thread);
+                launches.push((pending, Some(thread)));
+                continue;
+            }
+            // A muxloom record that never named a conversation had none worth
+            // reopening, and comes back as itself, fresh, rather than on
+            // somebody else's.
+            if is_daemon_session_id(&pending.session_id) {
+                launches.push((pending, None));
+                continue;
+            }
+            // A legacy tmux session records nothing, and the newest transcript
+            // of its kind is the best there is.
             let Some(slot) = candidates
                 .iter()
                 .position(|candidate| candidate.kind == pending.kind)
@@ -2640,7 +2663,7 @@ impl App {
                 continue;
             };
             let candidate = candidates.remove(slot);
-            launches.push((pending, candidate.id));
+            launches.push((pending, Some(candidate.id)));
         }
         update.resumes = remaining;
         let target = update.target.clone();
@@ -2658,7 +2681,7 @@ impl App {
                 path: pending.path,
                 label: pending.label,
                 temporary: false,
-                resume_id: Some(resume_id),
+                resume_id,
                 revive: in_place.then(|| pending.session_id.clone()),
                 initial_prompt: None,
                 // A person at the dashboard is nobody's subagent.
@@ -6050,6 +6073,13 @@ impl App {
                                     remove_archive: !in_place
                                         && self.state.remove_archive_after_resume,
                                 });
+                            } else if let Some(thread) = pending.thread.clone()
+                                && self.restore_archived_conversation(&pending, &thread)
+                            {
+                                // Its own conversation, gone from the machine
+                                // but kept by the backup: it goes back first,
+                                // and lands back on this number when it is
+                                // there.
                             } else if !of_kind.is_empty() {
                                 // Several conversations in this folder and no way
                                 // to say which one this session was having.
@@ -6546,10 +6576,15 @@ impl App {
                                     None,
                                     revive,
                                 );
-                                self.status_message = format!(
-                                    "Restored {} of history to {target_id} - resuming {kind}...",
-                                    crate::ui::format_bytes(restored.bytes)
-                                );
+                                self.status_message = match restored.placed {
+                                    true => format!(
+                                        "Restored {} of history to {target_id} - resuming {kind}...",
+                                        crate::ui::format_bytes(restored.bytes)
+                                    ),
+                                    false => format!(
+                                        "The conversation is still on {target_id} - resuming {kind}..."
+                                    ),
+                                };
                             }
                             None => {
                                 self.status_message = format!(
@@ -6777,6 +6812,49 @@ impl App {
             session.display_label(),
             session.target_id
         );
+    }
+
+    /// Bring an archived session's own conversation back from the backup when
+    /// its runtime no longer has it, and resume it there once it lands. Says
+    /// whether a restore went out: without a backup of that conversation there
+    /// is nothing to bring back, and the caller hands the person the folder's.
+    fn restore_archived_conversation(&mut self, pending: &ArchivedResume, thread: &str) -> bool {
+        if !self.config.backup.enabled {
+            return false;
+        }
+        let target = pending.launch.target.clone();
+        let Some(machine_key) = backup_holding_conversation(
+            &self.backup_root,
+            &target.id,
+            &pending.source_session_id,
+            thread,
+        ) else {
+            return false;
+        };
+        let key = (target.id.clone(), pending.source_session_id.clone());
+        if !self.restoring.insert(key.clone()) {
+            self.status_message = "That history is already being transferred".into();
+            return true;
+        }
+        if self
+            .worker
+            .requests
+            .send(Request::BackupRestore {
+                target: target.clone(),
+                machine_key,
+                session_id: pending.source_session_id.clone(),
+            })
+            .is_err()
+        {
+            self.restoring.remove(&key);
+            return false;
+        }
+        self.busy_operations = self.busy_operations.saturating_add(1);
+        self.status_message = format!(
+            "{}'s conversation is no longer on {} - bringing it back from the backup...",
+            pending.label, target.id
+        );
+        true
     }
 
     /// Push a recoverable session's transcript back onto its machine in the
@@ -13488,6 +13566,42 @@ fn recoverable_backup_records(
     Vec::new()
 }
 
+/// The backup partition that holds a resumable copy of `thread` as the session
+/// `session_id` on `alias` mirrored it, if the store has one. What an archived
+/// session whose conversation its runtime has since cleaned away (Claude Code
+/// keeps a month) can be brought back from.
+#[cfg(feature = "controller")]
+fn backup_holding_conversation(
+    root: &Path,
+    alias: &str,
+    session_id: &str,
+    thread: &str,
+) -> Option<String> {
+    let store = crate::backup::BackupStore::new(root.to_path_buf());
+    let index = store.load_index().ok()?;
+    let machine = index.machine_key_for_alias(alias);
+    index
+        .records
+        .iter()
+        .any(|record| {
+            record.target_id == machine
+                && record.session_id == session_id
+                && record.native_id == thread
+                && crate::backup::is_restorable(record)
+        })
+        .then_some(machine)
+}
+
+#[cfg(not(feature = "controller"))]
+fn backup_holding_conversation(
+    _root: &Path,
+    _alias: &str,
+    _session_id: &str,
+    _thread: &str,
+) -> Option<String> {
+    None
+}
+
 /// The raw terminal capture kept for a backed-up session, ready to be rendered
 /// as read-only history. Empty when only messages were captured.
 #[cfg(feature = "controller")]
@@ -17208,6 +17322,220 @@ mod tests {
                 .remove_archive_after_resume
         );
         let _ = std::fs::remove_file(state_path);
+    }
+
+    /// Claude Code keeps a month of transcripts. An archived session older
+    /// than that still names its conversation, the machine no longer has it,
+    /// and the backup does: it is put back and resumed, on the session's own
+    /// number, instead of the person being asked to pick somebody else's.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn an_archived_session_whose_conversation_was_cleaned_away_comes_back_from_the_backup() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "muxloom-backup-resume-{}-{unique}",
+            std::process::id()
+        ));
+        let mut config = Config::default();
+        config.backup.enabled = true;
+        let mut app = App::new(
+            config,
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            scratch.join("state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.backup_root = scratch.join("backup");
+        app.targets[0].probe.set(AgentKind::Claude, true);
+        let record = "muxloomd-claude-1785000000-1-0";
+        let store = crate::backup::BackupStore::new(app.backup_root.clone());
+        let mut index = crate::backup::BackupIndex::default();
+        index.upsert(crate::backup::BackupRecord {
+            target_id: "local".into(),
+            session_id: record.into(),
+            kind: "claude".into(),
+            cwd: "/work/project".into(),
+            native_id: "a-month-ago".into(),
+            native_path: "/home/test/.claude/projects/-work-project/a-month-ago.jsonl".into(),
+            jsonl_bytes_synced: 4_096,
+            message_count: 12,
+            ..Default::default()
+        });
+        store.save_index(&index).unwrap();
+        app.sessions.push(AgentSession {
+            id: record.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            label: "pager fix".into(),
+            created_at: 1,
+            archived_at: Some(2),
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: Some("a-month-ago".into()),
+            parent: None,
+            used_at: None,
+        });
+        app.selected_session_id = Some(record.into());
+        app.focus = Focus::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::ScanResumes { .. }
+        ));
+        let candidate = |id: &str| ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/test/.claude/projects/-work-project/{id}.jsonl"),
+            recap: Some(format!("conversation {id}")),
+            first_message: None,
+            last_message: None,
+            updated_at: "2026-10-26T12:00:00Z".into(),
+        };
+        app.handle_worker_event(Event::ResumesScanned {
+            target_id: "local".into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            warning: None,
+            result: Ok(vec![candidate("newest"), candidate("older")]),
+        });
+        // Not the picker: the conversation it was having goes back first.
+        assert!(
+            !matches!(app.modal, Some(Modal::Resume(_))),
+            "{:?}",
+            app.modal
+        );
+        match receive_request(&request_rx) {
+            Request::BackupRestore {
+                machine_key,
+                session_id,
+                ..
+            } => {
+                assert_eq!(machine_key, "local");
+                assert_eq!(session_id, record);
+            }
+            request => panic!("expected a restore, got {request:?}"),
+        }
+
+        // Back on the machine, it resumes as itself.
+        app.handle_worker_event(Event::BackupRestored {
+            target_id: "local".into(),
+            session_id: record.into(),
+            result: Ok(crate::model::RestoredTranscript {
+                resume_id: "a-month-ago".into(),
+                path: "/home/test/.claude/projects/-work-project/a-month-ago.jsonl".into(),
+                bytes: 4_096,
+                placed: true,
+            }),
+        });
+        match receive_request(&request_rx) {
+            Request::Launch { request, .. } => {
+                assert_eq!(request.resume_id.as_deref(), Some("a-month-ago"));
+                assert_eq!(request.revive.as_deref(), Some(record));
+            }
+            request => panic!("expected the resume, got {request:?}"),
+        }
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// A forced update brings every agent back on the conversation it
+    /// recorded — two agents in one folder used to be handed the folder's
+    /// newest in list order, each the other's — and a muxloom record that
+    /// recorded none comes back as itself, fresh.
+    #[test]
+    fn a_forced_update_resumes_each_agent_on_its_own_conversation() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            std::env::temp_dir().join(format!("muxloom-forced-{}.json", std::process::id())),
+            vec![Target::local()],
+            worker,
+        );
+        let pending = |id: &str, thread: Option<&str>| PendingResume {
+            session_id: id.into(),
+            kind: AgentKind::Claude,
+            path: "/work/project".into(),
+            label: id.into(),
+            thread: thread.map(Into::into),
+        };
+        app.forced_updates.insert(
+            "local".into(),
+            ForcedUpdate {
+                target: Target::local(),
+                phase: ForcedPhase::Resuming,
+                deadline: Instant::now() + Duration::from_secs(60),
+                resumes: vec![
+                    pending("muxloomd-claude-api-1-0", Some("conv-api")),
+                    pending("muxloomd-claude-ui-1-1", Some("conv-ui")),
+                    pending("muxloomd-claude-quiet-1-2", None),
+                ],
+                pending_acks: 1,
+                terminals_archived: 0,
+                escalated: false,
+            },
+        );
+        let candidate = |id: &str| ResumeCandidate {
+            id: id.into(),
+            kind: AgentKind::Claude,
+            source_path: format!("/home/test/.claude/projects/{id}.jsonl"),
+            recap: None,
+            first_message: None,
+            last_message: None,
+            updated_at: "2026-10-26T12:00:00Z".into(),
+        };
+        // Newest first: the order that used to decide who got what.
+        assert!(app.forced_update_handle_resumes(
+            "local",
+            "/work/project",
+            &Ok(vec![
+                candidate("conv-ui"),
+                candidate("conv-api"),
+                candidate("stray")
+            ]),
+        ));
+        let mut resumed = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            match receive_request(&request_rx) {
+                Request::Launch { request, .. } => {
+                    resumed.insert(request.revive.clone().unwrap(), request.resume_id.clone());
+                }
+                request => panic!("expected a resume, got {request:?}"),
+            }
+        }
+        assert_eq!(
+            resumed["muxloomd-claude-api-1-0"].as_deref(),
+            Some("conv-api")
+        );
+        assert_eq!(
+            resumed["muxloomd-claude-ui-1-1"].as_deref(),
+            Some("conv-ui")
+        );
+        assert_eq!(resumed["muxloomd-claude-quiet-1-2"], None);
     }
 
     /// A daemon record is asked back under its own number. That is what
@@ -21317,6 +21645,7 @@ mod tests {
                 resume_id: "native-lost".into(),
                 path: "/home/me/.codex/sessions/2026/08/09/rollout-native-lost.jsonl".into(),
                 bytes: 128,
+                placed: true,
             }),
         });
         assert!(!app.is_restoring("local", "muxloomd-codex-lost"));

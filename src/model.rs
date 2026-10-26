@@ -832,6 +832,11 @@ pub struct RestoredTranscript {
     pub path: String,
     /// Uncompressed transcript size, for the status line.
     pub bytes: u64,
+    /// Whether the backup was written onto the machine. A transcript that is
+    /// still there is left alone and resumed as it is: it is the newer of the
+    /// two, and a conversation missing only from a capped listing is not one
+    /// the machine lost.
+    pub placed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

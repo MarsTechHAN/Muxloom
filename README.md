@@ -291,8 +291,15 @@ started over, and no second entry left behind in the archive. The
 conversation it reopens is the one the record names - the transcript the
 daemon matched it to while it ran, or, never matched, the one its own launch
 was told to reopen - so a session that was resumed and put down again before
-anyone typed into it still knows which conversation it was. Only when the
-record names none and the folder holds several is the choice handed to you.
+anyone typed into it still knows which conversation it was. A runtime cleans
+its own transcripts away after a while (Claude Code keeps a month), so when the
+machine no longer has that conversation and the local backup does, it is put
+back and resumed — a transcript still on the machine is never written over,
+since it is the newer copy. Only when the record names none and the folder
+holds several, or the backup has nothing either, is the choice handed to you.
+A forced daemon update brings every agent back the same way, each on the
+conversation its own record names, and one that named none comes back fresh
+rather than on whichever conversation its folder wrote to last.
 An entry a resume superseded before this - one whose record says the
 conversation moved on to another entry still listed - is not shown twice.
 Legacy tmux sessions are relaunched beside their archive instead, and for
