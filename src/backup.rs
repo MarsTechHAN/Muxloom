@@ -1041,10 +1041,7 @@ fn sync_transcript(
             .unwrap_or_default();
     }
     // Nothing to do if the transcript has not advanced since the last sync.
-    if !candidate.updated_at.is_empty()
-        && candidate.updated_at == record.native_updated_at
-        && record.jsonl_bytes_synced > 0
-    {
+    if mirror_is_current(kind, &candidate.updated_at, record) {
         return Ok(());
     }
     let updated_at = candidate.updated_at.clone();
@@ -1102,6 +1099,19 @@ fn sync_transcript(
     // asked for that one session, which is also what it takes back on restore.
     let data = if kind == AgentKind::OpenCode {
         match runtime.export_opencode_session(target, &candidate.id)? {
+            Some(document) if !whole_opencode_document(&document) => {
+                crate::debug::log(
+                    "backup",
+                    format!(
+                        "opencode export of {} on {} did not parse ({} bytes); keeping the \
+                         backup as it was",
+                        candidate.id,
+                        target.id,
+                        document.len()
+                    ),
+                );
+                return Ok(());
+            }
             Some(document) => document,
             // The session was deleted, or the machine no longer has opencode on
             // it. Either way there is nothing new to mirror and what is already
@@ -1161,6 +1171,23 @@ fn sync_transcript(
     }
     stats.transcripts += 1;
     Ok(())
+}
+
+/// Whether the mirror already holds the transcript as it stands at `updated_at`.
+/// An OpenCode mirror holding no messages never is: exports used to come back
+/// cut off by the pipe they were read through, and a conversation nobody is
+/// adding to would otherwise keep the half document it was first mirrored as.
+fn mirror_is_current(kind: AgentKind, updated_at: &str, record: &BackupRecord) -> bool {
+    !updated_at.is_empty()
+        && updated_at == record.native_updated_at
+        && record.jsonl_bytes_synced > 0
+        && !(kind == AgentKind::OpenCode && record.message_count == 0)
+}
+
+/// Whether an OpenCode export is a whole document. A cut-off one does not
+/// parse, and keeping what is already backed up beats replacing it with half.
+fn whole_opencode_document(document: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(document).is_ok()
 }
 
 /// Choose the native transcript for a session.
@@ -2817,6 +2844,31 @@ mod tests {
     /// An OpenCode record has no transcript path to put back, because there is
     /// no file - it goes home through OpenCode's own import, and the folder it
     /// belonged to is part of the address.
+    #[test]
+    fn a_cut_off_opencode_export_is_neither_mirrored_nor_left_standing() {
+        // What a pipe used to hand back: the front of the document only.
+        let whole = br#"{"info":{"id":"ses_1"},"messages":[{"info":{"role":"user"},"parts":[]}]}"#;
+        assert!(whole_opencode_document(whole));
+        assert!(!whole_opencode_document(&whole[..40]));
+
+        // A mirror made from one holds no messages, and is pulled again even
+        // though the conversation has not moved since.
+        let mut record = BackupRecord {
+            kind: AgentKind::OpenCode.as_str().into(),
+            native_updated_at: "2026-10-26T08:00:00.000Z".into(),
+            jsonl_bytes_synced: 65_536,
+            message_count: 0,
+            ..Default::default()
+        };
+        let unchanged = "2026-10-26T08:00:00.000Z";
+        assert!(!mirror_is_current(AgentKind::OpenCode, unchanged, &record));
+        record.message_count = 202;
+        assert!(mirror_is_current(AgentKind::OpenCode, unchanged, &record));
+        // A transcript file with no messages yet is just a quiet one.
+        record.message_count = 0;
+        assert!(mirror_is_current(AgentKind::Claude, unchanged, &record));
+    }
+
     #[test]
     fn an_opencode_session_is_restored_by_handing_it_back() {
         let mut record = BackupRecord {

@@ -2724,9 +2724,17 @@ END {
     /// gone: a backup run sweeps every session it knows of, and a machine that
     /// has since dropped the CLI is not an error worth failing the sweep over.
     pub fn export_opencode_session(&self, target: &Target, id: &str) -> Result<Option<Vec<u8>>> {
+        // Into a file and read back from there, never straight down a pipe:
+        // OpenCode exits the moment it has written the document, and what had
+        // not drained from the pipe by then is lost. Every export through one
+        // came back cut at a multiple of 64 KiB — a 1 MB conversation as 128
+        // KiB of JSON that does not parse — so every OpenCode backup held no
+        // messages and a restore would have imported half a document.
         let script = format!(
-            "PATH=\"$HOME/.local/bin:$PATH\"; command -v opencode >/dev/null 2>&1 || exit 0; {} \
-             </dev/null 2>/dev/null",
+            "PATH=\"$HOME/.local/bin:$PATH\"; command -v opencode >/dev/null 2>&1 || exit 0; \
+             dir=\"$HOME/.cache/muxloom\"; mkdir -p \"$dir\" || exit 1; \
+             out=\"$dir/opencode-export-$$.json\"; {} </dev/null >\"$out\" 2>/dev/null; \
+             status=$?; cat \"$out\"; rm -f \"$out\"; exit $status",
             shell_join(&["opencode", "export", id])
         );
         let output = self.run_shell(target, &script, false)?;
