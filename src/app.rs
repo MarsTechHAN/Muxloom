@@ -8475,12 +8475,18 @@ impl App {
             self.show_history_page(page);
             let stride = history_capture_stride(chunk_lines, viewport_lines);
             let next_capture = capture_offset.saturating_add(stride);
+            // Once: a chunk already in hand, or one the history is known to
+            // end before, is not fetched again. Without this every arrival of
+            // the next chunk passed the same test as the scroll that asked for
+            // it, and asked for it again - back to back, for as long as the
+            // view sat in the second half of a chunk.
             if desired_offset.saturating_sub(capture_offset) > stride / 2
                 && self.pending_capture.is_none()
                 && self
                     .history
                     .oldest_offset()
                     .is_none_or(|oldest| next_capture <= oldest)
+                && !self.history_chunk_known(&session.target_id, &session.id, next_capture)
             {
                 self.send_history_capture(&session, next_capture, chunk_lines, false);
             }
@@ -8538,18 +8544,19 @@ impl App {
         }
     }
 
-    fn cached_history_page(
-        &self,
+    /// The cached pages of a session that still describe it the way the page
+    /// on screen does, so that one may stand in for another.
+    fn reusable_history_pages<'a>(
+        &'a self,
         target_id: &str,
         session_id: &str,
-        desired_offset: usize,
-        viewport_lines: usize,
-    ) -> Option<HistoryPage> {
+    ) -> impl Iterator<Item = &'a HistoryPage> + 'a {
         let key = history_cache_key(target_id, session_id);
         let drawn_width = self.history_drawn_width(&key);
         self.history_cache
-            .get(&key)?
-            .iter()
+            .get(&key)
+            .into_iter()
+            .flatten()
             // A rendered page is not text, it is the rows a terminal of one
             // particular width drew, and only pages drawn at one width tile:
             // the rows a page counts back depend on where its lines wrapped.
@@ -8558,7 +8565,7 @@ impl App {
             // one at. Matching it to the pane instead turned away every page
             // of a session not exactly as wide as the pane, the one that had
             // just arrived included, and each arrival asked for itself again.
-            .filter(|page| !page.rendered || page.pane_width == drawn_width)
+            .filter(move |page| !page.rendered || page.pane_width == drawn_width)
             .filter(|page| {
                 if self.history.total_lines() == 0 {
                     return true;
@@ -8571,6 +8578,27 @@ impl App {
                 page.rendered == self.history.rendered
                     && (page.rendered || page.total_lines() == self.history.total_lines())
             })
+    }
+
+    /// Whether the chunk captured from `offset` needs no asking for: a page
+    /// that starts there is cached, or a cached page says the history ends
+    /// before it.
+    fn history_chunk_known(&self, target_id: &str, session_id: &str, offset: usize) -> bool {
+        self.reusable_history_pages(target_id, session_id)
+            .any(|page| {
+                page.offset_from_bottom == offset
+                    || page.oldest_offset().is_some_and(|oldest| offset > oldest)
+            })
+    }
+
+    fn cached_history_page(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        desired_offset: usize,
+        viewport_lines: usize,
+    ) -> Option<HistoryPage> {
+        self.reusable_history_pages(target_id, session_id)
             .filter_map(|page| materialize_history_page(page, desired_offset, viewport_lines))
             .max_by_key(|page| page.offset_from_bottom)
     }
@@ -16504,6 +16532,125 @@ mod tests {
             "one capture for one page, not one after another for as long as it is selected"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Page an attached session back `steps` times by `step_lines`, with a
+    /// daemon that renders a 5,000-line log and can read back no further than
+    /// `reach` rows, answering each capture `delay` scroll steps after it was
+    /// asked for. Says how many captures it took, or where the view stuck.
+    fn page_back_through(
+        reach: usize,
+        step_lines: usize,
+        delay: usize,
+        steps: usize,
+    ) -> Result<(usize, usize, String), String> {
+        let (mut app, request_rx, root, _boundary) = attached_claude_app("paging");
+        app.agent_viewport_width = 80;
+        app.agent_viewport_height = 40;
+        let mut terminal = TerminalSession::detached(80, 40);
+        let output: String = (1..=100).map(|line| format!("live-{line}\r\n")).collect();
+        terminal.process_output_for_test(output.as_bytes());
+        app.terminal = Some(terminal);
+        app.history_offset = 0;
+        app.terminal_scrollback_pin = 0;
+        let log: String = (1..=5000).map(|line| format!("line-{line}\r\n")).collect();
+        let mut queue: std::collections::VecDeque<(usize, Request)> = Default::default();
+        let mut captures = 0;
+        let mut loading_since: Option<usize> = None;
+        let mut outcome = Ok(());
+        for step in 0..steps {
+            app.scroll_history(true, step_lines);
+            let mut serve_until_quiet = true;
+            while serve_until_quiet {
+                while let Ok(request) = request_rx.try_recv() {
+                    captures += 1;
+                    queue.push_back((step + delay, request));
+                }
+                serve_until_quiet = false;
+                if captures > 200 {
+                    break;
+                }
+                if queue.front().is_some_and(|(due, _)| *due <= step) {
+                    let (_, request) = queue.pop_front().unwrap();
+                    let Request::Capture {
+                        offset_from_bottom,
+                        lines,
+                        ..
+                    } = request
+                    else {
+                        continue;
+                    };
+                    let (page, total, actual) = crate::terminal_session::render_history_rows(
+                        log.as_bytes(),
+                        80,
+                        40,
+                        offset_from_bottom,
+                        lines,
+                    )
+                    .unwrap();
+                    // A daemon that could read back only `reach` rows hands
+                    // over what it found and says there is more.
+                    let text = String::from_utf8_lossy(&page).trim_end().to_string();
+                    let rows: Vec<&str> = text.lines().collect();
+                    let kept = reach.saturating_sub(actual).min(rows.len());
+                    let text = rows[rows.len() - kept..].join("\n");
+                    app.handle_worker_event(Event::Captured {
+                        target_id: "local".into(),
+                        session_id: "muxloomd-claude-long-history".into(),
+                        result: Ok(HistoryPage {
+                            text,
+                            history_size: total.min(reach).saturating_sub(40),
+                            pane_height: 40,
+                            pane_width: 80,
+                            offset_from_bottom: actual,
+                            rendered: true,
+                            more_history: actual >= offset_from_bottom,
+                        }),
+                    });
+                    serve_until_quiet = true;
+                }
+            }
+            if captures > 200 {
+                outcome = Err(format!(
+                    "a capture storm at offset {}: {captures} captures by step {step}",
+                    app.history_offset
+                ));
+                break;
+            }
+            if app.history_loading {
+                let since = *loading_since.get_or_insert(step);
+                if step - since > delay * 4 + 4 {
+                    outcome = Err(format!(
+                        "loading since step {since}, at offset {}",
+                        app.history_offset
+                    ));
+                    break;
+                }
+            } else {
+                loading_since = None;
+            }
+        }
+        let result = outcome.map(|()| (app.history_offset, captures, app.status_message.clone()));
+        let _ = std::fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
+    fn a_chunk_in_hand_is_not_asked_for_again() {
+        // Past the middle of a chunk the next one is fetched ahead of the
+        // view. Its arrival passed the same test as the scroll that asked for
+        // it, and asked for it again: back to back, for as long as the view
+        // sat there, a daemon replaying the log for each.
+        for (step_lines, delay) in [(1, 0), (1, 3), (38, 0), (38, 2)] {
+            let steps = 1_500 / step_lines;
+            let (offset, captures, _) = page_back_through(usize::MAX, step_lines, delay, steps)
+                .unwrap_or_else(|stuck| panic!("{step_lines}-line steps: {stuck}"));
+            assert!(offset >= 1_400, "the view got where it was going: {offset}");
+            assert!(
+                captures <= 4,
+                "one capture per chunk of 440 rows, not {captures}"
+            );
+        }
     }
 
     /// The daemon draws a page at the session's own width, and wider still
