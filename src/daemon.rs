@@ -4603,7 +4603,12 @@ mod platform {
         // already held: it is the same session coming back, not a new one
         // being started with nobody watching, and a resume that quietly handed
         // a subagent full powers would be a way to shed its limits by dying.
-        let powers = powers.or_else(|| resuming.as_ref().and_then(|record| record.powers.clone()));
+        //
+        // So does a resume onto a new number: the label and the parent come
+        // over from the archived record, and its limits have to come with
+        // them, or a restricted subagent reopened from the picker came back
+        // holding everything.
+        let powers = powers.or_else(|| carried.and_then(|record| record.powers.clone()));
         // What the agent that asked for this session handed it. Set here and
         // nowhere else, so an agent cannot read its own limits off a variable
         // it could have written: the muxloom tools inside the session read
@@ -4683,11 +4688,13 @@ mod platform {
             // nobody has typed into yet was written long before it. Archived
             // in that state the record named no conversation at all, and the
             // next resume of it had to ask which of the folder's it meant.
-            thread: resuming
-                .as_ref()
-                .filter(|_| seed.is_some())
-                .and_then(|record| record.thread.clone())
-                .or_else(|| seed.clone()),
+            //
+            // The seed is that conversation, whatever the record was on
+            // before. Preferring the record's old thread put a revival onto a
+            // different conversation back on the one it left: the matcher
+            // took the old thread for a claim this session had inherited, and
+            // the session archived as the conversation nobody had reopened.
+            thread: seed.clone(),
             seed: seed.clone(),
             // A launch that reopens a thread reopens the conversation that
             // opened with those words too. One that starts fresh is being
@@ -4710,9 +4717,11 @@ mod platform {
             // next launch of this session stamps the same environment.
             powers,
             resumed_from: resumed_from.as_ref().map(|record| record.id.clone()),
-            resumed_to: resuming
-                .as_ref()
-                .and_then(|record| record.resumed_to.clone()),
+            // Live again under its own number, so whatever it was once
+            // resumed as is not where it lives now. Carried over, the old
+            // successor hid this running session from every listing that
+            // folds a superseded record into its successor.
+            resumed_to: None,
             // Starting a session is using it — reviving an old one most of all,
             // which would otherwise sort by when it was last used before it was
             // put down.
@@ -10107,6 +10116,76 @@ mod platform {
                     .windows(11)
                     .any(|w| w == b"marker line")
             );
+        }
+
+        /// A revival reopens the conversation it is given, keeps the limits
+        /// the record held, and is no longer anybody's past; a resume onto a
+        /// new number takes the archived record's limits with its label.
+        #[test]
+        fn a_revival_takes_the_conversation_it_is_given_and_a_resume_keeps_the_limits() {
+            let state = test_state("revive-seed");
+            let root = state.paths.root.clone();
+            let launch = |id: &str, conversation: &str, powers| {
+                launch_session(
+                    &state,
+                    id.into(),
+                    "claude".into(),
+                    "/tmp".into(),
+                    "helper".into(),
+                    false,
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "cat".into(),
+                        "--resume".into(),
+                        conversation.into(),
+                    ],
+                    vec![],
+                    111,
+                    80,
+                    24,
+                    Some("muxloomd-claude-lead".into()),
+                    powers,
+                    None,
+                )
+                .unwrap()
+            };
+            let limited = crate::model::Powers {
+                reach: crate::model::Reach::Parent,
+                launches: Vec::new(),
+                may_reach_person: false,
+            };
+            let first = launch(
+                "muxloomd-claude-revive-seed",
+                "conv-a",
+                Some(limited.clone()),
+            );
+            assert_eq!(first.snapshot().thread.as_deref(), Some("conv-a"));
+            first.archive().unwrap();
+            drop(first);
+
+            // Back on its own number, onto another conversation: that one,
+            // not the one the record was on.
+            let revived = launch("muxloomd-claude-revive-seed", "conv-b", None);
+            let snapshot = revived.snapshot();
+            assert_eq!(snapshot.thread.as_deref(), Some("conv-b"));
+            assert_eq!(snapshot.powers.as_ref(), Some(&limited));
+            assert!(snapshot.resumed_to.is_none());
+            revived.archive().unwrap();
+            drop(revived);
+
+            // Reopened on a new number: the label, the parent and the limits
+            // of the record it came from all come with it.
+            let moved = launch("muxloomd-claude-revive-moved", "conv-b", None);
+            let snapshot = moved.snapshot();
+            assert_eq!(
+                snapshot.resumed_from.as_deref(),
+                Some("muxloomd-claude-revive-seed")
+            );
+            assert_eq!(snapshot.powers.as_ref(), Some(&limited));
+            moved.archive().unwrap();
+            drop(moved);
+            discard_root(root);
         }
 
         #[test]

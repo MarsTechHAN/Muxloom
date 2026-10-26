@@ -5134,8 +5134,11 @@ fn daemon_agent_session(target_id: &str, session: DaemonSession) -> Option<Agent
 /// searchable, and the daemon still reads its alias.
 fn without_superseded(sessions: Vec<DaemonSession>) -> Vec<DaemonSession> {
     let listed: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+    // Only a record that has stopped can be superseded: a running session is
+    // nobody's past, whatever its record says it was once resumed as.
     let superseded: HashSet<String> = sessions
         .iter()
+        .filter(|session| session.dead || session.archived)
         .filter(|session| {
             session
                 .resumed_to
@@ -5417,6 +5420,14 @@ mod tests {
                 "muxloomd-claude-4-1-0"
             ]
         );
+
+        // Revived in place after its successor stopped: running again, and
+        // never folded into the stopped record it was once resumed as.
+        let mut revived = stored("muxloomd-claude-1-1-0", Some("muxloomd-claude-2-1-0"));
+        revived.dead = false;
+        revived.archived = false;
+        let listed = without_superseded(vec![revived, stored("muxloomd-claude-2-1-0", None)]);
+        assert_eq!(listed.len(), 2, "{listed:?}");
     }
 
     #[test]
