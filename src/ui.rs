@@ -1363,7 +1363,7 @@ fn render_vt_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, area: Rect, s
                 destination.set_symbol(if contents.is_empty() || clipped {
                     " "
                 } else {
-                    &contents
+                    cell_symbol(&contents, source.is_wide())
                 });
                 destination.set_style(vt_style(source));
             }
@@ -1372,6 +1372,27 @@ fn render_vt_screen(frame: &mut Frame<'_>, screen: &vt100::Screen, area: Rect, s
     if let Some(cursor) = cursor {
         frame.set_cursor_position(cursor);
     }
+}
+
+/// What to draw for a cell holding `contents`: the contents themselves,
+/// unless they measure wider than the cell the emulator gave them.
+///
+/// vt100 sizes a cell by its first character and hangs whatever zero-width
+/// characters follow onto it, so `⚠️` - a warning sign and the selector that
+/// asks for its emoji form - sits in one cell with the next character in the
+/// cell after. The painter measures the whole string, finds two columns, and
+/// skips the next cell as covered: the character after the emoji was never
+/// drawn, or stayed whatever was there before. Keep the grid the emulator
+/// laid out and draw the character on its own.
+fn cell_symbol(contents: &str, wide: bool) -> &str {
+    let room = if wide { 2 } else { 1 };
+    if UnicodeWidthStr::width(contents) <= room {
+        return contents;
+    }
+    contents
+        .char_indices()
+        .nth(1)
+        .map_or(contents, |(end, _)| &contents[..end])
 }
 
 /// Dim and strikethrough are missing here on purpose: vt100 0.15 tracks them
@@ -7119,6 +7140,36 @@ mod tests {
         app.terminal = Some(terminal);
         app.interactive = true;
         app
+    }
+
+    #[test]
+    fn the_character_after_an_emoji_selector_is_drawn() {
+        // A warning sign with the selector asking for its emoji form, the
+        // same for a keycap, and a plain wide glyph for comparison.
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process("⚠\u{fe0f}x ok\r\n1\u{fe0f}\u{20e3}y\r\n界z".as_bytes());
+        let backend = TestBackend::new(12, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_vt_screen(frame, parser.screen(), frame.area(), false))
+            .unwrap();
+
+        // What reached the terminal, through the painter's own diff.
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..12)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(
+            row(0),
+            "⚠x ok",
+            "the emulator put x in the cell after the sign, so that is where it is drawn"
+        );
+        assert_eq!(row(1), "1y");
+        assert_eq!(row(2), "界 z", "a wide glyph still covers two cells");
     }
 
     #[test]
