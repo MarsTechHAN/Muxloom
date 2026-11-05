@@ -2502,6 +2502,75 @@ mod tests {
         assert_eq!(out, b"second value");
     }
 
+    /// The store holds the complete native transcript of every mirrored agent
+    /// conversation and every terminal capture on the machine. Bare
+    /// `create_dir_all`/`fs::write` calls inherit the umask, which under the
+    /// usual 022 leaves the tree 0755/0644: readable by every other local user.
+    /// Everything the store writes is private to its owner instead.
+    #[cfg(unix)]
+    #[test]
+    fn backup_store_keeps_everything_it_writes_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A normal desktop umask. The store must not depend on the umask to
+        // keep conversations private.
+        struct Umask(libc::mode_t);
+        impl Drop for Umask {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _umask = Umask(unsafe { libc::umask(0o022) });
+
+        let store = temp_store();
+        // A root and index left loose by an older build are repaired when the
+        // store touches them; the rest of the tree is not walked.
+        fs::create_dir_all(store.root()).unwrap();
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(store.index_path(), "{\"records\":[],\"machines\":[]}\n").unwrap();
+        fs::set_permissions(store.index_path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        store
+            .append_frame("local", "s1", CAPTURE_BLOB, b"hello\n")
+            .unwrap();
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, b"{\"type\":\"user\"}\n")
+            .unwrap();
+        store.save_index(&BackupIndex::default()).unwrap();
+
+        let root = store.root().to_path_buf();
+        let blobs = root.join("blobs");
+        let machine = blobs.join("local");
+        let session = store.session_dir("local", "s1");
+        let index = store.index_path();
+        let capture = session.join(CAPTURE_BLOB);
+        let transcript = session.join(TRANSCRIPT_BLOB);
+
+        let mut loose = Vec::new();
+        for (path, want, what) in [
+            (root.as_path(), 0o700, "the store root"),
+            (blobs.as_path(), 0o700, "the blob partition"),
+            (machine.as_path(), 0o700, "the machine directory"),
+            (session.as_path(), 0o700, "the session directory"),
+            (index.as_path(), 0o600, "the index"),
+            (capture.as_path(), 0o600, "the capture blob"),
+            (transcript.as_path(), 0o600, "the transcript blob"),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            if mode != want {
+                loose.push(format!(
+                    "{what} is {mode:04o}, want {want:04o}: {}",
+                    path.display()
+                ));
+            }
+        }
+        assert!(
+            loose.is_empty(),
+            "the backup store is readable by every local user:\n{}",
+            loose.join("\n")
+        );
+    }
+
     /// A transcript long enough to fingerprint, written where a sync can read
     /// it. Returns the path and the record a first whole pass would have left.
     fn mirrored_transcript(name: &str, lines: usize) -> (PathBuf, BackupRecord) {
