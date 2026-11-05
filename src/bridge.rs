@@ -35,6 +35,37 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a bootstrap read may wait for the target to say anything.
+///
+/// Everything between spawning ssh and the framed handshake is one line on a
+/// pipe — the first status line, the answer to a companion pull, the word that
+/// an install finished — while [`REQUEST_TIMEOUT`] only starts with the first
+/// framed request. ssh's own ConnectTimeout and ServerAlive options bound the
+/// transport, not a remote process that accepted the connection and then said
+/// nothing: a hung home directory, a login rc that never returns, a stalled
+/// `protocol-version`. With no deadline here one such machine holds the
+/// per-target connect lock forever, so later scans, launches and attaches
+/// queue behind a connection that will never be made, and the user is handed
+/// no error to act on.
+///
+/// Half a minute covers ssh's whole connect budget — three attempts of five
+/// seconds — with room for the remote shell to start.
+#[cfg(not(test))]
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same deadline in the test build, which cannot spend half a minute
+/// proving that a read with nothing behind it comes back at all. The wiring is
+/// the one the thirty seconds above govern; only the number is shorter.
+#[cfg(test)]
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the target's own companion fetch may take before the controller
+/// stops waiting for the PULL reply.
+///
+/// This is the one bootstrap read with real work behind it: the bootstrap
+/// script fetches the asset itself before it answers, bounded on the target by
+/// `curl --max-time 120` (or wget's own timeouts). The deadline here has to
+/// outlast that download instead of cutting a slow but working link off in the
+/// middle of it, which is why it is not [`BOOTSTRAP_TIMEOUT`].
+const COMPANION_PULL_TIMEOUT: Duration = Duration::from_secs(150);
 /// Keeping standing watches on session screens.
 const TRIGGERS_CAPABILITY: &str = "triggers-v1";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -441,23 +472,25 @@ impl BridgeConnection {
             .spawn()
             .with_context(|| format!("failed to open muxloomd bridge to {alias}"))?;
         let mut writer = child.stdin.take().context("ssh bridge has no stdin")?;
-        let mut reader = BufReader::new(child.stdout.take().context("ssh bridge has no stdout")?);
+        let reader = BufReader::new(child.stdout.take().context("ssh bridge has no stdout")?);
         let stderr_lines = child
             .stderr
             .take()
             .map(|stderr| capture_bridge_stderr(stderr, alias));
         progress(TaskProgress::pending(format!("Checking {alias} companion")));
-        let provision_notice = match negotiate_remote_companion(
+        let (provision_notice, reader) = match negotiate_remote_companion(
             alias,
             options,
             &mut child,
-            &mut reader,
+            reader,
             &mut writer,
             stderr_lines.as_ref(),
             &mut progress,
         ) {
-            Ok(notice) => notice,
+            Ok(negotiated) => negotiated,
             Err(error) => {
+                // Abandoning the bootstrap is what ends the deadline's reader
+                // thread too: killing ssh closes the pipe it is parked on.
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
@@ -1866,17 +1899,79 @@ fn capture_bridge_stderr(
     lines
 }
 
-fn negotiate_remote_companion(
+/// Read one line of the bootstrap conversation, giving up after `timeout`.
+///
+/// A bare `read_line` on a pipe has no deadline of its own, and the reader is
+/// generic enough that it cannot be polled portably. So the reader is moved
+/// into a worker thread that sends it back with the line, and the wait happens
+/// on a channel. On expiry the caller kills the ssh child, which closes the
+/// pipe and lets the thread finish; the connection is being abandoned, so the
+/// reader is not waited for.
+///
+/// `Ok(None)` is the stream closing before a newline. The error names the
+/// machine, the phase that never answered and whatever the remote said on
+/// stderr, so the person reading it knows which of the three reads failed.
+fn read_bootstrap_line<R: BufRead + Send + 'static>(
+    alias: &str,
+    phase: &str,
+    reader: R,
+    timeout: Duration,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
+) -> Result<(Option<String>, R)> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut line = String::new();
+        let read = reader.read_line(&mut line);
+        let _ = sender.send((reader, read, line));
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok((reader, Ok(0), _)) => Ok((None, reader)),
+        Ok((reader, Ok(_), line)) => Ok((Some(line), reader)),
+        Ok((_, Err(error), _)) => {
+            Err(error).with_context(|| format!("failed to read {phase} from {alias}"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let said = stderr_lines
+                .map(|lines| {
+                    lines
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .join("; ")
+                })
+                .filter(|said| !said.is_empty());
+            let detail = match said {
+                Some(said) => format!("; the remote said: {said}"),
+                None => String::new(),
+            };
+            bail!(
+                "the bootstrap on {alias} gave no answer within {timeout:?} while waiting for \
+                 {phase}{detail}"
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("the bootstrap on {alias} ended while waiting for {phase}")
+        }
+    }
+}
+
+fn negotiate_remote_companion<R: BufRead + Send + 'static>(
     alias: &str,
     options: &BridgeOptions,
     child: &mut Child,
-    reader: &mut impl BufRead,
+    reader: R,
     writer: &mut impl Write,
     stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
-) -> Result<Option<String>> {
-    let mut status = String::new();
-    if reader.read_line(&mut status)? == 0 {
+) -> Result<(Option<String>, R)> {
+    let (status, reader) = read_bootstrap_line(
+        alias,
+        "its first status line",
+        reader,
+        BOOTSTRAP_TIMEOUT,
+        stderr_lines,
+    )?;
+    let Some(status) = status else {
         let _ = child.wait();
         let detail = stderr_lines
             .map(|lines| {
@@ -1888,10 +1983,10 @@ fn negotiate_remote_companion(
             .filter(|detail| !detail.is_empty())
             .unwrap_or_else(|| "remote bootstrap exited before reporting status".into());
         bail!("failed to start muxloomd on {alias}: {detail}");
-    }
+    };
     let fields: Vec<_> = status.split_whitespace().collect();
     match fields.as_slice() {
-        [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok(None),
+        [marker, "READY"] if *marker == BOOTSTRAP_MARKER => Ok((None, reader)),
         [marker, "HAVE", os, arch, fingerprint, version, generation]
             if *marker == BOOTSTRAP_MARKER =>
         {
@@ -1915,7 +2010,7 @@ fn negotiate_remote_companion(
                     );
                     writeln!(writer, "USE")?;
                     writer.flush()?;
-                    return Ok(None);
+                    return Ok((None, reader));
                 }
                 // It is not older than this controller and this controller
                 // holds no copy of what it is running. Anything it could push
@@ -1929,9 +2024,12 @@ fn negotiate_remote_companion(
                 );
                 writeln!(writer, "USE")?;
                 writer.flush()?;
-                return Ok(Some(format!(
-                    "{alias} runs muxloomd {version}, which is not older than this controller; leaving it in place"
-                )));
+                return Ok((
+                    Some(format!(
+                        "{alias} runs muxloomd {version}, which is not older than this controller; leaving it in place"
+                    )),
+                    reader,
+                ));
             }
             let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
@@ -1944,15 +2042,27 @@ fn negotiate_remote_companion(
                     );
                     writeln!(writer, "USE")?;
                     writer.flush()?;
-                    return Ok(Some(format!(
-                        "companion update unavailable; continuing compatible remote generation ({error:#})"
-                    )));
+                    return Ok((
+                        Some(format!(
+                            "companion update unavailable; continuing compatible remote generation ({error:#})"
+                        )),
+                        reader,
+                    ));
                 }
             };
             let expected = sha256_file(&asset)?;
             if !fingerprint.eq_ignore_ascii_case(&expected) {
                 return deploy_remote_companion(
-                    alias, options, &asset, &notice, os, arch, reader, writer, progress,
+                    alias,
+                    options,
+                    &asset,
+                    &notice,
+                    os,
+                    arch,
+                    reader,
+                    writer,
+                    stderr_lines,
+                    progress,
                 );
             }
             writeln!(writer, "USE")?;
@@ -1968,15 +2078,27 @@ fn negotiate_remote_companion(
                     asset.display(),
                 ),
             );
-            Ok(Some(format!(
-                "remote muxloomd {version} is an older build than this client and the {} companion asset is that same build, so it cannot be updated; rebuild or replace that asset",
-                companion_target_triple(os, arch).unwrap_or_else(|_| format!("{os}/{arch}"))
-            )))
+            Ok((
+                Some(format!(
+                    "remote muxloomd {version} is an older build than this client and the {} companion asset is that same build, so it cannot be updated; rebuild or replace that asset",
+                    companion_target_triple(os, arch).unwrap_or_else(|_| format!("{os}/{arch}"))
+                )),
+                reader,
+            ))
         }
         [marker, "NEED", os, arch] if *marker == BOOTSTRAP_MARKER => {
             let (asset, notice) = resolve_companion_asset(options, os, arch, progress)?;
             deploy_remote_companion(
-                alias, options, &asset, &notice, os, arch, reader, writer, progress,
+                alias,
+                options,
+                &asset,
+                &notice,
+                os,
+                arch,
+                reader,
+                writer,
+                stderr_lines,
+                progress,
             )
         }
         _ => bail!(
@@ -2013,54 +2135,74 @@ fn remote_companion_is_behind(generation: &str, version: &str, current: &str) ->
 /// generation the controller decided on — a source build, a bundled asset — from
 /// being quietly swapped for whatever the latest release happens to hold.
 ///
-/// `Ok(None)` means the bytes still have to go down this pipe; the caller
+/// `Ok((None, _))` means the bytes still have to go down this pipe; the caller
 /// pushes. An error means the bootstrap stream itself is no longer trustworthy,
 /// and pushing into it would be worse than failing.
 #[allow(clippy::too_many_arguments)]
-fn pull_remote_companion(
+fn pull_remote_companion<R: BufRead + Send + 'static>(
     alias: &str,
     options: &BridgeOptions,
     asset: &Path,
     os: &str,
     arch: &str,
-    reader: &mut impl BufRead,
+    reader: R,
     writer: &mut impl Write,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, R)> {
     let Some((url, digest, triple)) = companion_release_match(options, asset, os, arch) else {
-        return Ok(None);
+        return Ok((None, reader));
     };
     debug::log(
         "bridge",
         format!("target={alias} fetching its own {triple} companion from {url}"),
     );
-    exchange_companion_pull(alias, &url, &digest, &triple, reader, writer, progress)
+    exchange_companion_pull(
+        alias,
+        &url,
+        &digest,
+        &triple,
+        reader,
+        writer,
+        stderr_lines,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exchange_companion_pull(
+fn exchange_companion_pull<R: BufRead + Send + 'static>(
     alias: &str,
     url: &str,
     digest: &str,
     triple: &str,
-    reader: &mut impl BufRead,
+    reader: R,
     writer: &mut impl Write,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, R)> {
     progress(TaskProgress::pending(format!(
         "{alias} is downloading its companion"
     )));
     writeln!(writer, "PULL {url} {digest}")?;
     writer.flush()?;
-    let mut status = String::new();
-    if reader.read_line(&mut status)? == 0 {
+    let (status, reader) = read_bootstrap_line(
+        alias,
+        "the answer to its companion pull",
+        reader,
+        COMPANION_PULL_TIMEOUT,
+        stderr_lines,
+    )?;
+    let Some(status) = status else {
         bail!("the bootstrap on {alias} closed while fetching its companion");
-    }
+    };
     let status = status.trim();
     if status == format!("{BOOTSTRAP_MARKER} PULLED") {
-        return Ok(Some(format!(
-            "{alias} downloaded the {triple} muxloomd companion itself"
-        )));
+        return Ok((
+            Some(format!(
+                "{alias} downloaded the {triple} muxloomd companion itself"
+            )),
+            reader,
+        ));
     }
     if let Some(reason) = status.strip_prefix(&format!("{BOOTSTRAP_MARKER} PULLFAILED")) {
         debug::log(
@@ -2070,7 +2212,7 @@ fn exchange_companion_pull(
                 reason.trim()
             ),
         );
-        return Ok(None);
+        return Ok((None, reader));
     }
     bail!("invalid bootstrap pull response from {alias}: {status}")
 }
@@ -2142,21 +2284,31 @@ fn companion_release_match(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deploy_remote_companion(
+fn deploy_remote_companion<R: BufRead + Send + 'static>(
     alias: &str,
     options: &BridgeOptions,
     asset: &Path,
     notice: &str,
     os: &str,
     arch: &str,
-    reader: &mut impl BufRead,
+    reader: R,
     writer: &mut impl Write,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
-) -> Result<Option<String>> {
-    if let Some(pulled) =
-        pull_remote_companion(alias, options, asset, os, arch, reader, writer, progress)?
-    {
-        return Ok(Some(pulled));
+) -> Result<(Option<String>, R)> {
+    let (pulled, reader) = pull_remote_companion(
+        alias,
+        options,
+        asset,
+        os,
+        arch,
+        reader,
+        writer,
+        stderr_lines,
+        progress,
+    )?;
+    if let Some(pulled) = pulled {
+        return Ok((Some(pulled), reader));
     }
     let mut file = fs::File::open(asset)
         .with_context(|| format!("failed to open companion asset {}", asset.display()))?;
@@ -2184,16 +2336,21 @@ fn deploy_remote_companion(
         progress(TaskProgress::bytes(&label, transferred, Some(size)));
     }
     writer.flush()?;
-    let mut status = String::new();
-    if reader.read_line(&mut status)? == 0
-        || status.trim() != format!("{BOOTSTRAP_MARKER} INSTALLED")
-    {
+    let (status, reader) = read_bootstrap_line(
+        alias,
+        "the word that its companion was installed",
+        reader,
+        BOOTSTRAP_TIMEOUT,
+        stderr_lines,
+    )?;
+    let installed = format!("{BOOTSTRAP_MARKER} INSTALLED");
+    if status.as_deref().map(str::trim) != Some(installed.as_str()) {
         bail!(
             "muxloomd deployment on {alias} did not complete: {}",
-            status.trim()
+            status.as_deref().unwrap_or_default().trim()
         );
     }
-    Ok(Some(notice.into()))
+    Ok((Some(notice.into()), reader))
 }
 
 /// The companions that ship beside (or below) the controller for one target
@@ -3909,7 +4066,7 @@ mod tests {
             "{BOOTSTRAP_MARKER} HAVE Linux x86_64 {digest} 0.5.5 {}\n",
             crate::daemon::current_generation()
         );
-        let mut reader = std::io::Cursor::new(status.into_bytes());
+        let reader = std::io::Cursor::new(status.into_bytes());
         let mut writer = Vec::new();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -3917,7 +4074,7 @@ mod tests {
                 "SEED_DEBUG",
                 &options,
                 &mut child,
-                &mut reader,
+                reader,
                 &mut writer,
                 None,
                 &mut |_| {},
@@ -3930,7 +4087,7 @@ mod tests {
         let (result, written) = receiver.recv_timeout(Duration::from_secs(5)).expect(
             "the controller went looking for a release before using the companion it already held",
         );
-        assert!(result.unwrap().is_none());
+        assert!(result.unwrap().0.is_none());
         assert_eq!(String::from_utf8(written).unwrap(), "USE\n");
         assert!(
             proxy.accept().is_err(),
@@ -3974,7 +4131,7 @@ mod tests {
             "{BOOTSTRAP_MARKER} HAVE Linux x86_64 {} 0.5.5 0.5.5:protocol-1:abcdef0:999:theirs\n",
             "ab".repeat(32)
         );
-        let mut reader = std::io::Cursor::new(status.into_bytes());
+        let reader = std::io::Cursor::new(status.into_bytes());
         let mut writer = Vec::new();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -3982,7 +4139,7 @@ mod tests {
                 "SEED_DEBUG",
                 &options,
                 &mut child,
-                &mut reader,
+                reader,
                 &mut writer,
                 None,
                 &mut |_| {},
@@ -3998,6 +4155,7 @@ mod tests {
         assert_eq!(String::from_utf8(written).unwrap(), "USE\n");
         let notice = result
             .unwrap()
+            .0
             .expect("a target left alone should be reported");
         assert!(notice.contains("not older"), "{notice}");
         let _ = fs::remove_file(&asset);
@@ -4118,15 +4276,16 @@ mod tests {
     fn the_controller_reads_every_answer_a_pull_can_come_back_with() {
         let digest = "ab".repeat(32);
         let exchange = |answer: &str| {
-            let mut reader = std::io::Cursor::new(answer.to_string());
+            let reader = std::io::Cursor::new(answer.to_string());
             let mut writer = Vec::new();
             let result = exchange_companion_pull(
                 "gpu",
                 "https://example.invalid/muxloomd-linux",
                 &digest,
                 "x86_64-unknown-linux-musl",
-                &mut reader,
+                reader,
                 &mut writer,
+                None,
                 &mut |_| {},
             );
             (result, String::from_utf8(writer).unwrap())
@@ -4137,11 +4296,16 @@ mod tests {
             sent,
             format!("PULL https://example.invalid/muxloomd-linux {digest}\n")
         );
-        assert!(pulled.unwrap().is_some_and(|notice| notice.contains("gpu")));
+        assert!(
+            pulled
+                .unwrap()
+                .0
+                .is_some_and(|notice| notice.contains("gpu"))
+        );
 
         // A target with no route says so, and the caller pushes instead.
         let (refused, _) = exchange(&format!("{BOOTSTRAP_MARKER} PULLFAILED download failed\n"));
-        assert_eq!(refused.unwrap(), None);
+        assert_eq!(refused.unwrap().0, None);
 
         // Anything else means the stream no longer says what we think it says,
         // and pushing megabytes into it would be worse than stopping.
@@ -4180,7 +4344,7 @@ mod tests {
         ));
         let contents = vec![7u8; 128 * 1024 + 3];
         fs::write(&asset, &contents).unwrap();
-        let mut reader = std::io::Cursor::new(format!("{BOOTSTRAP_MARKER} INSTALLED\n"));
+        let reader = std::io::Cursor::new(format!("{BOOTSTRAP_MARKER} INSTALLED\n"));
         let mut writer = Vec::new();
         let mut updates = Vec::new();
         // No route to the release: the checksum lookup fails, so the bytes go
@@ -4196,11 +4360,13 @@ mod tests {
             "deployed test companion",
             "Linux",
             "x86_64",
-            &mut reader,
+            reader,
             &mut writer,
+            None,
             &mut |progress| updates.push(progress),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         fs::remove_file(asset).unwrap();
 
         assert_eq!(notice.as_deref(), Some("deployed test companion"));
