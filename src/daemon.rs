@@ -15370,6 +15370,113 @@ mod platform {
             discard_root(paths.root);
         }
 
+        /// A power cut can leave a session record truncated: the record is
+        /// written beside itself and renamed over itself, and the rename can
+        /// reach the disk while the bytes it publishes did not. The keeper and
+        /// the child are untouched by that — they were running before the old
+        /// daemon went away. Such a record used to be logged and dropped: it
+        /// was pushed into the dismissed set before it was read, so nor did
+        /// the dismissal sweep end the keeper, and no session was ever put in
+        /// the map. The agent kept working with no row to attach to, archive,
+        /// or kill. It has to be adopted from what is still known: its id and
+        /// the greeting its keeper answers with.
+        #[test]
+        fn a_live_session_whose_record_was_truncated_is_still_adopted() {
+            let state = test_state("truncated-record");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-terminal-1700000000-9-6";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "record lost in the crash".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                5,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let child_pid = launched.snapshot().pid.expect("launched session has a pid");
+            let socket_path = keeper::socket_path_for(&paths.keepers, session_id);
+            let metadata_path = paths.sessions.join(format!("{session_id}.json"));
+            assert!(socket_path.exists(), "the keeper is running");
+            assert!(metadata_path.is_file(), "and its record is written");
+
+            // The crash: the old daemon is gone without adopting anything, and
+            // the record it left behind is the empty file a power cut makes.
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+            fs::write(&metadata_path, b"").unwrap();
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            assert!(
+                daemon_session(&restarted, session_id).is_err(),
+                "nothing has read the record yet"
+            );
+            adopt_keeper_sessions(&restarted);
+
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper whose record cannot be read must still be adopted");
+            let snapshot = adopted.snapshot();
+            assert_eq!(snapshot.id, session_id);
+            assert_eq!(snapshot.kind, "terminal", "the id still names the kind");
+            assert_eq!(
+                snapshot.created_at, 1_700_000_000,
+                "and the moment the session was created"
+            );
+            assert_eq!(snapshot.label, "recovered session");
+            assert!(!snapshot.dead, "the child was alive when the keeper greeted");
+            assert_eq!(snapshot.pid, Some(child_pid), "it is the same child");
+            assert!(process_alive(child_pid), "adoption must not stop the child");
+            assert!(socket_path.exists(), "nor dismiss its keeper");
+            assert!(
+                metadata_path.is_file(),
+                "the recovered session has a record again, so it is served and listable"
+            );
+            assert_eq!(
+                fs::read(paths.sessions.join(format!("{session_id}.json.corrupt"))).unwrap(),
+                b"",
+                "what was left of the unreadable record is kept beside the new one"
+            );
+
+            // Served, not merely listed: input reaches the same PTY.
+            adopted.write_input(b"recovered-generation-probe\r").unwrap();
+            let probe = b"recovered-generation-probe";
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut output = Vec::new();
+            while Instant::now() < deadline {
+                output = history_tail(&adopted.history_path, RECENT_OUTPUT_LIMIT as u64)
+                    .unwrap_or_default();
+                if output.windows(probe.len()).any(|window| window == probe) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                output.windows(probe.len()).any(|window| window == probe),
+                "typed bytes must reach the recovered PTY"
+            );
+
+            adopted.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().dead && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                adopted.snapshot().dead,
+                "the recovered session is killable again"
+            );
+            discard_root(paths.root);
+        }
+
         /// The test above sets the flag by hand because that is what the loop
         /// is meant to have done. A signal has to be latched, not merely
         /// noticed: the readers decide what a keeper hanging up meant by
