@@ -4659,8 +4659,10 @@ impl App {
             // Full-screen TUIs keep no primary-screen scrollback. Let
             // Muxloom page the active session's rendered history in that one
             // case; otherwise PageUp has nowhere to go and the view appears
-            // completely stuck.
-            return older;
+            // completely stuck. Its empty buffer says nothing about a
+            // position muxloom scrolled to in daemon history, so PageDown is
+            // ours too until the view is back at the live tail.
+            return older || self.history_offset > 0;
         }
         if older {
             true
