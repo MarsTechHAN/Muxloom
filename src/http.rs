@@ -545,6 +545,33 @@ pub fn fetch_text(url: &str, environment: &[(String, String)]) -> Result<String>
         .to_string())
 }
 
+/// Fetch a small text body in one bounded attempt.
+///
+/// This is for a lookup that stands between a person and a machine: until it
+/// answers, the bridge is not open and the dashboard is still saying
+/// "Checking…". A network with no route to the release must cost seconds
+/// there, not the retry budget a chat request is allowed to spend. The caller
+/// supplies the whole-request deadline; there is no second attempt.
+#[cfg(feature = "controller")]
+pub fn fetch_text_bounded(
+    url: &str,
+    environment: &[(String, String)],
+    seconds: u64,
+) -> Result<String> {
+    let response = prepare(minreq::get(url), url, environment)
+        .with_timeout(seconds.max(1))
+        .send()
+        .map_err(|error| anyhow!(error).context(format!("request to {url} failed")))?;
+    let status = response.status_code;
+    let body = response
+        .as_str()
+        .with_context(|| format!("{url} returned a non-text body"))?;
+    if !(200..300).contains(&status) {
+        bail!("{url} returned HTTP {status}: {}", excerpt(body));
+    }
+    Ok(body.to_string())
+}
+
 /// Return the `Location` a URL redirects to, without downloading the target.
 /// Used to read the newest release tag from `.../releases/latest`.
 #[cfg(feature = "controller")]

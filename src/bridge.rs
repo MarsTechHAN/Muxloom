@@ -63,6 +63,14 @@ const COMPANION_NIGHTLY_STREAM: &str = "nightly";
 /// for it by name.
 const COMPANION_NIGHTLY_ROOT: &str =
     "https://github.com/MarsTechHAN/Muxloom/releases/download/nightly";
+/// How long the release lookup that gates a companion decision may take.
+///
+/// It runs before a target can be reached, so a network with no route to
+/// GitHub has to fail in seconds and let the checksum-verified cache answer.
+/// The ordinary request budget — three attempts of a minute each — is what a
+/// chat API gets; here it turned every launch into minutes of "Checking…".
+#[cfg(feature = "controller")]
+const COMPANION_RELEASE_LOOKUP_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
@@ -1887,6 +1895,27 @@ fn negotiate_remote_companion(
         [marker, "HAVE", os, arch, fingerprint, version, generation]
             if *marker == BOOTSTRAP_MARKER =>
         {
+            let current = crate::daemon::current_generation();
+            // A target already running bytes this controller holds does not
+            // need the release consulted before it can be reached: the lookup
+            // exists to find something to deploy, and there is nothing to
+            // deploy. Asking first is what parked every launch on a machine
+            // whose network has no route to GitHub, for the whole retry budget
+            // of the checksum request.
+            if !remote_companion_is_behind(generation, version, &current)
+                && let Some(local) = companion_matching_fingerprint(options, os, arch, fingerprint)
+            {
+                debug::log(
+                    "bridge",
+                    format!(
+                        "target={alias} already runs {}; connecting without a companion release lookup",
+                        local.display()
+                    ),
+                );
+                writeln!(writer, "USE")?;
+                writer.flush()?;
+                return Ok(None);
+            }
             let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
                 Err(error) => {
@@ -1916,11 +1945,7 @@ fn negotiate_remote_companion(
             // behind by an older build matches itself forever, so without this
             // the remote stays pinned to it and every capability added since
             // goes silently missing.
-            if !remote_companion_is_behind(
-                generation,
-                version,
-                &crate::daemon::current_generation(),
-            ) {
+            if !remote_companion_is_behind(generation, version, &current) {
                 debug::log(
                     "bridge",
                     format!("target={alias} remote companion fingerprint is current"),
@@ -1930,9 +1955,8 @@ fn negotiate_remote_companion(
             debug::log(
                 "bridge",
                 format!(
-                    "target={alias} companion asset {} is muxloomd {generation}, not {}; the remote cannot be updated from it",
+                    "target={alias} companion asset {} is muxloomd {generation}, not {current}; the remote cannot be updated from it",
                     asset.display(),
-                    crate::daemon::current_generation()
                 ),
             );
             Ok(Some(format!(
@@ -2163,6 +2187,72 @@ fn deploy_remote_companion(
     Ok(Some(notice.into()))
 }
 
+/// The companions that ship beside (or below) the controller for one target
+/// triple, in the order they are preferred.
+///
+/// Pure search, no release lookup: these are the assets a controller already
+/// holds. [`resolve_companion_asset`] decides whether a found one is fresh
+/// enough to deploy; [`companion_matching_fingerprint`] asks a narrower
+/// question — whether a target is already running these exact bytes.
+fn bundled_companion_candidates(triple: &str, executable: &str) -> Vec<PathBuf> {
+    let Ok(current) = env::current_exe() else {
+        return Vec::new();
+    };
+    let parent = current.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = vec![
+        parent.join("companions").join(triple).join(executable),
+        parent.join(format!("muxloomd-{triple}")),
+    ];
+    if current_target_triple().as_deref() == Some(triple) {
+        candidates.insert(0, parent.join(executable));
+    }
+    if let Some(workspace) = parent.parent().and_then(Path::parent) {
+        candidates.push(
+            workspace
+                .join("target")
+                .join(triple)
+                .join("release")
+                .join(executable),
+        );
+    }
+    candidates
+}
+
+/// A companion this controller already holds whose bytes are exactly what a
+/// target is running, or `None` when the release has to be consulted.
+///
+/// The release lookup is what can park a connection on a network that cannot
+/// see GitHub. A target that already runs a companion sitting here — the
+/// configured asset, one bundled with the controller, or the copy verified
+/// into the cache by an earlier download — needs nothing from the release to
+/// be reached, so it is not asked for one. The generation stamp still decides
+/// afterwards whether that build is current; this only answers the narrower
+/// question of whether the bytes are the same.
+fn companion_matching_fingerprint(
+    options: &BridgeOptions,
+    os: &str,
+    arch: &str,
+    fingerprint: &str,
+) -> Option<PathBuf> {
+    let triple = companion_target_triple(os, arch).ok()?;
+    let executable = format!("muxloomd{}", executable_suffix(os));
+    let mut candidates = Vec::new();
+    if !options.bootstrap_binary.trim().is_empty() {
+        let configured = expand_local_tilde(options.bootstrap_binary.trim());
+        if configured.is_file() {
+            candidates.push(configured);
+        }
+    }
+    candidates.extend(bundled_companion_candidates(&triple, &executable));
+    let cached = cached_companion_path(&triple, &executable);
+    if cached.is_file() {
+        candidates.push(cached);
+    }
+    candidates.into_iter().find(|candidate| {
+        sha256_file(candidate).is_ok_and(|digest| digest.eq_ignore_ascii_case(fingerprint))
+    })
+}
+
 fn resolve_companion_asset(
     options: &BridgeOptions,
     os: &str,
@@ -2195,23 +2285,7 @@ fn resolve_companion_asset(
     }
     let executable = format!("muxloomd{}", executable_suffix(os));
     let current = env::current_exe().context("failed to locate the muxloom executable")?;
-    let parent = current.parent().unwrap_or_else(|| Path::new("."));
-    let mut candidates = vec![
-        parent.join("companions").join(&triple).join(&executable),
-        parent.join(format!("muxloomd-{triple}")),
-    ];
-    if current_target_triple().as_deref() == Some(triple.as_str()) {
-        candidates.insert(0, parent.join(&executable));
-    }
-    if let Some(workspace) = parent.parent().and_then(Path::parent) {
-        candidates.push(
-            workspace
-                .join("target")
-                .join(&triple)
-                .join("release")
-                .join(&executable),
-        );
-    }
+    let candidates = bundled_companion_candidates(&triple, &executable);
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         // A bundle ships companions built together with the controller; a
         // source tree can hold a cross-build from weeks ago that would pin
@@ -2355,21 +2429,13 @@ fn download_latest_companion_at(
         "muxloomd-{triple}{}",
         executable_suffix_for_name(executable)
     );
-    let cache = if following_the_nightly_stream() {
-        // Two controllers of different streams share one cache directory, and
-        // the asset name is the same in both releases. Offline, the verified
-        // cache is used as-is - so a nightly must not be handed the stable
-        // companion another install left there.
-        cache_root.join(triple).join(COMPANION_NIGHTLY_STREAM)
-    } else {
-        cache_root.join(triple)
-    };
+    let cache = companion_cache_dir(cache_root, triple);
     fs::create_dir_all(&cache)
         .with_context(|| format!("failed to create companion cache {}", cache.display()))?;
     let destination = cache.join(executable);
     let checksum_url = format!("{}/{asset_name}.sha256", companion_release_root());
     progress(TaskProgress::pending(format!(
-        "Checking {triple} companion release"
+        "Checking GitHub for a newer {triple} companion"
     )));
     let expected = match controller_fetch_text(&checksum_url, environment) {
         Ok(expected) => expected,
@@ -2460,10 +2526,30 @@ fn companion_cache_root() -> PathBuf {
     env::temp_dir().join("muxloom-cache/companions")
 }
 
+/// The directory one triple's companions are cached in.
+///
+/// Two controllers of different streams share one cache root, and the asset
+/// name is the same in both releases. Offline, the verified cache is used
+/// as-is — so a nightly must not be handed the stable companion another
+/// install left there, and the read and the write have to agree on which
+/// directory that is.
+fn companion_cache_dir(cache_root: &Path, triple: &str) -> PathBuf {
+    if following_the_nightly_stream() {
+        cache_root.join(triple).join(COMPANION_NIGHTLY_STREAM)
+    } else {
+        cache_root.join(triple)
+    }
+}
+
+/// The cached companion for a triple, whether or not it exists.
+fn cached_companion_path(triple: &str, executable: &str) -> PathBuf {
+    companion_cache_dir(&companion_cache_root(), triple).join(executable)
+}
+
 fn controller_fetch_text(url: &str, environment: &[(String, String)]) -> Result<String> {
     #[cfg(feature = "controller")]
     {
-        crate::http::fetch_text(url, environment)
+        crate::http::fetch_text_bounded(url, environment, COMPANION_RELEASE_LOOKUP_SECS)
     }
     #[cfg(not(feature = "controller"))]
     {
@@ -3738,6 +3824,135 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A target that already runs a companion this controller holds is
+    /// reachable without the release being consulted: the lookup is only there
+    /// to find something to deploy, and there is nothing to deploy. Asking
+    /// first is what parked every launch behind an unreachable GitHub for the
+    /// whole retry budget of a checksum request.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_on_the_companion_this_machine_caches_is_reached_without_github() {
+        use std::net::TcpListener;
+
+        struct Environment {
+            name: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Environment {
+            fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+                let previous = env::var_os(name);
+                // SAFETY: this suite runs one test at a time, and the value is
+                // put back by the guard before the next one starts.
+                unsafe { env::set_var(name, value) };
+                Self { name, previous }
+            }
+        }
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                // SAFETY: as above.
+                match &self.previous {
+                    Some(value) => unsafe { env::set_var(self.name, value) },
+                    None => unsafe { env::remove_var(self.name) },
+                }
+            }
+        }
+
+        let root = env::temp_dir().join(format!(
+            "muxloom-cached-companion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let environment = Environment::set("MUXLOOM_CACHE_DIR", root.as_os_str());
+        // The path the downloader would fall back to, reached through the code
+        // under test rather than spelled out: a nightly reads its own cache
+        // directory, and a test build does not.
+        let cached = cached_companion_path("x86_64-unknown-linux-musl", "muxloomd");
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, b"the companion the target already runs").unwrap();
+        let digest = sha256_file(&cached).unwrap();
+
+        // Every release lookup goes through this proxy. Nothing may arrive:
+        // an accepted connection is the controller asking GitHub a question it
+        // did not need answered.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let options = BridgeOptions {
+            download_environment: vec![(
+                "HTTPS_PROXY".into(),
+                format!("http://{}", proxy.local_addr().unwrap()),
+            )],
+            ..BridgeOptions::default()
+        };
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let status = format!(
+            "{BOOTSTRAP_MARKER} HAVE Linux x86_64 {digest} 0.5.5 {}\n",
+            crate::daemon::current_generation()
+        );
+        let mut reader = std::io::Cursor::new(status.into_bytes());
+        let mut writer = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = negotiate_remote_companion(
+                "SEED_DEBUG",
+                &options,
+                &mut child,
+                &mut reader,
+                &mut writer,
+                None,
+                &mut |_| {},
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = sender.send((result, writer));
+        });
+
+        let (result, written) = receiver.recv_timeout(Duration::from_secs(5)).expect(
+            "the controller went looking for a release before using the companion it already held",
+        );
+        assert!(result.unwrap().is_none());
+        assert_eq!(String::from_utf8(written).unwrap(), "USE\n");
+        assert!(
+            proxy.accept().is_err(),
+            "the controller opened a connection to the release"
+        );
+        drop(environment);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_release_lookup_that_gates_a_connection_is_bounded_to_seconds() {
+        use std::net::TcpListener;
+
+        // A server that accepts the connection and says nothing: this is what
+        // a filtered route to GitHub looks like from here. The lookup must
+        // give up in its own deadline rather than wait out a chat request's
+        // retry budget.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/muxloomd-x86_64-unknown-linux-musl.sha256",
+            listener.local_addr().unwrap()
+        );
+        let started = Instant::now();
+        let result = crate::http::fetch_text_bounded(&url, &[], 1);
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "the lookup took {elapsed:?}"
+        );
     }
 
     #[test]
