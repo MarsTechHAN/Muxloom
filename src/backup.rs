@@ -229,13 +229,11 @@ impl BackupStore {
 
     /// Persist the index atomically (temp file in the same dir, then rename).
     pub fn save_index(&self, index: &BackupIndex) -> Result<()> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create {}", self.root.display()))?;
+        create_private_dir(&self.root)?;
         let path = self.index_path();
         let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(index)?;
-        fs::write(&tmp, format!("{text}\n"))
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        write_private_file(&tmp, format!("{text}\n").as_bytes())?;
         fs::rename(&tmp, &path)
             .with_context(|| format!("failed to rename into {}", path.display()))?;
         Ok(())
@@ -254,14 +252,10 @@ impl BackupStore {
             return Ok(());
         }
         let dir = self.session_dir(target_id, session_id);
-        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        create_private_dir(&dir)?;
         let frame = encode_frame(chunk)?;
         let path = dir.join(name);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut file = open_private_file(&path, true)?;
         file.write_all(&frame)
             .with_context(|| format!("failed to append to {}", path.display()))?;
         Ok(())
@@ -277,11 +271,11 @@ impl BackupStore {
         data: &[u8],
     ) -> Result<()> {
         let dir = self.session_dir(target_id, session_id);
-        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        create_private_dir(&dir)?;
         let frame = encode_frame(data)?;
         let path = dir.join(name);
         let tmp = path.with_extension("zst.tmp");
-        fs::write(&tmp, &frame).with_context(|| format!("failed to write {}", tmp.display()))?;
+        write_private_file(&tmp, &frame)?;
         fs::rename(&tmp, &path)
             .with_context(|| format!("failed to rename into {}", path.display()))?;
         Ok(())
@@ -395,10 +389,76 @@ impl BackupStore {
         }
         let keep_from = frames[drop_to].0;
         let path_tmp = path.with_extension("zst.tmp");
-        fs::write(&path_tmp, &bytes[keep_from..])?;
+        write_private_file(&path_tmp, &bytes[keep_from..])?;
         fs::rename(&path_tmp, &path)?;
         Ok(())
     }
+}
+
+/// Create a store directory, private to its owner on unix.
+///
+/// The store holds the complete native transcript of every mirrored agent
+/// conversation and every terminal capture on the machine. A bare
+/// `create_dir_all` inherits the umask, so under the usual 022 every other
+/// local user could enter the tree. The recursive builder below sets 0700 on
+/// each directory it creates, and the `set_permissions` repairs one that was
+/// left loose by an older build as the store touches it. Windows keeps the
+/// ACLs inherited from the parent.
+fn create_private_dir(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to restrict {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Open a store file for writing, private to its owner on unix.
+///
+/// `append` keeps prior frames (blobs are append-only); otherwise the file is
+/// truncated for an atomic replace. The creation mode is 0600, and files are
+/// tightened after opening because `mode` only applies to a file that is
+/// created, not to one a looser build left behind.
+fn open_private_file(path: &Path, append: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict {}", path.display()))?;
+    }
+    Ok(file)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = open_private_file(path, false)?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Frame layout on disk: `[u64 LE raw_len][u64 LE comp_len][comp_bytes]`.
