@@ -215,6 +215,47 @@ impl BackupStore {
             .join(sanitize(session_id))
     }
 
+    /// Create a store directory, private to its owner on unix, and tighten the
+    /// store directories above it.
+    ///
+    /// The store holds the complete native transcript of every mirrored agent
+    /// conversation and every terminal capture on the machine. A bare
+    /// `create_dir_all` inherits the umask, so under the usual 022 every other
+    /// local user could enter the tree. The recursive builder below sets 0700
+    /// on each directory it creates -- but only on those: a store written by an
+    /// older build keeps 0755 on `blobs` and `blobs/<machine>` however often a
+    /// session below them is rewritten, which leaves the machine and session
+    /// names listable. So the path and each existing store directory between it
+    /// and the root are repaired here as the store touches them. Nothing below
+    /// the path is walked, so other machines' and sessions' directories are
+    /// left alone. Windows keeps the ACLs inherited from the parent.
+    fn create_private_dir(&self, path: &Path) -> Result<()> {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut level = Some(path);
+            while let Some(dir) = level {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to restrict {}", dir.display()))?;
+                if dir == self.root.as_path() {
+                    break;
+                }
+                level = dir.parent().filter(|parent| parent.starts_with(&self.root));
+            }
+        }
+        Ok(())
+    }
+
     /// Load the index, returning an empty one if it does not exist yet.
     pub fn load_index(&self) -> Result<BackupIndex> {
         let path = self.index_path();
@@ -229,7 +270,7 @@ impl BackupStore {
 
     /// Persist the index atomically (temp file in the same dir, then rename).
     pub fn save_index(&self, index: &BackupIndex) -> Result<()> {
-        create_private_dir(&self.root)?;
+        self.create_private_dir(&self.root)?;
         let path = self.index_path();
         let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(index)?;
@@ -252,7 +293,7 @@ impl BackupStore {
             return Ok(());
         }
         let dir = self.session_dir(target_id, session_id);
-        create_private_dir(&dir)?;
+        self.create_private_dir(&dir)?;
         let frame = encode_frame(chunk)?;
         let path = dir.join(name);
         let mut file = open_private_file(&path, true)?;
@@ -271,7 +312,7 @@ impl BackupStore {
         data: &[u8],
     ) -> Result<()> {
         let dir = self.session_dir(target_id, session_id);
-        create_private_dir(&dir)?;
+        self.create_private_dir(&dir)?;
         let frame = encode_frame(data)?;
         let path = dir.join(name);
         let tmp = path.with_extension("zst.tmp");
@@ -393,35 +434,6 @@ impl BackupStore {
         fs::rename(&path_tmp, &path)?;
         Ok(())
     }
-}
-
-/// Create a store directory, private to its owner on unix.
-///
-/// The store holds the complete native transcript of every mirrored agent
-/// conversation and every terminal capture on the machine. A bare
-/// `create_dir_all` inherits the umask, so under the usual 022 every other
-/// local user could enter the tree. The recursive builder below sets 0700 on
-/// each directory it creates, and the `set_permissions` repairs one that was
-/// left loose by an older build as the store touches it. Windows keeps the
-/// ACLs inherited from the parent.
-fn create_private_dir(path: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to restrict {}", path.display()))?;
-    }
-    Ok(())
 }
 
 /// Open a store file for writing, private to its owner on unix.
