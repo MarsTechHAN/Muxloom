@@ -6332,6 +6332,23 @@ mod tests {
         assert_eq!(tmux_pane_status(AgentKind::Pi, &pi, &pi, now), Status::Idle);
     }
 
+    /// Claude Code's approval dialog repaints about twice a second, so the
+    /// pane's last activity stays fresh for as long as the question sits
+    /// there. What says it waits is the cursor the dialog hid, not the quiet
+    /// the repaint never gives it.
+    #[test]
+    fn a_tmux_dialog_that_keeps_repainting_is_still_waiting() {
+        let sample = |title: &str, cursor: &str, activity: u64| {
+            parse_pane_sample(&format!("{title}\t{cursor}\t0\t{activity}\n")).unwrap()
+        };
+        let now = 2_000;
+        let repainting = sample("✳ Claude Code", "0", now - 1);
+        assert_eq!(
+            tmux_pane_status(AgentKind::Claude, &repainting, &repainting, now),
+            Status::Waiting
+        );
+    }
+
     /// A rule as wide as Claude Code draws one.
     fn rule() -> String {
         "─".repeat(120)
