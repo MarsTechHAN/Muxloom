@@ -4027,6 +4027,93 @@ mod tests {
         );
     }
 
+    /// One remote that accepts the connection and then says nothing used to
+    /// wedge the machine forever. Everything before the framed handshake is a
+    /// line on a pipe, and the bridge's only timeout starts after it: a hung
+    /// home directory, a broken login rc or a stalled `protocol-version` left
+    /// that first status line blocked for good, the per-target connect lock
+    /// held, and every later scan, launch and attach for that machine queued
+    /// behind it with no error to show the user.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_never_answers_the_bootstrap_ends_in_an_error_not_a_wedge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PathGuard {
+            previous: std::ffi::OsString,
+        }
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                // SAFETY: this suite runs one test at a time, and the value is
+                // put back by the guard before the next one starts.
+                unsafe { env::set_var("PATH", &self.previous) };
+            }
+        }
+
+        let root = env::temp_dir().join(format!(
+            "muxloom-hung-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // `ssh` here accepts the connection and then says nothing: what a
+        // remote whose login shell never starts looks like from this side. It
+        // waits out the test process rather than a fixed sleep, so a run that
+        // fails here leaves nothing behind.
+        let stub = root.join("ssh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             printf 'the login shell never answered\\n' >&2\n\
+             while kill -0 \"$PPID\" 2>/dev/null; do sleep 1; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let previous_path = env::var_os("PATH").unwrap_or_default();
+        let mut prefixed = root.clone().into_os_string();
+        prefixed.push(":");
+        prefixed.push(&previous_path);
+        // SAFETY: as above.
+        unsafe { env::set_var("PATH", &prefixed) };
+        let guard = PathGuard {
+            previous: previous_path,
+        };
+
+        let options = BridgeOptions {
+            connect_timeout_secs: 1,
+            ..BridgeOptions::default()
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = BridgeConnection::connect_ssh_with_progress("hung", &options, |_| {})
+                .map(|(connection, notice)| {
+                    connection.state.shutdown();
+                    notice
+                })
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the bootstrap never came back: one silent remote wedged the connection");
+        drop(guard);
+        let _ = fs::remove_dir_all(&root);
+
+        let error = outcome.expect_err("a remote that said nothing was taken for a live bridge");
+        assert!(
+            error.contains("hung"),
+            "the error must name the machine: {error}"
+        );
+        assert!(
+            error.contains("first status line"),
+            "the error must name the phase that never answered: {error}"
+        );
+    }
+
     #[test]
     fn the_controller_reads_every_answer_a_pull_can_come_back_with() {
         let digest = "ab".repeat(32);
