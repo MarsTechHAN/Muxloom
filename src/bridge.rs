@@ -4651,6 +4651,158 @@ mod tests {
         );
     }
 
+    /// The stall guard's only sign of life is the byte count the writer
+    /// publishes, and it publishes once `write_all` of a whole chunk returns.
+    /// On the bootstrap's pipe that is not until the remote has drained the
+    /// whole chunk — so a chunk the size of the read buffer makes any link
+    /// slower than one chunk per stall deadline look dead, and a push that was
+    /// making progress is aborted. The sink below holds the contract a
+    /// blocking pipe gives: `write` returns the full count only once the whole
+    /// buffer was taken, never a short count, and takes as long as those bytes
+    /// need at the link's rate.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_but_working_companion_push_is_not_taken_for_a_stall() {
+        const LINK_BYTES_PER_SECOND: u64 = 32 * 1024;
+        const ASSET_BYTES: usize = 32 * 1024;
+
+        struct BlockingSink {
+            accepted: Vec<usize>,
+        }
+
+        impl Write for BlockingSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                thread::sleep(Duration::from_micros(
+                    (buf.len() as u64).saturating_mul(1_000_000) / LINK_BYTES_PER_SECOND,
+                ));
+                self.accepted.push(buf.len());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let asset =
+            env::temp_dir().join(format!("muxloomd-slow-push-{}-{nonce}", std::process::id()));
+        let contents = vec![7u8; ASSET_BYTES];
+        fs::write(&asset, &contents).unwrap();
+        let mut file = fs::File::open(&asset).unwrap();
+        // Only here so a failed guard has the bootstrap it would kill in
+        // production; the sink stands in for the pipe the writer would own.
+        let mut bootstrap = Command::new("sleep")
+            .arg("10")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut sink = BlockingSink {
+            accepted: Vec::new(),
+        };
+        let mut updates = Vec::new();
+        let result = push_companion_file(
+            "slow-link",
+            &mut bootstrap,
+            &mut sink,
+            &mut file,
+            contents.len() as u64,
+            None,
+            &mut |progress| updates.push(progress),
+        );
+        let _ = bootstrap.kill();
+        let _ = bootstrap.wait();
+        let _ = fs::remove_file(&asset);
+
+        result.expect("a slow but working link must not be aborted as stalled");
+        assert_eq!(sink.accepted.iter().sum::<usize>(), contents.len());
+        assert_eq!(updates.first().unwrap().completed, 0);
+        assert_eq!(updates.last().unwrap().completed, contents.len() as u64);
+        // The defect is that the count moves only once a whole chunk is gone,
+        // so the guard has nothing to tell a working link from a dead one.
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.completed > 0 && update.completed < contents.len() as u64),
+            "progress must be visible while the push is still running, not only at the end: {:?}",
+            updates
+                .iter()
+                .map(|update| update.completed)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Making progress visible more often must not blunt the guard: a remote
+    /// that accepted the push and then stopped draining its pipe still ends in
+    /// the stall error rather than a wedge, and the child that held the read
+    /// end is killed so the writer parked on the pipe can come back.
+    #[cfg(unix)]
+    #[test]
+    fn a_companion_push_nobody_drains_still_stalls_and_kills_the_bootstrap() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let asset =
+            env::temp_dir().join(format!("muxloomd-dead-push-{}-{nonce}", std::process::id()));
+        let contents = vec![7u8; 256 * 1024];
+        fs::write(&asset, &contents).unwrap();
+        let mut file = fs::File::open(&asset).unwrap();
+        // `sleep` takes the pipe's read end as its stdin and never drains it.
+        // Killing it is what closes the pipe, so the writer parked in
+        // `write_all` can come back and the guard's error is really returned.
+        let mut bootstrap = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = bootstrap.stdin.take().unwrap();
+        let started = Instant::now();
+        let error = push_companion_file(
+            "unread",
+            &mut bootstrap,
+            &mut stdin,
+            &mut file,
+            contents.len() as u64,
+            None,
+            &mut |_| {},
+        )
+        .expect_err("a remote that stopped draining its stdin was taken for a live one");
+        let elapsed = started.elapsed();
+        let _ = fs::remove_file(&asset);
+
+        assert!(
+            format!("{error:#}").contains("stalled"),
+            "the guard must still call a pipe nobody drains stalled: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the guard must fire on its own deadline, not when something else closes the pipe: \
+             {elapsed:?}"
+        );
+        // A child that outlives the error means the guard did not close the
+        // pipe the writer is parked on.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match bootstrap.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    panic!("the bootstrap holding the unread pipe outlived the stall error")
+                }
+                Err(error) => panic!("the bootstrap could not be reaped: {error}"),
+            }
+        }
+        drop(stdin);
+    }
+
     /// The other unbounded wait on the failure path: a bootstrap that closes
     /// stdout but keeps running. The status read sees EOF at once and the old
     /// `child.wait()` then sits on a process that has already said it will
