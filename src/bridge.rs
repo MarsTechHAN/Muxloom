@@ -4272,6 +4272,184 @@ mod tests {
         );
     }
 
+    /// A stub `ssh` on `PATH` for the wiring tests: the script is what the
+    /// connect path runs instead of ssh. Dropping the guard puts `PATH` back
+    /// and takes the directory away, including the fixture files it held.
+    #[cfg(unix)]
+    struct StubSsh {
+        root: PathBuf,
+        previous: std::ffi::OsString,
+    }
+
+    #[cfg(unix)]
+    impl StubSsh {
+        fn install(tag: &str, script: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = env::temp_dir().join(format!(
+                "muxloom-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let stub = root.join("ssh");
+            fs::write(&stub, script).unwrap();
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+            let previous = env::var_os("PATH").unwrap_or_default();
+            let mut prefixed = root.clone().into_os_string();
+            prefixed.push(":");
+            prefixed.push(&previous);
+            // SAFETY: this suite runs one test at a time, and the value is put
+            // back by the guard before the next one starts.
+            unsafe { env::set_var("PATH", &prefixed) };
+            Self { root, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StubSsh {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe { env::set_var("PATH", &self.previous) };
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// One attempt at the connect path against the stub remote, on a worker
+    /// thread so a wedge shows up as the test's own deadline rather than as a
+    /// hung suite.
+    #[cfg(unix)]
+    fn connect_once(alias: &str, options: &BridgeOptions) -> Result<Option<String>, String> {
+        let options = options.clone();
+        let target = alias.to_string();
+        let worker = target.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = BridgeConnection::connect_ssh_with_progress(&worker, &options, |_| {})
+                .map(|(connection, notice)| {
+                    connection.state.shutdown();
+                    notice
+                })
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connect to {target} never came back: one bootstrap that stopped answering \
+                 wedged the connect thread"
+                )
+            })
+    }
+
+    /// Run the connect path against the stub remote, retrying only the case
+    /// where the stub itself lost the test build's half-second bootstrap
+    /// deadline before it had printed a status line.
+    ///
+    /// The stub is a shell script on a machine the suite does not own, so a
+    /// loaded run can miss that deadline; the read guard then reports exactly
+    /// the phase it was waiting for. That is the guard doing its job, not the
+    /// wedge these tests are about. Such a start is retried until the budget
+    /// is spent, because on a machine shared with a build a single half-second
+    /// deadline can be missed more than once; every other outcome, including a
+    /// connect that never returns at all, is passed straight back.
+    #[cfg(unix)]
+    fn connect_against_stub(
+        alias: &str,
+        options: &BridgeOptions,
+    ) -> Result<Option<String>, String> {
+        let budget = Instant::now() + Duration::from_secs(8);
+        loop {
+            match connect_once(alias, options) {
+                Err(error) if error.contains("first status line") => {
+                    if Instant::now() >= budget {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// A remote that answers `NEED` and then stops draining its stdin used to
+    /// wedge the machine exactly as the silent bootstrap did: the push is a
+    /// bare `write_all` on a pipe, so once the pipe fills the connect thread -
+    /// and the per-target connect lock it holds - never comes back, and the
+    /// target is unreachable with no error to show for it. The companion is up
+    /// to ~10 MB, so the push has to be given up on for stalling, not for
+    /// being large.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_stops_reading_the_companion_push_ends_in_an_error_not_a_wedge() {
+        let ssh = StubSsh::install(
+            "push-stall",
+            "#!/bin/sh\n\
+             printf '__MUXLOOM_BOOTSTRAP__ NEED Linux x86_64\\n'\n\
+             while kill -0 \"$PPID\" 2>/dev/null; do sleep 1 < /dev/null; done\n",
+        );
+
+        // Far more than any pipe will hold, so an unbounded write_all parks
+        // for good instead of finishing.
+        let asset = ssh.root.join("muxloomd-push-stall");
+        let contents = vec![7u8; 512 * 1024];
+        fs::write(&asset, &contents).unwrap();
+        let options = BridgeOptions {
+            bootstrap_binary: asset.display().to_string(),
+            // No route to the release: the checksum lookup fails fast and the
+            // bytes go down this pipe, which is the path under test.
+            download_environment: vec![("HTTPS_PROXY".into(), "http://127.0.0.1:1".into())],
+            connect_timeout_secs: 1,
+            ..BridgeOptions::default()
+        };
+        let error = connect_against_stub("stuck", &options)
+            .expect_err("a remote that stopped reading was taken for a live bridge");
+        assert!(
+            error.contains("stuck"),
+            "the error must name the machine: {error}"
+        );
+        assert!(
+            error.contains("stalled"),
+            "the error must say that the push stalled: {error}"
+        );
+        assert!(
+            error.contains(&contents.len().to_string()),
+            "the error must say how many of how many bytes went: {error}"
+        );
+    }
+
+    /// The other unbounded wait on the failure path: a bootstrap that closes
+    /// stdout but keeps running. The status read sees EOF at once and the old
+    /// `child.wait()` then sits on a process that has already said it will
+    /// never report status, holding the connect thread for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_bootstrap_that_closes_its_output_but_keeps_running_ends_in_an_error_not_a_wedge() {
+        let _ssh = StubSsh::install(
+            "bootstrap-lingers",
+            "#!/bin/sh\n\
+             exec 1>&-\n\
+             while kill -0 \"$PPID\" 2>/dev/null; do sleep 1 < /dev/null; done\n",
+        );
+        let options = BridgeOptions {
+            connect_timeout_secs: 1,
+            ..BridgeOptions::default()
+        };
+        let error = connect_against_stub("lingering", &options)
+            .expect_err("a bootstrap that stopped talking was taken for a live bridge");
+        assert!(
+            error.contains("lingering"),
+            "the error must name the machine: {error}"
+        );
+        assert!(
+            error.contains("did not exit"),
+            "the error must say why it was given up on: {error}"
+        );
+    }
+
     #[test]
     fn the_controller_reads_every_answer_a_pull_can_come_back_with() {
         let digest = "ab".repeat(32);
