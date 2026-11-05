@@ -101,6 +101,17 @@ pub struct BackupRecord {
     /// path and is mirrored whole again. Empty until a transcript is long
     /// enough to fingerprint - see [`HEAD_DIGEST_BYTES`].
     pub jsonl_head_digest: String,
+    /// The uncompressed length of [`TRANSCRIPT_BLOB`] that `jsonl_bytes_synced`
+    /// accounts for. The frames are on disk as soon as they are appended, but
+    /// this length - like the cursor - reaches the index only when the round
+    /// ends, so a round that dies in between leaves the blob longer than the
+    /// record says. The next pass trims those unaccounted frames instead of
+    /// appending the same delta a second time. Zero on a record written before
+    /// this was kept; such a record cannot tell the two apart and is left
+    /// exactly as it was.
+    pub transcript_blob_bytes: u64,
+    /// The same for [`MESSAGES_BLOB`], against `message_count`.
+    pub messages_blob_bytes: u64,
     pub message_count: usize,
     /// Unix seconds of the last successful sync of this session.
     pub last_synced: u64,
@@ -1033,6 +1044,169 @@ fn whole_lines(data: &[u8]) -> usize {
         .map_or(0, |at| at + 1)
 }
 
+/// What a mirror blob holds relative to the length the record accounts for.
+enum Mirrored {
+    /// The whole frames on disk are exactly the bytes the record accounts for.
+    Exact,
+    /// Whole frames (or a half-written tail) past the recorded length were
+    /// removed, leaving the blob the record describes.
+    Trimmed,
+    /// The blob holds fewer bytes than the record accounts for.
+    Short,
+    /// The blob holds more, but not as frames appended after the recorded
+    /// length: it was replaced whole and the record never caught up.
+    Replaced,
+}
+
+/// End a blob at `end`, keeping prior frames untouched.
+fn trim_blob(path: &Path, bytes: &[u8], end: usize) -> Result<()> {
+    let tmp = path.with_extension("zst.tmp");
+    write_private_file(&tmp, &bytes[..end])?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to rename into {}", path.display()))?;
+    Ok(())
+}
+
+/// Compare a blob's frames with the length the record accounts for, and remove
+/// frames past it.
+///
+/// Appends are whole frames written immediately; the length that says they are
+/// part of the mirror is saved with the index at the end of the round. A round
+/// that dies in between therefore leaves frames no record claims, and this is
+/// what makes reading the same delta again safe.
+fn reconcile_blob(
+    store: &BackupStore,
+    partition: &str,
+    session_id: &str,
+    name: &str,
+    recorded: u64,
+) -> Result<Mirrored> {
+    let path = store.session_dir(partition, session_id).join(name);
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(Mirrored::Short);
+    };
+    let frames = frame_spans(&bytes);
+    let total: u64 = frames.iter().map(|(_, _, raw)| *raw as u64).sum();
+    // Where the frames the record accounts for end on disk. The frame headers
+    // are read, never the compressed bodies: reconciling a multi-megabyte blob
+    // must not decompress it.
+    let mut running = 0u64;
+    let mut boundary = None;
+    for (_, end, raw) in &frames {
+        running += *raw as u64;
+        if running == recorded {
+            boundary = Some(*end);
+            break;
+        }
+        if running > recorded {
+            break;
+        }
+    }
+    let last_end = frames.last().map_or(0, |(_, end, _)| *end);
+    if total == recorded {
+        // A half-written frame past the last whole one is not part of the
+        // mirror either: it was never a whole append, and everything appended
+        // after it would be invisible to a reader that stops there.
+        if last_end < bytes.len() {
+            trim_blob(&path, &bytes, last_end)?;
+            return Ok(Mirrored::Trimmed);
+        }
+        return Ok(Mirrored::Exact);
+    }
+    if total < recorded {
+        return Ok(Mirrored::Short);
+    }
+    match boundary {
+        Some(end) if end < bytes.len() => {
+            trim_blob(&path, &bytes, end)?;
+            Ok(Mirrored::Trimmed)
+        }
+        _ => Ok(Mirrored::Replaced),
+    }
+}
+
+/// Bring a session's mirrored blobs back in line with the lengths its record
+/// accounts for before any new delta is read.
+///
+/// The transcript and the searchable messages are appended to and only then
+/// counted, so a round that appended the transcript and failed on the messages
+/// (or simply died before `save_index`) leaves one or both blobs ahead of the
+/// record. Trimming them back to the recorded lengths means the retry writes
+/// the same delta exactly once. A blob replaced whole is complete by itself, so
+/// the record catches up to it and the messages are rebuilt from it; a blob
+/// shorter than the record is left alone rather than trimmed further.
+fn reconcile_mirror(
+    store: &BackupStore,
+    partition: &str,
+    session_id: &str,
+    kind: AgentKind,
+    record: &mut BackupRecord,
+) -> Result<()> {
+    // A record from before the lengths were kept describes a mirror it cannot
+    // reconcile: its cursor and its blob may already disagree, and guessing
+    // which one is the truth is how data gets lost.
+    if record.transcript_blob_bytes == 0
+        || record.transcript_blob_bytes != record.jsonl_bytes_synced
+    {
+        return Ok(());
+    }
+    let transcript = reconcile_blob(
+        store,
+        partition,
+        session_id,
+        TRANSCRIPT_BLOB,
+        record.transcript_blob_bytes,
+    )?;
+    match transcript {
+        Mirrored::Exact | Mirrored::Trimmed => {}
+        Mirrored::Short => return Ok(()),
+        Mirrored::Replaced => {
+            let raw = store.read_blob(partition, session_id, TRANSCRIPT_BLOB)?;
+            record.jsonl_bytes_synced = raw.len() as u64;
+            record.transcript_blob_bytes = raw.len() as u64;
+            record.jsonl_head_digest = if kind == AgentKind::OpenCode {
+                String::new()
+            } else {
+                head_digest(&raw)
+            };
+            return rebuild_messages(store, partition, session_id, kind, record, &raw);
+        }
+    }
+    let messages = reconcile_blob(
+        store,
+        partition,
+        session_id,
+        MESSAGES_BLOB,
+        record.messages_blob_bytes,
+    )?;
+    match messages {
+        Mirrored::Exact | Mirrored::Trimmed => Ok(()),
+        // Messages are derived from the transcript, which is consistent now, so
+        // rebuilding them is safe even when bytes went missing from the blob.
+        Mirrored::Short | Mirrored::Replaced => {
+            let raw = store.read_blob(partition, session_id, TRANSCRIPT_BLOB)?;
+            rebuild_messages(store, partition, session_id, kind, record, &raw)
+        }
+    }
+}
+
+/// Replace a session's message blob with what its mirrored transcript says, and
+/// keep the record's count and length in step with it.
+fn rebuild_messages(
+    store: &BackupStore,
+    partition: &str,
+    session_id: &str,
+    kind: AgentKind,
+    record: &mut BackupRecord,
+    transcript: &[u8],
+) -> Result<()> {
+    let (messages, _) = extract_messages(kind, transcript);
+    let jsonl = messages_to_jsonl(&messages);
+    store.write_blob(partition, session_id, MESSAGES_BLOB, jsonl.as_bytes())?;
+    record.message_count = messages.len();
+    record.messages_blob_bytes = jsonl.len() as u64;
+    Ok(())
+}
+
 /// The newest message already mirrored for a session, read off the end of its
 /// message blob without decompressing the rest of it.
 fn last_mirrored_message(
@@ -1127,6 +1301,8 @@ fn sync_transcript(
         record.native_updated_at.clear();
         record.jsonl_bytes_synced = 0;
         record.jsonl_head_digest.clear();
+        record.transcript_blob_bytes = 0;
+        record.messages_blob_bytes = 0;
         record.message_count = 0;
         record.title.clear();
     }
@@ -1148,6 +1324,11 @@ fn sync_transcript(
     if mirror_is_current(kind, &candidate.updated_at, record) {
         return Ok(());
     }
+    // A round appends frames and only then saves the lengths that claim them,
+    // so one that died in between left a blob the record does not describe.
+    // Put the mirror back the way the record says it is before reading the
+    // native file again, or the retry appends what is already there.
+    reconcile_mirror(store, partition, &session.id, kind, record)?;
     let updated_at = candidate.updated_at.clone();
     let source_path = candidate.source_path.clone();
 
@@ -1174,14 +1355,17 @@ fn sync_transcript(
             messages.remove(0);
         }
         store.append_frame(partition, &session.id, TRANSCRIPT_BLOB, added)?;
+        let message_lines = messages_to_jsonl(&messages);
         store.append_frame(
             partition,
             &session.id,
             MESSAGES_BLOB,
-            messages_to_jsonl(&messages).as_bytes(),
+            message_lines.as_bytes(),
         )?;
         record.message_count += messages.len();
         record.jsonl_bytes_synced += added.len() as u64;
+        record.transcript_blob_bytes += added.len() as u64;
+        record.messages_blob_bytes += message_lines.len() as u64;
         record.native_updated_at = updated_at;
         // Only a name the runtime wrote itself can come out of the end of a
         // transcript. A guess drawn from the last few lines is not what the
@@ -1252,14 +1436,17 @@ fn sync_transcript(
     };
     store.write_blob(partition, &session.id, TRANSCRIPT_BLOB, data)?;
     let (messages, title) = extract_messages(kind, data);
+    let message_lines = messages_to_jsonl(&messages);
     store.write_blob(
         partition,
         &session.id,
         MESSAGES_BLOB,
-        messages_to_jsonl(&messages).as_bytes(),
+        message_lines.as_bytes(),
     )?;
     record.message_count = messages.len();
     record.jsonl_bytes_synced = data.len() as u64;
+    record.transcript_blob_bytes = data.len() as u64;
+    record.messages_blob_bytes = message_lines.len() as u64;
     record.jsonl_head_digest = if kind == AgentKind::OpenCode {
         String::new()
     } else {
