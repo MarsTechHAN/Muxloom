@@ -15820,6 +15820,72 @@ mod tests {
         );
     }
 
+    /// Copy is a controller shortcut, not input for the agent. With nothing
+    /// selected it used to fall through to the attached session: Cmd+C typed a
+    /// literal "c" into the prompt, and Ctrl+Shift+C encoded as ETX, which
+    /// interrupts a running agent when the user only meant to copy.
+    #[test]
+    fn the_copy_shortcut_never_reaches_the_attached_agent() {
+        let (mut app, input) = app_with_a_pane_shorter_than_its_grid();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert_eq!(
+            input.take(),
+            Vec::<u8>::new(),
+            "Cmd+C with nothing selected must not type into the agent"
+        );
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            input.take(),
+            Vec::<u8>::new(),
+            "Ctrl+Shift+C must not send ETX to the agent"
+        );
+
+        // Plain Ctrl-c is not the copy chord: it stays the agent's interrupt.
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            input.take(),
+            b"\x03",
+            "plain Ctrl-c still reaches the agent"
+        );
+    }
+
+    /// The same chord over a text field that has no copy path of its own must
+    /// not land in the field as its letter. Search and the board's compose box
+    /// used to take Cmd+C as "type a c".
+    #[test]
+    fn the_copy_shortcut_never_types_into_a_modal_field() {
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.open_search();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let Some(Modal::Search(form)) = app.modal.as_ref() else {
+            panic!("the search modal closed on a copy chord");
+        };
+        assert_eq!(form.query, "", "Cmd+C must not type into the search box");
+        assert!(
+            app.status_message.contains("Nothing to copy"),
+            "a copy that finds nothing says so: {}",
+            app.status_message
+        );
+
+        let (mut app, _requests) = board_app();
+        app.open_board();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        let Some(Modal::Board(form)) = app.modal.as_ref() else {
+            panic!("the board closed on a copy chord");
+        };
+        assert_eq!(
+            form.compose.as_deref(),
+            Some(""),
+            "Cmd+C must not type into the board's compose box"
+        );
+    }
+
     #[test]
     fn f2_holds_the_wheel_for_history_when_the_terminal_cannot_send_alt() {
         // Ghostty drops the modifier bits from the wheel, so Alt+wheel is a
