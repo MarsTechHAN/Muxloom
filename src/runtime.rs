@@ -118,6 +118,10 @@ fn unattended_mode(kind: AgentKind) -> Option<UnattendedMode> {
                 "--full-auto",
                 "--approve-for-me",
                 "--dangerously-bypass-approvals-and-sandbox",
+                // `--yolo` is Codex's shorthand for the bypass flag. Left
+                // out, a config carrying it read as undecided and the
+                // unattended pair was added beside it, which Codex refuses.
+                "--yolo",
             ],
         }),
         AgentKind::OpenCode => Some(UnattendedMode {
@@ -6905,6 +6909,24 @@ mod tests {
             ["--auto"]
         );
         assert!(launch_arguments(&bare("pi"), AgentKind::Pi, false, None, None).is_empty());
+    }
+
+    /// `--yolo` is Codex's shorthand for the bypass flag, and a configured one
+    /// is a decision about how the session runs. Left out of the conflicts, it
+    /// was read as undecided and the unattended pair was added beside it —
+    /// which Codex refuses before drawing anything, so a session with it died
+    /// on its own argument parser rather than on the work it was given.
+    #[test]
+    fn a_configured_codex_yolo_is_not_overruled_by_the_unattended_pair() {
+        let command = CommandConfig {
+            command: "codex".into(),
+            args: vec!["--yolo".into()],
+            ..CommandConfig::default()
+        };
+        assert_eq!(
+            launch_arguments(&command, AgentKind::Codex, false, None, None),
+            with_codex_terminal(&["--yolo", "--no-alt-screen"])
+        );
     }
 
     /// A wrapper is not the runtime, however faithfully it passes its arguments
