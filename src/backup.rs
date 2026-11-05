@@ -2705,6 +2705,137 @@ mod tests {
         );
     }
 
+    /// A temp tree this test owns and removes, for looking at a store from
+    /// outside its root.
+    #[cfg(unix)]
+    struct TempTree(PathBuf);
+
+    #[cfg(unix)]
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!("muxloom-backup-{tag}-{nonce}")))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A machine or session id is remote-controlled: it arrives from a daemon
+    /// or the index, and the store is the last line of defense. `sanitize`
+    /// mapped `/` to `_` but let `.` and `..` through unchanged, so the whole
+    /// component became a traversal: `<root>/blobs/../..` names the store's
+    /// parent, the frame is written outside the store, and the privacy repair
+    /// then chmods that parent to 0700 on its way back up to the root.
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_backup_id_stays_inside_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The root sits one level below a directory the test owns, so an
+        // escaped path resolves inside this tree instead of the shared temp
+        // directory.
+        let tree = TempTree::new("traversal");
+        let base = tree.path();
+        let root = base.join("store");
+        fs::create_dir_all(base).unwrap();
+        fs::set_permissions(base, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = BackupStore::new(root.clone());
+
+        store
+            .append_frame("..", "..", CAPTURE_BLOB, b"escaped\n")
+            .unwrap();
+
+        let mut problems = Vec::new();
+        let escaped = base.join(CAPTURE_BLOB);
+        if escaped.exists() {
+            problems.push(format!(
+                "append_frame(\"..\", \"..\") wrote {} outside the store root {}",
+                escaped.display(),
+                root.display()
+            ));
+        }
+        let mode = fs::metadata(base).unwrap().permissions().mode() & 0o777;
+        if mode != 0o755 {
+            problems.push(format!(
+                "the store's parent {} was chmodded to {mode:04o}",
+                base.display()
+            ));
+        }
+        let dir = fs::canonicalize(store.session_dir("..", "..")).unwrap();
+        let store_root = fs::canonicalize(&root).unwrap();
+        if !dir.starts_with(&store_root) {
+            problems.push(format!(
+                "session_dir(\"..\", \"..\") resolves to {}, outside {}",
+                dir.display(),
+                store_root.display()
+            ));
+        }
+        assert!(
+            problems.is_empty(),
+            "a `..` backup id escaped the store:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// The rule behind the test above, including the empty component, which
+    /// already became a safe name: no input may yield a component that names a
+    /// directory relative to itself.
+    #[test]
+    fn sanitize_never_yields_a_traversal_component() {
+        for raw in ["", ".", ".."] {
+            let cleaned = sanitize(raw);
+            assert!(
+                !matches!(cleaned.as_str(), "" | "." | ".."),
+                "sanitize({raw:?}) returned {cleaned:?}, which names a traversal"
+            );
+        }
+    }
+
+    /// The privacy repair walks from the session directory up to the root. A
+    /// store can arrive with `blobs` replaced by a symlink (restored, copied,
+    /// or tampered with); the walk followed the link, chmodding the target
+    /// outside the store. A link must end the walk rather than hand it
+    /// directories the store does not own.
+    #[cfg(unix)]
+    #[test]
+    fn the_privacy_repair_stops_at_a_symlinked_store_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tree = TempTree::new("symlink");
+        let base = tree.path();
+        let root = base.join("store");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, root.join("blobs")).unwrap();
+        let store = BackupStore::new(root);
+
+        store
+            .append_frame("local", "s1", CAPTURE_BLOB, b"hello\n")
+            .unwrap();
+
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o755,
+            "the privacy repair chmodded {} through the `blobs` symlink",
+            outside.display()
+        );
+    }
+
     /// A transcript long enough to fingerprint, written where a sync can read
     /// it. Returns the path and the record a first whole pass would have left.
     fn mirrored_transcript(name: &str, lines: usize) -> (PathBuf, BackupRecord) {
