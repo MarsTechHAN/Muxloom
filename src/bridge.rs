@@ -1896,25 +1896,42 @@ fn negotiate_remote_companion(
             if *marker == BOOTSTRAP_MARKER =>
         {
             let current = crate::daemon::current_generation();
-            // A target already running bytes this controller holds does not
-            // need the release consulted before it can be reached: the lookup
-            // exists to find something to deploy, and there is nothing to
-            // deploy. Asking first is what parked every launch on a machine
-            // whose network has no route to GitHub, for the whole retry budget
-            // of the checksum request.
-            if !remote_companion_is_behind(generation, version, &current)
-                && let Some(local) = companion_matching_fingerprint(options, os, arch, fingerprint)
-            {
+            let behind = remote_companion_is_behind(generation, version, &current);
+            // A target that is not behind this controller needs nothing
+            // deployed to it, so the release is not consulted at all: not for
+            // the bytes it is running, and not for a replacement that could
+            // only move it backwards. Asking first is what parked every launch
+            // on a machine whose network has no route to GitHub, for the whole
+            // retry budget of the checksum request.
+            if !behind {
+                if let Some(local) = companion_matching_fingerprint(options, os, arch, fingerprint)
+                {
+                    debug::log(
+                        "bridge",
+                        format!(
+                            "target={alias} already runs {}; connecting without a companion release lookup",
+                            local.display()
+                        ),
+                    );
+                    writeln!(writer, "USE")?;
+                    writer.flush()?;
+                    return Ok(None);
+                }
+                // It is not older than this controller and this controller
+                // holds no copy of what it is running. Anything it could push
+                // would move the machine backwards or sideways — the fleet-wide
+                // form of the rule that a working tree is never deployed.
                 debug::log(
                     "bridge",
                     format!(
-                        "target={alias} already runs {}; connecting without a companion release lookup",
-                        local.display()
+                        "target={alias} runs muxloomd {generation}, not older than {current}; leaving it in place"
                     ),
                 );
                 writeln!(writer, "USE")?;
                 writer.flush()?;
-                return Ok(None);
+                return Ok(Some(format!(
+                    "{alias} runs muxloomd {version}, which is not older than this controller; leaving it in place"
+                )));
             }
             let (asset, notice) = match resolve_companion_asset(options, os, arch, progress) {
                 Ok(asset) => asset,
@@ -1940,18 +1957,10 @@ fn negotiate_remote_companion(
             }
             writeln!(writer, "USE")?;
             writer.flush()?;
-            // The remote already runs exactly this asset, which makes it
-            // current only if the asset is this generation. A companion left
-            // behind by an older build matches itself forever, so without this
-            // the remote stays pinned to it and every capability added since
-            // goes silently missing.
-            if !remote_companion_is_behind(generation, version, &current) {
-                debug::log(
-                    "bridge",
-                    format!("target={alias} remote companion fingerprint is current"),
-                );
-                return Ok(None);
-            }
+            // The remote is behind this controller and already runs exactly
+            // this asset, so the asset is that older build: a companion left
+            // behind by an older build matches itself forever, and no release
+            // copy of it can carry the machine forward.
             debug::log(
                 "bridge",
                 format!(
@@ -3929,6 +3938,69 @@ mod tests {
         );
         drop(environment);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A target that is not behind this controller already runs a build at
+    /// least as new, and this controller may hold no copy of it. Pushing the
+    /// copy it does hold would move the machine backwards — the fleet-wide
+    /// version of the rule that a working tree is never deployed anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_this_controller_is_not_ahead_of_is_left_in_place() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset = env::temp_dir().join(format!(
+            "muxloomd-other-build-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(&asset, b"a companion this controller holds").unwrap();
+        let options = BridgeOptions {
+            bootstrap_binary: asset.display().to_string(),
+            ..BridgeOptions::default()
+        };
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // A counted height far above this build's: it is ahead, not behind,
+        // and nothing this controller holds can bring it forward.
+        let status = format!(
+            "{BOOTSTRAP_MARKER} HAVE Linux x86_64 {} 0.5.5 0.5.5:protocol-1:abcdef0:999:theirs\n",
+            "ab".repeat(32)
+        );
+        let mut reader = std::io::Cursor::new(status.into_bytes());
+        let mut writer = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = negotiate_remote_companion(
+                "SEED_DEBUG",
+                &options,
+                &mut child,
+                &mut reader,
+                &mut writer,
+                None,
+                &mut |_| {},
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = sender.send((result, writer));
+        });
+
+        let (result, written) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the controller tried to deploy over a target that is not behind it");
+        assert_eq!(String::from_utf8(written).unwrap(), "USE\n");
+        let notice = result
+            .unwrap()
+            .expect("a target left alone should be reported");
+        assert!(notice.contains("not older"), "{notice}");
+        let _ = fs::remove_file(&asset);
     }
 
     #[cfg(feature = "controller")]
