@@ -3199,11 +3199,13 @@ mod tests {
     /// scan to find one points `$HOME` at a temp tree for its length instead.
     /// The state directory is taken away at the same time, so a test build
     /// refuses to open the local daemon and the scan stays on its shell path.
+    #[cfg(unix)]
     struct HomeGuard {
         home: Option<std::ffi::OsString>,
         state: Option<std::ffi::OsString>,
     }
 
+    #[cfg(unix)]
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             // SAFETY: the suite runs one test at a time (the PATH guard in
@@ -3222,6 +3224,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn scratch_home(home: &Path) -> HomeGuard {
         let guard = HomeGuard {
             home: std::env::var_os("HOME"),
@@ -3240,6 +3243,10 @@ mod tests {
     /// The next round loaded the old cursor, read the same delta again and
     /// appended it a second time: the archive held the turn twice, counted it
     /// twice, searched it twice, and wrote both copies back on restore.
+    ///
+    /// Only on unix: the scan it drives is the POSIX shell one
+    /// (`sh`/`find`/`grep`/`sed`/`tail`), not a portable code path.
+    #[cfg(unix)]
     #[test]
     fn an_interrupted_round_does_not_mirror_the_same_delta_twice() {
         const MARKER: &str = "the-second-turn-marker-8f3a";
@@ -3250,14 +3257,17 @@ mod tests {
             .as_nanos();
 
         let home = std::env::temp_dir().join(format!("muxloom-backup-home-{nonce}"));
-        let project = home.join("work");
         let projects = home.join(".claude").join("projects").join("-work");
         fs::create_dir_all(&projects).unwrap();
-        fs::create_dir_all(&project).unwrap();
         let _home = scratch_home(&home);
 
         let native_id = "11111111-2222-3333-4444-555555555555";
-        let project_path = project.to_string_lossy().into_owned();
+        // The scan finds a transcript by grepping the folder path as literal
+        // text in its JSON, and JSON escapes a backslash or a quote. A temp
+        // directory with one in its name would therefore never match, so the
+        // fixture's folder is a plain POSIX path of its own: `$HOME` below is
+        // still the scratch tree the scan walks.
+        let project_path = "/muxloom-backup-test/work".to_string();
         let native_path = projects.join(format!("{native_id}.jsonl"));
         let native_path_str = native_path.to_string_lossy().into_owned();
         let claude = |line_type: &str, stamp: &str, content: Value| {
@@ -3445,6 +3455,110 @@ mod tests {
         assert_eq!(messages.len(), 4);
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A whole-file round writes the replacement transcript and then rebuilds
+    /// the searchable messages from it. When that rebuild failed, the record
+    /// still had to describe the old mirror so the next round would try again.
+    /// It used to adopt the new transcript first: the round reported an error,
+    /// `sync_target` saved the adopted record anyway, and every later pass saw
+    /// both blobs as current and never rebuilt the messages. The transcript
+    /// and its searchable copy stayed different forever.
+    #[test]
+    fn a_replaced_transcript_is_not_adopted_until_its_messages_are_rebuilt() {
+        let store = temp_store();
+        let line = |line_type: &str, stamp: &str, text: &str| {
+            serde_json::json!({
+                "type": line_type,
+                "timestamp": stamp,
+                "sessionId": "11111111-2222-3333-4444-555555555555",
+                "cwd": "/muxloom-backup-test/work",
+                "message": { "content": text },
+            })
+            .to_string()
+        };
+        let old = format!(
+            "{}\n{}\n",
+            line("user", "2026-10-01T00:00:00.000Z", "the first question"),
+            line("assistant", "2026-10-01T00:00:01.000Z", "the first answer"),
+        );
+        let new = format!(
+            "{old}{}\n{}\n",
+            line("user", "2026-10-01T00:01:00.000Z", "the second question"),
+            line("assistant", "2026-10-01T00:01:01.000Z", "the second answer"),
+        );
+        let (old_messages, _) = extract_messages(AgentKind::Claude, old.as_bytes());
+        let old_messages_jsonl = messages_to_jsonl(&old_messages);
+        let (new_messages, _) = extract_messages(AgentKind::Claude, new.as_bytes());
+        let new_messages_jsonl = messages_to_jsonl(&new_messages);
+        assert_eq!(old_messages.len(), 2);
+        assert_eq!(new_messages.len(), 4);
+
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, old.as_bytes())
+            .unwrap();
+        store
+            .write_blob("local", "s1", MESSAGES_BLOB, old_messages_jsonl.as_bytes())
+            .unwrap();
+        let mut record = BackupRecord {
+            target_id: "local".into(),
+            session_id: "s1".into(),
+            kind: AgentKind::Claude.as_str().into(),
+            native_updated_at: "2026-10-01T00:00:01.000Z".into(),
+            jsonl_bytes_synced: old.len() as u64,
+            jsonl_head_digest: head_digest(old.as_bytes()),
+            transcript_blob_bytes: old.len() as u64,
+            messages_blob_bytes: old_messages_jsonl.len() as u64,
+            message_count: old_messages.len(),
+            ..Default::default()
+        };
+        // The next round replaced the transcript whole and then failed on the
+        // messages, so the record that round started from is still the old one.
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, new.as_bytes())
+            .unwrap();
+        let old_record = record.clone();
+
+        // Make the rebuild itself fail, the way a full disk or a path that is
+        // not a file would.
+        let messages_tmp = store
+            .session_dir("local", "s1")
+            .join(MESSAGES_BLOB)
+            .with_extension("zst.tmp");
+        fs::create_dir_all(&messages_tmp).unwrap();
+        assert!(
+            reconcile_mirror(&store, "local", "s1", AgentKind::Claude, &mut record).is_err(),
+            "the rebuild was supposed to fail"
+        );
+        assert_eq!(
+            store.read_blob("local", "s1", MESSAGES_BLOB).unwrap(),
+            old_messages_jsonl.as_bytes(),
+            "the failed rebuild changed the messages blob"
+        );
+        assert_eq!(
+            record, old_record,
+            "the record adopted the replaced transcript before its messages were rebuilt; \
+             the next round sees both blobs as current and the mirror stays inconsistent"
+        );
+
+        // The obstruction goes away and the next round retries the rebuild.
+        fs::remove_dir_all(&messages_tmp).unwrap();
+        reconcile_mirror(&store, "local", "s1", AgentKind::Claude, &mut record).unwrap();
+        assert_eq!(
+            store.read_blob("local", "s1", MESSAGES_BLOB).unwrap(),
+            new_messages_jsonl.as_bytes(),
+            "the retry did not rebuild the messages from the adopted transcript"
+        );
+        assert_eq!(record.message_count, new_messages.len());
+        assert_eq!(record.messages_blob_bytes, new_messages_jsonl.len() as u64);
+        assert_eq!(record.jsonl_bytes_synced, new.len() as u64);
+        assert_eq!(record.transcript_blob_bytes, new.len() as u64);
+        assert_eq!(record.jsonl_head_digest, head_digest(new.as_bytes()));
+
+        // A mirror that caught up is left alone.
+        let caught_up = record.clone();
+        reconcile_mirror(&store, "local", "s1", AgentKind::Claude, &mut record).unwrap();
+        assert_eq!(record, caught_up);
     }
 
     #[test]
