@@ -229,6 +229,11 @@ impl BackupStore {
     /// and the root are repaired here as the store touches them. Nothing below
     /// the path is walked, so other machines' and sessions' directories are
     /// left alone. Windows keeps the ACLs inherited from the parent.
+    ///
+    /// The repair only follows the levels the store itself laid out. A level
+    /// that is not a plain directory inside the root ends it: a `..` component
+    /// or a symlinked directory would otherwise hand `set_permissions` a path
+    /// outside the store -- and `set_permissions` follows a link to its target.
     fn create_private_dir(&self, path: &Path) -> Result<()> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -243,17 +248,44 @@ impl BackupStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mut levels: Vec<&Path> = Vec::new();
             let mut level = Some(path);
             while let Some(dir) = level {
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                    .with_context(|| format!("failed to restrict {}", dir.display()))?;
+                let Ok(meta) = fs::symlink_metadata(dir) else {
+                    break;
+                };
+                if !meta.is_dir() {
+                    break;
+                }
+                levels.push(dir);
                 if dir == self.root.as_path() {
                     break;
                 }
-                level = dir.parent().filter(|parent| parent.starts_with(&self.root));
+                level = dir.parent().filter(|parent| self.inside_root(parent));
+            }
+            // Repair nothing unless the whole chain reached the root: levels
+            // below a link or a `..` live somewhere the store does not own.
+            if levels.last().copied() == Some(self.root.as_path()) {
+                for dir in levels {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("failed to restrict {}", dir.display()))?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Whether `path` is lexically inside the store root and does not climb
+    /// back out of it with `..`.
+    #[cfg(unix)]
+    fn inside_root(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root)
+            .map(|rest| {
+                !rest
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            })
+            .unwrap_or(false)
     }
 
     /// Load the index, returning an empty one if it does not exist yet.
@@ -2392,6 +2424,13 @@ fn make_snippet(text: &str, needle: &str) -> String {
 }
 
 /// Sanitize a path component so a target/session id can name a directory.
+///
+/// Ids come from remote daemons and from the index, so the store must not
+/// trust one with the shape of a directory reference: `.` and `..` survive the
+/// character mapping whole, and a component of `..` would walk the session
+/// path straight out of the store. Such an id gets the same safe placeholder
+/// as an empty one; the write and read paths share this function, so the
+/// on-disk name stays consistent.
 fn sanitize(component: &str) -> String {
     let cleaned: String = component
         .chars()
@@ -2403,7 +2442,7 @@ fn sanitize(component: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "_".into()
     } else {
         cleaned
