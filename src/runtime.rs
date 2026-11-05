@@ -516,7 +516,7 @@ impl Runtime {
         probe.push_str(
             "if command -v tmux >/dev/null 2>&1; then printf 'tmux=1\\n'; else printf 'tmux=0\\n'; fi",
         );
-        let managed_panes = shell_join(&[
+        let managed_panes = tmux_in_utf8(&[
             "tmux",
             "list-panes",
             "-a",
@@ -529,7 +529,7 @@ impl Runtime {
             "{managed_panes} 2>/dev/null | while IFS= read -r pane; do \
              tmux set-option -w -t \"$pane\" remain-on-exit on 2>/dev/null || true; done"
         );
-        let discover = shell_join(&[
+        let discover = tmux_in_utf8(&[
             "tmux",
             "list-panes",
             "-a",
@@ -594,7 +594,7 @@ impl Runtime {
     /// its folder and its tokens for as long as the machine stays up. Listing
     /// them costs one `tmux list-panes` a scan and hands `x` back its target.
     fn stranded_tmux_sessions(&self, target: &Target) -> Vec<AgentSession> {
-        let discover = shell_join(&[
+        let discover = tmux_in_utf8(&[
             "tmux",
             "list-panes",
             "-a",
@@ -1833,7 +1833,7 @@ if [ -z "$found" ]; then exit 69; fi
         // Derive capture coordinates from the pane's actual height. History
         // reads must never resize the tmux window: doing so races the attached
         // PTY and produces the familiar vertical-bar/dot resize artifacts.
-        let pane_height = shell_join(&[
+        let pane_height = tmux_in_utf8(&[
             "tmux",
             "display-message",
             "-p",
@@ -1841,7 +1841,7 @@ if [ -z "$found" ]; then exit 69; fi
             session_id,
             "#{pane_height}",
         ]);
-        let history_size = shell_join(&[
+        let history_size = tmux_in_utf8(&[
             "tmux",
             "display-message",
             "-p",
@@ -1849,7 +1849,7 @@ if [ -z "$found" ]; then exit 69; fi
             session_id,
             "#{history_size}",
         ]);
-        let pane_width = shell_join(&[
+        let pane_width = tmux_in_utf8(&[
             "tmux",
             "display-message",
             "-p",
@@ -1857,7 +1857,7 @@ if [ -z "$found" ]; then exit 69; fi
             session_id,
             "#{pane_width}",
         ]);
-        let capture = shell_join(&["tmux", "capture-pane", "-p", "-e", "-t", session_id]);
+        let capture = tmux_in_utf8(&["tmux", "capture-pane", "-p", "-e", "-t", session_id]);
         let script = format!(
             "history_size=$({history_size}) || exit $?; \
              pane_height=$({pane_height}) || exit $?; \
@@ -1914,7 +1914,7 @@ if [ -z "$found" ]; then exit 69; fi
         if is_daemon_session_id(session_id) {
             return Ok((false, None, None));
         }
-        let sample = shell_join(&[
+        let sample = tmux_in_utf8(&[
             "tmux",
             "display-message",
             "-p",
@@ -1922,7 +1922,7 @@ if [ -z "$found" ]; then exit 69; fi
             session_id,
             PANE_SAMPLE_FORMAT,
         ]);
-        let capture = shell_join(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
+        let capture = tmux_in_utf8(&["tmux", "capture-pane", "-p", "-S", "-200", "-t", session_id]);
         let script =
             format!("{sample}; sleep {PANE_SAMPLE_GAP_SECS}; {sample}; date +%s; {capture}");
         let output = self.run_shell(target, &script, false)?;
@@ -2029,8 +2029,8 @@ if [ -z "$found" ]; then exit 69; fi
                 })
                 .collect());
         }
-        let recap = shell_join(&["tmux", "capture-pane", "-p", "-J", "-t", session_id]);
-        let history = shell_join(&[
+        let recap = tmux_in_utf8(&["tmux", "capture-pane", "-p", "-J", "-t", session_id]);
+        let history = tmux_in_utf8(&[
             "tmux",
             "capture-pane",
             "-p",
@@ -5375,6 +5375,22 @@ pub fn shell_join(values: &[&str]) -> String {
         .join(" ")
 }
 
+/// One tmux command, started in a locale that keeps the tabs its formats ask
+/// for.
+///
+/// tmux only treats a format's output as UTF-8 when the locale it starts in
+/// says so, and otherwise replaces every tab with `_`. A remote `sh -lc` has no
+/// locale at all unless sshd passes one through, and `LC_ALL=C` is common on
+/// servers: either way the tab-separated listings collapsed into one field, so
+/// tmux sessions went missing from the machine and their panes always read as
+/// idle. The empty `LC_ALL` keeps an inherited one from overriding the setting,
+/// and both assignments are scoped to this one command.
+fn tmux_in_utf8(arguments: &[&str]) -> String {
+    let mut values = vec!["LC_ALL=", "LC_CTYPE=C.UTF-8"];
+    values.extend_from_slice(arguments);
+    shell_join(&values)
+}
+
 /// Whole seconds since the epoch, for naming the copy a placement keeps.
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -6065,6 +6081,18 @@ mod tests {
         assert_eq!(sessions[0].target_id, "gpu");
         assert!(sessions[1].id.starts_with("ad-"));
         assert!(sessions[1].dead, "remote dead panes must be archived");
+    }
+
+    /// tmux replaces the tabs a format asks for with `_` when it starts in a
+    /// locale that does not name UTF-8 — and a remote `sh -lc` often has no
+    /// locale at all. Every listing parsed below is tab-separated, so the
+    /// command has to carry the locale that keeps them.
+    #[test]
+    fn a_tmux_listing_is_asked_for_in_a_utf8_locale() {
+        assert_eq!(
+            tmux_in_utf8(&["tmux", "list-panes", "-F", "#{session_name}\t#{pane_dead}"]),
+            "LC_ALL= LC_CTYPE=C.UTF-8 tmux list-panes -F '#{session_name}\t#{pane_dead}'"
+        );
     }
 
     /// A machine that gains a daemon does not lose the agents tmux was already

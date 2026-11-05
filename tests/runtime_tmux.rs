@@ -18,6 +18,35 @@ use muxloom::{
     terminal_session::TerminalSession,
 };
 
+/// An environment variable set for as long as the guard lives, then put back.
+///
+/// Only held around a probe: a test that forces `LC_ALL=C` proves the discovery
+/// does not depend on the shell's locale, without leaving the whole suite in a
+/// locale it did not choose.
+struct Environment {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Environment {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the value is put back before the guard leaves this scope.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 struct SessionGuard<'a> {
     runtime: &'a Runtime,
     target: &'a Target,
@@ -242,9 +271,16 @@ fn discovers_legacy_agent_deck_sessions_after_the_rename() {
         assert!(status.success());
     }
 
-    let (_, sessions) = runtime
-        .probe_and_discover(&target, &probe_commands(), &[])
-        .unwrap();
+    // tmux replaces the tabs every record is split on with `_` unless its
+    // locale names UTF-8, and a remote `sh -lc` often has no locale at all.
+    // Forcing the same here is what keeps a regression from passing on a
+    // developer machine whose shell happens to be UTF-8.
+    let (_, sessions) = {
+        let _locale = Environment::set("LC_ALL", "C");
+        runtime
+            .probe_and_discover(&target, &probe_commands(), &[])
+            .unwrap()
+    };
     let session = sessions
         .iter()
         .find(|session| session.id == session_id)
