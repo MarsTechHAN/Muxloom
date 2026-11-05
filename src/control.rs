@@ -6805,6 +6805,34 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A controller search that could not run is a refusal, not a `[]`.
+    ///
+    /// The id below is one the runtime refuses before a machine is touched,
+    /// which stands in for every failure that left the search unrun — an
+    /// unknown id, an unreachable machine, a capture that cannot be read. Each
+    /// of them used to be swallowed, and the caller was told the word does not
+    /// occur in a session the search never reached.
+    #[test]
+    fn a_controller_search_that_could_not_run_is_not_an_empty_answer() {
+        let (control, root) = controller_over_temp("search-refused");
+        let error = control
+            .call(
+                "search_history",
+                &json!({
+                    "machine": "local",
+                    "query": "needle",
+                    "session_id": "not-a-session-id",
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing invalid Muxloom session id"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_call_coming_back_from_the_fleet_calls_this_machine_by_its_hostname() {
         let (control, root) = controller_over_temp("hostname");
@@ -7444,6 +7472,36 @@ mod tests {
                 json!({ "include_archived": true }),
             );
             assert!(!listed.contains(&session_id));
+        }
+
+        /// A search for a session nobody holds comes back as the refusal every
+        /// other tool over that id gives, never as `[]`.
+        ///
+        /// `[]` means "the captures were read and the word is not there". This
+        /// search never opened one: the daemon answered `unknown daemon
+        /// session`, the answer was thrown away, and an agent was left
+        /// concluding that a behavior it never checked does not exist.
+        #[test]
+        fn a_search_for_an_unknown_session_is_refused_not_answered_empty() {
+            let surface = surface("search-unknown");
+            let missing = "muxloomd-claude-0-0-0";
+
+            // read_screen over the same id is already answered this way.
+            let read = surface
+                .call("read_screen", &json!({ "session_id": missing }))
+                .unwrap_err()
+                .to_string();
+            assert!(read.contains("unknown daemon session"), "{read}");
+
+            let error = surface
+                .call(
+                    "search_history",
+                    &json!({ "query": "needle", "session_id": missing }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown daemon session"), "{error}");
+            assert!(error.contains(missing), "{error}");
         }
 
         // The tests below rewrite MUXLOOM_SESSION_ID and its neighbours,
