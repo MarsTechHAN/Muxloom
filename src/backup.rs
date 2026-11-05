@@ -3005,6 +3005,261 @@ mod tests {
         assert_eq!(head_digest(&long), head_digest(&longer));
     }
 
+    /// A scratch `$HOME` for one test, put back on drop.
+    ///
+    /// `scan_resumes` looks for a transcript under `$HOME/.claude/projects`,
+    /// which is the real home of whoever runs the suite. A test that needs the
+    /// scan to find one points `$HOME` at a temp tree for its length instead.
+    /// The state directory is taken away at the same time, so a test build
+    /// refuses to open the local daemon and the scan stays on its shell path.
+    struct HomeGuard {
+        home: Option<std::ffi::OsString>,
+        state: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: the suite runs one test at a time (the PATH guard in
+            // `bridge` relies on the same thing), and both values are put back
+            // before the next test starts.
+            unsafe {
+                match &self.home {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.state {
+                    Some(state) => std::env::set_var("MUXLOOMD_STATE_DIR", state),
+                    None => std::env::remove_var("MUXLOOMD_STATE_DIR"),
+                }
+            }
+        }
+    }
+
+    fn scratch_home(home: &Path) -> HomeGuard {
+        let guard = HomeGuard {
+            home: std::env::var_os("HOME"),
+            state: std::env::var_os("MUXLOOMD_STATE_DIR"),
+        };
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::remove_var("MUXLOOMD_STATE_DIR");
+        }
+        guard
+    }
+
+    /// A round that appended a transcript delta and died before the index was
+    /// saved used to leave the frames on disk with no cursor claiming them.
+    /// The next round loaded the old cursor, read the same delta again and
+    /// appended it a second time: the archive held the turn twice, counted it
+    /// twice, searched it twice, and wrote both copies back on restore.
+    #[test]
+    fn an_interrupted_round_does_not_mirror_the_same_delta_twice() {
+        const MARKER: &str = "the-second-turn-marker-8f3a";
+        let store = temp_store();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let home = std::env::temp_dir().join(format!("muxloom-backup-home-{nonce}"));
+        let project = home.join("work");
+        let projects = home.join(".claude").join("projects").join("-work");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let _home = scratch_home(&home);
+
+        let native_id = "11111111-2222-3333-4444-555555555555";
+        let project_path = project.to_string_lossy().into_owned();
+        let native_path = projects.join(format!("{native_id}.jsonl"));
+        let native_path_str = native_path.to_string_lossy().into_owned();
+        let claude = |line_type: &str, stamp: &str, content: Value| {
+            serde_json::json!({
+                "type": line_type,
+                "timestamp": stamp,
+                "sessionId": native_id,
+                "cwd": project_path,
+                "message": { "content": content },
+            })
+            .to_string()
+        };
+
+        // The first turn as a first whole round would have left it: mirrored
+        // whole, long enough to fingerprint.
+        let first = format!(
+            "{}\n{}\n",
+            claude(
+                "user",
+                "2026-10-01T00:00:00.000Z",
+                Value::String(format!("the first question {}", "x".repeat(5_000))),
+            ),
+            claude(
+                "assistant",
+                "2026-10-01T00:00:01.000Z",
+                Value::String("the first answer".into()),
+            ),
+        );
+        assert!(
+            first.len() > HEAD_DIGEST_BYTES,
+            "the fixture has to be long enough to fingerprint: {}",
+            first.len()
+        );
+        fs::write(&native_path, &first).unwrap();
+        let (first_messages, _) = extract_messages(AgentKind::Claude, first.as_bytes());
+        let first_messages_jsonl = messages_to_jsonl(&first_messages);
+        store
+            .write_blob("local", "s1", TRANSCRIPT_BLOB, first.as_bytes())
+            .unwrap();
+        store
+            .write_blob(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                first_messages_jsonl.as_bytes(),
+            )
+            .unwrap();
+
+        // The record that round saved. The lengths of the two blobs it
+        // accounts for go in as JSON: a test that has to run against the build
+        // before those fields existed cannot name them in Rust, and serde
+        // ignores the ones it does not know.
+        let mut record = serde_json::to_value(BackupRecord {
+            target_id: "local".into(),
+            session_id: "s1".into(),
+            kind: AgentKind::Claude.as_str().into(),
+            cwd: project_path.clone(),
+            created_at: 1_000,
+            native_id: native_id.into(),
+            native_path: native_path_str.clone(),
+            native_updated_at: "2026-10-01T00:00:01.000Z".into(),
+            jsonl_bytes_synced: first.len() as u64,
+            jsonl_head_digest: head_digest(first.as_bytes()),
+            message_count: first_messages.len(),
+            last_synced: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let fields = record.as_object_mut().unwrap();
+        fields.insert("transcript_blob_bytes".into(), (first.len() as u64).into());
+        fields.insert(
+            "messages_blob_bytes".into(),
+            (first_messages_jsonl.len() as u64).into(),
+        );
+        fs::create_dir_all(store.root()).unwrap();
+        fs::write(
+            store.index_path(),
+            serde_json::json!({ "records": [record] }).to_string(),
+        )
+        .unwrap();
+
+        // A second turn lands in the native transcript.
+        let second = format!(
+            "{}\n{}\n",
+            claude(
+                "user",
+                "2026-10-01T00:01:00.000Z",
+                Value::String(format!("{MARKER}: one more question")),
+            ),
+            claude(
+                "assistant",
+                "2026-10-01T00:01:01.000Z",
+                Value::String("the second answer".into()),
+            ),
+        );
+        let mut file = OpenOptions::new().append(true).open(&native_path).unwrap();
+        file.write_all(second.as_bytes()).unwrap();
+        drop(file);
+
+        // The round that died: it mirrored the delta into both blobs and never
+        // reached the index write, exactly what the transcript append did
+        // before the messages append or the save could fail.
+        let stale = store
+            .load_index()
+            .unwrap()
+            .records
+            .into_iter()
+            .next()
+            .unwrap();
+        let added = appended_locally(&native_path_str, &stale)
+            .unwrap()
+            .expect("the same transcript, grown");
+        let added = &added[..whole_lines(&added)];
+        assert_eq!(added, second.as_bytes());
+        let (delta_messages, _) = extract_messages(AgentKind::Claude, added);
+        store
+            .append_frame("local", "s1", TRANSCRIPT_BLOB, added)
+            .unwrap();
+        store
+            .append_frame(
+                "local",
+                "s1",
+                MESSAGES_BLOB,
+                messages_to_jsonl(&delta_messages).as_bytes(),
+            )
+            .unwrap();
+
+        // The next round loads the record the dead one never saved.
+        let mut record = store
+            .load_index()
+            .unwrap()
+            .records
+            .into_iter()
+            .next()
+            .unwrap();
+        let runtime = Runtime::new(&crate::config::Config::default());
+        let target = Target::local();
+        let session = crate::daemon_protocol::DaemonSession {
+            path: project_path.clone(),
+            created_at: 1_000,
+            ..live_session("s1", None)
+        };
+        let mut spoken_for = HashMap::new();
+        let mut stats = SyncSummary::default();
+        sync_transcript(
+            &runtime,
+            &store,
+            &target,
+            "local",
+            true,
+            AgentKind::Claude,
+            &session,
+            &mut record,
+            &mut spoken_for,
+            &mut stats,
+        )
+        .unwrap();
+
+        let mirrored = store.read_blob("local", "s1", TRANSCRIPT_BLOB).unwrap();
+        let mirrored = String::from_utf8_lossy(&mirrored);
+        assert_eq!(
+            mirrored.matches(MARKER).count(),
+            1,
+            "the delta the interrupted round had already appended was appended again"
+        );
+        assert_eq!(
+            mirrored.lines().count(),
+            4,
+            "the mirrored transcript holds the second turn twice"
+        );
+        let messages_raw = store.read_blob("local", "s1", MESSAGES_BLOB).unwrap();
+        let messages = messages_from_jsonl(&messages_raw);
+        assert_eq!(
+            String::from_utf8_lossy(&messages_raw)
+                .matches(MARKER)
+                .count(),
+            1,
+            "the searchable messages hold the second turn twice"
+        );
+        assert_eq!(
+            record.message_count,
+            messages.len(),
+            "the record counts messages the blob does not hold, or the other way round"
+        );
+        assert_eq!(messages.len(), 4);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn the_seam_between_two_appended_chunks_knows_what_came_before_it() {
         let store = temp_store();
