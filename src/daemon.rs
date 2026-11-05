@@ -8133,22 +8133,31 @@ mod platform {
     }
 
     fn tcp_listener_ports() -> Result<Vec<u16>> {
-        let ports = BTreeSet::new();
         #[cfg(target_os = "linux")]
-        let mut ports = ports;
-        #[cfg(target_os = "linux")]
-        for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-            let table = match fs::read_to_string(path) {
-                Ok(table) => table,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to read TCP listeners from {path}"));
-                }
-            };
-            collect_linux_tcp_listeners(&table, &mut ports);
+        {
+            let mut ports = BTreeSet::new();
+            for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+                let table = match fs::read_to_string(path) {
+                    Ok(table) => table,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to read TCP listeners from {path}"));
+                    }
+                };
+                collect_linux_tcp_listeners(&table, &mut ports);
+            }
+            Ok(ports.into_iter().collect())
         }
-        Ok(ports.into_iter().collect())
+        #[cfg(not(target_os = "linux"))]
+        {
+            // The socket table is a Linux interface (/proc/net/tcp); macOS
+            // keeps its listeners behind a different API this companion does
+            // not read. An empty list would claim the machine is idle when the
+            // feature never ran, so name the limitation and let the
+            // port-forward form show it.
+            bail!("listing TCP listeners is only supported on Linux companions")
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -17255,6 +17264,21 @@ mod platform {
                 "the refusal must name the platform limit: {error:#}"
             );
             drop(listener);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_tcp_listener_scan_finds_a_bound_local_port() {
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(port >= 1024, "the listener must be reportable: {port}");
+            let ports = tcp_listener_ports().unwrap();
+            assert!(
+                ports.contains(&port),
+                "a bound listener on {port} must be detected: {ports:?}"
+            );
         }
 
         #[cfg(target_os = "linux")]

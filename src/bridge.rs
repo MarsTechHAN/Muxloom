@@ -3827,6 +3827,58 @@ mod tests {
         );
     }
 
+    /// The daemon refuses a listener scan on a platform that cannot serve it
+    /// (macOS), and that refusal has to reach the caller as the reason. It is
+    /// already the generic request path's job to turn an Error reply into the
+    /// error; this pins it for the listener call, whose own match would
+    /// otherwise read as "unexpected response".
+    #[cfg(unix)]
+    #[test]
+    fn a_tcp_listener_error_reply_reaches_the_caller_verbatim() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = client.try_clone().unwrap();
+        let connection = BridgeConnection::from_parts("test".into(), reader, client, None);
+        connection
+            .state
+            .capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert("tcp-listeners-v1".into());
+        let server_thread = thread::spawn(move || {
+            let frame = Frame::read_from(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                frame.decode_json::<DaemonRequest>().unwrap(),
+                DaemonRequest::ListTcpListeners
+            ));
+            Frame::json(
+                FrameKind::Response,
+                0,
+                frame.request_id,
+                &DaemonResponse::Error {
+                    message: "listing TCP listeners is only supported on Linux companions".into(),
+                },
+            )
+            .unwrap()
+            .write_to(&mut server)
+            .unwrap();
+        });
+        let error = connection
+            .tcp_listener_ports()
+            .expect_err("an error reply must not read as a listener list");
+        assert!(
+            error.to_string().contains("only supported on Linux"),
+            "the daemon's reason must survive the request: {error:#}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("unexpected TCP-listener response"),
+            "an error reply is not an unexpected reply: {error:#}"
+        );
+        server_thread.join().unwrap();
+        connection.state.shutdown();
+    }
+
     #[cfg(unix)]
     #[test]
     fn tcp_streams_are_not_sent_to_an_older_companion_generation() {
