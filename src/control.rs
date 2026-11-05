@@ -1110,7 +1110,7 @@ fn build_input(arguments: &Value, kind: Option<AgentKind>) -> Result<Vec<u8>> {
     if text.is_none() && keys.is_none_or(|keys| keys.is_empty()) && !submit {
         bail!("send_input needs text, keys, or submit");
     }
-    let pastes = matches!(kind, Some(AgentKind::Codex | AgentKind::Claude));
+    let pastes = kind.is_some_and(AgentKind::brackets_paste);
     let mut bytes = Vec::new();
     if let Some(text) = text.filter(|text| !text.is_empty()) {
         if pastes {

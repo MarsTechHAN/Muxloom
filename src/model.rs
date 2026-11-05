@@ -189,6 +189,16 @@ impl AgentKind {
         self != Self::Terminal
     }
 
+    /// Whether this CLI decides what an arriving carriage return means by how
+    /// much came with it. Codex and Claude Code read text and an Enter written
+    /// together as one paste and absorb the Enter into it as a newline, so text
+    /// for them travels bracketed and the Enter after it is a keystroke again.
+    /// Everything else types raw: a shell has no such heuristic, and a program
+    /// that never enabled bracketed paste would be handed the brackets as text.
+    pub fn brackets_paste(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+    }
+
     pub fn toggle(self) -> Self {
         self.next()
     }

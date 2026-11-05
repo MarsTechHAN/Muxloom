@@ -925,6 +925,28 @@ mod platform {
                 .is_some_and(|last| now.saturating_sub(last) < armed.spec.cooldown_ms)
     }
 
+    /// The bytes a `send_input` trigger types back into a session.
+    ///
+    /// This is the control surface's `build_input` in another door, so the text
+    /// is framed the same way: a runtime that reads text and Enter together as
+    /// one paste gets it bracketed, and the Enter after it stays a keystroke.
+    /// Typed raw to one of those, a long trigger text is left sitting unsent in
+    /// the prompt — and the trigger that typed it is already fired and gone.
+    fn trigger_input(kind: Option<AgentKind>, text: &str, submit: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if !text.is_empty() {
+            if kind.is_some_and(AgentKind::brackets_paste) {
+                bytes.extend(paste_bytes(text, false));
+            } else {
+                bytes.extend_from_slice(text.as_bytes());
+            }
+        }
+        if submit {
+            bytes.push(b'\r');
+        }
+        bytes
+    }
+
     /// Look at one session's screen for the triggers armed on it, and run what
     /// matched. Runs on that session's reader thread, after the bytes have
     /// reached the screen, so a trigger sees exactly the text the attention
@@ -992,14 +1014,17 @@ mod platform {
             }
         }
         // Outside the lock: an action writes to the keeper, and a trigger set
-        // must never be held across a write to a session.
+        // must never be held across a write to a session. Every trigger that
+        // just fired was armed on this one session, so the runtime that decides
+        // how its text is framed is read once.
+        if fired.is_empty() {
+            return;
+        }
+        let kind = session.snapshot().kind.parse::<AgentKind>().ok();
         for spec in fired {
             match spec.action {
                 TriggerAction::SendInput { text, submit } => {
-                    let mut bytes = text.into_bytes();
-                    if submit {
-                        bytes.push(b'\r');
-                    }
+                    let bytes = trigger_input(kind, &text, submit);
                     if let Err(error) = session.write_input(&bytes) {
                         eprintln!("muxloomd trigger {} could not type: {error:#}", spec.id);
                     }
@@ -1229,7 +1254,7 @@ mod platform {
     /// the draft in and leave it sitting in the box, which is what the
     /// "message never got through" reports were.
     fn message_bytes(kind: AgentKind, body: &str) -> Vec<u8> {
-        if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
+        if kind.brackets_paste() {
             paste_bytes(body, true)
         } else {
             let mut folded = folded(body).into_bytes();
