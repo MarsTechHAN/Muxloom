@@ -4268,25 +4268,32 @@ fn parse_pane_sample(line: &str) -> Option<PaneSample> {
 }
 
 /// [`crate::activity::agent_status`] over two tmux readings: a spinner at the
-/// head of the title is a turn running, so is output in the last couple of
-/// seconds; a title that changed between the readings without a spinner is
-/// being blinked at whoever is looking; a hidden cursor is a dialog holding
-/// the keyboard, on a runtime that shows the cursor at its prompt box at all.
+/// head of the title is a turn running; a hidden cursor is a dialog holding
+/// the keyboard, on a runtime that shows the cursor at its prompt box at all;
+/// a title that changed between the readings without a spinner is being
+/// blinked at whoever is looking; and, with the cursor shown, output in the
+/// last couple of seconds is a turn. The cursor is read before that output
+/// because a dialog that repaints itself — Claude Code redraws its own about
+/// twice a second — keeps `window_activity` fresh for as long as it waits, so
+/// freshness outranking the cursor read a stalled question as a running turn.
 pub(crate) fn tmux_pane_status(
     kind: AgentKind,
     first: &PaneSample,
     second: &PaneSample,
     now: u64,
 ) -> Status {
-    if title_has_spinner(&second.title) || now.saturating_sub(second.activity) <= 2 {
+    if title_has_spinner(&second.title) {
         return Status::Working;
-    }
-    if first.title != second.title {
-        return Status::Waiting;
     }
     // pi draws its own cursor and never shows the terminal's, so a hidden
     // cursor says nothing about it.
     if !second.cursor_shown && kind != AgentKind::Pi && kind != AgentKind::Terminal {
+        return Status::Waiting;
+    }
+    if now.saturating_sub(second.activity) <= 2 {
+        return Status::Working;
+    }
+    if first.title != second.title {
         return Status::Waiting;
     }
     Status::Idle
