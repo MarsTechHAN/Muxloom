@@ -15577,6 +15577,124 @@ mod platform {
             discard_root(paths.root);
         }
 
+        /// The record of a live keeper can parse and still carry the wrong id:
+        /// a file written under the wrong name, a hand copy, a rewrite that
+        /// stopped halfway. The adoption walk derived the socket from the
+        /// filename and marked that socket accounted for before it read the
+        /// record, so a bail on the id mismatch left the session in neither
+        /// `sessions` nor `persisted_sessions`, and the dismissal sweep skipped
+        /// the accounted socket. The agent kept running with no row to attach
+        /// to, archive, or kill.
+        ///
+        /// The keeper is the authority on which session its socket serves: the
+        /// socket's path was derived from the filename id and its greeting
+        /// names that same session. So when both agree, the record's id field
+        /// is what is wrong — correct it and adopt normally.
+        #[test]
+        fn a_live_session_whose_record_names_another_session_is_still_adopted() {
+            let state = test_state("mislabeled-record");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-terminal-1700000000-9-7";
+            let wrong_id = "muxloomd-terminal-1700000000-9-8";
+            let launched = launch_session(
+                &state,
+                session_id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                "record names another session".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                5,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let child_pid = launched.snapshot().pid.expect("launched session has a pid");
+            let socket_path = keeper::socket_path_for(&paths.keepers, session_id);
+            let metadata_path = paths.sessions.join(format!("{session_id}.json"));
+            assert!(socket_path.exists(), "the keeper is running");
+            assert!(metadata_path.is_file(), "and its record is written");
+
+            // The crash: the old daemon is gone without adopting anything.
+            state.draining.store(true, Ordering::Release);
+            drop(launched);
+            drop(state);
+
+            // The record is readable and filed under the id the keeper was
+            // launched with, but the id inside it is somebody else's.
+            let mut record: DaemonSession =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            assert_eq!(record.id, session_id);
+            record.id = wrong_id.into();
+            persist_session_metadata(&metadata_path, &record).unwrap();
+
+            let restarted = Arc::new(DaemonState::new(paths.clone(), KeeperMode::InProcess));
+            assert!(
+                persisted_session(&restarted, session_id).is_err(),
+                "a live session is adopted, not retired into the archive"
+            );
+            adopt_keeper_sessions(&restarted);
+
+            let adopted = daemon_session(&restarted, session_id)
+                .expect("a live keeper whose record carries the wrong id must still be adopted");
+            let snapshot = adopted.snapshot();
+            assert_eq!(
+                snapshot.id, session_id,
+                "the session is listed under the id its keeper serves"
+            );
+            assert!(
+                !snapshot.dead,
+                "the child was alive when the keeper greeted"
+            );
+            assert_eq!(snapshot.pid, Some(child_pid), "it is the same child");
+            assert_eq!(snapshot.label, "record names another session");
+            assert!(process_alive(child_pid), "adoption must not stop the child");
+            assert!(socket_path.exists(), "nor dismiss its keeper");
+            let corrected: DaemonSession =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            assert_eq!(
+                corrected.id, session_id,
+                "the served record is corrected on disk under the same filename"
+            );
+            assert_ne!(corrected.id, wrong_id);
+
+            // Served, not merely listed: input reaches the same PTY.
+            adopted
+                .write_input(b"mislabeled-generation-probe\r")
+                .unwrap();
+            let probe = b"mislabeled-generation-probe";
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut output = Vec::new();
+            while Instant::now() < deadline {
+                output = history_tail(&adopted.history_path, RECENT_OUTPUT_LIMIT as u64)
+                    .unwrap_or_default();
+                if output.windows(probe.len()).any(|window| window == probe) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                output.windows(probe.len()).any(|window| window == probe),
+                "typed bytes must reach the adopted PTY"
+            );
+
+            adopted.stop().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !adopted.snapshot().dead && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                adopted.snapshot().dead,
+                "the adopted session is killable again"
+            );
+            discard_root(paths.root);
+        }
+
         /// The test above sets the flag by hand because that is what the loop
         /// is meant to have done. A signal has to be latched, not merely
         /// noticed: the readers decide what a keeper hanging up meant by
