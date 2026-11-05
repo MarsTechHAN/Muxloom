@@ -5879,7 +5879,24 @@ mod platform {
             Err(error) => recover_unreadable_session(id, &metadata_path, &status, &error),
         };
         if metadata.id != id {
-            bail!("metadata id {} does not match {id}", metadata.id);
+            // A record that parses can still name another session: a file
+            // written under the wrong name, a hand copy, a rewrite that stopped
+            // halfway through the id. The keeper is the authority on which
+            // session its socket serves — this one answered on a path derived
+            // from `id`, and its greeting says so — so when the two agree the
+            // record is this session's and only the id inside it is wrong.
+            // Correcting it adopts a live child that a bail would leave with no
+            // row to attach to, archive, or kill, while the socket it answered
+            // on was already marked accounted for.
+            if status.session_id != id {
+                bail!("metadata id {} does not match {id}", metadata.id);
+            }
+            eprintln!(
+                "muxloomd corrected record {}: it named session {} but its keeper serves {id}",
+                metadata_path.display(),
+                metadata.id
+            );
+            metadata.id = id.to_string();
         }
         if !status.alive {
             // The child died while no daemon was listening. The keeper kept
