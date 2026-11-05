@@ -572,6 +572,32 @@ pub fn fetch_text_bounded(
     Ok(body.to_string())
 }
 
+/// Return the `Location` a URL redirects to, in one bounded attempt.
+///
+/// The background update check asks this at every launch, and it stands
+/// between a person and the machine they are using only as far as the network
+/// is concerned: a route with no way to the release must cost seconds, not the
+/// retry budget a chat request is allowed to spend.
+#[cfg(feature = "controller")]
+pub fn redirect_location_bounded(
+    url: &str,
+    environment: &[(String, String)],
+    seconds: u64,
+) -> Result<String> {
+    let response = prepare(minreq::get(url), url, environment)
+        .with_follow_redirects(false)
+        .with_timeout(seconds.max(1))
+        .send()
+        .map_err(|error| anyhow!(error).context(format!("request to {url} failed")))?;
+    let status = response.status_code;
+    if !(300..400).contains(&status) {
+        bail!("{url} returned HTTP {status}");
+    }
+    header(&response.headers, "location")
+        .map(str::to_string)
+        .with_context(|| format!("{url} redirect had no Location header"))
+}
+
 /// Return the `Location` a URL redirects to, without downloading the target.
 /// Used to read the newest release tag from `.../releases/latest`.
 #[cfg(feature = "controller")]
@@ -686,6 +712,23 @@ fn download_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The update check runs at every launch; an unreachable release must
+    /// cost its own deadline, not the retry budget of a chat request.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_bounded_redirect_lookup_gives_up_in_its_own_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases/latest", listener.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let error = redirect_location_bounded(&url, &[], 1).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "the lookup took {elapsed:?}"
+        );
+        assert!(format!("{error:#}").contains("releases/latest"));
+    }
 
     #[test]
     fn proxy_bypass_matches_hosts_subdomains_and_ports() {

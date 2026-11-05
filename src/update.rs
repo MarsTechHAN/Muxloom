@@ -256,10 +256,17 @@ fn release_archive_name(version: &str, triple: &str) -> String {
     format!("muxloom-v{version}-{triple}.tar.gz")
 }
 
+/// How long one release lookup may take when it runs as the background update
+/// check. What travels is a redirect or a small JSON document, so a slow link
+/// is served well inside this; a route with no way to the release gives up
+/// here instead of holding sockets for the retry budget of a chat request.
+/// The next launch asks again.
+const RELEASE_LOOKUP_SECS: u64 = 20;
+
 /// Read the newest published version (e.g. `"0.4.3"`) from the latest-release
 /// redirect target (`.../releases/tag/v0.4.3`).
 pub fn detect_latest(environment: &[(String, String)]) -> Result<String> {
-    let location = http::redirect_location(REPO_LATEST, environment)
+    let location = http::redirect_location_bounded(REPO_LATEST, environment, RELEASE_LOOKUP_SECS)
         .context("could not reach GitHub to check for updates")?;
     let tag = location.rsplit('/').next().unwrap_or_default().trim();
     let version = tag.trim_start_matches('v');
@@ -272,7 +279,7 @@ pub fn detect_latest(environment: &[(String, String)]) -> Result<String> {
 /// Read what the rolling nightly release currently holds.
 pub fn detect_nightly(environment: &[(String, String)]) -> Result<NightlyBuild> {
     let url = format!("{DOWNLOAD_BASE}/{NIGHTLY_TAG}/{NIGHTLY_MANIFEST}");
-    let manifest = http::fetch_text(&url, environment)
+    let manifest = http::fetch_text_bounded(&url, environment, RELEASE_LOOKUP_SECS)
         .context("could not reach GitHub to check for a nightly build")?;
     let build: NightlyBuild =
         serde_json::from_str(&manifest).context("unexpected nightly manifest")?;

@@ -154,8 +154,12 @@ fn spawn_update_check(
     ask: bool,
 ) {
     std::thread::spawn(move || {
-        let Ok(result) = muxloom::update::check_and_maybe_apply(channel, !ask, &environment) else {
-            return;
+        let result = match muxloom::update::check_and_maybe_apply(channel, !ask, &environment) {
+            Ok(result) => result,
+            Err(error) => {
+                muxloom::debug::log("update", format!("update check failed: {error:#}"));
+                return;
+            }
         };
         let Some(release) = result.release else {
             return;
