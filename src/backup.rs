@@ -1132,8 +1132,10 @@ fn reconcile_blob(
 /// (or simply died before `save_index`) leaves one or both blobs ahead of the
 /// record. Trimming them back to the recorded lengths means the retry writes
 /// the same delta exactly once. A blob replaced whole is complete by itself, so
-/// the record catches up to it and the messages are rebuilt from it; a blob
-/// shorter than the record is left alone rather than trimmed further.
+/// the record catches up to it - once the messages rebuilt from it are on disk,
+/// because a failed rebuild has to leave the record on the old mirror for the
+/// next pass to try again. A blob shorter than the record is left alone rather
+/// than trimmed further.
 fn reconcile_mirror(
     store: &BackupStore,
     partition: &str,
@@ -1161,14 +1163,23 @@ fn reconcile_mirror(
         Mirrored::Short => return Ok(()),
         Mirrored::Replaced => {
             let raw = store.read_blob(partition, session_id, TRANSCRIPT_BLOB)?;
-            record.jsonl_bytes_synced = raw.len() as u64;
-            record.transcript_blob_bytes = raw.len() as u64;
-            record.jsonl_head_digest = if kind == AgentKind::OpenCode {
+            // Compute the adopted record apart from the caller's, and install
+            // it only after the messages rebuilt from this transcript have
+            // been written. The caller saves the record even when a round
+            // fails, so committing the transcript first would tell every later
+            // pass that both blobs are current and leave the messages stale
+            // forever.
+            let mut adopted = record.clone();
+            adopted.jsonl_bytes_synced = raw.len() as u64;
+            adopted.transcript_blob_bytes = raw.len() as u64;
+            adopted.jsonl_head_digest = if kind == AgentKind::OpenCode {
                 String::new()
             } else {
                 head_digest(&raw)
             };
-            return rebuild_messages(store, partition, session_id, kind, record, &raw);
+            rebuild_messages(store, partition, session_id, kind, &mut adopted, &raw)?;
+            *record = adopted;
+            return Ok(());
         }
     }
     let messages = reconcile_blob(
