@@ -76,12 +76,28 @@ const COMPANION_PULL_TIMEOUT: Duration = Duration::from_secs(150);
 /// stdin — the target's `head -c` stuck on a full disk, a login wrapper that
 /// consumes nothing, a hung ssh channel — fills the pipe, and without a stall
 /// guard the write never returns, holding the per-target connect lock forever.
+///
+/// The guard can only see progress that the writer has published, and a
+/// blocking pipe does not acknowledge a write until the remote has drained the
+/// whole buffer. So the smallest rate this can tell from a dead link is
+/// [`COMPANION_PUSH_CHUNK`] per this deadline, which is why the push hands the
+/// pipe pieces far smaller than the read buffer.
 #[cfg(not(test))]
 const COMPANION_PUSH_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// The same stall guard in the test build, which cannot spend a minute
 /// proving that a push with a remote that stopped reading comes back at all.
 #[cfg(test)]
 const COMPANION_PUSH_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// How many bytes the push hands the pipe at a time.
+///
+/// A blocking pipe accepts a write only once the remote has drained the whole
+/// buffer, so the writer can publish progress no faster than one chunk per
+/// round trip through the pipe. A whole 64 KiB read is therefore invisible
+/// until all 64 KiB is gone: a link slower than 64 KiB per
+/// [`COMPANION_PUSH_STALL_TIMEOUT`] (~1 KiB/s in production) looks exactly
+/// like a dead one and a working upload is aborted. At 4 KiB the floor drops
+/// to ~68 B/s, and a 10 MB asset still costs only a few thousand writes.
+const COMPANION_PUSH_CHUNK: usize = 4 * 1024;
 /// How often the push's published byte count is read while waiting for the
 /// remote to take more bytes.
 const COMPANION_PUSH_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -2421,10 +2437,10 @@ impl PushMeter<'_> {
     /// has stood still for [`COMPANION_PUSH_STALL_TIMEOUT`].
     ///
     /// The writer thread owns the pipe, so the counter it publishes after each
-    /// chunk is the only portable view of progress: while it is parked in
-    /// `write_all` the count stands still. The error names the machine, the
-    /// bytes that did go and whatever the remote said on stderr, so a full
-    /// disk can be told from a login wrapper that consumes nothing.
+    /// [`COMPANION_PUSH_CHUNK`] is the only portable view of progress: while it
+    /// is parked in `write_all` the count stands still. The error names the
+    /// machine, the bytes that did go and whatever the remote said on stderr,
+    /// so a full disk can be told from a login wrapper that consumes nothing.
     fn poll(
         &mut self,
         alias: &str,
@@ -2467,14 +2483,18 @@ impl PushMeter<'_> {
 /// connect thread, which holds the per-target connect lock: a remote that
 /// stops draining stdin used to wedge that lock forever. So a writer thread
 /// owns the pipe, the main thread hands it one chunk at a time, and the meter
-/// watches the count it publishes. When the count stands still for
+/// watches the count it publishes. The chunks are [`COMPANION_PUSH_CHUNK`]
+/// pieces of each read, small enough that a blocking pipe acknowledges one
+/// well inside the stall deadline, so a slow but working link shows progress
+/// instead of looking dead. When the count stands still for
 /// [`COMPANION_PUSH_STALL_TIMEOUT`] the bootstrap child is killed — which
 /// closes the pipe and unblocks the writer — and the connection is abandoned
 /// with an error. After the last chunk the writer is waited for under the same
 /// guard, so a flush that never comes back cannot wedge it either.
 ///
-/// A slow but working link may take as long as it needs; only standing still
-/// fails.
+/// A slow but working link may take as long as it needs, down to one
+/// [`COMPANION_PUSH_CHUNK`] per [`COMPANION_PUSH_STALL_TIMEOUT`]; only
+/// standing still fails.
 #[allow(clippy::too_many_arguments)]
 fn push_companion_file<W: Write + Send>(
     alias: &str,
@@ -2523,25 +2543,32 @@ fn push_companion_file<W: Write + Send>(
                 if read == 0 {
                     break;
                 }
-                let mut pending = buffer[..read].to_vec();
-                loop {
-                    match chunks.try_send(pending) {
-                        Ok(()) => break,
-                        Err(mpsc::TrySendError::Full(returned)) => {
-                            pending = returned;
-                            meter.poll(alias, stderr_lines, progress)?;
-                            thread::sleep(COMPANION_PUSH_POLL_INTERVAL);
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            let reason = match completion.try_recv() {
-                                Ok(Err(error)) => error.to_string(),
-                                _ => "the remote closed the connection".into(),
-                            };
-                            bail!(
-                                "the companion push to {alias} stopped after {} of {size} \
-                                 bytes: {reason}",
-                                meter.reported
-                            )
+                // The writer publishes a count only after `write_all` of what
+                // it is handed returns, and on a blocking pipe that is not
+                // until the remote has drained all of it. So split the read:
+                // the pipe sees small pieces and the meter sees movement long
+                // before a whole buffer has gone.
+                for piece in buffer[..read].chunks(COMPANION_PUSH_CHUNK) {
+                    let mut pending = piece.to_vec();
+                    loop {
+                        match chunks.try_send(pending) {
+                            Ok(()) => break,
+                            Err(mpsc::TrySendError::Full(returned)) => {
+                                pending = returned;
+                                meter.poll(alias, stderr_lines, progress)?;
+                                thread::sleep(COMPANION_PUSH_POLL_INTERVAL);
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                let reason = match completion.try_recv() {
+                                    Ok(Err(error)) => error.to_string(),
+                                    _ => "the remote closed the connection".into(),
+                                };
+                                bail!(
+                                    "the companion push to {alias} stopped after {} of {size} \
+                                     bytes: {reason}",
+                                    meter.reported
+                                )
+                            }
                         }
                     }
                 }
