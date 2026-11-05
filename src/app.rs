@@ -16900,6 +16900,38 @@ mod tests {
     }
 
     #[test]
+    fn alt_screen_page_down_stays_in_daemon_history() {
+        let (mut app, _request_rx, root, _boundary) = attached_claude_app("alt-page-down");
+        // A full-screen TUI keeps no scrollback in the emulator, so a page
+        // above the live screen lives only in `history_offset`. Recording what
+        // is written toward the program says whether the key reached it too.
+        let (mut terminal, input) = TerminalSession::recording(20, 5);
+        terminal.process_output_for_test(b"\x1b[?1049h");
+        assert_eq!(terminal.max_scrollback(), 0);
+        app.terminal = Some(terminal);
+        app.history_offset = 0;
+        app.interactive = true;
+
+        app.scroll_history(true, 3);
+        app.scroll_history(true, 3);
+        assert_eq!(app.history_offset, 6);
+        assert!(!app.attached_history_is_buffered());
+
+        // A PageDown from here belongs to muxloom: it pages back down to
+        // where the read came from rather than snapping to the live tail and
+        // also paging the application's own view.
+        let can_page_back = app.attached_scrollback_can_move(false);
+        let action = app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(matches!(action, Action::Continue));
+        assert_eq!(
+            (can_page_back, app.history_offset, input.take().is_empty()),
+            (true, 3, true),
+            "PageDown must page back down through daemon history, not reset to the live tail and reach the agent"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_scrolled_back_view_stays_on_its_rows_while_the_session_prints() {
         // The emulator lifts its own offset for every line that arrives so the
         // page keeps the same rows. Handing it the app's older count back on
