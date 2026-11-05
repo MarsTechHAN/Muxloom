@@ -139,8 +139,8 @@ mod platform {
         recap::extract_recap,
         relay::{RELAY_CAPABILITY, RelayQueue},
         runtime::{
-            DAEMON_SESSION_PREFIX, WAITING_FOR_INPUT, composer, composer_text, dialog_question,
-            dialog_shown, is_temporary_session_id,
+            DAEMON_SESSION_PREFIX, TEMPORARY_SESSION_MARKER, WAITING_FOR_INPUT, composer,
+            composer_text, dialog_question, dialog_shown, is_temporary_session_id,
         },
         talk::{
             DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
@@ -1908,7 +1908,7 @@ mod platform {
                 let _ = fs::remove_file(&metadata_path);
                 continue;
             }
-            let Some((kind, created_at)) = session_origin_from_id(&id) else {
+            let Some((kind, created_at, _)) = session_origin_from_id(&id) else {
                 eprintln!(
                     "muxloomd left an unrecognized session log in place: {}",
                     history_path.display()
@@ -1973,14 +1973,22 @@ mod platform {
     }
 
     /// What a session id still says about the session once its metadata is
-    /// gone: the agent that ran and when the controller created it.
-    fn session_origin_from_id(session_id: &str) -> Option<(AgentKind, u64)> {
-        let mut fields = session_id
-            .strip_prefix(DAEMON_SESSION_PREFIX)?
-            .splitn(3, '-');
+    /// gone: the agent that ran, when the controller created it, and whether
+    /// it was a temporary one. The shape a launch writes is
+    /// `muxloomd-[temporal-]<kind>-<epoch>-<pid>-<sequence>`, so the marker
+    /// sits between the prefix and the kind.
+    fn session_origin_from_id(session_id: &str) -> Option<(AgentKind, u64, bool)> {
+        let rest = session_id.strip_prefix(DAEMON_SESSION_PREFIX)?;
+        let temporary = is_temporary_session_id(session_id);
+        let rest = if temporary {
+            rest.strip_prefix(TEMPORARY_SESSION_MARKER)?
+        } else {
+            rest
+        };
+        let mut fields = rest.splitn(3, '-');
         let kind = fields.next()?.parse::<AgentKind>().ok()?;
         let created_at = fields.next().and_then(|value| value.parse().ok())?;
-        Some((kind, created_at))
+        Some((kind, created_at, temporary))
     }
 
     /// Whether `pid` still names a live process.
@@ -5754,6 +5762,80 @@ mod platform {
         let _ = keeper::write_frame(&mut stream, keeper::frame::QUIT, &[]);
     }
 
+    /// The record a live keeper deserves when the one on disk cannot be read
+    /// at all.
+    ///
+    /// `persist_session_metadata` writes a record beside itself and renames it
+    /// over itself, so a power cut can publish the rename without the bytes it
+    /// was publishing. What is left is the id — which still says the kind and
+    /// the creation time — and the keeper's greeting, which says the child and
+    /// its pid. That is enough to serve the session again instead of leaving a
+    /// running agent with no row to attach to, archive, or kill.
+    ///
+    /// The unreadable bytes are copied aside, never moved: until the fresh
+    /// record is written the original file is what keeps the next generation's
+    /// dismissal sweep from taking this keeper for one no record accounts for.
+    /// A copy that fails for want of room leaves it standing, which is also
+    /// the safe way round.
+    fn recover_unreadable_session(
+        id: &str,
+        metadata_path: &Path,
+        status: &keeper::KeeperStatus,
+        error: &anyhow::Error,
+    ) -> DaemonSession {
+        let kept = metadata_path.with_extension("json.corrupt");
+        match fs::copy(metadata_path, &kept) {
+            Ok(_) => eprintln!(
+                "muxloomd kept the unreadable record {} as {}",
+                metadata_path.display(),
+                kept.display()
+            ),
+            Err(copy_error) => eprintln!(
+                "muxloomd could not keep the unreadable record {}: {copy_error}",
+                metadata_path.display()
+            ),
+        }
+        eprintln!("muxloomd recovered live session {id} from an unreadable record: {error:#}");
+        // An id that does not even name a kind still names a live child;
+        // `terminal` is the least a session can be when the record that said
+        // what it was has gone, and now is when this generation can first say
+        // it saw it.
+        let (kind, created_at, temporary) = session_origin_from_id(id)
+            .unwrap_or_else(|| (AgentKind::Terminal, now_secs(), is_temporary_session_id(id)));
+        DaemonSession {
+            id: id.to_string(),
+            kind: kind.as_str().into(),
+            // The folder the session ran in lived only in the lost record.
+            path: String::new(),
+            label: "recovered session".into(),
+            temporary,
+            created_at,
+            // A live session has no ending to record. Whether it is alive at
+            // all is the keeper's to say, and adoption settles the rest of
+            // its status from the greeting.
+            archived_at: None,
+            pid: status.child_pid,
+            dead: false,
+            archived: false,
+            recap: None,
+            // The conversation it was having, what opened it, its prompt box,
+            // and who started it were all in the record that went unreadable.
+            title: None,
+            thread: None,
+            seed: None,
+            first_prompt: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            composer: None,
+            parent: None,
+            powers: None,
+            resumed_from: None,
+            resumed_to: None,
+            used_at: None,
+        }
+    }
+
     /// Adopt one keeper-owned session; `Ok(true)` means it is live again under
     /// this daemon, `Ok(false)` that it was retired into the archive.
     fn adopt_keeper_session(
@@ -5779,10 +5861,23 @@ mod platform {
             }
             return Ok(false);
         };
-        let mut metadata: DaemonSession =
-            serde_json::from_slice(&fs::read(&metadata_path).with_context(|| {
-                format!("adopted keeper has no metadata {}", metadata_path.display())
-            })?)?;
+        let reading: Result<DaemonSession> = fs::read(&metadata_path)
+            .with_context(|| format!("adopted keeper has no metadata {}", metadata_path.display()))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "adopted keeper metadata {} is unreadable",
+                        metadata_path.display()
+                    )
+                })
+            });
+        // A record that cannot be read at all is not a session to lose. The
+        // keeper is alive and its child with it; what the id says and the
+        // greeting says are enough to put a row back on the machine.
+        let mut metadata = match reading {
+            Ok(metadata) => metadata,
+            Err(error) => recover_unreadable_session(id, &metadata_path, &status, &error),
+        };
         if metadata.id != id {
             bail!("metadata id {} does not match {id}", metadata.id);
         }
@@ -15433,7 +15528,10 @@ mod platform {
                 "and the moment the session was created"
             );
             assert_eq!(snapshot.label, "recovered session");
-            assert!(!snapshot.dead, "the child was alive when the keeper greeted");
+            assert!(
+                !snapshot.dead,
+                "the child was alive when the keeper greeted"
+            );
             assert_eq!(snapshot.pid, Some(child_pid), "it is the same child");
             assert!(process_alive(child_pid), "adoption must not stop the child");
             assert!(socket_path.exists(), "nor dismiss its keeper");
@@ -15448,7 +15546,9 @@ mod platform {
             );
 
             // Served, not merely listed: input reaches the same PTY.
-            adopted.write_input(b"recovered-generation-probe\r").unwrap();
+            adopted
+                .write_input(b"recovered-generation-probe\r")
+                .unwrap();
             let probe = b"recovered-generation-probe";
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut output = Vec::new();
