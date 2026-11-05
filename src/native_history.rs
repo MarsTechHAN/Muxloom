@@ -113,9 +113,7 @@ pub struct NativeThread {
 /// belongs to which session, because a folder can hold several conversations
 /// at once and some of them belong to nobody here.
 pub fn threads_for(kind: AgentKind, cwd: &str, since: u64) -> Vec<NativeThread> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
+    let home = crate::config::home_dir();
     match kind {
         AgentKind::Claude => claude_threads(&home.join(".claude").join("projects"), cwd, since),
         AgentKind::Codex => codex_threads(&home.join(".codex"), cwd, since),
@@ -143,9 +141,7 @@ pub fn threads_for(kind: AgentKind, cwd: &str, since: u64) -> Vec<NativeThread> 
 /// OpenCode keeps its conversations in a store only OpenCode reads, and is
 /// asked for them elsewhere.
 pub fn resumable(kind: AgentKind, cwd: &str, limit: usize) -> Vec<NativeThread> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
+    let home = crate::config::home_dir();
     let limit = limit.clamp(1, MAX_SCANNED);
     let mut threads = match kind {
         AgentKind::Claude => claude_threads(&home.join(".claude").join("projects"), cwd, 0),
@@ -205,7 +201,7 @@ pub fn reread(kind: AgentKind, path: &Path, id: &str) -> Option<NativeThread> {
     match kind {
         AgentKind::Claude => claude_thread(path, updated_at),
         AgentKind::Codex => {
-            let names = codex_names(&home_dir()?.join(".codex"));
+            let names = codex_names(&crate::config::home_dir().join(".codex"));
             codex_thread(path, updated_at, &names)
         }
         AgentKind::Pi => pi_thread(path, updated_at),
@@ -1188,10 +1184,7 @@ fn opencode_threads(cwd: &str, since: u64) -> Vec<NativeThread> {
 static OPENCODE_SNAPSHOT: Mutex<Option<(u64, Vec<NativeThread>)>> = Mutex::new(None);
 
 fn opencode_snapshot() -> Vec<NativeThread> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
-    let store = opencode_store(&home);
+    let store = opencode_store(&crate::config::home_dir());
     let stamped = last_written(&store).unwrap_or_default();
     let mut cached = OPENCODE_SNAPSHOT
         .lock()
@@ -1263,11 +1256,12 @@ fn opencode_thread(row: &Value, store: &Path) -> Option<NativeThread> {
 /// so that copy is tried first and the PATH is the fallback rather than the
 /// other way round.
 fn opencode_command() -> PathBuf {
-    if let Some(home) = home_dir() {
-        let installed = home.join(".local").join("bin").join("opencode");
-        if installed.is_file() {
-            return installed;
-        }
+    let installed = crate::config::home_dir()
+        .join(".local")
+        .join("bin")
+        .join("opencode");
+    if installed.is_file() {
+        return installed;
     }
     PathBuf::from("opencode")
 }
@@ -1316,12 +1310,6 @@ fn sub_folders(folder: &Path) -> Vec<PathBuf> {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .collect()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
 }
 
 /// When a file was last written to (epoch ms). A session that already knows

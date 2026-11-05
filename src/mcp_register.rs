@@ -173,9 +173,7 @@ pub fn register_for_this_daemon(serves_the_machines_state: bool) -> Result<Vec<P
     if !wanted(setting.as_deref(), serves_the_machines_state) {
         return Ok(Vec::new());
     }
-    let Some(home) = home_directory() else {
-        bail!("no home directory to register an MCP server in");
-    };
+    let home = crate::config::home_dir();
     let mut written = register(&home, &ServerEntry::for_this_machine()?)?;
     if !switched_off("MUXLOOM_SKILL") {
         written.extend(install_skills(&home)?);
@@ -452,12 +450,6 @@ fn skill_revision(text: &str) -> Option<u32> {
     let rest = text.split_once(SKILL_MARKER)?.1;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
-}
-
-fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
 }
 
 /// Claude Code keeps its user-scope servers under `mcpServers` in
@@ -930,10 +922,7 @@ pub fn trust_directory_for_this_daemon(kind: AgentKind, directory: &Path) -> Res
     if switched_off("MUXLOOM_TRUST_DIRECTORY") {
         return Ok(Vec::new());
     }
-    let Some(home) = home_directory() else {
-        bail!("no home directory to record a trusted directory in");
-    };
-    trust_directory(&home, kind, directory)
+    trust_directory(&crate::config::home_dir(), kind, directory)
 }
 
 /// The same, for a named home directory. See

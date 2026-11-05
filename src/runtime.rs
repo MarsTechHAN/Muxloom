@@ -1593,9 +1593,7 @@ impl Runtime {
         let Transport::Ssh { alias } = &target.transport else {
             return Ok(0);
         };
-        let local_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("HOME is unavailable while syncing local config")?;
+        let local_home = crate::config::home_dir();
         let remote_home = self.remote_home(target)?;
         let staging_dir = format!("{remote_home}/.cache/muxloom/install");
         let mut synced = 0;
@@ -2551,8 +2549,7 @@ END {
     /// Resolve a `$HOME`-relative path against the target's own home directory.
     pub fn home_relative_path(&self, target: &Target, relative: &str) -> Result<String> {
         let home = match target.transport {
-            Transport::Local => std::env::var("HOME")
-                .context("HOME is unavailable while resolving a target path")?,
+            Transport::Local => crate::config::home_dir().to_string_lossy().into_owned(),
             Transport::Ssh { .. } => self.remote_home(target)?,
         };
         Ok(format!(
@@ -3299,17 +3296,7 @@ fn bundle_executable(kind: AgentKind) -> &'static str {
 }
 
 fn controller_download_cache() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache/muxloom/downloads")
-}
-
-#[cfg(feature = "controller")]
-fn local_install_home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is unavailable while installing the local agent runtime")
+    crate::config::home_dir().join(".cache/muxloom/downloads")
 }
 
 /// Unpack a downloaded package beside its cache entry and hand back the one
@@ -3364,7 +3351,7 @@ fn extract_cached_bundle_executable(_archive: &Path, _kind: AgentKind) -> Result
 
 #[cfg(feature = "controller")]
 fn install_local_runtime_binary(source: &Path, executable: &str) -> Result<()> {
-    install_local_runtime_binary_at(source, executable, &local_install_home()?)
+    install_local_runtime_binary_at(source, executable, &crate::config::home_dir())
 }
 
 #[cfg(not(feature = "controller"))]
@@ -3395,7 +3382,7 @@ fn install_local_runtime_binary_at(source: &Path, executable: &str, home: &Path)
 
 #[cfg(feature = "controller")]
 fn install_local_bundle(archive: &Path, kind: AgentKind, version: &str) -> Result<()> {
-    install_local_bundle_at(archive, kind, version, &local_install_home()?)
+    install_local_bundle_at(archive, kind, version, &crate::config::home_dir())
 }
 
 #[cfg(not(feature = "controller"))]

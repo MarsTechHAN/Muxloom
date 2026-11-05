@@ -551,10 +551,37 @@ pub fn expand_tilde(value: &str) -> PathBuf {
     }
 }
 
-fn home_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
+/// This user's home directory, wherever the platform spells it.
+///
+/// `HOME` is what a POSIX shell exports and what the rest of muxloom has
+/// always read. Windows does not set it outside a Git-Bash or MSYS shell:
+/// Explorer, `cmd` and PowerShell name the profile through `USERPROFILE`,
+/// and the classic pair below that is `HOMEDRIVE` + `HOMEPATH`. Reading only
+/// `HOME` there left every default directory — config, state, SSH config,
+/// agent registrations, downloads — relative to the process's working
+/// directory, so the controller started empty and its state followed whatever
+/// folder it was launched from.
+///
+/// A Git-Bash `HOME=/c/Users/ada` is rooted but not drive-absolute and would
+/// resolve under the current drive, so the drive-absolute Windows variables
+/// are read only when `HOME` itself is absent or empty. With nothing set at
+/// all the current directory remains the answer, as it always was.
+pub(crate) fn home_dir() -> PathBuf {
+    home_variable("HOME")
+        .or_else(|| home_variable("USERPROFILE"))
+        .or_else(|| {
+            let drive = home_variable("HOMEDRIVE")?;
+            let path = home_variable("HOMEPATH")?;
+            Some(drive.join(path))
+        })
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// One environment variable as a path, with an empty value read as unset.
+fn home_variable(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 pub const EXAMPLE_CONFIG: &str = r#"# muxloom configuration
@@ -937,7 +964,8 @@ mod tests {
         variables.remove("USERPROFILE");
         variables.set("HOMEDRIVE", "C:");
         variables.set("HOMEPATH", r"\Users\ada");
-        let drive_home = Path::new("C:").join(r"\Users\ada");
+        let mut drive_home = PathBuf::from("C:");
+        drive_home.push(r"\Users\ada");
         assert_eq!(home_dir(), drive_home);
         assert_eq!(
             default_state_path(),

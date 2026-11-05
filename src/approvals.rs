@@ -263,8 +263,7 @@ impl Approvals {
     /// The controller is the only reader and writer of this ledger, so this
     /// needs no discovery fancier than the default home path.
     pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Self::approvals_path_in(&Path::new(&home).join(".local/state/muxloom"))
+        crate::config::default_state_path().with_file_name("approvals.json")
     }
 
     /// True when the person has already said "yes for the rest of this

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    env, fs, io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -136,12 +136,7 @@ fn load_file(
 /// resolved against the including file's directory when relative.
 fn resolve_include_path(source: &Path, pattern: &str) -> PathBuf {
     if pattern == "~" || pattern.starts_with("~/") {
-        let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        if pattern == "~" {
-            home
-        } else {
-            home.join(pattern.trim_start_matches("~/"))
-        }
+        crate::config::expand_tilde(pattern)
     } else {
         let path = PathBuf::from(pattern);
         if path.is_absolute() {
@@ -394,7 +389,10 @@ pub fn write_private(path: &Path, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        env,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 

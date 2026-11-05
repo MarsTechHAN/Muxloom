@@ -304,9 +304,8 @@ mod platform {
             if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
                 return Ok(Self::under(PathBuf::from(path).join("muxloom")));
             }
-            let home = std::env::var_os("HOME").context("HOME is not set")?;
             Ok(Self::under(
-                PathBuf::from(home).join(".local/state/muxloom"),
+                crate::config::home_dir().join(".local/state/muxloom"),
             ))
         }
 
@@ -4412,7 +4411,7 @@ mod platform {
             .transpose()?
             .filter(|parent| *parent != session_id);
         let path = if path == "~" {
-            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+            crate::config::home_dir().to_string_lossy().into_owned()
         } else {
             path
         };
@@ -4537,10 +4536,8 @@ mod platform {
         let path_overridden = environment.iter().any(|(name, _)| name == "PATH");
         let prepended_path = if path_overridden {
             None
-        } else if let (Some(home), Some(path)) =
-            (std::env::var_os("HOME"), std::env::var_os("PATH"))
-        {
-            let mut paths = vec![PathBuf::from(home).join(".local/bin")];
+        } else if let Some(path) = std::env::var_os("PATH") {
+            let mut paths = vec![crate::config::home_dir().join(".local/bin")];
             paths.extend(std::env::split_paths(&path));
             std::env::join_paths(paths).ok()
         } else {
@@ -6017,10 +6014,11 @@ mod platform {
             .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
             .map(|directory| directory.join(executable))
             .any(|path| is_executable(&path))
-            || std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local/bin").join(executable))
-                .is_some_and(|path| is_executable(&path))
+            || is_executable(
+                &crate::config::home_dir()
+                    .join(".local/bin")
+                    .join(executable),
+            )
     }
 
     fn native_list_directory(path: &str) -> Result<DirectoryListing> {

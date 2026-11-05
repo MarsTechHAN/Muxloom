@@ -9087,12 +9087,7 @@ impl App {
 
     fn user_folder(&self, target: &Target) -> String {
         if target.id == LOCAL_TARGET_ID {
-            env::var("HOME").unwrap_or_else(|_| {
-                env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .display()
-                    .to_string()
-            })
+            crate::config::home_dir().display().to_string()
         } else {
             "~".into()
         }
@@ -14095,10 +14090,7 @@ fn child_path(path: &str, child: &str) -> String {
 }
 
 fn default_download_directory() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Downloads"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::config::home_dir().join("Downloads")
 }
 
 fn dropped_file_paths(value: &str) -> Vec<PathBuf> {
