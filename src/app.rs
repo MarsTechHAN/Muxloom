@@ -2834,13 +2834,20 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        // The settings panel copies its own field: a selection left in the
-        // terminal behind it is not what a person pressing copy over a field
-        // they are looking at means.
-        if is_copy_shortcut(key)
-            && !matches!(self.modal, Some(Modal::Settings(_)))
-            && (self.copy_preview_selection() || self.copy_terminal_selection())
-        {
+        // Copy belongs to whatever is focused, and it is never forwarded. Left
+        // to fall through, Cmd+C over an attached agent typed a literal "c"
+        // into its prompt and Ctrl+Shift+C sent ETX, interrupting it when the
+        // user only meant to copy. A dialog owns the keyboard while it is open,
+        // so a selection behind it is not what the person pressing copy is
+        // looking at, and a field with no copy path of its own must not take
+        // the chord as its letter. The settings panel copies its own field in
+        // its key handler, so it is left to fall through here.
+        if is_copy_shortcut(key) && !matches!(self.modal, Some(Modal::Settings(_))) {
+            let copied = self.modal.is_none()
+                && (self.copy_preview_selection() || self.copy_terminal_selection());
+            if !copied {
+                self.status_message = "Nothing to copy".into();
+            }
             return Action::Continue;
         }
         // The other half of that pair, and it has to be caught here rather
@@ -7555,7 +7562,7 @@ impl App {
     fn handle_board_key(&mut self, key: KeyEvent, form: &mut BoardForm) -> bool {
         let plain = !key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         if let Some(mut text) = form.compose.take() {
             match key.code {
                 KeyCode::Esc => {
@@ -11678,9 +11685,9 @@ impl App {
                     self.modal = Some(Modal::Search(form));
                 }
                 KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
                 {
                     form.query.push(character);
                     mark_search_edited(&mut form);
@@ -11727,9 +11734,9 @@ impl App {
                     self.modal = Some(Modal::PathPicker(form));
                 }
                 KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
                 {
                     form.query.push(character);
                     form.selected = 0;
@@ -11818,7 +11825,11 @@ impl App {
                         None => self.confirm_or_submit_launch(form.launch, None, None),
                     }
                 }
-                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                {
                     form.query.push(character);
                     form.search_edited_at = Some(Instant::now());
                     self.modal = Some(Modal::Resume(form));
@@ -12010,9 +12021,9 @@ impl App {
                     self.modal = Some(Modal::Launch(form));
                 }
                 KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
                 {
                     if let Some(field) = active_text(&mut form) {
                         field.push(character);
