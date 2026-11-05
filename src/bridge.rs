@@ -66,6 +66,27 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// outlast that download instead of cutting a slow but working link off in the
 /// middle of it, which is why it is not [`BOOTSTRAP_TIMEOUT`].
 const COMPANION_PULL_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long the companion push may stand still before the connection is
+/// abandoned.
+///
+/// The pushed asset is up to ~10 MB, so this is a stall guard and not a total
+/// cap: a slow but working link is allowed to finish. A pipe write has no
+/// deadline of its own, though, and this write is what the connect thread is
+/// parked on. A remote that answered HAVE/NEED and then stopped draining
+/// stdin — the target's `head -c` stuck on a full disk, a login wrapper that
+/// consumes nothing, a hung ssh channel — fills the pipe, and without a stall
+/// guard the write never returns, holding the per-target connect lock forever.
+#[cfg(not(test))]
+const COMPANION_PUSH_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The same stall guard in the test build, which cannot spend a minute
+/// proving that a push with a remote that stopped reading comes back at all.
+#[cfg(test)]
+const COMPANION_PUSH_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often the push's published byte count is read while waiting for the
+/// remote to take more bytes.
+const COMPANION_PUSH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How often a bootstrap that has already stopped talking is checked for exit.
+const BOOTSTRAP_REAP_INTERVAL: Duration = Duration::from_millis(10);
 /// Keeping standing watches on session screens.
 const TRIGGERS_CAPABILITY: &str = "triggers-v1";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -1955,12 +1976,36 @@ fn read_bootstrap_line<R: BufRead + Send + 'static>(
     }
 }
 
+/// Wait for a bootstrap child to exit, killing it rather than waiting forever
+/// once `timeout` has passed.
+///
+/// `Child::wait` has no deadline. A bootstrap that closes stdout and then
+/// lingers hands the status read an EOF and leaves the connect thread — and
+/// the per-target connect lock it holds — parked on a process that has already
+/// said it will never report status. `Ok(true)` means the child exited on its
+/// own; `Ok(false)` means the deadline passed and it was killed.
+fn wait_for_bootstrap_child(child: &mut Child, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        thread::sleep(remaining.min(BOOTSTRAP_REAP_INTERVAL));
+    }
+}
+
 fn negotiate_remote_companion<R: BufRead + Send + 'static>(
     alias: &str,
     options: &BridgeOptions,
     child: &mut Child,
     reader: R,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + Send),
     stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
 ) -> Result<(Option<String>, R)> {
@@ -1972,16 +2017,26 @@ fn negotiate_remote_companion<R: BufRead + Send + 'static>(
         stderr_lines,
     )?;
     let Some(status) = status else {
-        let _ = child.wait();
-        let detail = stderr_lines
+        let exited = wait_for_bootstrap_child(child, BOOTSTRAP_TIMEOUT)
+            .with_context(|| format!("failed to wait for the muxloomd bootstrap on {alias}"))?;
+        let said = stderr_lines
             .map(|lines| {
                 lines
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .join("; ")
             })
-            .filter(|detail| !detail.is_empty())
-            .unwrap_or_else(|| "remote bootstrap exited before reporting status".into());
+            .filter(|detail| !detail.is_empty());
+        let detail = match (said, exited) {
+            (Some(said), true) => said,
+            (Some(said), false) => format!(
+                "{said}; the bootstrap closed its output but did not exit within {BOOTSTRAP_TIMEOUT:?}"
+            ),
+            (None, true) => "remote bootstrap exited before reporting status".into(),
+            (None, false) => format!(
+                "the bootstrap closed its output but did not exit within {BOOTSTRAP_TIMEOUT:?}"
+            ),
+        };
         bail!("failed to start muxloomd on {alias}: {detail}");
     };
     let fields: Vec<_> = status.split_whitespace().collect();
@@ -2059,6 +2114,7 @@ fn negotiate_remote_companion<R: BufRead + Send + 'static>(
                     &notice,
                     os,
                     arch,
+                    child,
                     reader,
                     writer,
                     stderr_lines,
@@ -2095,6 +2151,7 @@ fn negotiate_remote_companion<R: BufRead + Send + 'static>(
                 &notice,
                 os,
                 arch,
+                child,
                 reader,
                 writer,
                 stderr_lines,
@@ -2291,8 +2348,9 @@ fn deploy_remote_companion<R: BufRead + Send + 'static>(
     notice: &str,
     os: &str,
     arch: &str,
+    child: &mut Child,
     reader: R,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + Send),
     stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
     progress: &mut impl FnMut(TaskProgress),
 ) -> Result<(Option<String>, R)> {
@@ -2322,20 +2380,15 @@ fn deploy_remote_companion<R: BufRead + Send + 'static>(
         ),
     );
     writeln!(writer, "INSTALL {size}")?;
-    let label = format!("Uploading {alias} companion");
-    progress(TaskProgress::bytes(&label, 0, Some(size)));
-    let mut transferred = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        writer.write_all(&buffer[..read])?;
-        transferred = transferred.saturating_add(read as u64);
-        progress(TaskProgress::bytes(&label, transferred, Some(size)));
-    }
-    writer.flush()?;
+    push_companion_file(
+        alias,
+        child,
+        writer,
+        &mut file,
+        size,
+        stderr_lines,
+        progress,
+    )?;
     let (status, reader) = read_bootstrap_line(
         alias,
         "the word that its companion was installed",
@@ -2351,6 +2404,183 @@ fn deploy_remote_companion<R: BufRead + Send + 'static>(
         );
     }
     Ok((Some(notice.into()), reader))
+}
+
+/// How far the companion push has come, so the wait around it can be bounded
+/// by progress rather than by the size of the asset.
+struct PushMeter<'a> {
+    label: String,
+    written: &'a AtomicU64,
+    total: u64,
+    reported: u64,
+    last_progress: Instant,
+}
+
+impl PushMeter<'_> {
+    /// Report the bytes the writer thread has taken and fail once the count
+    /// has stood still for [`COMPANION_PUSH_STALL_TIMEOUT`].
+    ///
+    /// The writer thread owns the pipe, so the counter it publishes after each
+    /// chunk is the only portable view of progress: while it is parked in
+    /// `write_all` the count stands still. The error names the machine, the
+    /// bytes that did go and whatever the remote said on stderr, so a full
+    /// disk can be told from a login wrapper that consumes nothing.
+    fn poll(
+        &mut self,
+        alias: &str,
+        stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
+        progress: &mut impl FnMut(TaskProgress),
+    ) -> Result<()> {
+        let bytes = self.written.load(Ordering::Relaxed).min(self.total);
+        if bytes > self.reported {
+            self.reported = bytes;
+            self.last_progress = Instant::now();
+            progress(TaskProgress::bytes(&self.label, bytes, Some(self.total)));
+        }
+        if self.last_progress.elapsed() < COMPANION_PUSH_STALL_TIMEOUT {
+            return Ok(());
+        }
+        let said = stderr_lines
+            .map(|lines| {
+                lines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .join("; ")
+            })
+            .filter(|said| !said.is_empty());
+        let detail = match said {
+            Some(said) => format!("; the remote said: {said}"),
+            None => String::new(),
+        };
+        bail!(
+            "the companion push to {alias} stalled after {} of {} bytes: the remote stopped \
+             reading its stdin for {COMPANION_PUSH_STALL_TIMEOUT:?}{detail}",
+            self.reported,
+            self.total
+        )
+    }
+}
+
+/// Push the companion asset down the bootstrap pipe with a stall guard.
+///
+/// `write_all` on a pipe has no deadline of its own, and this runs on the
+/// connect thread, which holds the per-target connect lock: a remote that
+/// stops draining stdin used to wedge that lock forever. So a writer thread
+/// owns the pipe, the main thread hands it one chunk at a time, and the meter
+/// watches the count it publishes. When the count stands still for
+/// [`COMPANION_PUSH_STALL_TIMEOUT`] the bootstrap child is killed — which
+/// closes the pipe and unblocks the writer — and the connection is abandoned
+/// with an error. After the last chunk the writer is waited for under the same
+/// guard, so a flush that never comes back cannot wedge it either.
+///
+/// A slow but working link may take as long as it needs; only standing still
+/// fails.
+#[allow(clippy::too_many_arguments)]
+fn push_companion_file<W: Write + Send>(
+    alias: &str,
+    child: &mut Child,
+    writer: &mut W,
+    file: &mut fs::File,
+    size: u64,
+    stderr_lines: Option<&Arc<Mutex<Vec<String>>>>,
+    progress: &mut impl FnMut(TaskProgress),
+) -> Result<()> {
+    let written = AtomicU64::new(0);
+    let written = &written;
+    let mut meter = PushMeter {
+        label: format!("Uploading {alias} companion"),
+        written,
+        total: size,
+        reported: 0,
+        last_progress: Instant::now(),
+    };
+    progress(TaskProgress::bytes(&meter.label, 0, Some(size)));
+    let (chunks, chunk_source) = mpsc::sync_channel::<Vec<u8>>(1);
+    let (finished, completion) = mpsc::channel::<std::io::Result<()>>();
+    thread::scope(|scope| {
+        let _ = scope.spawn(move || {
+            let sink = writer;
+            let mut outcome = Ok(());
+            for chunk in chunk_source {
+                if let Err(error) = sink.write_all(&chunk) {
+                    outcome = Err(error);
+                    break;
+                }
+                written.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+            if outcome.is_ok() {
+                outcome = sink.flush();
+            }
+            let _ = finished.send(outcome);
+        });
+        // This closure owns the chunk channel, so every return below — the
+        // `?` paths included — drops the sender and tells the writer that no
+        // more chunks are coming.
+        let attempt = (move || -> Result<()> {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let mut pending = buffer[..read].to_vec();
+                loop {
+                    match chunks.try_send(pending) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Full(returned)) => {
+                            pending = returned;
+                            meter.poll(alias, stderr_lines, progress)?;
+                            thread::sleep(COMPANION_PUSH_POLL_INTERVAL);
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            let reason = match completion.try_recv() {
+                                Ok(Err(error)) => error.to_string(),
+                                _ => "the remote closed the connection".into(),
+                            };
+                            bail!(
+                                "the companion push to {alias} stopped after {} of {size} \
+                                 bytes: {reason}",
+                                meter.reported
+                            )
+                        }
+                    }
+                }
+            }
+            drop(chunks);
+            loop {
+                match completion.recv_timeout(COMPANION_PUSH_POLL_INTERVAL) {
+                    Ok(Ok(())) => {
+                        if meter.reported < size {
+                            progress(TaskProgress::bytes(&meter.label, size, Some(size)));
+                        }
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "the companion push to {alias} failed after {} of {size} bytes",
+                                meter.reported
+                            )
+                        });
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        meter.poll(alias, stderr_lines, progress)?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => bail!(
+                        "the companion push to {alias} stopped after {} of {size} bytes",
+                        meter.reported
+                    ),
+                }
+            }
+        })();
+        if attempt.is_err() {
+            // The child's stdin is the pipe the writer is parked on: killing
+            // it closes the pipe, and the scope below waits for the writer to
+            // come back, so the connect thread can report instead of wedging.
+            let _ = child.kill();
+        }
+        attempt
+    })
 }
 
 /// The companions that ship beside (or below) the controller for one target
@@ -4531,6 +4761,15 @@ mod tests {
             download_environment: vec![("HTTPS_PROXY".into(), "http://127.0.0.1:1".into())],
             ..BridgeOptions::default()
         };
+        // The push is handed the bootstrap it may have to stop if the writer
+        // stalls. An in-memory sink never stalls, so this process only fills
+        // the parameter; it is reaped below.
+        let mut bootstrap = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit"]).spawn()
+        } else {
+            Command::new("true").spawn()
+        }
+        .unwrap();
         let notice = deploy_remote_companion(
             "gpu",
             &options,
@@ -4538,6 +4777,7 @@ mod tests {
             "deployed test companion",
             "Linux",
             "x86_64",
+            &mut bootstrap,
             reader,
             &mut writer,
             None,
@@ -4545,6 +4785,8 @@ mod tests {
         )
         .unwrap()
         .0;
+        let _ = bootstrap.kill();
+        let _ = bootstrap.wait();
         fs::remove_file(asset).unwrap();
 
         assert_eq!(notice.as_deref(), Some("deployed test companion"));
