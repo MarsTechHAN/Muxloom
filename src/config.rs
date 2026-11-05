@@ -551,30 +551,41 @@ pub fn expand_tilde(value: &str) -> PathBuf {
     }
 }
 
-/// This user's home directory, wherever the platform spells it.
+/// This user's home directory when the environment names one.
 ///
 /// `HOME` is what a POSIX shell exports and what the rest of muxloom has
 /// always read. Windows does not set it outside a Git-Bash or MSYS shell:
 /// Explorer, `cmd` and PowerShell name the profile through `USERPROFILE`,
-/// and the classic pair below that is `HOMEDRIVE` + `HOMEPATH`. Reading only
-/// `HOME` there left every default directory — config, state, SSH config,
-/// agent registrations, downloads — relative to the process's working
-/// directory, so the controller started empty and its state followed whatever
-/// folder it was launched from.
+/// and the classic pair below that is `HOMEDRIVE` + `HOMEPATH`.
 ///
-/// A Git-Bash `HOME=/c/Users/ada` is rooted but not drive-absolute and would
-/// resolve under the current drive, so the drive-absolute Windows variables
-/// are read only when `HOME` itself is absent or empty. With nothing set at
-/// all the current directory remains the answer, as it always was.
-pub(crate) fn home_dir() -> PathBuf {
+/// On Windows a value that is not drive-absolute or a UNC share is not a
+/// home: Git-Bash's `HOME=/c/Users/ada` is rooted but resolves under the
+/// current drive, which is the folder-relative state this resolver exists to
+/// leave behind. Such a `HOME` (or `USERPROFILE`) is skipped in favour of the
+/// pair that does name an absolute profile.
+///
+/// `None` means the environment names no usable home at all. Callers that
+/// cannot work without one refuse; [`home_dir`] is only for the defaults that
+/// have always fallen back to the current directory.
+pub(crate) fn home_dir_option() -> Option<PathBuf> {
     home_variable("HOME")
-        .or_else(|| home_variable("USERPROFILE"))
+        .and_then(usable_home)
+        .or_else(|| home_variable("USERPROFILE").and_then(usable_home))
         .or_else(|| {
             let drive = home_variable("HOMEDRIVE")?;
             let path = home_variable("HOMEPATH")?;
-            Some(drive.join(path))
+            usable_home(drive.join(path))
         })
-        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// [`home_dir_option`] for the paths that have always used `.` when no home
+/// was named: the default config, state and debug locations, the legacy
+/// migration paths, and `~` expansion in configuration values.
+///
+/// A site that would otherwise resolve against the launch directory asks
+/// [`home_dir_option`] instead.
+pub(crate) fn home_dir() -> PathBuf {
+    home_dir_option().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// One environment variable as a path, with an empty value read as unset.
@@ -582,6 +593,45 @@ fn home_variable(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// The Windows requirement, applied only there: on Unix a `HOME` is taken as
+/// written, as it always was.
+fn usable_home(path: PathBuf) -> Option<PathBuf> {
+    if cfg!(windows) && !windows_absolute_home(&path) {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Whether a Windows home names a location that resolves the same from any
+/// working directory: a drive letter, a colon and a slash (`C:\Users\ada`),
+/// or a UNC share (`\\server\share`).
+///
+/// Takes the text of the value, not this process's idea of a path, so the
+/// Windows rule can be tested on any host.
+fn windows_absolute_home(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    // UNC: a server and a share, both named. `//server/share` is the same
+    // shape with forward slashes, which Windows accepts too.
+    let Some(rest) = bytes
+        .strip_prefix(b"\\\\")
+        .or_else(|| bytes.strip_prefix(b"//"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split(|byte| matches!(byte, b'\\' | b'/'));
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    !server.is_empty() && !share.is_empty()
 }
 
 pub const EXAMPLE_CONFIG: &str = r#"# muxloom configuration
@@ -994,6 +1044,49 @@ mod tests {
         );
     }
 
+    /// Only runs on Windows, where the classic pair has a meaning; the
+    /// resolver test above checks the same composition on every host.
+    #[cfg(windows)]
+    #[test]
+    fn the_classic_windows_pair_resolves_absolute() {
+        let variables = HomeVariables::clear();
+        variables.set("HOMEDRIVE", "C:");
+        variables.set("HOMEPATH", r"\Users\ada");
+        let home = home_dir_option().expect("HOMEDRIVE and HOMEPATH name a home");
+        assert_eq!(home, PathBuf::from(r"C:\Users\ada"));
+        assert!(home.is_absolute());
+    }
+
+    #[test]
+    fn a_windows_home_must_be_drive_absolute_or_a_unc_share() {
+        for absolute in [
+            r"C:\Users\ada",
+            "C:/Users/ada",
+            r"\\server\share",
+            r"\\server\share\ada",
+            "//server/share",
+        ] {
+            assert!(
+                windows_absolute_home(Path::new(absolute)),
+                "{absolute} names an absolute Windows home"
+            );
+        }
+        for relative in [
+            r"C:Users\ada",
+            "C:",
+            "/c/Users/ada",
+            "~/ada",
+            r"\\server",
+            r"\\",
+            "",
+        ] {
+            assert!(
+                !windows_absolute_home(Path::new(relative)),
+                "{relative} does not name an absolute Windows home"
+            );
+        }
+    }
+
     /// A scratch path that no earlier run of this test left behind.
     fn scratch_root(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -1022,7 +1115,7 @@ mod tests {
 
     #[test]
     fn a_missing_home_is_refused_by_the_sites_that_need_one() {
-        let variables = HomeVariables::clearing(&[
+        let _variables = HomeVariables::clearing(&[
             "HOME",
             "USERPROFILE",
             "HOMEDRIVE",

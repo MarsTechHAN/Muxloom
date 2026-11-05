@@ -1593,7 +1593,8 @@ impl Runtime {
         let Transport::Ssh { alias } = &target.transport else {
             return Ok(0);
         };
-        let local_home = crate::config::home_dir();
+        let local_home = crate::config::home_dir_option()
+            .context("HOME is unavailable while syncing local config")?;
         let remote_home = self.remote_home(target)?;
         let staging_dir = format!("{remote_home}/.cache/muxloom/install");
         let mut synced = 0;
@@ -2549,7 +2550,10 @@ END {
     /// Resolve a `$HOME`-relative path against the target's own home directory.
     pub fn home_relative_path(&self, target: &Target, relative: &str) -> Result<String> {
         let home = match target.transport {
-            Transport::Local => crate::config::home_dir().to_string_lossy().into_owned(),
+            Transport::Local => crate::config::home_dir_option()
+                .context("HOME is unavailable while resolving a target path")?
+                .to_string_lossy()
+                .into_owned(),
             Transport::Ssh { .. } => self.remote_home(target)?,
         };
         Ok(format!(
@@ -3296,7 +3300,15 @@ fn bundle_executable(kind: AgentKind) -> &'static str {
 }
 
 fn controller_download_cache() -> PathBuf {
-    crate::config::home_dir().join(".cache/muxloom/downloads")
+    crate::config::home_dir_option()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/muxloom/downloads")
+}
+
+#[cfg(feature = "controller")]
+fn local_install_home() -> Result<PathBuf> {
+    crate::config::home_dir_option()
+        .context("HOME is unavailable while installing the local agent runtime")
 }
 
 /// Unpack a downloaded package beside its cache entry and hand back the one
@@ -3351,7 +3363,7 @@ fn extract_cached_bundle_executable(_archive: &Path, _kind: AgentKind) -> Result
 
 #[cfg(feature = "controller")]
 fn install_local_runtime_binary(source: &Path, executable: &str) -> Result<()> {
-    install_local_runtime_binary_at(source, executable, &crate::config::home_dir())
+    install_local_runtime_binary_at(source, executable, &local_install_home()?)
 }
 
 #[cfg(not(feature = "controller"))]
@@ -3382,7 +3394,7 @@ fn install_local_runtime_binary_at(source: &Path, executable: &str, home: &Path)
 
 #[cfg(feature = "controller")]
 fn install_local_bundle(archive: &Path, kind: AgentKind, version: &str) -> Result<()> {
-    install_local_bundle_at(archive, kind, version, &crate::config::home_dir())
+    install_local_bundle_at(archive, kind, version, &local_install_home()?)
 }
 
 #[cfg(not(feature = "controller"))]
@@ -7226,5 +7238,33 @@ mod tests {
                 .unwrap(),
             format!("{}/.local/bin/agent", profile.display())
         );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_missing_home_refuses_the_local_runtime_installation() {
+        let _environment = HomeEnvironment::without_home();
+        let error = local_install_home().unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("HOME is unavailable while installing the local agent runtime"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_windows_profile_locates_the_local_runtime_installation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = std::env::temp_dir().join(format!(
+            "muxloom-runtime-install-{}-{nonce}",
+            std::process::id()
+        ));
+        let environment = HomeEnvironment::without_home();
+        environment.set("USERPROFILE", &profile);
+        assert_eq!(local_install_home().unwrap(), profile);
     }
 }

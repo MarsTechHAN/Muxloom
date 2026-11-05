@@ -9087,7 +9087,10 @@ impl App {
 
     fn user_folder(&self, target: &Target) -> String {
         if target.id == LOCAL_TARGET_ID {
-            crate::config::home_dir().display().to_string()
+            crate::config::home_dir_option()
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .display()
+                .to_string()
         } else {
             "~".into()
         }
@@ -14090,7 +14093,9 @@ fn child_path(path: &str, child: &str) -> String {
 }
 
 fn default_download_directory() -> PathBuf {
-    crate::config::home_dir().join("Downloads")
+    crate::config::home_dir_option()
+        .map(|home| home.join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn dropped_file_paths(value: &str) -> Vec<PathBuf> {
@@ -23106,5 +23111,33 @@ mod tests {
             env::temp_dir().join(format!("muxloom-downloads-{}-{nonce}", std::process::id()));
         environment.set("USERPROFILE", &profile);
         assert_eq!(default_download_directory(), profile.join("Downloads"));
+    }
+
+    #[test]
+    fn the_local_user_folder_never_becomes_a_relative_home() {
+        let (app, _requests) = board_app();
+        let environment = HomeEnvironment::without_home();
+        // No home: the pre-existing fallback is the absolute launch directory,
+        // not a bare "." that would read as a folder named "." in a launch
+        // form.
+        let launch_directory = env::current_dir().unwrap();
+        assert_eq!(
+            app.user_folder(&Target::local()),
+            launch_directory.display().to_string()
+        );
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = env::temp_dir().join(format!(
+            "muxloom-user-folder-{}-{nonce}",
+            std::process::id()
+        ));
+        environment.set("USERPROFILE", &profile);
+        assert_eq!(
+            app.user_folder(&Target::local()),
+            profile.display().to_string()
+        );
     }
 }

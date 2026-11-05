@@ -1736,12 +1736,12 @@ fn local_companion_in(
 /// The search, run against this process's own environment.
 fn local_companion() -> Result<PathBuf, Vec<PathBuf>> {
     let exe = env::current_exe().ok();
-    let home = crate::config::home_dir();
+    let home = crate::config::home_dir_option();
     let data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     let stash = daemon_stash();
     let places = local_companion_places(
         exe.as_deref(),
-        Some(home.as_path()),
+        home.as_deref(),
         data_home.as_deref(),
         stash.as_deref(),
     );
@@ -1757,7 +1757,7 @@ fn daemon_stash() -> Option<PathBuf> {
         Some(state) => PathBuf::from(state),
         None => match env::var_os("XDG_STATE_HOME") {
             Some(state_home) => PathBuf::from(state_home).join("muxloom"),
-            None => crate::config::home_dir().join(".local/state/muxloom"),
+            None => crate::config::home_dir_option()?.join(".local/state/muxloom"),
         },
     };
     Some(root.join("bin"))
@@ -2943,7 +2943,10 @@ fn companion_cache_root() -> PathBuf {
     if let Some(path) = env::var_os("LOCALAPPDATA") {
         return PathBuf::from(path).join("Muxloom/cache/companions");
     }
-    crate::config::home_dir().join(".cache/muxloom/companions")
+    if let Some(home) = crate::config::home_dir_option() {
+        return home.join(".cache/muxloom/companions");
+    }
+    env::temp_dir().join("muxloom-cache/companions")
 }
 
 /// The directory one triple's companions are cached in.
@@ -3047,8 +3050,10 @@ fn executable_suffix(os: &str) -> &'static str {
 }
 
 fn expand_local_tilde(value: &str) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~/") {
-        return crate::config::home_dir().join(rest);
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = crate::config::home_dir_option()
+    {
+        return home.join(rest);
     }
     PathBuf::from(value)
 }

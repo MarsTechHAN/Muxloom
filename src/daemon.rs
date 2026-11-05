@@ -304,9 +304,8 @@ mod platform {
             if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
                 return Ok(Self::under(PathBuf::from(path).join("muxloom")));
             }
-            Ok(Self::under(
-                crate::config::home_dir().join(".local/state/muxloom"),
-            ))
+            let home = crate::config::home_dir_option().context("HOME is not set")?;
+            Ok(Self::under(home.join(".local/state/muxloom")))
         }
 
         /// Whether this daemon is serving that directory. One serving anywhere
@@ -4411,7 +4410,10 @@ mod platform {
             .transpose()?
             .filter(|parent| *parent != session_id);
         let path = if path == "~" {
-            crate::config::home_dir().to_string_lossy().into_owned()
+            crate::config::home_dir_option()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .to_string_lossy()
+                .into_owned()
         } else {
             path
         };
@@ -4536,12 +4538,8 @@ mod platform {
         let path_overridden = environment.iter().any(|(name, _)| name == "PATH");
         let prepended_path = if path_overridden {
             None
-        } else if let Some(path) = std::env::var_os("PATH") {
-            let mut paths = vec![crate::config::home_dir().join(".local/bin")];
-            paths.extend(std::env::split_paths(&path));
-            std::env::join_paths(paths).ok()
         } else {
-            None
+            path_with_home_bin()
         };
         let child_path = if path_overridden {
             environment
@@ -6005,6 +6003,22 @@ mod platform {
         Ok(())
     }
 
+    /// The PATH a launched session runs with: this home's `~/.local/bin` in
+    /// front of the daemon's own, because muxloom provisions its runtimes
+    /// there and not every shell a session starts from has it.
+    ///
+    /// A home is required. `./.local/bin` is a folder in whatever directory
+    /// the daemon happened to be started in, and putting that on a child's
+    /// PATH would let a same-named executable there shadow the one the session
+    /// meant to run; with no home there is nothing to prepend.
+    fn path_with_home_bin() -> Option<std::ffi::OsString> {
+        let home = crate::config::home_dir_option()?;
+        let path = std::env::var_os("PATH")?;
+        let mut paths = vec![home.join(".local/bin")];
+        paths.extend(std::env::split_paths(&path));
+        std::env::join_paths(paths).ok()
+    }
+
     fn executable_available(executable: &str) -> bool {
         if executable.contains('/') {
             return is_executable(Path::new(executable));
@@ -6014,11 +6028,8 @@ mod platform {
             .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
             .map(|directory| directory.join(executable))
             .any(|path| is_executable(&path))
-            || is_executable(
-                &crate::config::home_dir()
-                    .join(".local/bin")
-                    .join(executable),
-            )
+            || crate::config::home_dir_option()
+                .is_some_and(|home| is_executable(&home.join(".local/bin").join(executable)))
     }
 
     fn native_list_directory(path: &str) -> Result<DirectoryListing> {
@@ -17511,6 +17522,76 @@ mod platform {
 
             drop(client);
             discard_root(paths.root);
+        }
+
+        /// The environment variables this test touches, put back when it ends.
+        struct Environment {
+            saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+
+        impl Environment {
+            fn clear(names: &[&'static str]) -> Self {
+                let saved = names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect();
+                // SAFETY: the suite runs one test at a time, and the guard
+                // puts every value back before the next test can look.
+                unsafe {
+                    for name in names {
+                        std::env::remove_var(name);
+                    }
+                }
+                Self { saved }
+            }
+
+            fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+                // SAFETY: as above.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                // SAFETY: as above.
+                unsafe {
+                    for (name, value) in &self.saved {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A launch must not inherit `./.local/bin`: with no home that is a
+        /// folder in the daemon's launch directory, not this user's, and a
+        /// same-named executable there would shadow the one the session meant
+        /// to run.
+        #[test]
+        fn a_launch_path_only_gets_a_home_bin_when_there_is_a_home() {
+            let environment =
+                Environment::clear(&["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATH"]);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "muxloom-launch-path-{}-{nonce}",
+                std::process::id()
+            ));
+            let bin = root.join("path");
+            fs::create_dir_all(&bin).unwrap();
+            environment.set("PATH", &bin);
+            assert_eq!(path_with_home_bin(), None);
+
+            let profile = root.join("profile");
+            environment.set("USERPROFILE", &profile);
+            let paths: Vec<_> = std::env::split_paths(&path_with_home_bin().unwrap()).collect();
+            assert_eq!(paths.first(), Some(&profile.join(".local/bin")));
+            assert_eq!(paths.get(1), Some(&bin));
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }

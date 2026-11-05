@@ -173,7 +173,9 @@ pub fn register_for_this_daemon(serves_the_machines_state: bool) -> Result<Vec<P
     if !wanted(setting.as_deref(), serves_the_machines_state) {
         return Ok(Vec::new());
     }
-    let home = crate::config::home_dir();
+    let Some(home) = crate::config::home_dir_option() else {
+        bail!("no home directory to register an MCP server in");
+    };
     let mut written = register(&home, &ServerEntry::for_this_machine()?)?;
     if !switched_off("MUXLOOM_SKILL") {
         written.extend(install_skills(&home)?);
@@ -922,7 +924,10 @@ pub fn trust_directory_for_this_daemon(kind: AgentKind, directory: &Path) -> Res
     if switched_off("MUXLOOM_TRUST_DIRECTORY") {
         return Ok(Vec::new());
     }
-    trust_directory(&crate::config::home_dir(), kind, directory)
+    let Some(home) = crate::config::home_dir_option() else {
+        bail!("no home directory to record a trusted directory in");
+    };
+    trust_directory(&home, kind, directory)
 }
 
 /// The same, for a named home directory. See
