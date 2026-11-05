@@ -17240,6 +17240,23 @@ mod platform {
             upstream_handle.join().unwrap();
         }
 
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn a_tcp_listener_scan_says_the_platform_is_unsupported_instead_of_none() {
+            // macOS has no /proc/net/tcp, and answering with an empty list
+            // made detection look like a machine with nothing listening. The
+            // port-forward form draws its "no ports found" state from that, so
+            // the companion has to refuse rather than pretend.
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let error = tcp_listener_ports()
+                .expect_err("a non-Linux companion cannot scan a TCP listener table");
+            assert!(
+                error.to_string().contains("only supported on Linux"),
+                "the refusal must name the platform limit: {error:#}"
+            );
+            drop(listener);
+        }
+
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_tcp_listener_parser_returns_only_unprivileged_listeners() {
