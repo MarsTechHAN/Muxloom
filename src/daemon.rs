@@ -11386,6 +11386,88 @@ mod platform {
             discard_root(state.paths.root.clone());
         }
 
+        /// A trigger that types back into a session is the `send_input` tool
+        /// in another door, and has to frame its text the same way. Codex and
+        /// Claude Code read text and the Enter arriving together as one paste
+        /// and absorb the Enter into it as a newline, so a trigger's text is
+        /// left sitting in the prompt unsent - on a trigger that has already
+        /// fired and been removed, with nobody told.
+        #[test]
+        fn a_trigger_types_into_a_claude_session_as_a_bracketed_paste() {
+            let state = test_state("trigger-paste");
+            let root = state.paths.root.clone();
+            let id = "muxloomd-terminal-trigger-paste";
+            let session = launch_session(
+                &state,
+                id.into(),
+                "terminal".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                100,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // The runtime the session is recorded as is what decides the
+            // framing, and that record is what a trigger acts on. Set here
+            // rather than launched as a CLI so the launch does not write a
+            // trusted-directory record into the developer's own agent config.
+            session
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .kind = "claude".into();
+            session.record_output(b"Ready\r\n");
+
+            let text = "please fetch the next page of the report and summarize it for the review";
+            let mut spec = armed_trigger(false, 0, None).spec;
+            spec.session_id = id.to_string();
+            // The case that hurts: the trigger is spent by the firing, so the
+            // unsent prompt is the only thing left of it.
+            spec.once = true;
+            spec.action = TriggerAction::SendInput {
+                text: text.into(),
+                submit: true,
+            };
+            *state
+                .triggers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![ArmedTrigger {
+                spec,
+                matched: false,
+            }];
+
+            fire_triggers(&state, &session, id);
+
+            // What the trigger typed comes back through the PTY and into the
+            // session's log, which is the only witness to the exact bytes.
+            let history = session.history_path.clone();
+            let expected = format!("\x1b[200~{text}\x1b[201~");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read(&history)
+                .unwrap_or_default()
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the trigger typed {text:?} unframed: Claude Code reads a long text and the \
+                     Enter that followed it as one paste, absorbs the Enter, and leaves the text \
+                     unsent in a trigger that is already gone"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+
+            discard_root(root);
+        }
+
         #[test]
         fn a_launch_in_flight_lets_a_client_in_but_not_a_handover() {
             let state = test_state("gate-split");
