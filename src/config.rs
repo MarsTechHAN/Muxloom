@@ -853,4 +853,105 @@ mod tests {
         assert_eq!(state.file_width, 34);
         assert!(state.remove_archive_after_resume);
     }
+
+    /// The environment every home fallback reads, put back when the test ends.
+    ///
+    /// The suite runs one test at a time, and `Drop` restores every value even
+    /// when an assertion fails, so a failure here cannot leave the rest of the
+    /// run reading a scratch home.
+    struct HomeVariables {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl HomeVariables {
+        fn clear() -> Self {
+            let names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+            let saved = names
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            // SAFETY: the suite runs with one test thread, and the guard puts
+            // every value back before the next test can look.
+            unsafe {
+                for name in names {
+                    env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+
+        fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: as above.
+            unsafe { env::set_var(name, value) };
+        }
+
+        fn remove(&self, name: &str) {
+            // SAFETY: as above.
+            unsafe { env::remove_var(name) };
+        }
+    }
+
+    impl Drop for HomeVariables {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_home_is_read_from_the_windows_variables() {
+        let variables = HomeVariables::clear();
+        let profile = env::temp_dir().join("muxloom-windows-profile");
+        // Stock Windows: Explorer, `cmd` and PowerShell set `USERPROFILE` and
+        // never `HOME`, so every default directory has to find it or start
+        // resolving relative to whatever directory the process was launched in.
+        variables.set("USERPROFILE", &profile);
+        assert_eq!(
+            default_config_path(),
+            profile.join(".config/muxloom/config.toml")
+        );
+        assert_eq!(
+            default_state_path(),
+            profile.join(".local/state/muxloom/state.json")
+        );
+        assert_eq!(
+            default_debug_log_path(),
+            profile.join(".local/state/muxloom/debug.log")
+        );
+        assert_eq!(expand_tilde("~/.ssh/config"), profile.join(".ssh/config"));
+        assert!(default_state_path().is_absolute());
+
+        // A launcher that exports an empty `HOME` names no directory either.
+        variables.set("HOME", "");
+        assert_eq!(home_dir(), profile);
+
+        // The classic pair, when neither `HOME` nor `USERPROFILE` is there.
+        variables.remove("HOME");
+        variables.remove("USERPROFILE");
+        variables.set("HOMEDRIVE", "C:");
+        variables.set("HOMEPATH", r"\Users\ada");
+        let drive_home = Path::new("C:").join(r"\Users\ada");
+        assert_eq!(home_dir(), drive_home);
+        assert_eq!(
+            default_state_path(),
+            drive_home.join(".local/state/muxloom/state.json")
+        );
+
+        // With nothing set at all the current directory remains the answer,
+        // the way it always was: no error and no panic.
+        variables.remove("HOMEDRIVE");
+        variables.remove("HOMEPATH");
+        assert_eq!(home_dir(), PathBuf::from("."));
+        assert_eq!(
+            default_state_path(),
+            PathBuf::from(".").join(".local/state/muxloom/state.json")
+        );
+    }
 }
