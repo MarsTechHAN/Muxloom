@@ -3731,7 +3731,14 @@ impl ControllerControl {
         let query = required_str(arguments, "query")?;
         let deep = optional_bool(arguments, "deep");
         let mut results = Vec::new();
-        for target in self.targets(arguments)? {
+        let targets = self.targets(arguments)?;
+        // A sweep asks its machines the same question, and one machine not
+        // knowing the session is that machine's row while another may still
+        // answer. Asked of a single machine, there is no second answer to
+        // lose: the failure is the answer, and the call's own wrapper gives it
+        // the same explanation read_screen and the rest already give.
+        let alone = targets.len() == 1;
+        for target in targets {
             // Asked about the whole machine, the machine is asked once. Walking
             // it from here meant fetching the session list — which draws every
             // live screen to answer — and then one round trip per session, for
@@ -3755,7 +3762,16 @@ impl ControllerControl {
                             }],
                             0,
                         ),
-                        Err(_) => continue,
+                        // A search that never opened a capture must not come
+                        // back as one that read them all and found nothing.
+                        Err(error) if alone => return Err(error),
+                        Err(error) => {
+                            results.push(json!({
+                                "machine": crate::model::machine_read_as(&target.id),
+                                "error": format!("{error:#}"),
+                            }));
+                            continue;
+                        }
                     }
                 }
                 None => {
@@ -4970,18 +4986,25 @@ mod daemon_surface {
         fn search_history(&self, arguments: &Value) -> Result<String> {
             let query = required_str(arguments, "query")?;
             let (hits, skipped) = match optional_str(arguments, "session_id") {
-                Some(session_id) => match self.transact(&DaemonRequest::SearchHistory {
-                    session_id: session_id.into(),
-                    query: query.into(),
-                    max_matches: SEARCH_MAX_MATCHES,
-                }) {
+                // The daemon's refusal is the answer, like it is for every
+                // other tool over a session id: a search that never opened a
+                // capture must not come back as one that read them all and
+                // found nothing.
+                Some(session_id) => match self
+                    .transact(&DaemonRequest::SearchHistory {
+                        session_id: session_id.into(),
+                        query: query.into(),
+                        max_matches: SEARCH_MAX_MATCHES,
+                    })?
+                    .0
+                {
                     // One named session is read whole however old it is: the
                     // pool exists to keep a search off captures nobody asked
                     // about, and this one was asked about.
-                    Ok((DaemonResponse::HistoryMatches { matches }, _)) => {
+                    DaemonResponse::HistoryMatches { matches } => {
                         (vec![(session_id.to_string(), String::new(), matches)], 0)
                     }
-                    Ok(_) | Err(_) => (Vec::new(), 0),
+                    response => bail!("unexpected history-search response: {response:?}"),
                 },
                 None => self.searched_sessions(query, optional_bool(arguments, "deep"))?,
             };
