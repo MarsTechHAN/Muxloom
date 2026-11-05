@@ -7815,6 +7815,39 @@ mod tests {
         }));
     }
 
+    /// A malformed `.json` preview must say that it did not parse, the way the
+    /// `.jsonl` and delimited previews do, instead of passing the raw source
+    /// off as a highlighted document.
+    #[test]
+    fn malformed_json_preview_reports_the_parse_error() {
+        let broken = |path: &str| crate::model::FilePreview {
+            path: path.into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 7,
+            content: r#"{"a": }"#.into(),
+            truncated: false,
+        };
+
+        let json = rendered_text(&file_preview_render(&broken("/tmp/broken.json")));
+        assert!(
+            json.contains("invalid JSON"),
+            "malformed JSON must name the parse error: {json:?}"
+        );
+        // The unparseable source stays readable next to the error.
+        assert!(
+            json.contains(r#"{"a": }"#),
+            "the source stays visible: {json:?}"
+        );
+
+        // The sibling structured previews already report their errors.
+        let jsonl = rendered_text(&file_preview_render(&broken("/tmp/broken.jsonl")));
+        assert!(
+            jsonl.contains("invalid JSON"),
+            "JSONL already reports the parse error: {jsonl:?}"
+        );
+    }
+
     /// A header stays pinned above the viewport while the body pages, and both
     /// the ruler and the row gutter number what is on screen.
     #[test]
