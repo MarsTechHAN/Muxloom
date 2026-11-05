@@ -2631,6 +2631,68 @@ mod tests {
         );
     }
 
+    /// A store written by an older build has 0755 on the directories between
+    /// the root and a session. The privacy repair tightened only the one path
+    /// it was handed, so `blobs` and `blobs/<machine>` stayed listable and
+    /// another local user could still enumerate which machines and sessions
+    /// had been backed up. Every level of the layout the store knows it owns is
+    /// repaired as it writes, without walking into other machines or sessions.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_left_loose_by_an_older_build_is_tightened_all_the_way_down() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Umask(libc::mode_t);
+        impl Drop for Umask {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _umask = Umask(unsafe { libc::umask(0o022) });
+
+        let store = temp_store();
+        let root = store.root().to_path_buf();
+        let blobs = root.join("blobs");
+        let machine = blobs.join("local");
+        let session = store.session_dir("local", "s1");
+        // What an older build left behind: the whole layout world-listable.
+        for dir in [&root, &blobs, &machine, &session] {
+            fs::create_dir_all(dir).unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        store
+            .append_frame("local", "s1", CAPTURE_BLOB, b"hello\n")
+            .unwrap();
+        store.save_index(&BackupIndex::default()).unwrap();
+
+        let index = store.index_path();
+        let capture = session.join(CAPTURE_BLOB);
+        let mut loose = Vec::new();
+        for (path, want, what) in [
+            (root.as_path(), 0o700, "the store root"),
+            (blobs.as_path(), 0o700, "the blob partition"),
+            (machine.as_path(), 0o700, "the machine directory"),
+            (session.as_path(), 0o700, "the session directory"),
+            (index.as_path(), 0o600, "the index"),
+            (capture.as_path(), 0o600, "the capture blob"),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            if mode != want {
+                loose.push(format!(
+                    "{what} is {mode:04o}, want {want:04o}: {}",
+                    path.display()
+                ));
+            }
+        }
+        assert!(
+            loose.is_empty(),
+            "a store an older build left behind is still readable by every \
+             local user:\n{}",
+            loose.join("\n")
+        );
+    }
+
     /// A transcript long enough to fingerprint, written where a sync can read
     /// it. Returns the path and the record a first whole pass would have left.
     fn mirrored_transcript(name: &str, lines: usize) -> (PathBuf, BackupRecord) {
