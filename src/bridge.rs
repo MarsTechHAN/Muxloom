@@ -5100,4 +5100,95 @@ mod tests {
         let daemon = crate::daemon::DaemonPaths::discover().unwrap();
         assert_eq!(daemon_stash().unwrap(), daemon.bin);
     }
+
+    /// The home variables for one test, put back when it ends.
+    struct HomeEnvironment {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl HomeEnvironment {
+        fn clearing(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            // SAFETY: this suite runs one test at a time, and the guard puts
+            // every value back before the next test can look.
+            unsafe {
+                for name in names {
+                    env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+
+        fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: as above.
+            unsafe { env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for HomeEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_home_keeps_the_companion_search_out_of_the_launch_directory() {
+        let environment = HomeEnvironment::clearing(&[
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "MUXLOOM_CACHE_DIR",
+            "XDG_CACHE_HOME",
+            "LOCALAPPDATA",
+            "MUXLOOMD_STATE_DIR",
+            "XDG_STATE_HOME",
+        ]);
+
+        // No home: a `~/...` stays as written, and the cache falls back to
+        // the temp directory instead of becoming `.cache` in the directory
+        // the controller happened to start in.
+        assert_eq!(
+            expand_local_tilde("~/companions"),
+            PathBuf::from("~/companions")
+        );
+        assert_eq!(
+            companion_cache_root(),
+            env::temp_dir().join("muxloom-cache/companions")
+        );
+        assert_eq!(daemon_stash(), None);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = env::temp_dir().join(format!(
+            "muxloom-companion-home-{}-{nonce}",
+            std::process::id()
+        ));
+        environment.set("USERPROFILE", &profile);
+        assert_eq!(
+            expand_local_tilde("~/companions"),
+            profile.join("companions")
+        );
+        assert_eq!(
+            companion_cache_root(),
+            profile.join(".cache/muxloom/companions")
+        );
+        assert_eq!(
+            daemon_stash(),
+            Some(profile.join(".local/state/muxloom/bin"))
+        );
+    }
 }

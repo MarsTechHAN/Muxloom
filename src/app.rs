@@ -23048,4 +23048,63 @@ mod tests {
         assert!(form.compose.is_none(), "nothing should be being written");
         assert_eq!(form.error.as_deref(), Some("Nothing here to reply to"));
     }
+
+    /// The home variables for one test, put back when it ends.
+    struct HomeEnvironment {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl HomeEnvironment {
+        fn without_home() -> Self {
+            let names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+            let saved = names
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            // SAFETY: this suite runs one test at a time, and the guard puts
+            // every value back before the next test can look.
+            unsafe {
+                for name in names {
+                    env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+
+        fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: as above.
+            unsafe { env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for HomeEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_download_folder_follows_the_home_variables() {
+        let environment = HomeEnvironment::without_home();
+        // No home: the fallback is the launch directory itself, not
+        // `./Downloads` spelled as a relative home.
+        assert_eq!(default_download_directory(), PathBuf::from("."));
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile =
+            env::temp_dir().join(format!("muxloom-downloads-{}-{nonce}", std::process::id()));
+        environment.set("USERPROFILE", &profile);
+        assert_eq!(default_download_directory(), profile.join("Downloads"));
+    }
 }

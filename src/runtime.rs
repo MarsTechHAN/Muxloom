@@ -7151,4 +7151,80 @@ mod tests {
             "src/main.rs"
         );
     }
+
+    /// The home variables for one test, put back when it ends.
+    struct HomeEnvironment {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl HomeEnvironment {
+        fn without_home() -> Self {
+            let names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            // SAFETY: this suite runs one test at a time, and the guard puts
+            // every value back before the next test can look.
+            unsafe {
+                for name in names {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+
+        fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for HomeEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_home_refuses_to_resolve_a_local_target_path() {
+        let _environment = HomeEnvironment::without_home();
+        let runtime = Runtime::new(&crate::config::Config::default());
+        let error = runtime
+            .home_relative_path(&Target::local(), ".local/bin/agent")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("HOME is unavailable while resolving a target path"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_windows_profile_resolves_a_local_target_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = std::env::temp_dir().join(format!(
+            "muxloom-target-path-{}-{nonce}",
+            std::process::id()
+        ));
+        let environment = HomeEnvironment::without_home();
+        environment.set("USERPROFILE", &profile);
+        let runtime = Runtime::new(&crate::config::Config::default());
+        assert_eq!(
+            runtime
+                .home_relative_path(&Target::local(), ".local/bin/agent")
+                .unwrap(),
+            format!("{}/.local/bin/agent", profile.display())
+        );
+    }
 }

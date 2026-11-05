@@ -881,7 +881,7 @@ mod tests {
         assert!(state.remove_archive_after_resume);
     }
 
-    /// The environment every home fallback reads, put back when the test ends.
+    /// The environment variables a test reads, put back when the test ends.
     ///
     /// The suite runs one test at a time, and `Drop` restores every value even
     /// when an assertion fails, so a failure here cannot leave the rest of the
@@ -892,7 +892,10 @@ mod tests {
 
     impl HomeVariables {
         fn clear() -> Self {
-            let names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+            Self::clearing(&["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"])
+        }
+
+        fn clearing(names: &[&'static str]) -> Self {
             let saved = names
                 .iter()
                 .map(|name| (*name, env::var_os(name)))
@@ -964,13 +967,21 @@ mod tests {
         variables.remove("USERPROFILE");
         variables.set("HOMEDRIVE", "C:");
         variables.set("HOMEPATH", r"\Users\ada");
-        let mut drive_home = PathBuf::from("C:");
-        drive_home.push(r"\Users\ada");
-        assert_eq!(home_dir(), drive_home);
+        let drive_home = home_dir();
+        // Composed with `Path::join`, so the drive prefix and the rooted
+        // `HOMEPATH` become the one path Windows means. The expected value is
+        // spelled out rather than recomputed with the same `join`, and the
+        // Windows-only assertion below is what says it is drive-absolute.
+        assert_eq!(drive_home, PathBuf::from(r"C:/\Users\ada"));
         assert_eq!(
             default_state_path(),
             drive_home.join(".local/state/muxloom/state.json")
         );
+        #[cfg(windows)]
+        {
+            assert_eq!(drive_home, PathBuf::from(r"C:\Users\ada"));
+            assert!(drive_home.is_absolute());
+        }
 
         // With nothing set at all the current directory remains the answer,
         // the way it always was: no error and no panic.
@@ -981,5 +992,126 @@ mod tests {
             default_state_path(),
             PathBuf::from(".").join(".local/state/muxloom/state.json")
         );
+    }
+
+    /// A scratch path that no earlier run of this test left behind.
+    fn scratch_root(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("muxloom-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    /// One Claude transcript filed the way Claude Code files a conversation in
+    /// `/work`, so reading the right home is visible in the result.
+    fn claude_transcript(home: &Path) {
+        let folder = home.join(".claude/projects/-work");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("thread.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"thread","cwd":"/work","timestamp":"2026-08-19T03:48:05.620Z","message":{"content":[{"type":"text","text":"Fix the recap first."}]}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"thread","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_missing_home_is_refused_by_the_sites_that_need_one() {
+        let variables = HomeVariables::clearing(&[
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_STATE_HOME",
+            "MUXLOOM_MCP_REGISTER",
+            "MUXLOOM_TRUST_DIRECTORY",
+        ]);
+
+        // The default paths keep the `.` fallback they have always had...
+        assert_eq!(home_dir(), PathBuf::from("."));
+        assert_eq!(
+            default_state_path(),
+            PathBuf::from(".").join(".local/state/muxloom/state.json")
+        );
+        assert_eq!(
+            expand_tilde("~/.ssh/config"),
+            PathBuf::from(".").join(".ssh/config")
+        );
+
+        // ...but a site that cannot work without a real home says so instead
+        // of quietly resolving against the directory it was launched from.
+        #[cfg(unix)]
+        {
+            let error = crate::daemon::DaemonPaths::the_machines_own().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("HOME is not set"),
+                "unexpected refusal: {error:#}"
+            );
+        }
+        assert!(crate::native_history::threads_for(AgentKind::Claude, "/work", 0).is_empty());
+        let error = crate::mcp_register::register_for_this_daemon(true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no home directory to register an MCP server in"),
+            "unexpected refusal: {error:#}"
+        );
+        let error = crate::mcp_register::trust_directory_for_this_daemon(
+            AgentKind::Claude,
+            Path::new("/work"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no home directory to record a trusted directory in"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_windows_profile_is_used_by_the_sites_that_need_a_home() {
+        let profile = scratch_root("windows-profile");
+        let variables = HomeVariables::clearing(&[
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_STATE_HOME",
+            "MUXLOOM_MCP_REGISTER",
+            "MUXLOOM_TRUST_DIRECTORY",
+        ]);
+        variables.set("USERPROFILE", &profile);
+
+        assert_eq!(
+            default_state_path(),
+            profile.join(".local/state/muxloom/state.json")
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            crate::daemon::DaemonPaths::the_machines_own().unwrap().root,
+            profile.join(".local/state/muxloom")
+        );
+
+        claude_transcript(&profile);
+        let threads = crate::native_history::threads_for(AgentKind::Claude, "/work", 0);
+        assert_eq!(
+            threads.len(),
+            1,
+            "the profile's transcripts were not the ones read"
+        );
+        assert_eq!(threads[0].id, "thread");
+
+        let written = crate::mcp_register::register_for_this_daemon(true).unwrap();
+        assert!(!written.is_empty());
+        for path in &written {
+            assert!(
+                path.starts_with(&profile),
+                "{} is outside the profile",
+                path.display()
+            );
+        }
+        fs::remove_dir_all(&profile).unwrap();
     }
 }
