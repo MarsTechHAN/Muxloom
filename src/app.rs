@@ -14737,6 +14737,70 @@ mod tests {
         );
     }
 
+    /// The wheel walks the panel the keyboard walks. It used to clamp against
+    /// `values.len()`, which counts only the text fields: every environment
+    /// row and every action sits past that count, so the wheel could never
+    /// reach them, and the edit cursor stayed on the field the wheel had left
+    /// rather than landing at the end of the one it selected.
+    #[test]
+    fn the_settings_wheel_reaches_every_row_and_lands_the_cursor_at_the_end() {
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.open_global_settings();
+        for _ in 0..64 {
+            app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        }
+        let Some(Modal::Settings(form)) = app.modal.clone() else {
+            panic!("the settings panel closed under the wheel");
+        };
+        assert_eq!(
+            form.selected,
+            form.focus_len() - 1,
+            "the wheel stopped at row {} of {} (values = {})",
+            form.selected,
+            form.focus_len(),
+            form.values.len()
+        );
+
+        // A wheel notch of one row is a field change like Tab: typing starts
+        // at the end of the field now selected, not at the offset left on the
+        // previous one.
+        let mut app = ux_test_app(vec![Target::local()]);
+        app.open_global_settings();
+        app.handle_key(KeyEvent::from(KeyCode::Home));
+        let Some(Modal::Settings(form)) = app.modal.clone() else {
+            panic!("the settings panel closed under the key");
+        };
+        assert_eq!(
+            (form.selected, form.cursor),
+            (0, 0),
+            "Home must put the cursor at the start of the first field"
+        );
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        let Some(Modal::Settings(form)) = app.modal.clone() else {
+            panic!("the settings panel closed under the wheel");
+        };
+        assert_eq!(form.selected, 1, "one notch selects the next row");
+        let selected = form
+            .selected_text()
+            .expect("the SSH config path is a text field");
+        assert!(
+            !selected.is_empty(),
+            "the fixture needs a non-empty field to measure"
+        );
+        assert_eq!(
+            form.cursor,
+            selected.chars().count(),
+            "the cursor must land at the end of the newly selected field"
+        );
+    }
+
     #[test]
     fn a_forced_update_is_a_one_shot_action_never_an_ambient_state() {
         // A lagging cycle result on its own opens nothing and starts
