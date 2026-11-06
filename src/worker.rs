@@ -1,7 +1,8 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -621,16 +622,84 @@ pub struct Worker {
     pub bridges: BridgePool,
 }
 
+/// Which preview read of a file was asked for last. Preview reads run on a
+/// thread each, so a freshness poll and a close/reopen (or Ctrl-r) can both be
+/// in flight for one file. The newer read is the one that saw the later bytes,
+/// and the browser records the listing as current when it asks, so an older
+/// read replying after it would leave the pane on stale bytes that nothing asks
+/// for again. Each read takes a ticket here; only the ticket still current for
+/// its `(target, path)` is allowed to deliver.
+#[derive(Default)]
+struct PreviewReads {
+    latest: Mutex<HashMap<(String, String), u64>>,
+    next: AtomicU64,
+}
+
+impl PreviewReads {
+    fn issue(reads: &Arc<Self>, target_id: &str, path: &str) -> PreviewTicket {
+        let ticket = reads.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let key = (target_id.to_string(), path.to_string());
+        reads
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone(), ticket);
+        PreviewTicket {
+            reads: Arc::clone(reads),
+            key,
+            ticket,
+        }
+    }
+}
+
+/// One outstanding preview read, and the right to deliver its reply only while
+/// no read of the same file was asked for after it.
+struct PreviewTicket {
+    reads: Arc<PreviewReads>,
+    key: (String, String),
+    ticket: u64,
+}
+
+impl PreviewTicket {
+    /// Delivers `event` unless a newer read of the same file is outstanding.
+    /// The check and the send share one lock, so a read issued between them
+    /// cannot have its reply overtaken by this one.
+    fn deliver(&self, events: &mpsc::Sender<Event>, event: Event) -> bool {
+        let mut latest = self
+            .reads
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if latest.get(&self.key) != Some(&self.ticket) {
+            return false;
+        }
+        latest.remove(&self.key);
+        let _ = events.send(event);
+        true
+    }
+}
+
 impl Worker {
     pub fn start(runtime: Runtime) -> Self {
         let bridges = runtime.bridge_pool();
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let preview_reads = Arc::new(PreviewReads::default());
 
         thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 let runtime = runtime.clone();
                 let events = event_tx.clone();
+                // The ticket has to be taken when the request is picked up, in
+                // request order, rather than inside the read's own thread: two
+                // threads started a moment apart would otherwise decide which
+                // read is newer by whichever reached the registry first.
+                let preview_ticket = match &request {
+                    Request::PreviewFile { target, path } => {
+                        Some(PreviewReads::issue(&preview_reads, &target.id, path))
+                    }
+                    _ => None,
+                };
                 thread::spawn(move || match request {
                     Request::Scan(request) => {
                         let target_id = request.target.id.clone();
@@ -1165,11 +1234,21 @@ impl Worker {
                             .preview_file(&target, &path)
                             .map(normalize_legacy_image_preview)
                             .map_err(|error| error.to_string());
-                        let _ = events.send(Event::FilePreviewed {
-                            target_id,
-                            path,
+                        let ticket = preview_ticket.expect("a preview read is issued a ticket");
+                        let event = Event::FilePreviewed {
+                            target_id: target_id.clone(),
+                            path: path.clone(),
                             result,
-                        });
+                        };
+                        if !ticket.deliver(&events, event) {
+                            debug::log(
+                                "files",
+                                format!(
+                                    "discarded superseded preview reply target={target_id} path={path} request={}",
+                                    ticket.ticket
+                                ),
+                            );
+                        }
                     }
                     Request::OpenMedia {
                         target,
@@ -2185,6 +2264,48 @@ mod tests {
             },
         ];
         assert!(best_history_match(&matches, "renderer").unwrap().0.recap);
+    }
+
+    /// The browser records a freshness listing as current when it asks for the
+    /// read, so a reply from a read a newer one superseded must never reach it:
+    /// the newer read is the one that saw the later bytes, and the pane would
+    /// otherwise keep the earlier ones with nothing left to ask again.
+    #[test]
+    fn a_superseded_preview_read_hands_back_its_reply() {
+        let (events, received) = mpsc::channel::<Event>();
+        let reads = Arc::new(PreviewReads::default());
+        let first = PreviewReads::issue(&reads, "local", "/work/notes.log");
+        let second = PreviewReads::issue(&reads, "local", "/work/notes.log");
+
+        let reply = |content: &str| Event::FilePreviewed {
+            target_id: "local".into(),
+            path: "/work/notes.log".into(),
+            result: Ok(FilePreview {
+                path: "/work/notes.log".into(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: content.len() as u64,
+                content: content.into(),
+                truncated: false,
+            }),
+        };
+        assert!(!first.deliver(&events, reply("first\n")));
+        assert!(second.deliver(&events, reply("second\n")));
+
+        match received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the newest reply is delivered")
+        {
+            Event::FilePreviewed {
+                result: Ok(preview),
+                ..
+            } => assert_eq!(preview.content, "second\n"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "the superseded reply is dropped"
+        );
     }
 
     #[test]

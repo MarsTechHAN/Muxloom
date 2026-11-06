@@ -6309,10 +6309,18 @@ impl App {
                         }
                     }
                 }
+                // The worker discards the reply of a preview read that a newer
+                // read of the same file superseded, so a reply reaches the app
+                // only while no newer read is outstanding. It used to be
+                // applied only when it still matched preview_requested_path,
+                // which the first of two overlapping replies cleared: the
+                // second and newer reply then found nothing to match, and the
+                // pane stayed on the earlier read while the listing recorded
+                // the file as current. The path is what keeps a reply for a
+                // file the browser is not showing out.
                 if let Some(form) = self.file_manager.as_mut()
                     && form.target.id == target_id
                     && form.preview_path.as_deref() == Some(path.as_str())
-                    && form.preview_requested_path.as_deref() == Some(path.as_str())
                 {
                     form.preview_loading = false;
                     form.preview_requested_path = None;
