@@ -3112,15 +3112,7 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.focus = Focus::Recap;
-                if self
-                    .file_manager
-                    .as_ref()
-                    .is_some_and(|form| form.preview_path.is_some())
-                {
-                    self.release_terminal_input("File preview focused");
-                } else {
-                    self.activate_terminal();
-                }
+                self.focus_recap_pane();
                 true
             }
             _ => false,
@@ -4679,6 +4671,47 @@ impl App {
             // Only reclaim PageDown while we are actually scrolled up.
             self.history_offset > 0
         }
+    }
+
+    /// Move focus into the recap pane without opening what is selected in it.
+    /// Enter and a click are the gestures that attach, resume an archived row,
+    /// or put a backup-only one back on its machine. Arriving in the pane is
+    /// not one of those: treating it as one fired a remote history scan from a
+    /// stray focus move, and for a backup-only row wrote the transcript back to
+    /// the machine and relaunched the agent. The pane is already showing the
+    /// read-only history, so say how to open it and leave it be.
+    fn focus_recap_pane(&mut self) {
+        if self
+            .file_manager
+            .as_ref()
+            .is_some_and(|form| form.preview_path.is_some())
+        {
+            self.release_terminal_input("File preview focused");
+            return;
+        }
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        if self.is_recoverable(&session.target_id, &session.id) {
+            let message = if self.is_restorable(&session.target_id, &session.id) {
+                "Local backup only - press Enter to restore it to the machine"
+            } else {
+                "Local backup only - its output can be read here, but not resumed"
+            };
+            self.release_terminal_input(message);
+            return;
+        }
+        if session.dead {
+            // A dead terminal has no history to open - only an exit to report,
+            // which is what Enter says too.
+            self.release_terminal_input(if session.kind == AgentKind::Terminal {
+                "Exited terminals are removed automatically"
+            } else {
+                "Archived session - press Enter to resume"
+            });
+            return;
+        }
+        self.activate_terminal();
     }
 
     fn activate_terminal(&mut self) {
@@ -8217,15 +8250,7 @@ impl App {
         );
         self.focus = next;
         if next == Focus::Recap {
-            if self
-                .file_manager
-                .as_ref()
-                .is_some_and(|form| form.preview_path.is_some())
-            {
-                self.release_terminal_input("File preview focused");
-            } else {
-                self.activate_terminal();
-            }
+            self.focus_recap_pane();
         } else {
             self.release_terminal_input("Terminal remains attached; focus moved to a sidebar");
         }
