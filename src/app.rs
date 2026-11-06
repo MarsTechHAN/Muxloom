@@ -6322,14 +6322,23 @@ impl App {
                     && form.target.id == target_id
                     && form.preview_path.as_deref() == Some(path.as_str())
                 {
+                    // A file watch reads through this same pipeline, so its
+                    // poll replies land here too. A pending path is the one
+                    // thing that marks a read as the browser's own, which is
+                    // what decides whether an image or video may be re-opened:
+                    // restarting the decoder for a watch poll would reset
+                    // playback under the viewer on every interval.
+                    let form_asked = form.preview_requested_path.as_deref() == Some(path.as_str());
                     form.preview_loading = false;
                     form.preview_requested_path = None;
                     match result {
                         Ok(preview) => {
-                            if matches!(
-                                preview.kind,
-                                FilePreviewKind::Image | FilePreviewKind::Video
-                            ) {
+                            if form_asked
+                                && matches!(
+                                    preview.kind,
+                                    FilePreviewKind::Image | FilePreviewKind::Video
+                                )
+                            {
                                 media_request =
                                     Some((form.target.clone(), path.clone(), preview.kind));
                             }
