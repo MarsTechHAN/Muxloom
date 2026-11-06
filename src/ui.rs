@@ -3106,11 +3106,23 @@ fn text_preview_render(
         // on the render thread, so a big file gets the plain reader instead.
         "csv" if rich => delimited_render(pinned, &preview.content, b','),
         "tsv" if rich => delimited_render(pinned, &preview.content, b'\t'),
-        "json" if rich => PreviewRender::lines(
-            pinned,
-            parsed_json_lines(&preview.content)
-                .unwrap_or_else(|| syntax_lines(&preview.content, &preview.path, Some("json"))),
-        ),
+        "json" if rich => match parsed_json_lines(&preview.content) {
+            Ok(lines) => PreviewRender::lines(pinned, lines),
+            // A document that does not parse still keeps its readable source,
+            // but the error is pinned above it so a half-written file is never
+            // mistaken for a parsed one, matching the JSONL preview.
+            Err(error) => {
+                let mut pinned = pinned;
+                pinned.push(Line::styled(
+                    format!("invalid JSON: {error}"),
+                    Style::default().fg(Color::Red),
+                ));
+                PreviewRender::lines(
+                    pinned,
+                    syntax_lines(&preview.content, &preview.path, Some("json")),
+                )
+            }
+        },
         "jsonl" | "ndjson" if rich => PreviewRender::lines(pinned, json_lines(&preview.content)),
         _ if rich => {
             PreviewRender::lines(pinned, syntax_lines(&preview.content, &preview.path, None))
@@ -3119,10 +3131,13 @@ fn text_preview_render(
     }
 }
 
-fn parsed_json_lines(content: &str) -> Option<Vec<Line<'static>>> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let pretty = serde_json::to_string_pretty(&value).ok()?;
-    Some(syntax_lines(&pretty, "preview.json", Some("json")))
+/// Pretty-print a whole JSON document so its structure is what the preview
+/// shows. The serde error is returned rather than swallowed so the caller can
+/// report a document that did not parse.
+fn parsed_json_lines(content: &str) -> Result<Vec<Line<'static>>, serde_json::Error> {
+    let value = serde_json::from_str::<serde_json::Value>(content)?;
+    let pretty = serde_json::to_string_pretty(&value)?;
+    Ok(syntax_lines(&pretty, "preview.json", Some("json")))
 }
 
 fn json_lines(content: &str) -> Vec<Line<'static>> {
