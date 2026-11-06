@@ -4505,14 +4505,25 @@ mod platform {
         // scratch chat that moves into the project you happened to have
         // selected leaves its droppings in a repository that never asked for
         // one, and there is nothing to keep afterwards by definition.
-        let path = if temporary {
+        //
+        // The folder is this launch's until the live session holds its number.
+        // Everything between those two points can fail - resolving the
+        // program, recording the directory as trusted, writing the record,
+        // starting the keeper - and a launch that fails at any of them never
+        // becomes a session, so there is nothing that will ever end it, delete
+        // it, or find it stale before the next daemon start.
+        let (path, scratch_rollback) = if temporary {
+            let scratch_rollback = ScratchRollback::new(&state.paths, &session_id);
             let scratch = state.paths.scratch.join(&session_id);
             fs::create_dir_all(&scratch)
                 .with_context(|| format!("failed to create {}", scratch.display()))?;
             fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700))?;
-            scratch.to_string_lossy().into_owned()
+            (
+                scratch.to_string_lossy().into_owned(),
+                Some(scratch_rollback),
+            )
         } else {
-            path
+            (path, None)
         };
         if !Path::new(&path).is_dir() {
             bail!("working directory does not exist: {path}");
@@ -4865,6 +4876,11 @@ mod platform {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(session_id.clone(), Arc::clone(&session));
+        // The folder has a session that will end with it now, so it is no
+        // longer a failed launch's to take back.
+        if let Some(scratch_rollback) = scratch_rollback {
+            scratch_rollback.kept();
+        }
         rollback.replaced();
         // The split is recorded only once it is real: the keeper is connected
         // and the successor already holds its number in the live map. Written
@@ -4963,6 +4979,47 @@ mod platform {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(id, entry);
+            }
+        }
+    }
+
+    /// The scratch folder a temporary launch made, and has not yet handed to a
+    /// live session.
+    ///
+    /// The folder is created before the launch does anything else that can
+    /// fail, and only the launch that ends with a session in the map may keep
+    /// it. A temporary session that never becomes one has no record to end, no
+    /// entry to delete, and nothing the UI can show, so nothing else will ever
+    /// clean the folder up - only the sweep at the next daemon start, which a
+    /// daemon that stays up for days never reaches. So every way out that is
+    /// not a live session takes it back here, and the successful one disarms
+    /// the guard once the session holds its number.
+    struct ScratchRollback<'a> {
+        paths: &'a DaemonPaths,
+        session_id: &'a str,
+        armed: bool,
+    }
+
+    impl<'a> ScratchRollback<'a> {
+        fn new(paths: &'a DaemonPaths, session_id: &'a str) -> Self {
+            Self {
+                paths,
+                session_id,
+                armed: true,
+            }
+        }
+
+        /// The launch reached the point where the live session holds the
+        /// number, so the folder is its to keep and its to remove with it.
+        fn kept(mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ScratchRollback<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                remove_scratch_dir(self.paths, self.session_id);
             }
         }
     }
