@@ -22060,6 +22060,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An archived row, dead and with nothing in the local backup for it.
+    fn archived_codex_session(id: &str) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            target_id: "local".into(),
+            kind: AgentKind::Codex,
+            path: "/work".into(),
+            label: id.into(),
+            created_at: 1,
+            archived_at: None,
+            dead: true,
+            pid: None,
+            working: false,
+            needs_attention: false,
+            attention_reason: None,
+            recap: None,
+            title: None,
+            thread: None,
+            parent: None,
+            used_at: None,
+        }
+    }
+
+    /// An app showing one session, with the recap pane above the agents list so
+    /// a modified Up moves focus from the list into that pane.
+    fn recap_focus_app(session: AgentSession) -> (App, std::sync::mpsc::Receiver<Request>) {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Request>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+        let worker = Worker {
+            requests: request_tx,
+            events: event_rx,
+            bridges: crate::bridge::BridgePool::default(),
+        };
+        let mut state = State::default();
+        state.enabled_hosts.insert("local".into());
+        state.show_archived = true;
+        let mut app = App::new(
+            Config::default(),
+            PathBuf::from("unused-config.toml"),
+            state,
+            PathBuf::from("unused-state.json"),
+            vec![Target::local()],
+            worker,
+        );
+        app.selected_session_id = Some(session.id.clone());
+        app.sessions = vec![session];
+        app.focus = Focus::Agents;
+        app.pane_layout = PaneLayout {
+            recap: Some(Rect::new(0, 0, 100, 60)),
+            machines: Some(Rect::new(0, 60, 45, 40)),
+            agents: Some(Rect::new(45, 60, 55, 40)),
+            ..PaneLayout::default()
+        };
+        (app, request_rx)
+    }
+
+    /// Moving focus into the recap pane is not the open gesture. Alt+3 and the
+    /// modified arrows set `focus` and then used to call `activate_terminal`,
+    /// so stepping into the pane while an archived row was selected fired a
+    /// remote resume scan and put "Finding Codex history to resume..." on the
+    /// status line - a navigation keystroke doing what Enter is documented to
+    /// do. Enter still resumes.
+    #[test]
+    fn focusing_the_recap_pane_does_not_resume_an_archived_session() {
+        let (mut app, request_rx) =
+            recap_focus_app(archived_codex_session("muxloomd-codex-archived"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Recap);
+        assert!(
+            app.pending_archived_resume.is_none(),
+            "Alt+3 started a resume: {:?}",
+            app.status_message
+        );
+        assert!(
+            !app.status_message.contains("Finding"),
+            "moving focus to the pane reported a resume scan: {:?}",
+            app.status_message
+        );
+        let sent: Vec<_> = request_rx.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::ScanResumes { .. })),
+            "moving focus scanned for a resume: {sent:?}"
+        );
+
+        // The arrow-key focus move goes through the same pane-open path.
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Up, pane_focus_modifier()));
+        assert_eq!(app.focus, Focus::Recap);
+        assert!(
+            app.pending_archived_resume.is_none(),
+            "the focus-move key started a resume: {:?}",
+            app.status_message
+        );
+        let sent: Vec<_> = request_rx.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::ScanResumes { .. })),
+            "the focus-move key scanned for a resume: {sent:?}"
+        );
+
+        // Enter is the documented gesture and must keep resuming.
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        match receive_request(&request_rx) {
+            Request::ScanResumes { target, kind, path } => {
+                assert_eq!(target.id, "local");
+                assert_eq!(kind, AgentKind::Codex);
+                assert_eq!(path, "/work");
+            }
+            request => panic!("Enter is the resume gesture; expected a scan, got {request:?}"),
+        }
+        assert!(
+            app.pending_archived_resume.is_some(),
+            "Enter should be waiting on the history scan"
+        );
+    }
+
+    /// The backup-only row makes the same move worse: activating it restores
+    /// the transcript to the machine and, when the restore lands, relaunches
+    /// the agent. A focus move must leave it read-only; Enter still restores.
+    #[test]
+    fn focusing_the_recap_pane_does_not_restore_a_backup_only_session() {
+        let (mut app, request_rx) = recap_focus_app(archived_codex_session("muxloomd-codex-lost"));
+        app.recoverable.insert(
+            ("local".into(), "muxloomd-codex-lost".into()),
+            RecoveryInfo {
+                machine_key: "local".into(),
+                restorable: true,
+            },
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.focus, Focus::Recap);
+        assert!(
+            !app.is_restoring("local", "muxloomd-codex-lost"),
+            "moving focus started a restore: {:?}",
+            app.status_message
+        );
+        let sent: Vec<_> = request_rx.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::BackupRestore { .. })),
+            "moving focus wrote the transcript back to the machine: {sent:?}"
+        );
+
+        // Enter still restores, and the restore is what relaunches the agent.
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            app.is_restoring("local", "muxloomd-codex-lost"),
+            "Enter should start the restore"
+        );
+        match receive_request(&request_rx) {
+            Request::BackupRestore {
+                target,
+                machine_key,
+                session_id,
+            } => {
+                assert_eq!(target.id, "local");
+                assert_eq!(machine_key, "local");
+                assert_eq!(session_id, "muxloomd-codex-lost");
+            }
+            request => panic!("Enter is the restore gesture; expected a restore, got {request:?}"),
+        }
+    }
+
     /// Reading a fleet's scrollback takes seconds; matching names and recaps
     /// takes none. The search answers with the second lot at once and fills in
     /// the first as it goes, so the list has to survive being rewritten under a
