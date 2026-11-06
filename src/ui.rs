@@ -2880,7 +2880,16 @@ impl PreviewBody {
 
 fn file_preview_render(preview: &crate::model::FilePreview) -> PreviewRender {
     let mut pinned = vec![file_preview_metadata(preview)];
-    if preview.truncated {
+    if preview.starts_mid_file {
+        pinned.push(Line::styled(
+            format!(
+                "Showing the last {} of {} — the start is not loaded",
+                format_bytes(preview.content.len() as u64),
+                format_bytes(preview.size)
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if preview.truncated {
         pinned.push(Line::styled(
             format!(
                 "Showing the first {} of {} — download it to read the rest",
@@ -3004,6 +3013,7 @@ fn draw_file_watch_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             size: watch.last_stamp.0,
             content: watch.content.clone(),
             truncated: watch.truncated,
+            starts_mid_file: watch.starts_mid_file,
         })
     };
     render.measure(inner.width);
@@ -7563,6 +7573,7 @@ mod tests {
                 size: 42,
                 content: "# File preview\n\n- item".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
             preview_requested_path: Some("/work/README.md".into()),
             preview_loading: false,
@@ -7735,6 +7746,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             truncated: false,
+            starts_mid_file: false,
         };
         form.preview = Some(log(80));
         app.file_manager = Some(form);
@@ -7782,6 +7794,7 @@ mod tests {
             size: 20,
             content: r#"{"name":"muxloom","count":2}"#.into(),
             truncated: false,
+            starts_mid_file: false,
         });
         let json_text = rendered_text(&json);
         assert!(json_text.contains("\"name\""));
@@ -7795,6 +7808,7 @@ mod tests {
             size: 30,
             content: "{\"id\":1}\n{\"id\":2}".into(),
             truncated: false,
+            starts_mid_file: false,
         });
         let jsonl_text = rendered_text(&jsonl);
         assert!(jsonl_text.contains("record 1"));
@@ -7807,6 +7821,7 @@ mod tests {
             size: 30,
             content: "name,count\nmuxloom,2".into(),
             truncated: false,
+            starts_mid_file: false,
         });
         let csv_text = rendered_text(&csv);
         assert!(csv_text.contains("name"));
@@ -7822,12 +7837,38 @@ mod tests {
             size: 12,
             content: "fn main() {}".into(),
             truncated: false,
+            starts_mid_file: false,
         });
         assert!(preview_lines(&rust).iter().any(|line| {
             line.spans
                 .iter()
                 .any(|span| span.content.contains("fn") && span.style.fg.is_some())
         }));
+    }
+
+    /// A watch of a file larger than its window shows the end, and the panel
+    /// has to say so instead of claiming the file was cut off at its start.
+    #[test]
+    fn a_tail_preview_says_it_is_showing_the_last_bytes() {
+        let render = file_preview_render(&crate::model::FilePreview {
+            path: "/tmp/build.log".into(),
+            mime: "text/plain".into(),
+            kind: FilePreviewKind::Text,
+            size: 9 * 1024 * 1024,
+            content: "newest line\n".into(),
+            truncated: false,
+            starts_mid_file: true,
+        });
+        let text = rendered_text(&render);
+        assert!(
+            text.contains("Showing the last"),
+            "a mid-file window must say it is the end: {text:?}"
+        );
+        assert!(text.contains("9.0 MiB"), "the file size stays on screen");
+        assert!(
+            !text.contains("Showing the first"),
+            "a tail is not a truncated head: {text:?}"
+        );
     }
 
     /// A malformed `.json` preview must say that it did not parse, the way the
@@ -7842,6 +7883,7 @@ mod tests {
             size: 7,
             content: r#"{"a": }"#.into(),
             truncated: false,
+            starts_mid_file: false,
         };
 
         let json = rendered_text(&file_preview_render(&broken("/tmp/broken.json")));
@@ -7878,6 +7920,7 @@ mod tests {
             size: content.len() as u64,
             content,
             truncated: false,
+            starts_mid_file: false,
         });
         render.measure(60);
         // Metadata, the column ruler, the header and the rule sit above the body.
@@ -7917,6 +7960,7 @@ mod tests {
             size: 12,
             content: "1,2\n3,4".into(),
             truncated: false,
+            starts_mid_file: false,
         });
         render.measure(40);
         assert_eq!(render.height(), 2);

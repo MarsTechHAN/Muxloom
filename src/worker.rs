@@ -171,6 +171,10 @@ pub enum Request {
     PreviewFile {
         target: Target,
         path: String,
+        /// `Some(window)` asks for a watch's tail: the last `window` bytes of a
+        /// file too large to preview whole, rather than its head. `None` is the
+        /// browser's ordinary preview and always starts at byte 0.
+        tail_window: Option<u64>,
     },
     OpenMedia {
         target: Target,
@@ -457,6 +461,9 @@ pub enum Event {
         target_id: String,
         path: String,
         result: Result<FilePreview, String>,
+        /// True when the reply is a watch's tail window. A tail must never be
+        /// folded into the browser's head-first preview of the same path.
+        tail: bool,
     },
     MediaOpened {
         target_id: String,
@@ -628,17 +635,19 @@ pub struct Worker {
 /// and the browser records the listing as current when it asks, so an older
 /// read replying after it would leave the pane on stale bytes that nothing asks
 /// for again. Each read takes a ticket here; only the ticket still current for
-/// its `(target, path)` is allowed to deliver.
+/// its `(target, path, tail)` is allowed to deliver. A head read and a watch's
+/// tail read are separate keys: one does not supersede the other, so a watch
+/// poll can never swallow the browser's reply (or the reverse).
 #[derive(Default)]
 struct PreviewReads {
-    latest: Mutex<HashMap<(String, String), u64>>,
+    latest: Mutex<HashMap<(String, String, bool), u64>>,
     next: AtomicU64,
 }
 
 impl PreviewReads {
-    fn issue(reads: &Arc<Self>, target_id: &str, path: &str) -> PreviewTicket {
+    fn issue(reads: &Arc<Self>, target_id: &str, path: &str, tail: bool) -> PreviewTicket {
         let ticket = reads.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let key = (target_id.to_string(), path.to_string());
+        let key = (target_id.to_string(), path.to_string(), tail);
         reads
             .latest
             .lock()
@@ -653,10 +662,10 @@ impl PreviewReads {
 }
 
 /// One outstanding preview read, and the right to deliver its reply only while
-/// no read of the same file was asked for after it.
+/// no newer read of the same file and the same view was asked for after it.
 struct PreviewTicket {
     reads: Arc<PreviewReads>,
-    key: (String, String),
+    key: (String, String, bool),
     ticket: u64,
 }
 
@@ -695,9 +704,16 @@ impl Worker {
                 // threads started a moment apart would otherwise decide which
                 // read is newer by whichever reached the registry first.
                 let preview_ticket = match &request {
-                    Request::PreviewFile { target, path } => {
-                        Some(PreviewReads::issue(&preview_reads, &target.id, path))
-                    }
+                    Request::PreviewFile {
+                        target,
+                        path,
+                        tail_window,
+                    } => Some(PreviewReads::issue(
+                        &preview_reads,
+                        &target.id,
+                        path,
+                        tail_window.is_some(),
+                    )),
                     _ => None,
                 };
                 thread::spawn(move || match request {
@@ -1228,17 +1244,25 @@ impl Worker {
                             result,
                         });
                     }
-                    Request::PreviewFile { target, path } => {
+                    Request::PreviewFile {
+                        target,
+                        path,
+                        tail_window,
+                    } => {
                         let target_id = target.id.clone();
-                        let result = runtime
-                            .preview_file(&target, &path)
-                            .map(normalize_legacy_image_preview)
-                            .map_err(|error| error.to_string());
+                        let tail = tail_window.is_some();
+                        let result = match tail_window {
+                            Some(window) => runtime.preview_file_tail(&target, &path, window),
+                            None => runtime.preview_file(&target, &path),
+                        }
+                        .map(normalize_legacy_image_preview)
+                        .map_err(|error| error.to_string());
                         let ticket = preview_ticket.expect("a preview read is issued a ticket");
                         let event = Event::FilePreviewed {
                             target_id: target_id.clone(),
                             path: path.clone(),
                             result,
+                            tail,
                         };
                         if !ticket.deliver(&events, event) {
                             debug::log(
@@ -2274,8 +2298,8 @@ mod tests {
     fn a_superseded_preview_read_hands_back_its_reply() {
         let (events, received) = mpsc::channel::<Event>();
         let reads = Arc::new(PreviewReads::default());
-        let first = PreviewReads::issue(&reads, "local", "/work/notes.log");
-        let second = PreviewReads::issue(&reads, "local", "/work/notes.log");
+        let first = PreviewReads::issue(&reads, "local", "/work/notes.log", false);
+        let second = PreviewReads::issue(&reads, "local", "/work/notes.log", false);
 
         let reply = |content: &str| Event::FilePreviewed {
             target_id: "local".into(),
@@ -2287,7 +2311,9 @@ mod tests {
                 size: content.len() as u64,
                 content: content.into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
+            tail: false,
         };
         assert!(!first.deliver(&events, reply("first\n")));
         assert!(second.deliver(&events, reply("second\n")));
@@ -2308,6 +2334,49 @@ mod tests {
         );
     }
 
+    /// A watch's tail read and the browser's head read of one file are two
+    /// views, not two generations of the same read. Keying them apart keeps a
+    /// two-second watch poll from discarding the browser's outstanding refresh
+    /// (or the reverse) before its reply can land.
+    #[test]
+    fn a_head_and_a_tail_read_of_one_file_do_not_supersede_each_other() {
+        let (events, received) = mpsc::channel::<Event>();
+        let reads = Arc::new(PreviewReads::default());
+        let head = PreviewReads::issue(&reads, "local", "/work/notes.log", false);
+        let tail = PreviewReads::issue(&reads, "local", "/work/notes.log", true);
+
+        let reply = |content: &str, tail: bool| Event::FilePreviewed {
+            target_id: "local".into(),
+            path: "/work/notes.log".into(),
+            result: Ok(FilePreview {
+                path: "/work/notes.log".into(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: content.len() as u64,
+                content: content.into(),
+                truncated: false,
+                starts_mid_file: tail,
+            }),
+            tail,
+        };
+        assert!(head.deliver(&events, reply("head\n", false)));
+        assert!(tail.deliver(&events, reply("tail\n", true)));
+        let first = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        for event in [first, second] {
+            match event {
+                Event::FilePreviewed {
+                    result: Ok(preview),
+                    tail,
+                    ..
+                } => {
+                    assert_eq!(preview.content, if tail { "tail\n" } else { "head\n" });
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn legacy_binary_image_previews_are_normalized_on_the_controller() {
         let preview = normalize_legacy_image_preview(FilePreview {
@@ -2317,6 +2386,7 @@ mod tests {
             size: 12,
             content: String::new(),
             truncated: false,
+            starts_mid_file: false,
         });
         assert_eq!(preview.kind, FilePreviewKind::Image);
         assert_eq!(preview.mime, "image/*");

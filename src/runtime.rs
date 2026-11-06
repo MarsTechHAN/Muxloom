@@ -173,6 +173,11 @@ pub(crate) fn missing_unattended_arguments(
 /// Past this the reader is told the preview stops short.
 const PREVIEW_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// How much of a watched file's head to pull only to classify it. The daemon's
+/// own text test samples 8 KiB, so this is enough to agree with a preview's
+/// kind without carrying a large file's first bytes on every watch poll.
+const WATCH_METADATA_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone)]
 struct TargetPlatform {
     os: String,
@@ -2245,62 +2250,87 @@ END {
                 Err(_) => self.mark_bridge_failed(&target.id),
             }
         }
-        let quoted = shell_quote(path);
-        let script = format!(
-            r#"path={quoted}
-            test -f "$path" || {{ printf 'not a regular file\n' >&2; exit 2; }}
-            size=$(stat -c %s -- "$path" 2>/dev/null || stat -f %z "$path" 2>/dev/null || wc -c < "$path" | tr -d '[:space:]')
-            if command -v file >/dev/null 2>&1; then
-                mime=$(file -b --mime-type -- "$path" 2>/dev/null || printf application/octet-stream)
-                description=$(file -b -- "$path" 2>/dev/null || true)
-            else
-                mime=
-                description=
-            fi
-            lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
-            case "$lower" in
-                *.md|*.markdown|*.mdown|*.mkd) kind=markdown ;;
-                *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.ico|*.tif|*.tiff|*.pnm|*.pbm|*.pgm|*.ppm|*.qoi) kind=image ;;
-                *.mp3|*.wav|*.flac|*.aac|*.m4a|*.ogg|*.opus) kind=audio ;;
-                *.mp4|*.m4v|*.mov|*.mkv|*.webm|*.avi|*.mpeg|*.mpg) kind=video ;;
-                *) case "$mime" in
-                    text/*|application/json|application/xml|application/javascript|application/x-sh|application/toml) kind=text ;;
-                    image/*) kind=image ;;
-                    audio/*) kind=audio ;;
-                    video/*) kind=video ;;
-                    *) kind=binary ;;
-                esac ;;
-            esac
-            if [ "$kind" = binary ] && {{ [ ! -s "$path" ] || {{ command -v grep >/dev/null 2>&1 && LC_ALL=C grep -Iq . "$path"; }}; }}; then
-                kind=text
-                [ -n "$mime" ] || mime=text/plain
-            fi
-            limit={limit}
-            truncated=0
-            case "$kind" in
-                text|markdown) [ "${{size:-0}}" -gt "$limit" ] 2>/dev/null && truncated=1 ;;
-            esac
-            printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
-            case "$kind" in
-                text|markdown)
-                    if head -c 1 </dev/null >/dev/null 2>&1; then
-                        head -c "$limit" < "$path"
-                    else
-                        cat -- "$path"
-                    fi ;;
-                audio|video)
-                    if command -v ffprobe >/dev/null 2>&1; then
-                        ffprobe -v error -show_entries format=format_name,duration,size,bit_rate:stream=index,codec_name,codec_type,width,height,sample_rate,channels -of default=noprint_wrappers=1 -- "$path" 2>&1 | head -n 160
-                    else
-                        printf '%s\n' "$description"
-                        printf 'ffprobe is not installed on the target\n'
-                    fi ;;
-                *) printf '%s\n' "$description" ;;
-            esac"#
-        );
-        let output = self.run_shell(target, &script, false)?;
+        let output = self.run_shell(target, &preview_script(path, limit, false), false)?;
         ensure_success(&output, "preview file")?;
         parse_file_preview(&output.stdout)
+    }
+
+    /// The tail of a file under watch. A watch is `tail -f`, but a preview
+    /// always begins at byte 0; for a file larger than [`PREVIEW_BYTE_LIMIT`]
+    /// that would replay the same head forever while appended lines never
+    /// appear. The metadata comes from the preview path and only the last
+    /// `window` bytes are transferred, so the link carries a bounded amount and
+    /// the pane shows the newest lines.
+    pub fn preview_file_tail(
+        &self,
+        target: &Target,
+        path: &str,
+        window: u64,
+    ) -> Result<FilePreview> {
+        if !self.bridge_recently_failed(&target.id) {
+            match self
+                .bridges
+                .preview_file(target, path.into(), WATCH_METADATA_BYTES)
+            {
+                Ok(metadata) => return self.tail_preview(target, path, metadata, window),
+                Err(error) if self.bridges.is_connected(&target.id) => return Err(error),
+                Err(_) => self.mark_bridge_failed(&target.id),
+            }
+        }
+        let output = self.run_shell(target, &preview_script(path, window, true), false)?;
+        ensure_success(&output, "preview file tail")?;
+        let mut preview = parse_file_preview(&output.stdout)?;
+        // The script flags a body that is not the whole file; for a tail that
+        // means the first row on screen is not the file's first row.
+        preview.starts_mid_file = preview.truncated;
+        preview.truncated = false;
+        Ok(preview)
+    }
+
+    /// Build a watch preview from a small metadata read: the whole file when it
+    /// fits the window, otherwise only its last `window` bytes, read at an
+    /// offset so neither the link nor the render thread sees the head.
+    fn tail_preview(
+        &self,
+        target: &Target,
+        path: &str,
+        metadata: FilePreview,
+        window: u64,
+    ) -> Result<FilePreview> {
+        let mut preview = FilePreview {
+            path: path.into(),
+            mime: metadata.mime,
+            kind: metadata.kind,
+            size: metadata.size,
+            content: String::new(),
+            // A watch shows the end of the file rather than a head cut short,
+            // which `starts_mid_file` marks for the panel.
+            truncated: false,
+            starts_mid_file: false,
+        };
+        if !matches!(
+            preview.kind,
+            FilePreviewKind::Text | FilePreviewKind::Markdown
+        ) {
+            // Media and binary previews carry no body; keep the head preview's
+            // own truncation rule so a media watch reads as it did before.
+            preview.truncated = preview.size > 1024 * 1024;
+            return Ok(preview);
+        }
+        let (offset, length) = if preview.size > window {
+            preview.starts_mid_file = true;
+            (preview.size - window, window)
+        } else {
+            (0, preview.size)
+        };
+        if length == 0 {
+            return Ok(preview);
+        }
+        let bytes = self
+            .bridges
+            .read_file_window(target, path.into(), offset, length)?;
+        preview.content = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(preview)
     }
 
     /// Pull the rest of a text preview whose first response hit the per-frame
@@ -4386,6 +4416,76 @@ fn parse_file_listing(output: &[u8]) -> Result<FileListing> {
     })
 }
 
+/// The shell fallback's file preview: NUL-separated metadata followed by the
+/// body, used when no companion bridge can answer. `tail` reads the end of the
+/// file instead of its beginning; the fifth header field then means "the body
+/// starts mid-file" rather than "the body stops before the end", which the
+/// caller remaps.
+fn preview_script(path: &str, limit: u64, tail: bool) -> String {
+    let quoted = shell_quote(path);
+    let body = if tail {
+        r#"if tail -c 1 </dev/null >/dev/null 2>&1; then
+                        tail -c "$limit" < "$path"
+                    else
+                        tail -n 20 -- "$path" | head -c "$limit"
+                    fi"#
+    } else {
+        r#"if head -c 1 </dev/null >/dev/null 2>&1; then
+                        head -c "$limit" < "$path"
+                    else
+                        cat -- "$path"
+                    fi"#
+    };
+    format!(
+        r#"path={quoted}
+            test -f "$path" || {{ printf 'not a regular file\n' >&2; exit 2; }}
+            size=$(stat -c %s -- "$path" 2>/dev/null || stat -f %z "$path" 2>/dev/null || wc -c < "$path" | tr -d '[:space:]')
+            if command -v file >/dev/null 2>&1; then
+                mime=$(file -b --mime-type -- "$path" 2>/dev/null || printf application/octet-stream)
+                description=$(file -b -- "$path" 2>/dev/null || true)
+            else
+                mime=
+                description=
+            fi
+            lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+            case "$lower" in
+                *.md|*.markdown|*.mdown|*.mkd) kind=markdown ;;
+                *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.ico|*.tif|*.tiff|*.pnm|*.pbm|*.pgm|*.ppm|*.qoi) kind=image ;;
+                *.mp3|*.wav|*.flac|*.aac|*.m4a|*.ogg|*.opus) kind=audio ;;
+                *.mp4|*.m4v|*.mov|*.mkv|*.webm|*.avi|*.mpeg|*.mpg) kind=video ;;
+                *) case "$mime" in
+                    text/*|application/json|application/xml|application/javascript|application/x-sh|application/toml) kind=text ;;
+                    image/*) kind=image ;;
+                    audio/*) kind=audio ;;
+                    video/*) kind=video ;;
+                    *) kind=binary ;;
+                esac ;;
+            esac
+            if [ "$kind" = binary ] && {{ [ ! -s "$path" ] || {{ command -v grep >/dev/null 2>&1 && LC_ALL=C grep -Iq . "$path"; }}; }}; then
+                kind=text
+                [ -n "$mime" ] || mime=text/plain
+            fi
+            limit={limit}
+            truncated=0
+            case "$kind" in
+                text|markdown) [ "${{size:-0}}" -gt "$limit" ] 2>/dev/null && truncated=1 ;;
+            esac
+            printf '%s\0%s\0%s\0%s\0%s\0' "$path" "$mime" "$kind" "$size" "$truncated"
+            case "$kind" in
+                text|markdown)
+                    {body} ;;
+                audio|video)
+                    if command -v ffprobe >/dev/null 2>&1; then
+                        ffprobe -v error -show_entries format=format_name,duration,size,bit_rate:stream=index,codec_name,codec_type,width,height,sample_rate,channels -of default=noprint_wrappers=1 -- "$path" 2>&1 | head -n 160
+                    else
+                        printf '%s\n' "$description"
+                        printf 'ffprobe is not installed on the target\n'
+                    fi ;;
+                *) printf '%s\n' "$description" ;;
+            esac"#
+    )
+}
+
 fn parse_file_preview(output: &[u8]) -> Result<FilePreview> {
     let mut fields = output.splitn(6, |byte| *byte == 0);
     let path = fields
@@ -4425,6 +4525,7 @@ fn parse_file_preview(output: &[u8]) -> Result<FilePreview> {
         size,
         content,
         truncated,
+        starts_mid_file: false,
     })
 }
 
@@ -5496,6 +5597,84 @@ mod tests {
         assert_eq!(preview.mime, "text/markdown");
         assert!(preview.content.contains("Heading"));
         assert!(!preview.truncated);
+    }
+
+    /// A watch reads the end of a file; the browser's preview still reads the
+    /// start. Both must be true at once for the same file, or a refresh would
+    /// replace a large log's tail with its head on screen.
+    #[test]
+    fn a_tail_preview_reads_the_end_while_the_browser_preview_starts_at_the_top() {
+        // A test build never opens the machine's own companion: point the
+        // bridge at a path that cannot exist so the local shell fallback
+        // answers, the way a target without the bridge does.
+        let config = Config {
+            companion_command: "/nonexistent/muxloomd-watch-tail-test".into(),
+            ..Config::default()
+        };
+        let runtime = Runtime::new(&config);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "muxloom-tail-preview-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("notes.log");
+        let content = format!(
+            "start-of-file\n{}end-of-file-marker\n",
+            "padding line\n".repeat(1024)
+        );
+        fs::write(&path, &content).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let target = Target::local();
+
+        let tail = runtime.preview_file_tail(&target, &path, 128).unwrap();
+        assert_eq!(tail.size, content.len() as u64);
+        assert!(
+            tail.starts_mid_file,
+            "a window read past the start of the file must say so"
+        );
+        assert!(
+            !tail.truncated,
+            "a tail shows the file's end; nothing was left behind after it"
+        );
+        assert!(
+            tail.content.ends_with("end-of-file-marker\n"),
+            "the newest bytes must be what the watch sees: {:?}",
+            tail.content
+        );
+        assert!(
+            !tail.content.contains("start-of-file"),
+            "the head must not be pulled along with the tail"
+        );
+        assert_eq!(
+            tail.content.len(),
+            128,
+            "the transfer is bounded by the window, not the file"
+        );
+
+        // A file that fits the window is shown whole, exactly as before.
+        let whole = runtime
+            .preview_file_tail(&target, &path, content.len() as u64)
+            .unwrap();
+        assert!(!whole.starts_mid_file);
+        assert!(!whole.truncated);
+        assert_eq!(whole.content, content);
+
+        // The browser's preview of the very same path still begins at byte 0
+        // and says so, so the two views stay separate on one target.
+        let head = runtime.preview_file(&target, &path).unwrap();
+        assert!(
+            head.content.starts_with("start-of-file\n"),
+            "a browser preview must still start at the top: {:?}",
+            head.content.chars().take(40).collect::<String>()
+        );
+        assert!(!head.starts_mid_file);
+        assert!(!head.truncated);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

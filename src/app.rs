@@ -759,6 +759,9 @@ pub struct FileWatch {
     pub kind: FilePreviewKind,
     pub mime: String,
     pub truncated: bool,
+    /// True when the content is the last window of a file too large to show
+    /// whole, so the panel can say it is showing the end rather than a head.
+    pub starts_mid_file: bool,
     /// Scroll position in rendered rows, recomputed bounds, and whether the
     /// view sits at the tail and should follow new content.
     pub scroll: usize,
@@ -929,6 +932,10 @@ const AUTO_REFRESH_LIMIT: u64 = 4 * 1024 * 1024;
 /// One round reads every outstanding watch, so a dozen watched files still
 /// cost a dozen preview reads a couple of seconds, not per tick.
 const FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How much of a watched file's end is kept on screen. A watch is `tail -f`,
+/// so a file larger than this shows its newest bytes; only this window crosses
+/// the link per poll, no matter how large the file has grown.
+const FILE_WATCH_TAIL_WINDOW: u64 = 256 * 1024;
 /// How much of a backed-up capture is read to build one page of history. The
 /// blob holds every row the session ever printed, which for a long-running
 /// agent is tens of megabytes; a page is then cut from the tail of this.
@@ -6273,27 +6280,34 @@ impl App {
                 target_id,
                 path,
                 result,
+                tail,
             } => {
                 let mut media_request = None;
                 // A file watch is a pseudo-session on the same preview
-                // pipeline: fold the reply into whichever watch asked for it.
-                // The stamp the preview can confirm is the size; the mtime is
-                // only carried over from the listing that created the watch.
-                if let Some(watch) = self
-                    .file_watches
-                    .iter_mut()
-                    .find(|watch| watch.target.id == target_id && watch.path == path)
+                // pipeline, but it reads and shows the end of the file. Only a
+                // tail reply may replace what it has on screen; a browser head
+                // refresh for the same path would otherwise roll a large log
+                // back to its first lines. The stamp the preview can confirm is
+                // the size; the mtime is only carried over from the listing
+                // that created the watch.
+                if tail
+                    && let Some(watch) = self
+                        .file_watches
+                        .iter_mut()
+                        .find(|watch| watch.target.id == target_id && watch.path == path)
                 {
                     match &result {
                         Ok(preview) => {
                             watch.loading = false;
                             let changed = preview.size != watch.last_stamp.0
-                                || preview.content != watch.content;
+                                || preview.content != watch.content
+                                || preview.starts_mid_file != watch.starts_mid_file;
                             if changed {
                                 watch.last_stamp = (preview.size, watch.last_stamp.1);
                                 watch.kind = preview.kind;
                                 watch.mime = preview.mime.clone();
                                 watch.truncated = preview.truncated;
+                                watch.starts_mid_file = preview.starts_mid_file;
                                 watch.content = preview.content.clone();
                                 watch.rendered = None;
                             }
@@ -6317,17 +6331,19 @@ impl App {
                 // second and newer reply then found nothing to match, and the
                 // pane stayed on the earlier read while the listing recorded
                 // the file as current. The path is what keeps a reply for a
-                // file the browser is not showing out.
-                if let Some(form) = self.file_manager.as_mut()
+                // file the browser is not showing out. The browser's preview
+                // always starts at byte 0, so only a head reply belongs here:
+                // a watch's tail window is a different view of the file,
+                // handled above. A pending path is the one thing that marks a
+                // read as the browser's own, which is what decides whether an
+                // image or video may be re-opened: restarting the decoder for
+                // a watch poll would reset playback under the viewer on every
+                // interval.
+                if !tail
+                    && let Some(form) = self.file_manager.as_mut()
                     && form.target.id == target_id
                     && form.preview_path.as_deref() == Some(path.as_str())
                 {
-                    // A file watch reads through this same pipeline, so its
-                    // poll replies land here too. A pending path is the one
-                    // thing that marks a read as the browser's own, which is
-                    // what decides whether an image or video may be re-opened:
-                    // restarting the decoder for a watch poll would reset
-                    // playback under the viewer on every interval.
                     let form_asked = form.preview_requested_path.as_deref() == Some(path.as_str());
                     form.preview_loading = false;
                     form.preview_requested_path = None;
@@ -10673,6 +10689,7 @@ impl App {
         let request = Request::PreviewFile {
             target: form.target.clone(),
             path: path.clone(),
+            tail_window: None,
         };
         if self.worker.requests.send(request).is_ok() {
             form.preview_requested_path = Some(path);
@@ -10736,6 +10753,7 @@ impl App {
             let request = Request::PreviewFile {
                 target: watch.target.clone(),
                 path: watch.path.clone(),
+                tail_window: Some(FILE_WATCH_TAIL_WINDOW),
             };
             watch.loading = self.worker.requests.send(request).is_ok();
         }
@@ -10774,9 +10792,21 @@ impl App {
         let id = format!("filewatch:{}:{}", form.target.id, path);
         // Seed with whatever the preview already holds so the first frame is
         // not blank; a fresh read follows to confirm the on-disk bytes.
-        let (content, kind, mime, truncated) = match form.preview.as_ref() {
-            Some(p) => (p.content.clone(), p.kind, p.mime.clone(), p.truncated),
-            None => (String::new(), FilePreviewKind::Text, String::new(), false),
+        let (content, kind, mime, truncated, starts_mid_file) = match form.preview.as_ref() {
+            Some(p) => (
+                p.content.clone(),
+                p.kind,
+                p.mime.clone(),
+                p.truncated,
+                p.starts_mid_file,
+            ),
+            None => (
+                String::new(),
+                FilePreviewKind::Text,
+                String::new(),
+                false,
+                false,
+            ),
         };
         let (size, mtime) = form.preview_stamp.unwrap_or((0, 0));
         let mut watch = FileWatch {
@@ -10790,6 +10820,7 @@ impl App {
             kind,
             mime,
             truncated,
+            starts_mid_file,
             scroll: 0,
             max_scroll: 0,
             page_rows: 0,
@@ -10799,6 +10830,7 @@ impl App {
         let request = Request::PreviewFile {
             target: form.target.clone(),
             path: path.clone(),
+            tail_window: Some(FILE_WATCH_TAIL_WINDOW),
         };
         watch.loading = self.worker.requests.send(request).is_ok();
         self.file_watches.push(watch);
@@ -11194,6 +11226,7 @@ impl App {
                 let request = Request::PreviewFile {
                     target: form.target.clone(),
                     path: entry.path.clone(),
+                    tail_window: None,
                 };
                 if self.worker.requests.send(request).is_err() {
                     form.preview_loading = false;
@@ -19571,6 +19604,7 @@ mod tests {
                 size: 12,
                 content: "fn beta() {}".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
         });
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -19630,6 +19664,7 @@ mod tests {
             size,
             content: "first\n".into(),
             truncated: false,
+            starts_mid_file: false,
         });
         form.preview_scroll = 4;
         form.preview_max_scroll = 4;
@@ -19736,6 +19771,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: entry.path.clone(),
+            tail: false,
             result: Ok(FilePreview {
                 path: entry.path.clone(),
                 mime: "text/plain".into(),
@@ -19743,6 +19779,7 @@ mod tests {
                 size: 12,
                 content: "first\nsecond\n".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
         });
         let form = app.file_manager.as_ref().expect("browser stays open");
@@ -19807,6 +19844,7 @@ mod tests {
                 size: 6,
                 content: "first\n".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
         });
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -19828,6 +19866,7 @@ mod tests {
             app.handle_worker_event(Event::FilePreviewed {
                 target_id: "local".into(),
                 path: entry.path.clone(),
+                tail: false,
                 result: Ok(FilePreview {
                     path: entry.path.clone(),
                     mime: "text/plain".into(),
@@ -19835,6 +19874,7 @@ mod tests {
                     size,
                     content: content.into(),
                     truncated: false,
+                    starts_mid_file: false,
                 }),
             });
         }
@@ -19927,6 +19967,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: "/work/notes.log".into(),
+            tail: true,
             result: Ok(FilePreview {
                 path: "/work/notes.log".into(),
                 mime: "text/plain".into(),
@@ -19934,6 +19975,7 @@ mod tests {
                 size: 6,
                 content: "first\n".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
         });
         assert!(app.file_watches[0].content == "first\n" && !app.file_watches[0].loading);
@@ -19950,6 +19992,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: "/work/notes.log".into(),
+            tail: true,
             result: Ok(FilePreview {
                 path: "/work/notes.log".into(),
                 mime: "text/plain".into(),
@@ -19957,6 +20000,7 @@ mod tests {
                 size: 13,
                 content: "first\nsecond\n".into(),
                 truncated: false,
+                starts_mid_file: false,
             }),
         });
         let watch = &app.file_watches[0];
@@ -19964,6 +20008,120 @@ mod tests {
         assert_eq!(watch.last_stamp.0, 13);
         assert!(!watch.loading);
         assert!(watch.rendered.is_none());
+    }
+
+    /// A watch asks for the end of its file and nothing else: the poll carries
+    /// a bounded tail window, and a tail reply may only update the watch. The
+    /// browser's own preview of the same path stays on the head it read, and a
+    /// later head reply must not roll the watch back to the file's first lines.
+    #[test]
+    fn a_watch_poll_carries_a_tail_window_and_keeps_the_two_views_separate() {
+        let (mut app, request_rx, entry) = preview_monitor_app(6, 1_700_000_000);
+        app.focus = Focus::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        // The read issued on attach is already a tail read, bounded by the
+        // window rather than by the size of the file.
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile {
+                path,
+                tail_window: Some(window),
+                ..
+            } if path == entry.path && window == FILE_WATCH_TAIL_WINDOW
+        ));
+
+        // The watch's reply replaces its seeded head with the file's newest
+        // bytes and marks the body as starting mid-file.
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            tail: true,
+            result: Ok(FilePreview {
+                path: entry.path.clone(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: 9 * 1024 * 1024,
+                content: "newest line\n".into(),
+                truncated: false,
+                starts_mid_file: true,
+            }),
+        });
+        assert_eq!(app.file_watches[0].content, "newest line\n");
+        assert!(app.file_watches[0].starts_mid_file);
+        assert_eq!(app.file_watches[0].last_stamp.0, 9 * 1024 * 1024);
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .and_then(|form| form.preview.as_ref())
+                .map(|preview| preview.content.as_str()),
+            Some("first\n"),
+            "a watch tail must not replace the browser's head preview"
+        );
+
+        // The next poll asks for the same bounded window.
+        app.file_watch_poll_at =
+            Some(Instant::now() - FILE_WATCH_POLL_INTERVAL - Duration::from_secs(1));
+        app.maybe_poll_file_watches();
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile {
+                path,
+                tail_window: Some(window),
+                ..
+            } if path == entry.path && window == FILE_WATCH_TAIL_WINDOW
+        ));
+
+        // A reply the browser asked for is a head and belongs to the browser:
+        // it refreshes the preview, and the watch keeps its tail.
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            tail: false,
+            result: Ok(FilePreview {
+                path: entry.path.clone(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: 9 * 1024 * 1024,
+                content: "first\nsecond\n".into(),
+                truncated: true,
+                starts_mid_file: false,
+            }),
+        });
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert_eq!(
+            form.preview
+                .as_ref()
+                .map(|preview| preview.content.as_str()),
+            Some("first\nsecond\n")
+        );
+        let watch = &app.file_watches[0];
+        assert_eq!(watch.content, "newest line\n");
+        assert!(watch.starts_mid_file);
+
+        // And a watch tail reply never touches the browser's preview.
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            tail: true,
+            result: Ok(FilePreview {
+                path: entry.path.clone(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: 9 * 1024 * 1024 + 12,
+                content: "newest line\nanother\n".into(),
+                truncated: false,
+                starts_mid_file: true,
+            }),
+        });
+        assert_eq!(app.file_watches[0].content, "newest line\nanother\n");
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert_eq!(
+            form.preview
+                .as_ref()
+                .map(|preview| preview.content.as_str()),
+            Some("first\nsecond\n")
+        );
     }
 
     /// A file watch polls the same preview pipeline the browser does. When the
@@ -19981,6 +20139,7 @@ mod tests {
             size: 2048,
             content: String::new(),
             truncated: false,
+            starts_mid_file: false,
         };
         {
             let form = app.file_manager.as_mut().expect("browser stays open");
@@ -20009,6 +20168,7 @@ mod tests {
             kind: FilePreviewKind::Image,
             mime: "image/png".into(),
             truncated: false,
+            starts_mid_file: false,
             scroll: 0,
             max_scroll: 0,
             page_rows: 0,
@@ -20033,6 +20193,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: entry.path.clone(),
+            tail: true,
             result: Ok(media_preview.clone()),
         });
         assert!(
@@ -20069,6 +20230,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: entry.path.clone(),
+            tail: false,
             result: Ok(media_preview),
         });
         assert!(matches!(
@@ -20137,6 +20299,7 @@ mod tests {
             kind: FilePreviewKind::Text,
             mime: "text/plain".into(),
             truncated: false,
+            starts_mid_file: false,
             scroll: 0,
             max_scroll: 0,
             page_rows: 0,
@@ -20274,6 +20437,7 @@ mod tests {
         app.handle_worker_event(Event::FilePreviewed {
             target_id: "local".into(),
             path: "/work/README.md".into(),
+            tail: false,
             result: Ok(FilePreview {
                 path: "/work/README.md".into(),
                 mime: "text/markdown".into(),
@@ -20281,6 +20445,7 @@ mod tests {
                 size: 300_000,
                 content: "# Muxloom".into(),
                 truncated: true,
+                starts_mid_file: false,
             }),
         });
         tap(&mut app, click(1));

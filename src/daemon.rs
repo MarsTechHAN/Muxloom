@@ -6403,6 +6403,7 @@ mod platform {
             size: metadata.len(),
             content,
             truncated: metadata.len() > limit as u64,
+            starts_mid_file: false,
         })
     }
 

@@ -3577,15 +3577,28 @@ impl BridgePool {
     /// no matter how big the file is — and bounded overall, because a preview
     /// nobody can scroll to the end of is not worth the wait or the memory.
     pub fn read_file(&self, target: &Target, path: String, limit: u64) -> Result<Vec<u8>> {
+        self.read_file_window(target, path, 0, limit)
+    }
+
+    /// Read at most `length` bytes of a remote file starting at `offset`.
+    /// Watches use it to carry only the end of a file too large to preview
+    /// whole, so the transfer is bounded by the window rather than the file.
+    pub fn read_file_window(
+        &self,
+        target: &Target,
+        path: String,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
         let connection = self.connection_for_target(target)?;
-        let mut stream = connection.open_file(path, 0, Some(limit), false)?;
+        let mut stream = connection.open_file(path, offset, Some(length), false)?;
         let mut bytes = Vec::new();
         while !stream.is_closed() {
             if let Some(chunk) = stream.read_timeout(REQUEST_TIMEOUT)? {
                 bytes.extend_from_slice(&chunk);
             }
         }
-        bytes.truncate(limit as usize);
+        bytes.truncate(length as usize);
         Ok(bytes)
     }
 

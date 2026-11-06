@@ -806,7 +806,15 @@ pub struct FilePreview {
     pub kind: FilePreviewKind,
     pub size: u64,
     pub content: String,
+    /// True when the body holds the start of the file and the rest was left
+    /// behind because it is too large to carry in one preview.
     pub truncated: bool,
+    /// True when `content` is a bounded window at the end of a file larger than
+    /// that window, so the first line on screen is not the file's first line.
+    /// Only a watched file is read this way; the browser's preview still starts
+    /// at byte 0. Defaulted so an older peer's preview is a head as before.
+    #[serde(default)]
+    pub starts_mid_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
