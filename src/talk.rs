@@ -2671,6 +2671,166 @@ mod tests {
         fs::remove_dir_all(&store.root).ok();
     }
 
+    /// A machine's clock can step backwards between two posts, and the board
+    /// must not reorder what that machine said because of it. A following read
+    /// used to choose its page by time and then advance the cursor to the
+    /// highest sequence in it, so the later sequence was handed out first and
+    /// the earlier one was left below the cursor - never offered again, with
+    /// nothing said about it.
+    #[test]
+    fn a_clock_that_steps_backwards_does_not_hide_a_message_from_a_follower() {
+        let store = store("cursor-clock");
+        let origin = "cccc-9012abcd";
+        let far = |seq: u64, ts: u64| TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.into(),
+            seq,
+            ts,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: origin.into(),
+                machine_label: "elsewhere".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Note,
+            to: None,
+            reply_to: None,
+            text: format!("said {seq}"),
+        };
+        // Written in sequence order, but the clock went back between the
+        // second and the third: the second is the newest by time and the
+        // oldest by sequence.
+        assert_eq!(
+            store
+                .merge(vec![far(1, 500), far(2, 1000), far(3, 900)])
+                .unwrap(),
+            3
+        );
+
+        // The reader has had the first post and asks for what follows, one
+        // message at a time.
+        let mut cursor = encode_cursor(&BTreeMap::from([(origin.to_string(), 1)]));
+        let mut seen = Vec::new();
+        let mut pages = Vec::new();
+        for _ in 0..4 {
+            let page = store.read(&TalkFilter {
+                since: decode_cursor(&cursor),
+                limit: 1,
+                ..TalkFilter::default()
+            });
+            if page.messages.is_empty() {
+                break;
+            }
+            let seqs: Vec<u64> = page.messages.iter().map(|message| message.seq).collect();
+            pages.push((
+                seqs.clone(),
+                decode_cursor(&page.cursor).get(origin).copied(),
+            ));
+            seen.extend(seqs);
+            cursor = page.cursor;
+        }
+
+        assert_eq!(
+            pages,
+            vec![(vec![2], Some(2)), (vec![3], Some(3))],
+            "a follower is handed the oldest unread sequence first, and the cursor stops \
+             where the page stops"
+        );
+        assert_eq!(
+            seen,
+            vec![2, 3],
+            "a poll that follows its cursor is handed every unread message once"
+        );
+        assert!(
+            store
+                .read(&TalkFilter {
+                    since: decode_cursor(&cursor),
+                    limit: 1,
+                    ..TalkFilter::default()
+                })
+                .messages
+                .is_empty(),
+            "the cursor has reached the end of what the board held"
+        );
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
+    /// A catch-up batch is the run a peer's vector can advance over. A peer
+    /// behind a machine whose clock stepped backwards used to be handed the
+    /// later sequence first; the earlier one stayed missing, so the vector
+    /// stopped below both and every round re-offered the message the peer
+    /// already held while the one it was missing was never in the batch.
+    #[test]
+    fn a_catch_up_batch_starts_at_the_lowest_sequence_a_peer_is_missing() {
+        let store = store("catch-up-clock");
+        let origin = "cccc-9012abcd";
+        let far = |seq: u64, ts: u64| TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.into(),
+            seq,
+            ts,
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: origin.into(),
+                machine_label: "elsewhere".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Note,
+            to: None,
+            reply_to: None,
+            text: format!("said {seq}"),
+        };
+        assert_eq!(
+            store
+                .merge(vec![far(1, 500), far(2, 1000), far(3, 900)])
+                .unwrap(),
+            3
+        );
+
+        // The peer holds only the first post. The batch has to begin with
+        // sequence 2 even though sequence 3 carries the older timestamp.
+        assert_eq!(
+            store
+                .since(&TalkVector::from([(origin.to_string(), 1)]), 2)
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        // One at a time, as a batch smaller than the backlog would: the peer
+        // files what it is handed and asks again from the run it holds. It
+        // reaches the end of what it is missing rather than being handed
+        // sequence 3 twice while 2 stays behind.
+        let mut held = TalkVector::from([(origin.to_string(), 1)]);
+        let mut carried = Vec::new();
+        for _ in 0..3 {
+            let batch = store.since(&held, 1);
+            if batch.is_empty() {
+                break;
+            }
+            carried.extend(batch.iter().map(|message| message.seq));
+            // A peer's vector is the run it holds unbroken, not the highest
+            // sequence it has seen: a hole stops it, which is what asks for
+            // the missing message again.
+            let mut mark = held[origin];
+            while carried.contains(&(mark + 1)) {
+                mark += 1;
+            }
+            held.insert(origin.to_string(), mark);
+        }
+        assert_eq!(
+            carried,
+            vec![2, 3],
+            "every message the peer was missing is carried once"
+        );
+        assert_eq!(held[origin], 3, "the peer's vector reaches what it holds");
+        assert!(store.since(&held, 1).is_empty());
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
     #[test]
     fn a_task_is_read_by_its_members_and_reaches_across_machines() {
         let store = store("task");
