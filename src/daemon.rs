@@ -4678,18 +4678,6 @@ mod platform {
             history_path: (!temporary).then(|| history_path.clone()),
             socket_path: keeper::socket_path_for(&state.paths.keepers, &session_id),
         };
-        if let Some(previous) = &resumed_from {
-            // The split is only survivable if it is recorded while it
-            // happens: every child still naming the retired id moves to this
-            // one, and both records carry the alias so the move can be
-            // followed in either direction afterwards.
-            let moved = reparent_children(state, &previous.id, &session_id);
-            mark_resumed_to(state, &previous.id, &session_id);
-            eprintln!(
-                "muxloomd resumed archived session {} as {session_id} with {moved} children repointed",
-                previous.id
-            );
-        }
         let mut metadata = DaemonSession {
             id: session_id.clone(),
             kind,
@@ -4861,8 +4849,26 @@ mod platform {
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(session_id, Arc::clone(&session));
+            .insert(session_id.clone(), Arc::clone(&session));
         rollback.replaced();
+        // The split is recorded only once it is real: the keeper is connected
+        // and the successor already holds its number in the live map. Written
+        // any earlier, a launch that failed on its way to a keeper took the
+        // archived master's fleet with it - repointing children onto a number
+        // nothing answered and leaving the archive naming a successor that
+        // never existed - and the failure path only removes the new record, so
+        // nothing put either back. Every fallible step is behind us now.
+        if let Some(previous) = &resumed_from {
+            // Every child still naming the retired id moves to this one, and
+            // both records carry the alias so the move can be followed in
+            // either direction afterwards.
+            let moved = reparent_children(state, &previous.id, &session_id);
+            mark_resumed_to(state, &previous.id, &session_id);
+            eprintln!(
+                "muxloomd resumed archived session {} as {session_id} with {moved} children repointed",
+                previous.id
+            );
+        }
         spawn_session_reader(state, Arc::clone(&session), stream);
         Ok(session)
     }
