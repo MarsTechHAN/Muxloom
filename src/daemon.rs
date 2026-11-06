@@ -4902,6 +4902,21 @@ mod platform {
             let Some(record) = self.record.take() else {
                 return;
             };
+            // The file goes back whatever the index says, because a launch
+            // that got as far as writing its own metadata has already written
+            // over the record's - and being in the map says nothing about
+            // that. A revival in place leaves the ended session in the live
+            // index all the way through the launch, and a keeper that would
+            // not start still wrote a fresh live record over the archived
+            // one; the map answering for the number only means the rollback
+            // has no index work to do. Rewriting the old record is idempotent
+            // when the launch never reached that write.
+            let path = self
+                .state
+                .paths
+                .sessions
+                .join(format!("{}.json", record.id));
+            let _ = persist_session_metadata(&path, record);
             // Back into the index it came out of, and no other. A session
             // this daemon ran itself and has not reloaded since sits among
             // the live records however it ended, and the take leaves it
@@ -4919,16 +4934,8 @@ mod platform {
             {
                 return;
             }
-            // The file first, because a launch that got as far as writing its
-            // own metadata has already written over the record's - and then
-            // read back rather than trusted, so what returns to the index is
+            // Read back rather than trusted, so what returns to the index is
             // what a restart would find there.
-            let path = self
-                .state
-                .paths
-                .sessions
-                .join(format!("{}.json", record.id));
-            let _ = persist_session_metadata(&path, record);
             if let Ok(Some((id, entry))) = load_persisted_session(&self.state.paths, &path) {
                 self.state
                     .persisted_sessions
