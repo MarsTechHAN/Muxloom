@@ -19741,6 +19741,96 @@ mod tests {
         assert!(form.preview_requested_path.is_none());
     }
 
+    /// A freshness poll and a close/reopen can both ask for the same file
+    /// before either reply is back. The reopen's read is the newer one, so its
+    /// reply carries the bytes the browser has to end up showing; dropping it
+    /// left the pane on the earlier read while the listing had already
+    /// recorded the file as current, and nothing asked again.
+    #[test]
+    fn a_second_outstanding_preview_read_still_lands_after_the_first() {
+        let (mut app, request_rx, entry) = preview_monitor_app(6, 1_700_000_000);
+        app.focus = Focus::Agents;
+
+        // The open preview's file changed, so the freshness poll starts a read.
+        let changed = FileEntry {
+            size: 12,
+            mtime: 1_700_000_050,
+            ..entry.clone()
+        };
+        app.handle_worker_event(Event::FilesListed {
+            target_id: "local".into(),
+            requested_path: "/work".into(),
+            result: Ok(FileListing {
+                truncated: false,
+                path: "/work".into(),
+                entries: vec![changed],
+            }),
+        });
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile { path, .. } if path == entry.path
+        ));
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .and_then(|form| form.preview_requested_path.as_deref()),
+            Some(entry.path.as_str())
+        );
+
+        // A preload has the body cached, so closing and reopening the same row
+        // shows it at once and starts a second read for the same path while the
+        // freshness read is still outstanding.
+        app.handle_worker_event(Event::PreviewPreloaded {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            result: Ok(FilePreview {
+                path: entry.path.clone(),
+                mime: "text/plain".into(),
+                kind: FilePreviewKind::Text,
+                size: 6,
+                content: "first\n".into(),
+                truncated: false,
+            }),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .and_then(|form| form.preview_path.as_deref()),
+            Some(entry.path.as_str())
+        );
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile { path, .. } if path == entry.path
+        ));
+
+        // The earlier read replies first, then the re-read that started after a
+        // further remote edit. The newer bytes are what has to be on screen.
+        for (size, content) in [(12, "first\nsecond\n"), (18, "first\nsecond\nthird\n")] {
+            app.handle_worker_event(Event::FilePreviewed {
+                target_id: "local".into(),
+                path: entry.path.clone(),
+                result: Ok(FilePreview {
+                    path: entry.path.clone(),
+                    mime: "text/plain".into(),
+                    kind: FilePreviewKind::Text,
+                    size,
+                    content: content.into(),
+                    truncated: false,
+                }),
+            });
+        }
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert_eq!(
+            form.preview
+                .as_ref()
+                .map(|preview| preview.content.as_str()),
+            Some("first\nsecond\nthird\n"),
+            "the reply to the newer read must not be discarded"
+        );
+    }
+
     #[test]
     fn preview_follows_the_tail_only_after_scrolling_to_the_bottom() {
         let (mut app, _request_rx, _entry) = preview_monitor_app(6, 1_700_000_000);
