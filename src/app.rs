@@ -19957,6 +19957,117 @@ mod tests {
         assert!(watch.rendered.is_none());
     }
 
+    /// A file watch polls the same preview pipeline the browser does. When the
+    /// file is an image or a video the browser already has open, that reply is
+    /// only a freshness check: folding it in must not restart the decoder, or
+    /// watching the file replaces the playback and the frame every poll.
+    #[test]
+    fn a_file_watch_poll_does_not_restart_a_media_preview() {
+        let (mut app, request_rx, entry) = preview_monitor_app(2048, 1_700_000_000);
+        app.focus = Focus::Agents;
+        let media_preview = FilePreview {
+            path: entry.path.clone(),
+            mime: "image/png".into(),
+            kind: FilePreviewKind::Image,
+            size: 2048,
+            content: String::new(),
+            truncated: false,
+        };
+        {
+            let form = app.file_manager.as_mut().expect("browser stays open");
+            form.preview = Some(media_preview.clone());
+            form.preview_stamp = Some((2048, 1_700_000_000));
+            // A decoder that is running and has already handed a frame over.
+            // The sink stays alive so the playback is connected, not finished.
+            let (_sink, playback) = MediaPlayback::channel();
+            form.media_playback = Some(playback);
+            form.media_frame = Some(MediaFrame {
+                width: 2,
+                height: 1,
+                rgba: vec![255; 8],
+                sequence: 7,
+            });
+            form.media_loading = false;
+        }
+        app.file_watches.push(FileWatch {
+            id: format!("filewatch:local:{}", entry.path),
+            path: entry.path.clone(),
+            target: Target::local(),
+            label: "notes.log".into(),
+            last_stamp: (2048, 1_700_000_000),
+            content: String::new(),
+            loading: false,
+            kind: FilePreviewKind::Image,
+            mime: "image/png".into(),
+            truncated: false,
+            scroll: 0,
+            max_scroll: 0,
+            page_rows: 0,
+            follow_tail: true,
+            rendered: None,
+        });
+
+        // The poll asks for the watched file's bytes and the reply comes back
+        // through the ordinary preview pipeline. Nothing in the browser asked
+        // for this read, so it is not a fresh open.
+        app.file_watch_poll_at = None;
+        app.maybe_poll_file_watches();
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile { path, .. } if path == entry.path
+        ));
+        assert!(
+            app.file_manager
+                .as_ref()
+                .is_some_and(|form| form.preview_requested_path.is_none())
+        );
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            result: Ok(media_preview.clone()),
+        });
+        assert!(
+            !request_rx
+                .try_iter()
+                .any(|request| matches!(request, Request::OpenMedia { .. })),
+            "a watch poll must not re-issue OpenMedia for the preview it refreshes"
+        );
+        let form = app.file_manager.as_ref().expect("browser stays open");
+        assert!(
+            form.media_playback.is_some(),
+            "the decoder must keep running across a watch poll"
+        );
+        assert_eq!(
+            form.media_frame.as_ref().map(|frame| frame.sequence),
+            Some(7),
+            "the frame on screen must not be thrown away by a watch poll"
+        );
+        assert!(!form.media_loading);
+
+        // A refresh the browser itself asks for is different: Ctrl-r on the
+        // open preview must still re-open the media stream.
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .and_then(|form| form.preview_requested_path.as_deref()),
+            Some(entry.path.as_str())
+        );
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::PreviewFile { path, .. } if path == entry.path
+        ));
+        app.handle_worker_event(Event::FilePreviewed {
+            target_id: "local".into(),
+            path: entry.path.clone(),
+            result: Ok(media_preview),
+        });
+        assert!(matches!(
+            receive_request(&request_rx),
+            Request::OpenMedia { path, .. } if path == entry.path
+        ));
+    }
+
     #[test]
     fn file_preview_owns_terminal_pane_focus_without_activating_agent_input() {
         let mut app = ux_test_app(vec![Target::local()]);
