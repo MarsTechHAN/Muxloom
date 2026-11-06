@@ -143,9 +143,9 @@ mod platform {
             composer_text, dialog_question, dialog_shown, is_temporary_session_id,
         },
         talk::{
-            DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkDeliver, TalkDraft,
-            TalkKind, TalkMessage, TalkPage, TalkQueued, TalkScope, TalkStore, TalkUndelivered,
-            TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
+            DIRECT_CAPABILITY, TALK_CAPABILITY, TalkAddress, TalkAuthor, TalkBatch, TalkDeliver,
+            TalkDraft, TalkKind, TalkMessage, TalkPage, TalkQueued, TalkScope, TalkStore,
+            TalkUndelivered, TalkVoice, folded, paste_bytes, render_bounce, render_delivery,
         },
         terminal_session::{
             Anchor, InlineScrollback, REPLAY_COLUMNS_LIMIT, page_has_content, render_history_page,
@@ -3419,14 +3419,18 @@ mod platform {
                     },
                 )
             }
-            DaemonRequest::TalkFetch { from, limit } => write_response(
-                writer,
-                request_id,
-                &DaemonResponse::TalkCarry {
-                    messages: state.talk()?.since(&from, limit),
-                    added: 0,
-                },
-            ),
+            DaemonRequest::TalkFetch { from, limit } => {
+                let batch = state.talk()?.since(&from, limit);
+                write_response(
+                    writer,
+                    request_id,
+                    &DaemonResponse::TalkCarry {
+                        messages: batch.messages,
+                        low_water: batch.low_water,
+                        added: 0,
+                    },
+                )
+            }
             DaemonRequest::TalkDeliver {
                 draft,
                 deliver,
@@ -3583,13 +3587,24 @@ mod platform {
                 let dropped = state.talk()?.clear()?;
                 write_response(writer, request_id, &DaemonResponse::TalkCleared { dropped })
             }
-            DaemonRequest::TalkAppend { messages } => {
-                let added = state.talk()?.merge(messages)?;
+            DaemonRequest::TalkAppend {
+                messages,
+                low_water,
+                sender,
+            } => {
+                let added = state.talk()?.merge_from(
+                    &sender,
+                    TalkBatch {
+                        messages,
+                        low_water,
+                    },
+                )?;
                 write_response(
                     writer,
                     request_id,
                     &DaemonResponse::TalkCarry {
                         messages: Vec::new(),
+                        low_water: Default::default(),
                         added,
                     },
                 )

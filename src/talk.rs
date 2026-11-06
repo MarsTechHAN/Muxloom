@@ -402,15 +402,71 @@ pub struct TalkDraft {
 /// The highest unbroken sequence number held for each origin.
 pub type TalkVector = BTreeMap<String, u64>;
 
+/// What one board hands another: everything held past a peer's vector, plus
+/// the prefixes an origin's owner has dropped for good, as far as this board
+/// knows them.
+///
+/// The floor has to travel with the messages, because it is the only thing
+/// that can move a peer past a hole it will never be offered. A receiver
+/// adopts the floor it is handed and never lowers it: the run it can claim
+/// then starts above the gap, so the messages beyond the gap advance its
+/// vector instead of being re-offered behind it forever.
+///
+/// A high sequence number inside a message is not a floor. Only a board's
+/// statement about a dropped prefix is one; reading a hole as a retention
+/// would make ordinary out-of-order replication throw records away. And the
+/// statement is the owner's, not the carrier's: a board may publish a floor
+/// for an origin it owns, and for one whose owner's floor it was told. That is
+/// what lets a controller carrying a machine's batch to the next machine relay
+/// what the owner said, while a replica clearing its own copy of somebody
+/// else's log has nothing to publish. See [`TalkStore::since`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TalkBatch {
+    pub messages: Vec<TalkMessage>,
+    /// The owner's dropped prefix per origin, as far as this board knows it.
+    /// A floor travels whether or not the peer's vector already sits above it:
+    /// it is metadata, not payload, and a peer that was running an older build
+    /// may hold the records above a gap while covering the gap in its vector,
+    /// having never been told the prefix is gone. A receiver adopts a floor
+    /// monotonically, so a value it already knows is ignored.
+    pub low_water: TalkVector,
+}
+
+impl TalkBatch {
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, TalkMessage> {
+        self.messages.iter()
+    }
+}
+
+impl From<Vec<TalkMessage>> for TalkBatch {
+    /// A batch with no floors: what a caller that only has messages can say.
+    fn from(messages: Vec<TalkMessage>) -> Self {
+        Self {
+            messages,
+            low_water: TalkVector::new(),
+        }
+    }
+}
+
 /// What one machine holds, as told to another.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkState {
     pub origin: String,
     pub label: String,
     pub vector: TalkVector,
-    /// The oldest sequence number still held per origin. A peer whose vector
-    /// sits below this has missed messages for good, and saying so is kinder
-    /// than pretending the gap can be filled.
+    /// The highest sequence number this board has dropped per origin, by its
+    /// own retention or by adopting an owner's floor. This is the local
+    /// compaction mark, not the claim replication carries: for an origin this
+    /// machine does not own, clearing its copy says nothing about what the
+    /// origin still holds. See [`TalkStore::since`] for what a peer is told.
     #[serde(default)]
     pub low_water: TalkVector,
 }
@@ -699,12 +755,35 @@ struct OriginLog {
     /// Sorted by seq, gaps allowed: a message can arrive before the one in
     /// front of it and must still be filed.
     messages: Vec<TalkMessage>,
-    /// The highest seq compacted away, so a hole left by retention is not
-    /// mistaken for one replication can still fill.
+    /// The highest seq compacted away on this machine. This is local
+    /// housekeeping: it starts this log's contiguity above a hole and keeps
+    /// re-offered records out, but for an origin this machine does not own it
+    /// says nothing about the origin's sequence space.
     low_water: u64,
+    /// The highest seq the origin's owner has said is gone for good, as far as
+    /// this machine can state it. Only the owner's word raises it, heard
+    /// directly, carried by another board, or read back from the header an
+    /// explicit clear or retention of a log this machine owns wrote down. A
+    /// local clear of a copy never does, which is what stops a replica
+    /// poisoning a peer with a prefix the origin still holds, while a hub that
+    /// legitimately learned the floor can pass it on.
+    owner_low_water: u64,
 }
 
 impl OriginLog {
+    /// The floor this board may state to a peer for this origin.
+    ///
+    /// This is the owner's word, never the local serving mark. For an origin
+    /// this machine owns, an explicit clear or retention is its own word and
+    /// raises this mark when it writes the header; for a copy, only a floor
+    /// learned from the real owner counts. A mark inferred from the oldest
+    /// record still held is deliberately not part of it: a truncated or
+    /// corrupt owned log has no header saying the missing prefix is gone, and
+    /// a peer told otherwise would skip a record the origin might recover.
+    fn published_floor(&self) -> u64 {
+        self.owner_low_water
+    }
+
     /// The highest seq held with nothing missing below it.
     fn contiguous(&self) -> u64 {
         let mut reached = self.low_water;
@@ -721,7 +800,7 @@ impl OriginLog {
     fn highest(&self) -> u64 {
         self.messages
             .last()
-            .map_or(self.low_water, |message| message.seq)
+            .map_or(self.low_water, |message| message.seq.max(self.low_water))
     }
 }
 
@@ -733,7 +812,7 @@ impl TalkStore {
             format!("failed to create the talk directory at {}", root.display())
         })?;
         let identity = load_identity(&root)?;
-        let logs = load_logs(&root.join("log"));
+        let logs = load_logs(&root.join("log"), &identity.origin);
         let store = Self {
             root,
             inner: Mutex::new(TalkInner { identity, logs }),
@@ -878,11 +957,50 @@ impl TalkStore {
         Ok(message)
     }
 
-    /// File messages that came from somewhere else. Returns how many were new;
-    /// filing the same message twice is a no-op, which is what lets the
-    /// controller push and pull without tracking what it has already carried.
-    pub fn merge(&self, messages: Vec<TalkMessage>) -> Result<usize> {
+    /// File messages that came from somewhere else. Returns how many messages
+    /// were new; filing the same message twice is a no-op, which is what lets
+    /// the controller push and pull without tracking what it has already
+    /// carried.
+    ///
+    /// A floor carried by the batch is adopted here too, and a batch may carry
+    /// one without carrying a message: the floor alone is what moves this
+    /// board's run above a gap that no page can fill, so dropping it would
+    /// leave the peer behind the gap until a post happened to share a page
+    /// with it. A caller that only has messages hands over a batch with no
+    /// floors, so nothing is ever inferred from a hole.
+    pub fn merge(&self, batch: impl Into<TalkBatch>) -> Result<usize> {
+        self.merge_batch(batch.into())
+    }
+
+    /// File a batch a board handed over during replication, adopting the owner
+    /// floors it carries.
+    ///
+    /// `sender` names the board that handed the batch over. It stays in the
+    /// signature — and on the wire — so controllers and daemons from different
+    /// builds keep talking, but receipt no longer judges a floor by it. It
+    /// cannot: `run_sync` is a hub, and a batch the controller pushes to the
+    /// next machine names the controller, while the floor inside it belongs to
+    /// the origin the controller heard from. A sender check made that relay
+    /// indistinguishable from a replica speaking for an origin it does not
+    /// own, and the peer behind the controller stalled below the gap forever.
+    ///
+    /// What keeps the statement honest is the publishing side instead: a board
+    /// publishes a floor only for an origin it owns or one whose owner it was
+    /// told about, and a local clear of a copy publishes nothing. See
+    /// [`TalkStore::since`]. Entries are adopted monotonically and only as
+    /// stated; a floor is never inferred from a gap or an out-of-order
+    /// sequence number.
+    pub fn merge_from(&self, _sender: &str, batch: impl Into<TalkBatch>) -> Result<usize> {
+        self.merge_batch(batch.into())
+    }
+
+    fn merge_batch(&self, batch: TalkBatch) -> Result<usize> {
+        let TalkBatch {
+            messages,
+            low_water,
+        } = batch;
         let mut inner = self.inner();
+        self.adopt_owner_floors(&mut inner, &low_water)?;
         let mut added = 0;
         for message in messages {
             if !message.acceptable() {
@@ -893,6 +1011,41 @@ impl TalkStore {
             }
         }
         Ok(added)
+    }
+
+    /// Take a board's word for a prefix the origin's owner says is gone.
+    ///
+    /// Both marks move: the local one because this board will not hold those
+    /// records again, and the owner's one because from here on this board may
+    /// relay the claim when it syncs another machine. That second mark is what
+    /// lets a controller carry a machine's floor to the machines behind it;
+    /// without it the hub stalled every peer it served.
+    ///
+    /// Never lower: a floor says records are gone for good, and the board
+    /// saying so may know less than this one does about a prefix it already
+    /// dropped. Raising the local mark is what lets [`OriginLog::contiguous`]
+    /// start above the hole, so a message past a compacted prefix advances the
+    /// vector instead of waiting below a message that will never arrive.
+    fn adopt_owner_floors(&self, inner: &mut TalkInner, floors: &TalkVector) -> Result<()> {
+        for (origin, floor) in floors {
+            if *floor == 0 || !valid_origin(origin) {
+                continue;
+            }
+            let log = inner.logs.entry(origin.clone()).or_default();
+            if *floor <= log.low_water && *floor <= log.owner_low_water {
+                continue;
+            }
+            log.low_water = log.low_water.max(*floor);
+            log.owner_low_water = log.owner_low_water.max(*floor);
+            rewrite_log(
+                &self.root.join("log").join(format!("{origin}.jsonl")),
+                origin,
+                log.low_water,
+                log.owner_low_water,
+                &log.messages,
+            )?;
+        }
+        Ok(())
     }
 
     /// Everything held past a peer's vector, oldest first, so a peer that is
@@ -911,13 +1064,38 @@ impl TalkStore {
     /// only the end it is going to hand back. This runs on every sync round
     /// against every reachable machine, which is the one place on the board
     /// where the cost of the whole board is paid over and over.
-    pub fn since(&self, from: &TalkVector, limit: usize) -> Vec<TalkMessage> {
+    ///
+    /// Every batch also carries every owner floor this board can state, for
+    /// every origin it knows one — whether or not the peer's vector already
+    /// sits at or above it. A floor is metadata, not payload: a machine that
+    /// was running an older build can hold every record above a gap and cover
+    /// the gap in its vector, having missed the floor completely, and a
+    /// publication filtered by that vector would never reach it. A receiver
+    /// adopts a floor monotonically and ignores a value it already knows, so
+    /// restating one costs a word and is what lets an upgraded hub learn and
+    /// relay a floor it missed. Message selection is unchanged and still
+    /// starts above the peer's vector.
+    ///
+    /// The floor is the owner's, not this board's local serving mark. For an
+    /// origin this machine owns, an explicit clear or retention is the owner's
+    /// statement; for a copy it is not, and only a floor learned from the owner
+    /// may travel. Clearing this machine's copy of somebody else's log is
+    /// housekeeping, and passing that mark on would make a peer skip records
+    /// the origin still holds. A hub that was told the owner's floor may relay
+    /// it, which is how a machine synced through the controller hears that an
+    /// origin's prefix is gone.
+    pub fn since(&self, from: &TalkVector, limit: usize) -> TalkBatch {
         let inner = self.inner();
         let runs: Vec<UnreadRun<'_>> = inner
             .logs
             .iter()
             .filter_map(|(origin, log)| {
                 let held = from.get(origin).copied().unwrap_or(0);
+                // Nothing at or below this board's own watermark can be filed
+                // by a peer that is behind it: those records are gone for
+                // good, and a page spent on them is a page the peer cannot
+                // use.
+                let held = held.max(log.low_water);
                 // An origin is sorted by seq, so where the peer's knowledge
                 // ends is found rather than walked to. The common case by far
                 // is a peer that is already up to date, and that case should
@@ -930,7 +1108,15 @@ impl TalkStore {
                 }
             })
             .collect();
-        oldest_page(runs, limit.clamp(1, MAX_PAGE), |_| true).1
+        TalkBatch {
+            messages: oldest_page(runs, limit.clamp(1, MAX_PAGE), |_| true).1,
+            low_water: inner
+                .logs
+                .iter()
+                .map(|(origin, log)| (origin.clone(), log.published_floor()))
+                .filter(|(_, floor)| *floor > 0)
+                .collect(),
+        }
     }
 
     /// Read the board as someone standing on this machine sees it.
@@ -1039,6 +1225,7 @@ impl TalkStore {
 
     /// Add one message to memory and to its origin's log file.
     fn file(&self, inner: &mut TalkInner, message: TalkMessage) -> Result<bool> {
+        let mine = inner.identity.origin.clone();
         let message_origin = message.origin.clone();
         let log = inner.logs.entry(message.origin.clone()).or_default();
         if message.seq <= log.low_water {
@@ -1060,9 +1247,23 @@ impl TalkStore {
         let (retain, _) = retention_for(&message_origin);
         if log.messages.len() > retain + COMPACT_SLACK {
             let cut = log.messages.len() - retain;
-            log.low_water = log.messages[cut - 1].seq;
+            // A watermark adopted from a peer can sit above records this board
+            // still holds; retention must not walk it back down.
+            log.low_water = log.low_water.max(log.messages[cut - 1].seq);
+            if owns_origin(&mine, &message_origin) {
+                // Retention on a log this machine owns is the owner dropping
+                // its own prefix, so it may be stated to a peer; a copy's
+                // retention is housekeeping and stays local.
+                log.owner_low_water = log.owner_low_water.max(log.low_water);
+            }
             log.messages.drain(..cut);
-            rewrite_log(&path, &message_origin, log.low_water, &log.messages)?;
+            rewrite_log(
+                &path,
+                &message_origin,
+                log.low_water,
+                log.owner_low_water,
+                &log.messages,
+            )?;
         }
         Ok(true)
     }
@@ -1080,9 +1281,13 @@ impl TalkStore {
     ///
     /// It clears this machine's board. Another machine's copy is that
     /// machine's to clear — the board is replicated, not shared, and nothing
-    /// here can speak for a daemon it cannot see.
+    /// here can speak for a daemon it cannot see. Clearing therefore raises
+    /// only this machine's local mark for a copied origin, while for an origin
+    /// owned here the mark is also the owner's floor and is written down as
+    /// such; [`TalkStore::since`] publishes that floor and never a copy's.
     pub fn clear(&self) -> Result<usize> {
         let mut inner = self.inner();
+        let mine = inner.identity.origin.clone();
         let root = self.root.join("log");
         let mut dropped = 0;
         for (origin, log) in inner.logs.iter_mut() {
@@ -1091,11 +1296,15 @@ impl TalkStore {
             }
             dropped += log.messages.len();
             log.low_water = log.highest();
+            if owns_origin(&mine, origin) {
+                log.owner_low_water = log.owner_low_water.max(log.low_water);
+            }
             log.messages.clear();
             rewrite_log(
                 &root.join(format!("{origin}.jsonl")),
                 origin,
                 log.low_water,
+                log.owner_low_water,
                 &log.messages,
             )?;
         }
@@ -1106,6 +1315,7 @@ impl TalkStore {
     /// a timer: a daemon that nobody talks to should not be doing work.
     pub fn compact(&self) -> Result<()> {
         let mut inner = self.inner();
+        let mine = inner.identity.origin.clone();
         let now = now_ms();
         let root = self.root.join("log");
         for (origin, log) in inner.logs.iter_mut() {
@@ -1118,12 +1328,20 @@ impl TalkStore {
             if keep == 0 {
                 continue;
             }
-            log.low_water = log.messages[keep - 1].seq;
+            // A watermark adopted from a peer can sit above records this board
+            // still holds; retention must not walk it back down.
+            log.low_water = log.low_water.max(log.messages[keep - 1].seq);
+            if owns_origin(&mine, origin) {
+                // As in `file`: aging out an owned log is the owner dropping
+                // its own prefix, so write down that it may be stated.
+                log.owner_low_water = log.owner_low_water.max(log.low_water);
+            }
             log.messages.drain(..keep);
             rewrite_log(
                 &root.join(format!("{origin}.jsonl")),
                 origin,
                 log.low_water,
+                log.owner_low_water,
                 &log.messages,
             )?;
         }
@@ -1280,6 +1498,12 @@ fn valid_origin(origin: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Whether this board owns an origin's sequence space: its own log, or the
+/// companion log it files wire traffic in. Anything else is a copy.
+fn owns_origin(mine: &str, origin: &str) -> bool {
+    origin == mine || wire_origin(mine) == origin
+}
+
 fn append_line(path: &Path, message: &TalkMessage) -> Result<()> {
     let mut line = serde_json::to_vec(message).context("failed to encode a talk message")?;
     line.push(b'\n');
@@ -1293,15 +1517,22 @@ fn append_line(path: &Path, message: &TalkMessage) -> Result<()> {
         .with_context(|| format!("failed to write to the talk log at {}", path.display()))
 }
 
-fn rewrite_log(path: &Path, origin: &str, low_water: u64, messages: &[TalkMessage]) -> Result<()> {
+fn rewrite_log(
+    path: &Path,
+    origin: &str,
+    low_water: u64,
+    owner_low_water: u64,
+    messages: &[TalkMessage],
+) -> Result<()> {
     let temporary = path.with_extension("jsonl.tmp");
     let mut file = File::create(&temporary)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
     restrict(&file);
-    if low_water > 0 {
+    if low_water > 0 || owner_low_water > 0 {
         let mut header = serde_json::to_vec(&LogHeader {
             log: origin.to_string(),
             dropped_through: low_water,
+            owner_dropped_through: owner_low_water,
         })
         .context("failed to encode a talk log header")?;
         header.push(b'\n');
@@ -1328,6 +1559,15 @@ fn rewrite_log(path: &Path, origin: &str, low_water: u64, messages: &[TalkMessag
 /// whole thirty days again and filed all of it a second time. Retention that
 /// only holds until the next restart is not retention.
 ///
+/// [`OriginLog::owner_low_water`] is written beside it because it cannot be
+/// recovered from the records: a floor adopted from an origin belongs to a
+/// sequence space this machine may not hold anything of, and losing it on
+/// restart would leave every peer that syncs through this machine stalled
+/// behind the gap again. The same mark is what lets an owned log's own clear
+/// or retention survive a restart as a statement a peer may hear; a mark
+/// derived from the oldest record still held is local serving only and is
+/// never published as the owner's floor.
+///
 /// Written only when there is something to say, and shaped so that a build
 /// that predates it skips the line as unparseable and falls back to deriving
 /// the same number from the records — lower, never higher, so it can cost a
@@ -1336,9 +1576,15 @@ fn rewrite_log(path: &Path, origin: &str, low_water: u64, messages: &[TalkMessag
 struct LogHeader {
     log: String,
     dropped_through: u64,
+    /// The owner's floor as this board knew it. Defaulted so a log written by
+    /// a build that predates the distinction still opens: its local mark is
+    /// all it has, which the owner of the log may state as its own floor and
+    /// a copy may not.
+    #[serde(default)]
+    owner_dropped_through: u64,
 }
 
-fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
+fn load_logs(root: &Path, mine: &str) -> BTreeMap<String, OriginLog> {
     let mut logs: BTreeMap<String, OriginLog> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(root) else {
         return logs;
@@ -1375,6 +1621,15 @@ fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
                 {
                     headed = true;
                     log.low_water = log.low_water.max(header.dropped_through);
+                    log.owner_low_water = log.owner_low_water.max(header.owner_dropped_through);
+                    if owns_origin(mine, &origin) {
+                        // The header was written when this machine cleared or
+                        // trimmed a log it owns, so its mark is this
+                        // machine's own word as the origin. For a copy the
+                        // same header records local housekeeping and says
+                        // nothing a peer may hear.
+                        log.owner_low_water = log.owner_low_water.max(header.dropped_through);
+                    }
                 }
                 continue;
             };
@@ -1391,7 +1646,24 @@ fn load_logs(root: &Path) -> BTreeMap<String, OriginLog> {
             }
         }
         if let Some(first) = log.messages.first() {
+            // The run a board serves starts one below its oldest record, which
+            // is all a log without a header can say about its own prefix.
             log.low_water = log.low_water.max(first.seq - 1);
+            if !headed && first.seq > 1 && owns_origin(mine, &origin) {
+                // An owned log that starts above one with nothing on disk
+                // saying why is truncated or corrupt, not retention: the
+                // missing records may still exist on this machine and may
+                // still be recoverable. Keep serving what is here, but say
+                // nothing a peer could read as "skip the gap".
+                debug::log(
+                    "talk",
+                    format!(
+                        "{origin}: log starts at {} with no header; serving what is held, \
+                         publishing no owner floor",
+                        first.seq
+                    ),
+                );
+            }
         } else if !headed {
             // Nothing held and nothing dropped: an empty file nobody has
             // written to yet, and no reason to claim an origin over it.
@@ -1925,10 +2197,16 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target]) -> Result<TalkSyncSummary
     let pool = runtime.bridge_pool();
     let local = Target::local();
     let mut summary = TalkSyncSummary::default();
-    let mut mine = pool
+    let local_board = pool
         .talk_status(&local, None)
-        .context("the local talk board is unreachable")?
-        .vector;
+        .context("the local talk board is unreachable")?;
+    // The board a batch came from still travels with it, for older peers and
+    // for diagnosis. Floors no longer depend on it: a batch names the board
+    // that handed it over, and that board may be a hub relaying a floor it
+    // learned from the origin, which is exactly how a machine synced through
+    // the controller hears about a dropped prefix.
+    let local_origin = local_board.origin;
+    let mut mine = local_board.vector;
     for target in targets.iter().filter(|target| target.id != local.id) {
         // The name a human gave the machine travels with it: the daemon knows
         // its own hostname and nothing else about how it is spoken of.
@@ -1945,13 +2223,15 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target]) -> Result<TalkSyncSummary
             }
         };
         summary.machines += 1;
-        match carry(&pool, target, &local, mine.clone(), &theirs.vector) {
-            Ok((pulled, pushed)) => {
+        match carry(&pool, target, &local, &local_origin, mine.clone(), &theirs) {
+            Ok((pulled, pushed, local_moved)) => {
                 summary.pulled += pulled;
                 summary.pushed += pushed;
-                if pulled > 0 {
+                if local_moved {
                     // The next machine should be told what this one just said,
-                    // and not be asked for it a second time.
+                    // and not be asked for it a second time. A floor on its
+                    // own moves this board's mark, so it counts here even when
+                    // every message in the batch was already held.
                     mine = pool.talk_status(&local, None)?.vector;
                 }
             }
@@ -1966,26 +2246,40 @@ pub fn run_sync(runtime: &Runtime, targets: &[Target]) -> Result<TalkSyncSummary
 
 /// One machine's half of a round: pull first, so what it minted is on the
 /// local board before the next machine is pushed to.
+///
+/// Both appends name the board that handed the batch over, which is not
+/// necessarily the origin of every floor inside it. That is the point: the
+/// controller's local board is a hub, and a floor it pulled from a machine has
+/// to travel on to the next machine even though the controller does not own
+/// the origin. The floor's provenance is settled on the publishing side — see
+/// [`TalkStore::since`] — so the receiver adopts it without asking who is
+/// carrying it.
+///
+/// Returns how many messages were pulled, how many were pushed, and whether
+/// the local board was handed anything at all — a batch that carries only a
+/// dropped prefix still moves the local vector.
 fn carry(
     pool: &BridgePool,
     target: &Target,
     local: &Target,
+    local_origin: &str,
     mine: TalkVector,
-    theirs: &TalkVector,
-) -> Result<(usize, usize)> {
+    theirs: &TalkState,
+) -> Result<(usize, usize, bool)> {
     let inbound = pool.talk_fetch(target, mine, SYNC_BATCH)?;
-    let pulled = if inbound.is_empty() {
+    let handed = !inbound.is_empty() || !inbound.low_water.is_empty();
+    let pulled = if handed {
+        pool.talk_append(local, inbound, &theirs.origin)?
+    } else {
+        0
+    };
+    let outbound = pool.talk_fetch(local, theirs.vector.clone(), SYNC_BATCH)?;
+    let pushed = if outbound.is_empty() && outbound.low_water.is_empty() {
         0
     } else {
-        pool.talk_append(local, inbound)?
+        pool.talk_append(target, outbound, local_origin)?
     };
-    let outbound = pool.talk_fetch(local, theirs.clone(), SYNC_BATCH)?;
-    let pushed = if outbound.is_empty() {
-        0
-    } else {
-        pool.talk_append(target, outbound)?
-    };
-    Ok((pulled, pushed))
+    Ok((pulled, pushed, handed))
 }
 
 #[cfg(test)]
@@ -2023,6 +2317,39 @@ mod tests {
             reply_to: None,
             text: text.into(),
         }
+    }
+
+    /// A record from another machine, for tests that have to reconstruct a log
+    /// file the way a previous build left it.
+    fn far_record(origin: &str, seq: u64) -> TalkMessage {
+        TalkMessage {
+            id: format!("{origin}:{seq}"),
+            origin: origin.into(),
+            seq,
+            ts: now_ms(),
+            scope: TalkScope::Global,
+            author: TalkAuthor {
+                machine: origin.into(),
+                machine_label: "elsewhere".into(),
+                voice: TalkVoice::default(),
+            },
+            kind: TalkKind::Note,
+            to: None,
+            reply_to: None,
+            text: format!("held after the gap {seq}"),
+        }
+    }
+
+    /// Write a log exactly as given: no header, no rewriting — the shape a
+    /// build that did not know about owner floors would have left on disk.
+    fn write_log_file(root: &Path, origin: &str, messages: &[TalkMessage]) {
+        fs::create_dir_all(root.join("log")).unwrap();
+        let mut text = String::new();
+        for message in messages {
+            text.push_str(&serde_json::to_string(message).unwrap());
+            text.push('\n');
+        }
+        fs::write(root.join("log").join(format!("{origin}.jsonl")), text).unwrap();
     }
 
     #[test]
@@ -2639,7 +2966,10 @@ mod tests {
         };
         // The answer comes first and the noise that buries it comes after,
         // which is the order that made this lose the answer.
-        assert_eq!(store.merge((1..=9).map(far).collect()).unwrap(), 9);
+        assert_eq!(
+            store.merge((1..=9).map(far).collect::<Vec<_>>()).unwrap(),
+            9
+        );
 
         // Someone arriving at the board still gets the newest end: catching up
         // is what that read is for.
@@ -2852,6 +3182,536 @@ mod tests {
         assert!(store.since(&held, 1).is_empty());
 
         fs::remove_dir_all(&store.root).ok();
+    }
+
+    /// A peer behind a prefix its sender dropped for good has to step over
+    /// that prefix, not stall below it. A catch-up page is the oldest
+    /// [`MAX_PAGE`] messages a peer is missing, so once a clear leaves a
+    /// permanent gap under more held messages than one page, every round
+    /// offered the same 500 duplicates: the peer's vector could never advance
+    /// past the gap and the newer messages never reached the oldest page. The
+    /// sender's floor has to travel with the batch so the receiver can
+    /// re-anchor its run above what it will never be sent.
+    #[test]
+    fn a_peer_steps_over_a_dropped_prefix_instead_of_stalling_below_it() {
+        let source = store("floor-source");
+        let peer = store("floor-peer");
+        let origin = source.origin();
+
+        source
+            .post(draft("the board this replaces", TalkScope::Global))
+            .unwrap();
+        // Clearing keeps the mark: every message up to here is gone for good,
+        // and a peer that missed it cannot be sent it again.
+        source.clear().unwrap();
+        assert_eq!(source.state().low_water[&origin], 1);
+
+        // One full page's worth above the permanent gap, and one more. The
+        // page is the oldest MAX_PAGE, so the last post can only arrive after
+        // the peer's vector has stepped over the gap.
+        for seq in 2..=MAX_PAGE as u64 + 1 {
+            source
+                .post(draft(
+                    &format!("held after the gap {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        assert_eq!(source.state().low_water[&origin], 1);
+
+        let pulled = peer
+            .merge_from(&origin, source.since(&peer.state().vector, MAX_PAGE))
+            .unwrap();
+        assert_eq!(pulled, MAX_PAGE);
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 1,
+            "the peer stalled below a prefix it will never be sent"
+        );
+
+        // And the next post is in the next page rather than behind the same
+        // 500 duplicates.
+        source
+            .post(draft(
+                "the first thing said after the stall",
+                TalkScope::Global,
+            ))
+            .unwrap();
+        let page = source.since(&peer.state().vector, MAX_PAGE);
+        assert_eq!(
+            page.len(),
+            1,
+            "the newest post is behind the same 500 duplicates"
+        );
+        assert_eq!(
+            page.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            vec![MAX_PAGE as u64 + 2]
+        );
+
+        fs::remove_dir_all(&source.root).ok();
+        fs::remove_dir_all(&peer.root).ok();
+    }
+
+    /// A floor is a statement about one origin's whole sequence space, so only
+    /// the board that owns that origin may make it. A replica that clears its
+    /// own copy of somebody else's log has dropped a copy, not the origin; if
+    /// it handed that mark on, a fresh board syncing through it would skip
+    /// records the origin still holds, and the loss would be permanent and
+    /// depend only on the order the machines happened to be visited in.
+    #[test]
+    fn a_replica_does_not_publish_a_floor_for_an_origin_it_copied() {
+        let owner = store("floor-owner");
+        let replica = store("floor-replica");
+        let fresh = store("floor-fresh");
+        let origin = owner.origin();
+
+        for seq in 1..=100u64 {
+            owner
+                .post(draft(
+                    &format!("said before the clear {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        assert_eq!(owner.state().vector[&origin], 100);
+
+        // The replica catches up completely, then clears its own copy. The
+        // mark it keeps is about the copy on this machine, not about what the
+        // origin still holds.
+        let all = owner.since(&replica.state().vector, MAX_PAGE);
+        assert_eq!(replica.merge_from(&origin, all).unwrap(), 100);
+        assert_eq!(replica.state().vector[&origin], 100);
+        replica.clear().unwrap();
+        assert_eq!(replica.state().low_water[&origin], 100);
+
+        // A fresh board pulls the replica first, which is a legal sync order.
+        // The replica must not pass on a floor for an origin it merely copied:
+        // its batch carries no such claim, and the fresh board adopts none.
+        let from_replica = replica.since(&fresh.state().vector, MAX_PAGE);
+        assert!(
+            from_replica.low_water.is_empty(),
+            "a replica published a floor for an origin it copied: {:?}",
+            from_replica.low_water
+        );
+        fresh.merge_from(&replica.origin(), from_replica).unwrap();
+        assert_eq!(
+            fresh.state().low_water.get(&origin).copied().unwrap_or(0),
+            0,
+            "the fresh board adopted a floor from a board that does not own the origin"
+        );
+        assert_eq!(
+            fresh.state().vector.get(&origin).copied().unwrap_or(0),
+            0,
+            "an empty board claimed a prefix it was never given"
+        );
+
+        // Receipt cannot audit whether the board handing a batch over owns the
+        // origins its floors name, and must not: a hub carries a machine's
+        // batch to the machines behind it, and a floor the hub learned from
+        // the owner is exactly how a peer synced through the controller hears
+        // that a prefix is gone. What keeps the claim honest is the
+        // publishing side, above, and the relay is covered by
+        // `a_hub_relays_the_floor_it_learned_from_the_origin`.
+
+        // Pulling the origin itself is what restores the records, because the
+        // origin still holds all 100 and has not dropped anything.
+        let from_owner = owner.since(&fresh.state().vector, MAX_PAGE);
+        assert!(from_owner.low_water.is_empty());
+        assert_eq!(fresh.merge_from(&origin, from_owner).unwrap(), 100);
+        assert_eq!(
+            fresh.state().vector.get(&origin).copied().unwrap_or(0),
+            100,
+            "the fresh board never recovered the prefix the replica still held"
+        );
+        assert_eq!(
+            fresh.since(&TalkVector::new(), MAX_PAGE).len(),
+            100,
+            "the fresh board holds a vector without the records behind it"
+        );
+
+        // The original fix still holds, and a floor alone is enough: after a
+        // clear the owner's next batch carries no message at all, only the
+        // mark that the prefix is gone for good.
+        owner.clear().unwrap();
+        let behind = store("floor-behind");
+        let floor_only = owner.since(&behind.state().vector, MAX_PAGE);
+        assert!(floor_only.is_empty());
+        assert_eq!(
+            floor_only.low_water.get(&origin).copied(),
+            Some(100),
+            "the owner's own batch lost the floor for its own dropped prefix"
+        );
+        assert_eq!(behind.merge_from(&origin, floor_only).unwrap(), 0);
+        assert_eq!(
+            behind.state().vector.get(&origin).copied().unwrap_or(0),
+            100,
+            "a floor alone did not move the peer above the dropped prefix"
+        );
+
+        // And a floor never comes back down, even from the board that set it.
+        behind
+            .merge_from(
+                &origin,
+                TalkBatch {
+                    messages: Vec::new(),
+                    low_water: TalkVector::from([(origin.clone(), 50)]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            behind.state().low_water.get(&origin).copied(),
+            Some(100),
+            "a later floor walked the mark back down"
+        );
+
+        // Records beyond the gap then advance the vector, with no page spent
+        // on the prefix that will never be offered again.
+        for seq in 101..=150u64 {
+            owner
+                .post(draft(
+                    &format!("said after the clear {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        let after_gap = owner.since(&behind.state().vector, MAX_PAGE);
+        assert_eq!(after_gap.len(), 50);
+        assert_eq!(behind.merge_from(&origin, after_gap).unwrap(), 50);
+        assert_eq!(
+            behind.state().vector.get(&origin).copied().unwrap_or(0),
+            150,
+            "a peer behind the owner's floor stalled below it"
+        );
+
+        fs::remove_dir_all(&owner.root).ok();
+        fs::remove_dir_all(&replica.root).ok();
+        fs::remove_dir_all(&fresh.root).ok();
+        fs::remove_dir_all(&behind.root).ok();
+    }
+
+    /// `run_sync` is a hub: it pulls a machine's batch into the controller's
+    /// local board and then pushes that board to the next machine. A floor the
+    /// hub learned from the origin has to survive the second hop, even though
+    /// the hub does not own the origin. If a board may state only its own
+    /// origin's floor, a peer synced through the controller never hears that
+    /// the prefix is gone: it holds every message above the gap, its vector
+    /// cannot start above the gap, and once a full page sits above it every
+    /// round offers the same page again while the newest posts never arrive.
+    #[test]
+    fn a_hub_relays_the_floor_it_learned_from_the_origin() {
+        let owner = store("hub-owner");
+        let hub = store("hub-local");
+        let peer = store("hub-peer");
+        let origin = owner.origin();
+
+        owner
+            .post(draft("the board this replaces", TalkScope::Global))
+            .unwrap();
+        owner.clear().unwrap();
+        // Exactly one page above the permanent gap, and catching up the rest
+        // is what has to step over it.
+        for seq in 2..=MAX_PAGE as u64 + 1 {
+            owner
+                .post(draft(
+                    &format!("held after the gap {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        assert_eq!(owner.state().low_water[&origin], 1);
+
+        // First hop: the controller's local board pulls from the owner. The
+        // controller does not own the origin, but it now knows the owner's
+        // floor.
+        let pulled = hub
+            .merge_from(&origin, owner.since(&hub.state().vector, MAX_PAGE))
+            .unwrap();
+        assert_eq!(pulled, MAX_PAGE);
+        assert_eq!(hub.state().vector[&origin], MAX_PAGE as u64 + 1);
+
+        // Second hop: the controller pushes its board to a machine it does not
+        // own, naming itself as the sender, which is what `carry` does.
+        peer.merge_from(&hub.origin(), hub.since(&peer.state().vector, MAX_PAGE))
+            .unwrap();
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 1,
+            "a peer synced through the controller stalled below the origin's floor"
+        );
+
+        // And the next post crosses both hops rather than being hidden behind
+        // the same full page of duplicates.
+        owner
+            .post(draft(
+                "the first thing said after the gap",
+                TalkScope::Global,
+            ))
+            .unwrap();
+        assert_eq!(
+            hub.merge_from(&origin, owner.since(&hub.state().vector, MAX_PAGE))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            peer.merge_from(&hub.origin(), hub.since(&peer.state().vector, MAX_PAGE))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 2,
+            "the newest post stayed behind the duplicates already carried"
+        );
+
+        fs::remove_dir_all(&owner.root).ok();
+        fs::remove_dir_all(&hub.root).ok();
+        fs::remove_dir_all(&peer.root).ok();
+    }
+
+    /// A floor adopted from an origin is knowledge about that origin, not a
+    /// property of this machine's copy, so reopening the board must not forget
+    /// it. Losing it on restart would re-arm the hub stall for every peer that
+    /// syncs through this machine after the daemon comes back up.
+    #[test]
+    fn an_adopted_owner_floor_survives_reopening_the_board() {
+        let owner = store("floor-persist-owner");
+        let hub = store("floor-persist-hub");
+        let origin = owner.origin();
+
+        owner
+            .post(draft("the board this replaces", TalkScope::Global))
+            .unwrap();
+        owner.clear().unwrap();
+        for seq in 2..=10u64 {
+            owner
+                .post(draft(
+                    &format!("held after the gap {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        let adopted = hub
+            .merge_from(&origin, owner.since(&hub.state().vector, MAX_PAGE))
+            .unwrap();
+        assert_eq!(adopted, 9);
+        assert_eq!(
+            hub.since(&TalkVector::new(), MAX_PAGE)
+                .low_water
+                .get(&origin)
+                .copied(),
+            Some(1),
+            "the hub learned the owner's floor"
+        );
+
+        let root = hub.root.clone();
+        drop(hub);
+        let reopened = TalkStore::open(root.clone()).unwrap();
+        let announced = reopened.since(&TalkVector::new(), MAX_PAGE);
+        assert_eq!(
+            announced.low_water.get(&origin).copied(),
+            Some(1),
+            "the adopted owner floor was forgotten when the board was reopened"
+        );
+
+        // And it is still a usable floor: a peer adopts it and steps over the
+        // prefix the origin no longer holds.
+        let peer = store("floor-persist-peer");
+        assert_eq!(peer.merge_from(&reopened.origin(), announced).unwrap(), 9);
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            10,
+            "a peer could not step over the reopened board's floor"
+        );
+
+        fs::remove_dir_all(&owner.root).ok();
+        fs::remove_dir_all(&peer.root).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Housekeeping on a copy is not a statement about the origin. A hub that
+    /// clears its copy of somebody else's log has dropped records it held, not
+    /// records the origin holds, so the batch it hands on says nothing about
+    /// that origin's prefix.
+    #[test]
+    fn a_hub_does_not_publish_a_floor_for_clearing_a_copy() {
+        let owner = store("copy-owner");
+        let hub = store("copy-hub");
+        let origin = owner.origin();
+
+        for seq in 1..=10u64 {
+            owner
+                .post(draft(
+                    &format!("said before the copy is cleared {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        let all = owner.since(&hub.state().vector, MAX_PAGE);
+        assert_eq!(hub.merge_from(&origin, all).unwrap(), 10);
+        assert_eq!(hub.state().vector[&origin], 10);
+
+        hub.clear().unwrap();
+        assert_eq!(
+            hub.state().low_water[&origin],
+            10,
+            "clearing the copy did not raise this machine's own mark"
+        );
+        let batch = hub.since(&TalkVector::new(), MAX_PAGE);
+        assert!(batch.is_empty());
+        assert_eq!(
+            batch.low_water.get(&origin).copied().unwrap_or(0),
+            0,
+            "a local clear of a copy was published as the origin's floor"
+        );
+
+        // The origin still holds every record, so a peer that never adopted
+        // the copy's mark can still get all ten from it.
+        let peer = store("copy-peer");
+        let from_owner = owner.since(&peer.state().vector, MAX_PAGE);
+        assert!(from_owner.low_water.is_empty());
+        assert_eq!(peer.merge_from(&origin, from_owner).unwrap(), 10);
+        assert_eq!(peer.state().vector[&origin], 10);
+
+        fs::remove_dir_all(&owner.root).ok();
+        fs::remove_dir_all(&hub.root).ok();
+        fs::remove_dir_all(&peer.root).ok();
+    }
+
+    /// A controller-local hub that was running the base build already holds
+    /// the records above a cleared prefix, and its vector covers the gap
+    /// because the base build inferred the mark from the oldest record it
+    /// held. The floor it never learned is therefore older than its vector.
+    /// Filtering published floors by the peer's vector made that harmless-
+    /// looking state permanent: an ordinary upgrade left the hub unable to
+    /// relay, a fresh peer pulled through it filed 500 records below an
+    /// unknown gap, and its vector never advanced again.
+    #[test]
+    fn an_upgraded_hub_learns_and_relays_a_floor_its_vector_already_covers() {
+        let owner = store("upgrade-owner");
+        let origin = owner.origin();
+        owner
+            .post(draft("the board this replaces", TalkScope::Global))
+            .unwrap();
+        owner.clear().unwrap();
+        for seq in 2..=MAX_PAGE as u64 + 1 {
+            owner
+                .post(draft(
+                    &format!("held after the gap {seq}"),
+                    TalkScope::Global,
+                ))
+                .unwrap();
+        }
+        assert_eq!(owner.state().vector[&origin], MAX_PAGE as u64 + 1);
+
+        // The controller's copy as the base build left it: every post-clear
+        // record appended, no header, and the base load inferred a mark one
+        // below the oldest record. Nothing on disk names the owner's floor.
+        let hub = store("upgrade-hub");
+        let hub_root = hub.root.clone();
+        drop(hub);
+        let left = owner.since(&TalkVector::new(), MAX_PAGE);
+        assert_eq!(left.len(), MAX_PAGE);
+        write_log_file(&hub_root, &origin, &left.messages);
+        let hub = TalkStore::open(hub_root.clone()).unwrap();
+        assert_eq!(
+            hub.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 1,
+            "the base build's copy did not read back the way this test needs"
+        );
+
+        // The pull that used to say nothing: no message is missing, and the
+        // owner's floor sits below the peer's vector, but a floor is metadata
+        // and has to travel anyway.
+        let pulled = owner.since(&hub.state().vector, MAX_PAGE);
+        assert!(pulled.is_empty(), "the hub was missing a message");
+        hub.merge_from(&origin, pulled).unwrap();
+        assert_eq!(
+            hub.since(&TalkVector::new(), MAX_PAGE)
+                .low_water
+                .get(&origin)
+                .copied(),
+            Some(1),
+            "the upgraded hub never learned the floor it had missed"
+        );
+
+        // A fresh peer synced through the hub now steps over the gap instead
+        // of filing everything above an unknown one.
+        let peer = store("upgrade-peer");
+        peer.merge_from(&hub.origin(), hub.since(&peer.state().vector, MAX_PAGE))
+            .unwrap();
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 1,
+            "a peer synced through the upgraded hub stalled at the gap"
+        );
+
+        // And a post made after the upgrade crosses both hops.
+        owner
+            .post(draft(
+                "the first thing said after the upgrade",
+                TalkScope::Global,
+            ))
+            .unwrap();
+        assert_eq!(
+            hub.merge_from(&origin, owner.since(&hub.state().vector, MAX_PAGE))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            peer.merge_from(&hub.origin(), hub.since(&peer.state().vector, MAX_PAGE))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            MAX_PAGE as u64 + 2,
+            "the first post after the upgrade stayed behind the gap"
+        );
+
+        fs::remove_dir_all(&owner.root).ok();
+        fs::remove_dir_all(&hub_root).ok();
+        fs::remove_dir_all(&peer.root).ok();
+    }
+
+    /// A headerless owned log that begins above one is a truncated or corrupt
+    /// log, not retention: nothing on disk says the prefix was dropped. The
+    /// local serving mark may still start above the oldest record held, but
+    /// publishing it would tell a peer to skip a record this machine might
+    /// still recover from the origin.
+    #[test]
+    fn a_headerless_owned_log_does_not_publish_an_owner_floor() {
+        let owner = store("corrupt-owner");
+        let origin = owner.origin();
+        let root = owner.root.clone();
+        let first = 5;
+        let held: Vec<TalkMessage> = (first..=9).map(|seq| far_record(&origin, seq)).collect();
+        drop(owner);
+        write_log_file(&root, &origin, &held);
+        let reopened = TalkStore::open(root.clone()).unwrap();
+
+        let batch = reopened.since(&TalkVector::new(), MAX_PAGE);
+        assert_eq!(
+            batch.low_water.get(&origin).copied().unwrap_or(0),
+            0,
+            "a headerless log published an owner floor it never wrote down"
+        );
+        assert_eq!(batch.len(), 5, "the local records stopped being served");
+
+        let peer = store("corrupt-peer");
+        peer.merge_from(&origin, batch).unwrap();
+        assert_eq!(
+            peer.state().low_water.get(&origin).copied().unwrap_or(0),
+            0,
+            "a peer adopted a floor from a headerless log and will skip the gap"
+        );
+        assert_eq!(
+            peer.state().vector.get(&origin).copied().unwrap_or(0),
+            0,
+            "a peer advanced past a record the origin might still recover"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&peer.root).ok();
     }
 
     #[test]
@@ -3182,10 +4042,16 @@ mod tests {
         // controller between them: diff the vectors, pull, then push.
         let round = |pull_into: &TalkStore, from: &TalkStore| -> (usize, usize) {
             let pulled = pull_into
-                .merge(from.since(&pull_into.state().vector, MAX_PAGE))
+                .merge_from(
+                    &from.origin(),
+                    from.since(&pull_into.state().vector, MAX_PAGE),
+                )
                 .unwrap();
             let pushed = from
-                .merge(pull_into.since(&from.state().vector, MAX_PAGE))
+                .merge_from(
+                    &pull_into.origin(),
+                    pull_into.since(&from.state().vector, MAX_PAGE),
+                )
                 .unwrap();
             (pulled, pushed)
         };

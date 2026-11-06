@@ -29,8 +29,8 @@ use crate::{
     },
     relay::{RELAY_CAPABILITY, RelayAnswer, RelayJob, RelayPeer},
     talk::{
-        DIRECT_CAPABILITY, TALK_CAPABILITY, TalkDeliver, TalkDraft, TalkFilter, TalkMessage,
-        TalkPage, TalkState, TalkVector,
+        DIRECT_CAPABILITY, TALK_CAPABILITY, TalkBatch, TalkDeliver, TalkDraft, TalkFilter,
+        TalkMessage, TalkPage, TalkState, TalkVector,
     },
 };
 
@@ -1148,21 +1148,37 @@ impl BridgeConnection {
         }
     }
 
-    pub fn talk_fetch(&self, from: TalkVector, limit: usize) -> Result<Vec<TalkMessage>> {
+    pub fn talk_fetch(&self, from: TalkVector, limit: usize) -> Result<TalkBatch> {
         self.require_capability(TALK_CAPABILITY)?;
         match self
             .request(DaemonRequest::TalkFetch { from, limit })?
             .response
         {
-            DaemonResponse::TalkCarry { messages, .. } => Ok(messages),
+            DaemonResponse::TalkCarry {
+                messages,
+                low_water,
+                ..
+            } => Ok(TalkBatch {
+                messages,
+                low_water,
+            }),
             response => bail!("unexpected talk response: {response:?}"),
         }
     }
 
-    pub fn talk_append(&self, messages: Vec<TalkMessage>) -> Result<usize> {
+    /// Hand a batch to the board this connection speaks to, naming the board
+    /// it came from. The sender travels for compatibility and diagnosis; the
+    /// floors inside the batch are owner floors, and the receiving daemon
+    /// adopts them without checking the sender, because a hub relaying a floor
+    /// it learned from the origin names itself, not the origin.
+    pub fn talk_append(&self, batch: TalkBatch, sender: &str) -> Result<usize> {
         self.require_capability(TALK_CAPABILITY)?;
         match self
-            .request(DaemonRequest::TalkAppend { messages })?
+            .request(DaemonRequest::TalkAppend {
+                messages: batch.messages,
+                low_water: batch.low_water,
+                sender: sender.to_string(),
+            })?
             .response
         {
             DaemonResponse::TalkCarry { added, .. } => Ok(added),
@@ -3398,12 +3414,7 @@ impl BridgePool {
         self.connection_for_target(target)?.talk_status(label)
     }
 
-    pub fn talk_fetch(
-        &self,
-        target: &Target,
-        from: TalkVector,
-        limit: usize,
-    ) -> Result<Vec<TalkMessage>> {
+    pub fn talk_fetch(&self, target: &Target, from: TalkVector, limit: usize) -> Result<TalkBatch> {
         self.connection_for_target(target)?.talk_fetch(from, limit)
     }
 
@@ -3418,8 +3429,9 @@ impl BridgePool {
             .talk_deliver(draft, deliver, reply_expected)
     }
 
-    pub fn talk_append(&self, target: &Target, messages: Vec<TalkMessage>) -> Result<usize> {
-        self.connection_for_target(target)?.talk_append(messages)
+    pub fn talk_append(&self, target: &Target, batch: TalkBatch, sender: &str) -> Result<usize> {
+        self.connection_for_target(target)?
+            .talk_append(batch, sender)
     }
 
     pub fn relay_poll(

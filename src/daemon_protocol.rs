@@ -461,10 +461,27 @@ pub enum DaemonRequest {
         from: TalkVector,
         limit: usize,
     },
-    /// File messages minted elsewhere. Idempotent, so a carrier never has to
+    /// File messages minted elsewhere, and hear about the prefixes an origin's
+    /// owner has dropped for good. Idempotent, so a carrier never has to
     /// remember what it has already delivered.
     TalkAppend {
         messages: Vec<TalkMessage>,
+        /// The owner's dropped prefix per origin, as far as the board handing
+        /// the batch over knows it. Defaulted so a daemon too old to have one
+        /// behaves exactly as it always did: no floor, same catch-up.
+        #[serde(default)]
+        low_water: TalkVector,
+        /// The origin of the board that handed the batch over. Kept for
+        /// compatibility and diagnosis; receipt no longer judges a floor by
+        /// it. It cannot: the controller is a hub, and a batch it pushes names
+        /// the controller while the floor inside belongs to the origin the
+        /// controller heard from. A board publishes a floor only for an origin
+        /// it owns or one whose owner it was told about, so a relayed floor is
+        /// the owner's word, not a replica speaking for a sequence space it
+        /// does not own. Defaulted so a controller too old to name itself
+        /// still replicates its messages and simply offers no floor.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender: String,
     },
     /// Drop everything this machine's board holds, keeping the marks that say
     /// how far each log reached — so a peer that still holds all of it is
@@ -721,10 +738,16 @@ pub enum DaemonResponse {
     TalkCleared {
         dropped: usize,
     },
-    /// Answers `TalkFetch`, and `TalkAppend` with how many were new.
+    /// Answers `TalkFetch`, and `TalkAppend` with how many were new. A fetch
+    /// also carries the owner's floors for origins this board knows were
+    /// compacted or cleared, which is what lets a peer behind the gap step
+    /// over it instead of stalling below it — including when the board is a
+    /// controller relaying what it learned from the origin.
     TalkCarry {
         #[serde(default)]
         messages: Vec<TalkMessage>,
+        #[serde(default)]
+        low_water: TalkVector,
         #[serde(default)]
         added: usize,
     },
@@ -1030,6 +1053,48 @@ mod tests {
         };
         let frame = Frame::json(FrameKind::Request, 0, 7, &request).unwrap();
         assert_eq!(frame.decode_json::<DaemonRequest>().unwrap(), request);
+    }
+
+    #[test]
+    fn a_talk_append_from_an_older_controller_still_decodes_as_a_floorless_sender() {
+        // The sender and the floor are additive: a controller too old to name
+        // itself must still be able to file its messages, and the receiver
+        // reads that silence as "no claim about anybody's prefix".
+        let old: DaemonRequest =
+            serde_json::from_slice(br#"{"method":"talk_append","messages":[]}"#).unwrap();
+        assert_eq!(
+            old,
+            DaemonRequest::TalkAppend {
+                messages: Vec::new(),
+                low_water: TalkVector::new(),
+                sender: String::new(),
+            }
+        );
+
+        // A new controller sends the sender, and the receiver gets it back;
+        // an empty sender is left off the wire rather than sent as a claim.
+        let owned = DaemonRequest::TalkAppend {
+            messages: Vec::new(),
+            low_water: TalkVector::from([("owner-1234abcd".to_string(), 100)]),
+            sender: "owner-1234abcd".to_string(),
+        };
+        let encoded = serde_json::to_vec(&owned).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DaemonRequest>(&encoded).unwrap(),
+            owned
+        );
+        assert!(
+            String::from_utf8(encoded)
+                .unwrap()
+                .contains(r#""sender":"owner-1234abcd""#)
+        );
+        let floorless = DaemonRequest::TalkAppend {
+            messages: Vec::new(),
+            low_water: TalkVector::new(),
+            sender: String::new(),
+        };
+        let encoded = String::from_utf8(serde_json::to_vec(&floorless).unwrap()).unwrap();
+        assert!(!encoded.contains("sender"), "{encoded}");
     }
 
     #[test]
