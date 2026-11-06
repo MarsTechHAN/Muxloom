@@ -510,33 +510,11 @@ pub struct TalkPage {
 ///
 /// This is the right end to keep for someone arriving at the board and asking
 /// what is on it. It is the wrong end for someone following a cursor - see
-/// [`OldestFirst`], which is what such a read gets instead.
+/// [`oldest_page`], which is what such a read gets instead.
 struct NewestFirst {
     limit: usize,
     /// Oldest first, so the one to drop is the one on top.
     heap: BinaryHeap<Oldest>,
-    dropped: bool,
-}
-
-/// The oldest `limit` messages of however many are offered, oldest first.
-///
-/// What a caller following a cursor must be given. Such a caller hands the
-/// cursor back and is told only what has happened since, so anything a page
-/// leaves out is not paged past - it is lost, and the cursor is what loses it.
-/// Keeping the newest end is what did that: the page was the tail of a burst,
-/// the cursor was everything the board held, and the messages in between were
-/// dropped and then skipped. The one they were most likely to be was an answer
-/// somebody was waiting on, because an answer arrives before the noise that
-/// buries it.
-///
-/// Keeping the oldest end instead makes the window walk forwards: each read
-/// hands back a contiguous run and a cursor that reaches no further than the
-/// end of it, so a backlog drains in order over as many reads as it takes and
-/// nothing falls between two of them.
-struct OldestFirst {
-    limit: usize,
-    /// Newest first, so the one to drop is the one on top.
-    heap: BinaryHeap<Newest>,
     dropped: bool,
 }
 
@@ -563,69 +541,6 @@ impl PartialEq for Oldest {
 }
 
 impl Eq for Oldest {}
-
-/// A message ordered the plain way round, so the *newest* is on top of a
-/// [`BinaryHeap`] and first out of a full page.
-struct Newest(TalkMessage);
-
-impl Ord for Newest {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.0.ts, &self.0.origin, self.0.seq).cmp(&(other.0.ts, &other.0.origin, other.0.seq))
-    }
-}
-
-impl PartialOrd for Newest {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Newest {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Newest {}
-
-impl OldestFirst {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit: limit.max(1),
-            heap: BinaryHeap::new(),
-            dropped: false,
-        }
-    }
-
-    /// Take `message` if the page has room or if it is older than the newest
-    /// the page is holding.
-    fn offer(&mut self, message: &TalkMessage) {
-        if self.heap.len() == self.limit {
-            let newer_than_held = self.heap.peek().is_some_and(|newest| {
-                (message.ts, &message.origin, message.seq)
-                    >= (newest.0.ts, &newest.0.origin, newest.0.seq)
-            });
-            self.dropped = true;
-            if newer_than_held {
-                return;
-            }
-            self.heap.pop();
-        }
-        self.heap.push(Newest(message.clone()));
-    }
-
-    fn dropped(&self) -> bool {
-        self.dropped
-    }
-
-    fn into_page(self) -> Vec<TalkMessage> {
-        self.heap
-            .into_sorted_vec()
-            .into_iter()
-            .map(|held| held.0)
-            .collect()
-    }
-}
 
 impl NewestFirst {
     fn new(limit: usize) -> Self {
@@ -671,6 +586,95 @@ impl NewestFirst {
         messages.reverse();
         messages
     }
+}
+
+/// One origin's unread messages, walked in sequence order, as a following page
+/// takes them.
+///
+/// A page a caller follows has to be a prefix of every origin it speaks for.
+/// Such a caller hands the cursor back and is told only what has happened
+/// since, so a message the page stepped over is lost: the cursor is past it,
+/// and the next read filters it out. Time alone does not give that prefix - a
+/// machine's clock can step backwards between two posts, and a page chosen by
+/// time would hand out the later sequence first while the cursor moved past
+/// the earlier one. Sequence numbers are the machine's own order of what it
+/// said; time only decides which origin's next message the page takes.
+struct UnreadRun<'a> {
+    /// The origin whose sequences these are, and the tie-break between two
+    /// messages stamped at the same millisecond.
+    origin: &'a str,
+    /// The origin's log after the caller's mark, in sequence order, still to
+    /// be walked.
+    messages: std::slice::Iter<'a, TalkMessage>,
+    /// The next message of it the page may take, if any.
+    next: Option<&'a TalkMessage>,
+}
+
+impl<'a> UnreadRun<'a> {
+    fn new(origin: &'a str, messages: &'a [TalkMessage]) -> Self {
+        Self {
+            origin,
+            messages: messages.iter(),
+            next: None,
+        }
+    }
+
+    /// Walk forward to the next message the page may take, skipping what the
+    /// caller's filter leaves out.
+    fn advance(&mut self, accept: &impl Fn(&TalkMessage) -> bool) {
+        self.next = self.messages.find(|message| accept(message));
+    }
+}
+
+/// The oldest `limit` of what the runs offer, oldest first.
+///
+/// Each run is walked in its own sequence order and contributes only a prefix,
+/// with time deciding which origin goes next. Keeping the oldest end is what a
+/// caller following a cursor needs: such a caller hands the cursor back and is
+/// told only what has happened since, so a page that was the tail of a burst
+/// would leave the messages in between dropped and then skipped - and the one
+/// they were most likely to be was an answer somebody was waiting on, because
+/// an answer arrives before the noise that buries it.
+///
+/// Taking each origin in sequence order is what makes the cursor of a
+/// truncated page safe. Everything this reader still had to see is above the
+/// last sequence the page took from that origin, so the cursor the caller is
+/// handed cannot step over it. Where time is what orders a page, a clock that
+/// stepped backwards could put the later sequence in the page and leave the
+/// earlier one below the cursor.
+///
+/// Returns whether anything matched that the page had no room for.
+fn oldest_page(
+    mut runs: Vec<UnreadRun<'_>>,
+    limit: usize,
+    accept: impl Fn(&TalkMessage) -> bool,
+) -> (bool, Vec<TalkMessage>) {
+    for run in &mut runs {
+        run.advance(&accept);
+    }
+    let mut page = Vec::new();
+    while page.len() < limit {
+        let Some(at) = runs
+            .iter()
+            .enumerate()
+            .filter_map(|(at, run)| {
+                run.next
+                    .map(|message| (message.ts, run.origin, message.seq, at))
+            })
+            .min()
+            .map(|(_, _, _, at)| at)
+        else {
+            break;
+        };
+        let message = runs[at]
+            .next
+            .take()
+            .expect("a run was chosen for its next message");
+        page.push(message.clone());
+        runs[at].advance(&accept);
+    }
+    let dropped = runs.iter().any(|run| run.next.is_some());
+    (dropped, page)
 }
 
 /// The board on one machine.
@@ -894,27 +898,39 @@ impl TalkStore {
     /// Everything held past a peer's vector, oldest first, so a peer that is
     /// far behind catches up over several fetches rather than one huge one.
     ///
+    /// Each origin contributes only the run of its own sequence numbers from
+    /// the peer's mark, in sequence order; time only interleaves the origins.
+    /// A batch that took a later sequence from an origin before an earlier one
+    /// would leave a hole below everything it carried: the peer's vector stops
+    /// at the hole, so the next diff asks for the same batch again and the
+    /// message the peer is missing is never in it. A clock that stepped
+    /// backwards is no reason to reorder what a machine said.
+    ///
     /// A batch is at most [`MAX_PAGE`] and the board may hold tens of
-    /// thousands, so the walk keeps only the end it is going to hand back
-    /// rather than copying every message it looked at to sort and throw away.
-    /// This runs on every sync round against every reachable machine, which is
-    /// the one place on the board where the cost of the whole board is paid
-    /// over and over.
+    /// thousands, so the walk stops as soon as the page is full and copies
+    /// only the end it is going to hand back. This runs on every sync round
+    /// against every reachable machine, which is the one place on the board
+    /// where the cost of the whole board is paid over and over.
     pub fn since(&self, from: &TalkVector, limit: usize) -> Vec<TalkMessage> {
         let inner = self.inner();
-        let mut page = OldestFirst::new(limit.clamp(1, MAX_PAGE));
-        for (origin, log) in &inner.logs {
-            let held = from.get(origin).copied().unwrap_or(0);
-            // An origin is sorted by seq, so where the peer's knowledge ends
-            // is found rather than walked to. The common case by far is a peer
-            // that is already up to date, and that case should not cost a pass
-            // over everything the origin has ever said.
-            let fresh = log.messages.partition_point(|message| message.seq <= held);
-            for message in &log.messages[fresh..] {
-                page.offer(message);
-            }
-        }
-        page.into_page()
+        let runs: Vec<UnreadRun<'_>> = inner
+            .logs
+            .iter()
+            .filter_map(|(origin, log)| {
+                let held = from.get(origin).copied().unwrap_or(0);
+                // An origin is sorted by seq, so where the peer's knowledge
+                // ends is found rather than walked to. The common case by far
+                // is a peer that is already up to date, and that case should
+                // not cost a pass over everything the origin has ever said.
+                let fresh = log.messages.partition_point(|message| message.seq <= held);
+                if fresh < log.messages.len() {
+                    Some(UnreadRun::new(origin, &log.messages[fresh..]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        oldest_page(runs, limit.clamp(1, MAX_PAGE), |_| true).1
     }
 
     /// Read the board as someone standing on this machine sees it.
@@ -929,27 +945,25 @@ impl TalkStore {
             filter.limit.min(MAX_PAGE)
         };
         // A board holds up to [`RETAIN_PER_ORIGIN`] messages per machine and a
-        // page carries at most a few dozen, so the walk keeps only the end it
-        // is going to hand back rather than collecting every match to sort and
-        // throw away. What that saves is a copy of each message it looked at -
-        // and a read of the whole board is what a caller waiting for an answer
-        // does every couple of seconds.
+        // page carries at most a few dozen, so neither end collects every
+        // match to sort and throw away. What that saves is a copy of each
+        // message it looked at - and a read of the whole board is what a caller
+        // waiting for an answer does every couple of seconds.
         //
         // Which end depends on what the caller is doing. Arriving at the board
         // and asking what is on it wants the newest, with `before` to page
-        // back. Following a cursor wants the oldest of what is new, because
-        // that caller will hand the cursor back and never be offered anything
-        // this page left out.
+        // back; the cursor there is only the mark following starts from.
+        // Following a cursor wants the oldest of what is new, and it has to be
+        // a prefix of every origin it speaks for: that caller will hand the
+        // cursor back and never be offered anything this page left out.
         let following = !filter.since.is_empty();
-        let mut newest = NewestFirst::new(limit);
-        let mut oldest = OldestFirst::new(limit);
-        for message in inner.logs.values().flat_map(|log| log.messages.iter()) {
-            if message.seq <= filter.since.get(&message.origin).copied().unwrap_or(0)
-                || !filter.before.is_none_or(|before| message.ts < before)
-                || !visible(message, filter, &mine, &label)
-                || !(filter.kinds.is_empty()
+        let accepts = |message: &TalkMessage| -> bool {
+            message.seq > filter.since.get(&message.origin).copied().unwrap_or(0)
+                && filter.before.is_none_or(|before| message.ts < before)
+                && visible(message, filter, &mine, &label)
+                && (filter.kinds.is_empty()
                     || filter.kinds.iter().any(|kind| kind == message.kind.name()))
-                || !(filter.authors.is_empty()
+                && (filter.authors.is_empty()
                     || filter.authors.iter().any(|author| {
                         message
                             .author
@@ -964,35 +978,44 @@ impl TalkStore {
                                 .as_deref()
                                 .is_some_and(|label| label.eq_ignore_ascii_case(author))
                     }))
-            {
-                continue;
-            }
-            if query
-                .as_ref()
-                .is_some_and(|query| !message.text.to_lowercase().contains(query))
-            {
-                continue;
-            }
-            if following {
-                oldest.offer(message);
-            } else {
-                newest.offer(message);
-            }
-        }
+                && query
+                    .as_ref()
+                    .is_none_or(|query| message.text.to_lowercase().contains(query))
+        };
         let (truncated, matched) = if following {
-            (oldest.dropped(), oldest.into_page())
+            let runs: Vec<UnreadRun<'_>> = inner
+                .logs
+                .iter()
+                .filter_map(|(origin, log)| {
+                    let held = filter.since.get(origin).copied().unwrap_or(0);
+                    let fresh = log.messages.partition_point(|message| message.seq <= held);
+                    if fresh < log.messages.len() {
+                        Some(UnreadRun::new(origin, &log.messages[fresh..]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            oldest_page(runs, limit, accepts)
         } else {
+            let mut newest = NewestFirst::new(limit);
+            for message in inner.logs.values().flat_map(|log| log.messages.iter()) {
+                if accepts(message) {
+                    newest.offer(message);
+                }
+            }
             (newest.dropped(), newest.into_page())
         };
         // Everything the board holds is what the caller has been shown, unless
         // the page had to leave some of it out. Then the cursor may reach no
-        // further than the newest message actually in hand: the page is the
-        // oldest end of what matched, so every message at or below that point
-        // either went out with it or was filtered out on the way, and the ones
-        // left behind are all above it and will be offered again next read.
-        // An origin this page says nothing about keeps the caller's own mark,
-        // which costs a second look at messages that matched nothing and loses
-        // none that did.
+        // further than the newest message actually in hand. A following page
+        // takes each origin in sequence order and only a prefix of what that
+        // origin still has to say, so everything at or below the mark either
+        // went out with the page or was filtered out on the way, and the
+        // messages left behind are all above it and will be offered again next
+        // read. An origin this page says nothing about keeps the caller's own
+        // mark, which costs a second look at messages that matched nothing and
+        // loses none that did.
         let vector = if truncated {
             let mut vector = filter.since.clone();
             for message in &matched {
