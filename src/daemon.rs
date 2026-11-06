@@ -15280,6 +15280,61 @@ mod platform {
             discard_root(paths.root);
         }
 
+        /// A temporary launch that never becomes a session must not leave its
+        /// scratch folder behind.
+        ///
+        /// The folder is made before every step that can fail, and a failed
+        /// attempt is not a session: there is no live record to end, no
+        /// archived one to delete, and nothing the UI can show. The sweep that
+        /// reclaims orphaned folders runs once at daemon start, so a daemon
+        /// that stays up for days gathers one folder per failed temporary
+        /// attempt, invisibly, until it is restarted.
+        #[test]
+        fn a_failed_temporary_launch_leaves_no_scratch_folder() {
+            let state = test_state("scratch-leak");
+            let paths = state.paths.clone();
+            let session_id = "muxloomd-temporal-codex-not-installed";
+            let scratch = paths.scratch.join(session_id);
+            let record = paths.sessions.join(format!("{session_id}.json"));
+            // A bare program name, so the launch gets past the scratch folder
+            // and then fails where it resolves the executable: the folder is
+            // already there by the time this step runs.
+            let missing = format!("muxloom-not-installed-{}", std::process::id());
+            let result = launch_session(
+                &state,
+                session_id.into(),
+                "codex".into(),
+                "/tmp".into(),
+                "Temporal Chat".into(),
+                true,
+                missing.clone(),
+                vec![],
+                vec![],
+                1,
+                80,
+                24,
+                None,
+                None,
+                None,
+            );
+            let Err(error) = result else {
+                panic!("'{missing}' is not on PATH, so the launch cannot have succeeded");
+            };
+            let error = format!("{error:#}");
+            let leaked = scratch.exists();
+            let recorded = record.exists();
+            discard_root(paths.root);
+            assert!(
+                error.contains("not found on PATH"),
+                "the launch has to fail because the program is missing: {error}"
+            );
+            assert!(!recorded, "no session record may survive a failed launch");
+            assert!(
+                !leaked,
+                "a temporary launch that never started left its scratch folder behind"
+            );
+        }
+
         /// A delete has to outlast the writes that were already on their way.
         ///
         /// Nothing here walks the session map with the map lock in hand: the
