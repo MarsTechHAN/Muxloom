@@ -28,6 +28,7 @@
 
 use std::{
     fmt,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -494,16 +495,52 @@ impl Reach {
     }
 }
 
+/// How one queue's tickets are told from every other queue's.
+///
+/// A counter living in the queue is not enough. A daemon generation is a new
+/// process with a new queue, so `relay-{n}` began again at `relay-1` after
+/// every handover, and a controller still running the previous generation's
+/// errand completed its old ticket on the new daemon — which had already
+/// handed the same ticket to a different agent, whose call was then reported
+/// done with another tool's answer in it. The ticket carries the instant the
+/// queue was made, the process that made it, and which queue it is in that
+/// process, so no generation can mint a name an earlier one might still hold.
+fn ticket_prefix() -> String {
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let made = MADE.fetch_add(1, Ordering::Relaxed);
+    let made_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let process = std::process::id();
+    format!("{made_at:x}-{process:x}-{made:x}")
+}
+
 /// The daemon's side of the relay: jobs waiting, jobs answered, and when a
 /// controller last showed itself.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RelayQueue {
+    /// What this queue's tickets start with. Minted when the queue is made,
+    /// which is once per daemon generation.
+    tickets: String,
     entries: Vec<Entry>,
     next: u64,
     /// When a controller last asked for work. Zero until one ever has.
     last_poll: u64,
     /// Where each controller that has been round said it could reach.
     reaches: Vec<Reach>,
+}
+
+impl Default for RelayQueue {
+    fn default() -> Self {
+        Self {
+            tickets: ticket_prefix(),
+            entries: Vec::new(),
+            next: 0,
+            last_poll: 0,
+            reaches: Vec::new(),
+        }
+    }
 }
 
 impl RelayQueue {
@@ -607,7 +644,7 @@ impl RelayQueue {
             bail!("too many relayed requests are already waiting on the controller; try again");
         }
         self.next += 1;
-        let id = format!("relay-{}", self.next);
+        let id = format!("relay-{}-{}", self.tickets, self.next);
         self.entries.push(Entry {
             job: RelayJob {
                 id: id.clone(),
@@ -692,10 +729,22 @@ impl RelayQueue {
     }
 
     /// A controller writing back what happened. An answer for a job that has
-    /// already expired is dropped: nobody is waiting for it.
+    /// already expired is dropped: nobody is waiting for it. So is an answer
+    /// for a ticket this queue never handed out.
+    ///
+    /// Only a poll hands a job out, so a completion for an entry still waiting
+    /// here cannot be the follow-up to a run — after a handover it is the
+    /// previous generation's controller finishing an errand this queue never
+    /// saw. Its ticket now names nothing here at all; refusing the untouched
+    /// entry as well is what keeps a guessed or reissued name from opening the
+    /// same hole.
     pub fn complete(&mut self, id: &str, ok: bool, output: String, now: u64) {
         self.last_poll = now;
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.job.id == id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.job.id == id && entry.taken)
+        {
             entry.answer = Some(RelayAnswer {
                 done: true,
                 ok,
