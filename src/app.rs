@@ -20077,6 +20077,107 @@ mod tests {
         ));
     }
 
+    /// A file watch is `tail -f`, but the preview pipeline reads every file
+    /// from its first byte. A log larger than the 8 MiB preview budget
+    /// therefore shows a frozen head: each poll re-reads bytes 0..8 MiB and the
+    /// newest lines never appear. This drives the real watch poll through the
+    /// worker and the runtime against a scratch file, so it exercises the path
+    /// the TUI does rather than a hand-built reply.
+    #[test]
+    fn a_large_file_watch_shows_the_newest_bytes_not_the_head() {
+        // A test build never opens the machine's own companion, and this read
+        // must not either: point the bridge at a path that cannot exist so the
+        // preview falls back to the local shell, the way a target without the
+        // bridge does.
+        let config = Config {
+            companion_command: "/nonexistent/muxloomd-watch-tail-test".into(),
+            ..Config::default()
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("muxloom-watch-tail-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("huge.log");
+        let marker = "WATCH-TAIL-MARKER-9f3c2a\n";
+        // Comfortably past the 8 MiB preview budget.
+        const PADDING: usize = 9 * 1024 * 1024;
+        let line = "muxloom watch padding line\n";
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&file_path).unwrap();
+            let mut written = 0;
+            while written < PADDING {
+                let chunk = line.repeat((PADDING - written).div_ceil(line.len()));
+                file.write_all(chunk.as_bytes()).unwrap();
+                written += chunk.len();
+            }
+            file.write_all(marker.as_bytes()).unwrap();
+        }
+        let target = Target::local();
+        let mut app = App::new(
+            config.clone(),
+            PathBuf::from("unused-config.toml"),
+            State::default(),
+            PathBuf::from("unused-state.json"),
+            vec![target.clone()],
+            Worker::start(Runtime::new(&config)),
+        );
+        let path = file_path.to_string_lossy().into_owned();
+        app.file_watches.push(FileWatch {
+            id: format!("filewatch:local:{path}"),
+            path: path.clone(),
+            target,
+            label: "huge.log".into(),
+            last_stamp: (0, 0),
+            content: String::new(),
+            loading: false,
+            kind: FilePreviewKind::Text,
+            mime: "text/plain".into(),
+            truncated: false,
+            scroll: 0,
+            max_scroll: 0,
+            page_rows: 0,
+            follow_tail: true,
+            rendered: None,
+        });
+        app.file_watch_poll_at = None;
+        app.maybe_poll_file_watches();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            app.drain_worker();
+            let watch = &app.file_watches[0];
+            if !watch.loading && !watch.content.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let content = app.file_watches[0].content.clone();
+        let _ = fs::remove_dir_all(&root);
+
+        let tail: String = content
+            .chars()
+            .rev()
+            .take(80)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        assert!(
+            content.ends_with(marker),
+            "a watch must show the file's newest bytes; the reply held {} bytes ending {tail:?}",
+            content.len()
+        );
+        assert!(
+            content.len() <= 512 * 1024,
+            "a watch poll must transfer a bounded tail window, not the whole head: {} bytes",
+            content.len()
+        );
+    }
+
     #[test]
     fn file_preview_owns_terminal_pane_focus_without_activating_agent_input() {
         let mut app = ux_test_app(vec![Target::local()]);
