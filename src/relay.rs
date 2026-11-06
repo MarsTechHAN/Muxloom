@@ -1752,4 +1752,63 @@ mod tests {
         assert!(queue.attached(t0 + ATTACHED_MS));
         assert!(!queue.attached(t0 + ATTACHED_MS + 1));
     }
+
+    /// The bug this is here for: tickets were `relay-{n}` off a counter that
+    /// lived in the queue, and a daemon generation is a fresh queue, so the
+    /// generation after a handover minted `relay-1` all over again. A
+    /// controller still running the previous generation's errand reconnected
+    /// and completed *its* ticket on the new daemon, which had already handed
+    /// that ticket to a different agent: that agent was told its call had run,
+    /// carrying another tool's answer.
+    #[test]
+    fn a_handover_does_not_let_a_stale_completion_answer_a_new_job() {
+        let t0 = 11_000_000;
+
+        // The old generation hands a job to a controller that is still running
+        // it when the daemon it came from is replaced.
+        let mut old = RelayQueue::default();
+        old.poll(t0, Vec::new(), "", "");
+        let stale = old.submit("list_machines", "{}", "", t0).unwrap();
+        assert_eq!(
+            old.poll(t0 + 1, Vec::new(), "", "").len(),
+            1,
+            "the old generation hands its job out"
+        );
+
+        // The new generation starts its own queue, is asked for work, and
+        // hands its first job to its own controller.
+        let mut new = RelayQueue::default();
+        new.poll(t0 + 2, Vec::new(), "", "");
+        let fresh = new.submit("list_files", "{}", "", t0 + 2).unwrap();
+        assert_eq!(
+            new.poll(t0 + 3, Vec::new(), "", "").len(),
+            1,
+            "the new generation hands its job out too"
+        );
+
+        // The old controller reconnects and writes back what it was running.
+        new.complete(&stale, true, "another machine's answer".into(), t0 + 4);
+
+        // It names nothing the new generation handed out, and in particular it
+        // did not answer the job that agent is waiting on.
+        let answer = new.result(&fresh, t0 + 5).unwrap();
+        assert!(
+            !answer.done,
+            "a completion for the previous generation's {stale} answered this generation's \
+             {fresh}: {answer:?}"
+        );
+        // The tickets themselves must never be minted twice.
+        assert_ne!(stale, fresh, "a new daemon generation reissued {fresh}");
+
+        // A ticket nothing took cannot be answered either: a completion is
+        // only ever the follow-up to the poll that handed the job out, and
+        // accepting one for an untouched job is the same hole with the id
+        // guessed rather than repeated.
+        let untouched = new.submit("list_machines", "{}", "", t0 + 6).unwrap();
+        new.complete(&untouched, true, "nobody asked for this".into(), t0 + 7);
+        assert!(
+            !new.result(&untouched, t0 + 8).unwrap().done,
+            "a ticket no controller took was answered"
+        );
+    }
 }
