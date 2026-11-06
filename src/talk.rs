@@ -2901,6 +2901,62 @@ mod tests {
         fs::remove_dir_all(&store.root).ok();
     }
 
+    /// The mailbox is not a feed. A session that is neither end of a direct
+    /// message is not handed it for asking for the mailbox by name, because
+    /// the tool promises "my mailbox" and a wait that ends on a stranger's
+    /// answer is a wait that ends on the wrong thing.
+    #[test]
+    fn a_direct_message_is_not_offered_to_a_stranger_reading_the_mailbox() {
+        let store = store("direct-stranger");
+        let mine = store.origin();
+        let mut sent = draft("look at line 40", TalkScope::Global);
+        sent.kind = TalkKind::Direct;
+        sent.author.voice.human = false;
+        sent.to = Some(TalkAddress {
+            machine: mine.clone(),
+            session_id: "session-2".into(),
+        });
+        store.post(sent).unwrap();
+
+        let read = |session: &str, scope: Option<&str>, owner: bool| -> Vec<String> {
+            store
+                .read(&TalkFilter {
+                    session_id: Some(session.into()),
+                    scope: scope.map(Into::into),
+                    owner,
+                    ..TalkFilter::default()
+                })
+                .messages
+                .into_iter()
+                .map(|message| message.text)
+                .collect()
+        };
+        // A third session, in nobody's conversation, asked for the mailbox and
+        // was handed somebody else's mail.
+        assert!(
+            read("session-3", Some("direct"), false).is_empty(),
+            "a session that is neither end read somebody else's mailbox"
+        );
+        // The two ends still have it, and so does the person whose machines
+        // these are — the dashboard's privilege is the owner flag, not asking
+        // for the mailbox.
+        assert_eq!(
+            read("session-2", Some("direct"), false),
+            ["look at line 40"]
+        );
+        assert_eq!(
+            read("session-1", Some("direct"), false),
+            ["look at line 40"]
+        );
+        assert_eq!(read("session-3", Some("direct"), true), ["look at line 40"]);
+        // And the mailbox being readable does not put it on the board.
+        for owner in [false, true] {
+            assert!(read("session-3", None, owner).is_empty(), "owner={owner}");
+        }
+
+        fs::remove_dir_all(&store.root).ok();
+    }
+
     #[test]
     fn a_round_between_two_boards_leaves_them_holding_the_same_thing() {
         let here = store("sync-here");
