@@ -10599,6 +10599,105 @@ mod platform {
             assert!(!still_archived());
         }
 
+        /// A revival whose keeper never comes up is a failed launch, not a
+        /// live session, and its record has to keep saying what the daemon
+        /// knows. The in-place launch writes fresh live metadata before it
+        /// tries the keeper; when the keeper refuses to start, that write has
+        /// to be undone even though the ended session is still in the live
+        /// index, where the rollback's index check once mistook it for a
+        /// launch that had already replaced the record.
+        ///
+        /// Left claiming to be live, the record is read by the next daemon as
+        /// an interrupted session: it is recovered into the archive with a
+        /// false "muxloomd stopped unexpectedly" note in the transcript of a
+        /// session whose revival the user was just told had failed.
+        #[test]
+        fn a_revival_whose_keeper_will_not_start_leaves_its_record_where_it_was() {
+            let state = test_state("revive-keeper-fail");
+            let root = state.paths.root.clone();
+            let id = "muxloomd-terminal-revive-keeper-fail";
+            let launch = |created_at: u64| {
+                launch_session(
+                    &state,
+                    id.into(),
+                    "terminal".into(),
+                    "/tmp".into(),
+                    "coordinator".into(),
+                    false,
+                    "/bin/cat".into(),
+                    vec![],
+                    vec![],
+                    created_at,
+                    80,
+                    24,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            launch(111).unwrap().archive().unwrap();
+            let metadata_path = state.paths.sessions.join(format!("{id}.json"));
+            let history_path = state.paths.history.join(format!("{id}.ansi"));
+            let on_disk = || -> DaemonSession {
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap()
+            };
+            let record = on_disk();
+            assert!(record.archived && record.dead && record.archived_at.is_some());
+            assert_eq!(record.created_at, 111);
+
+            // A directory where the keeper's socket belongs makes the bind
+            // fail, which is the last step of a launch that can fail after its
+            // fresh metadata is already on disk.
+            let socket = keeper::socket_path_for(&state.paths.keepers, id);
+            let _ = fs::remove_file(&socket);
+            fs::create_dir_all(&socket).unwrap();
+            let outcome = launch(999);
+            assert!(
+                outcome.is_err(),
+                "the keeper cannot bind; the launch cannot be"
+            );
+
+            let record = on_disk();
+            assert!(
+                record.archived,
+                "a failed revival left its record claiming the session is not archived"
+            );
+            assert!(
+                record.dead,
+                "a failed revival left its record claiming the session is live"
+            );
+            assert!(
+                record.archived_at.is_some(),
+                "a failed revival dropped when the session ended"
+            );
+            assert_eq!(record.created_at, 111, "the record is the same session");
+            assert_eq!(record.label, "coordinator");
+            // The record was in the live index, and stays there: the failed
+            // launch must not file a second copy under the archive.
+            assert!(
+                !state
+                    .persisted_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(id)
+            );
+
+            // What the next daemon start would make of the record. Read the
+            // way startup reads it: an unarchived, unended record is an
+            // interruption, and gets marked as one in the transcript.
+            load_persisted_session(&state.paths, &metadata_path)
+                .unwrap()
+                .expect("the ended session must still be on disk to read back");
+            assert!(
+                !String::from_utf8_lossy(&fs::read(&history_path).unwrap_or_default())
+                    .contains("muxloomd stopped unexpectedly"),
+                "the next daemon start would invent an interruption for a session that ended"
+            );
+
+            fs::remove_dir_all(&socket).ok();
+            discard_root(root);
+        }
+
         #[test]
         fn a_refused_revival_puts_the_record_back_in_the_index_it_came_out_of() {
             let state = test_state("revive-indexes");
