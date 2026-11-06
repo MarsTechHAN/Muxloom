@@ -3511,9 +3511,11 @@ impl App {
                     form.offset.saturating_add(1).min(HELP_CONTENT_ROWS - 1)
                 };
             }
-            Modal::Settings(form) => {
-                form.selected = clamped_index(form.selected, form.values.len(), delta)
-            }
+            // The wheel walks the same rows the keyboard does, so it clamps
+            // against what the selection can land on — fields, environment
+            // rows and actions alike — and lands the cursor at the end of
+            // whatever it selected.
+            Modal::Settings(form) => form.step(delta),
             Modal::Search(form) => {
                 if form.results.is_empty() {
                     return;
