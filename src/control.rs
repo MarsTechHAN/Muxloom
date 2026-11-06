@@ -7798,7 +7798,15 @@ mod tests {
             assert_eq!(texts(&board).len(), 2, "two notes, no direct: {board:#}");
             let folder = read(&mut surface, json!({ "path": here, "scope": "folder" }));
             assert_eq!(texts(&folder).len(), 2, "{folder:#}");
+            // The mailbox is the two ends' own. A caller running in no session
+            // is neither end of it, so asking for it by name is not a way in.
             let mailbox = read(&mut surface, json!({ "scope": "direct" }));
+            assert!(texts(&mailbox).is_empty(), "{mailbox:#}");
+            // The session it was addressed to reads it as its own mail.
+            let mailbox = {
+                let _addressee = EnvScope::set("MUXLOOM_SESSION_ID", Some("muxloomd-claude-8-1-0"));
+                read(&mut surface, json!({ "scope": "direct" }))
+            };
             assert_eq!(
                 texts(&mailbox),
                 ["the fixture you asked about is in tests/data"],
@@ -8450,6 +8458,10 @@ mod tests {
 
         #[test]
         fn a_message_waits_for_a_working_agent_and_the_board_keeps_the_receipt() {
+            // Every mailbox read below is this test's to set: the caller is
+            // whoever the surface's environment says it is.
+            let _env_lock = test_env::lock();
+            let _nobody = test_env::nobody();
             // A stand-in for Claude Code, because a bare shell no longer is
             // one: what decides whether a message goes in is the prompt box on
             // screen, so the stand-in draws a prompt box. It echoes each line
@@ -8616,30 +8628,38 @@ mod tests {
             );
             until(&mut surface, &busy, "Message from");
 
-            // Both messages are on the board, so what the agents said to each
-            // other can be read by anyone who was not in the room.
-            let board: Value = serde_json::from_str(&call(
-                &mut surface,
-                "talk_read",
-                json!({ "scope": "direct" }),
-            ))
-            .unwrap();
-            let texts: Vec<&str> = board["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|message| message["text"].as_str().unwrap())
-                .collect();
+            // Each direct is filed in the mailbox of the session it was
+            // addressed to, and read only there: what two agents said to each
+            // other is not a feed for a session that was not in the room.
+            let mailbox = |surface: &mut DaemonControl, reader: &str| -> Value {
+                let _reader = EnvScope::set("MUXLOOM_SESSION_ID", Some(reader));
+                serde_json::from_str(&call(surface, "talk_read", json!({ "scope": "direct" })))
+                    .unwrap()
+            };
+            let texts = |page: &Value| -> Vec<String> {
+                page["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message["text"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let outsider = mailbox(&mut surface, &shell);
+            assert!(texts(&outsider).is_empty(), "{outsider:#}");
+            let theirs = mailbox(&mut surface, &idle);
             assert_eq!(
-                texts,
-                [
-                    "the parser is yours, I am on the lexer",
-                    "when you surface, the lexer needs a second pair of eyes",
-                ],
-                "{board:#}"
+                texts(&theirs),
+                ["the parser is yours, I am on the lexer"],
+                "{theirs:#}"
             );
-            assert_eq!(board["messages"][0]["kind"], "direct");
-            assert_eq!(board["messages"][0]["to"]["session_id"], idle);
+            assert_eq!(theirs["messages"][0]["kind"], "direct");
+            assert_eq!(theirs["messages"][0]["to"]["session_id"], idle);
+            let theirs = mailbox(&mut surface, &busy);
+            assert_eq!(
+                texts(&theirs),
+                ["when you surface, the lexer needs a second pair of eyes"],
+                "{theirs:#}"
+            );
 
             for session in [shell, idle, busy] {
                 call(

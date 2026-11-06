@@ -1126,7 +1126,32 @@ fn visible(message: &TalkMessage, filter: &TalkFilter, mine: &str, label: &str) 
     // another was a feed, and the notes worth keeping were the ones a reader
     // scrolled past.
     if message.kind == TalkKind::Direct {
-        return filter.scope.as_deref() == Some("direct");
+        if filter.scope.as_deref() != Some("direct") {
+            return false;
+        }
+        // And the mailbox is the reader's own: asking for it by name is not
+        // the whole of the check, or every session on the machine would be
+        // handed every agent-to-agent direct on it. Only the two ends of the
+        // conversation read it — and the person whose machines these are,
+        // which is what `owner` means. A caller with no session of its own is
+        // neither end of anything.
+        if filter.owner {
+            return true;
+        }
+        let Some(me) = filter.session_id.as_deref() else {
+            return false;
+        };
+        let addressed_to_me = message
+            .to
+            .as_ref()
+            .is_some_and(|to| to.session_id.as_str() == me);
+        let sent_by_me = message
+            .author
+            .voice
+            .session_id
+            .as_deref()
+            .is_some_and(|sender| sender == me);
+        return addressed_to_me || sent_by_me;
     }
     // Nor is the older kind, "message": a person speaking at a dashboard, or a
     // build from before notes. Kept, because a log cannot have holes in it, and
