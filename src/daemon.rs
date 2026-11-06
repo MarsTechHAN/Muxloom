@@ -15337,6 +15337,41 @@ mod platform {
             discard_root(paths.root);
         }
 
+        /// The agent-configuration write, switched off for one test and put
+        /// back how it was.
+        ///
+        /// A launch records the directory it is about to work in as trusted in
+        /// the runtime's own configuration, under the user's home. That is
+        /// right in production and wrong in a test: the regression below
+        /// launches a Codex-kind temporary session on purpose so the launch
+        /// reaches the trust write, and without this it appended a project
+        /// entry to the developer's real `~/.codex/config.toml` on every run
+        /// before it reached the missing-program failure. The scratch cleanup
+        /// under test does not depend on that write.
+        struct TrustWritesOff(Option<std::ffi::OsString>);
+
+        impl TrustWritesOff {
+            fn set() -> Self {
+                let previous = std::env::var_os("MUXLOOM_TRUST_DIRECTORY");
+                // SAFETY: the suite runs one test at a time, and the guard
+                // puts the previous value back before the next test can look.
+                unsafe { std::env::set_var("MUXLOOM_TRUST_DIRECTORY", "0") };
+                Self(previous)
+            }
+        }
+
+        impl Drop for TrustWritesOff {
+            fn drop(&mut self) {
+                // SAFETY: as above.
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("MUXLOOM_TRUST_DIRECTORY", value),
+                        None => std::env::remove_var("MUXLOOM_TRUST_DIRECTORY"),
+                    }
+                }
+            }
+        }
+
         /// A temporary launch that never becomes a session must not leave its
         /// scratch folder behind.
         ///
@@ -15348,6 +15383,9 @@ mod platform {
         /// attempt, invisibly, until it is restarted.
         #[test]
         fn a_failed_temporary_launch_leaves_no_scratch_folder() {
+            // Nothing this test does may leave a file outside its own temp
+            // root, and a trust write would land in the home directory.
+            let _trust_writes_off = TrustWritesOff::set();
             let state = test_state("scratch-leak");
             let paths = state.paths.clone();
             let session_id = "muxloomd-temporal-codex-not-installed";
