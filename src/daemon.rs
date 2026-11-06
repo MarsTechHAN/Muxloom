@@ -11418,6 +11418,106 @@ mod platform {
         }
 
         #[test]
+        fn a_failed_resume_onto_a_new_id_leaves_the_archived_fleet_and_alias_alone() {
+            let state = test_state("compat-alias-rollback");
+            let master = "muxloomd-claude-compat-fail-master";
+            let successor = "muxloomd-claude-compat-fail-successor";
+            let old = launch_session(
+                &state,
+                master.into(),
+                "claude".into(),
+                "/tmp".into(),
+                "coordinator".into(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-fail".into()],
+                vec![],
+                100,
+                80,
+                24,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let live_child = launch_session(
+                &state,
+                "muxloomd-claude-compat-fail-live".into(),
+                "claude".into(),
+                "/tmp".into(),
+                "worker".into(),
+                false,
+                "/bin/cat".into(),
+                vec![],
+                vec![],
+                101,
+                80,
+                24,
+                Some(master.into()),
+                None,
+                None,
+            )
+            .unwrap();
+            old.archive().unwrap();
+            drop(old);
+            // The successor's keeper cannot come up at all: a directory sits
+            // where its socket would be bound. The launch gets past writing
+            // the new record and only then asks for the keeper.
+            let blocked = keeper::socket_path_for(&state.paths.keepers, successor);
+            fs::create_dir(&blocked).unwrap();
+
+            let error = match launch_session(
+                &state,
+                successor.into(),
+                "claude".into(),
+                "/tmp".into(),
+                String::new(),
+                false,
+                "/bin/cat".into(),
+                vec!["--resume".into(), "ses-fail".into()],
+                vec![],
+                200,
+                80,
+                24,
+                None,
+                None,
+                None,
+            ) {
+                Ok(_) => panic!("a launch whose keeper never started has to fail"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("failed to remove stale"),
+                "the launch failed for something other than the blocked keeper socket: {error}"
+            );
+
+            // Nothing of the split is real: there is no successor session, so
+            // the fleet and the alias must not have moved onto its number.
+            assert_eq!(
+                live_child.snapshot().parent.as_deref(),
+                Some(master),
+                "a launch that never produced a successor took the fleet with it"
+            );
+            let sessions = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let retired = sessions
+                .get(master)
+                .expect("the retired master is still recorded here")
+                .snapshot();
+            assert_eq!(
+                retired.resumed_to, None,
+                "the archive names a successor that never existed"
+            );
+            assert!(
+                !sessions.contains_key(successor),
+                "the failed launch left a record for the successor it never started"
+            );
+            drop(sessions);
+        }
+
+        #[test]
         fn a_trigger_outlives_the_daemon_that_took_it() {
             let state = test_state("triggers-reload");
             state.save_triggers(&[armed_trigger(false, 5_000, Some(400))]);
